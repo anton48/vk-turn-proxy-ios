@@ -1,0 +1,20 @@
+# Build artifacts
+WireGuardBridge/build/
+
+# Xcode
+*.xcuserdata
+*.xcworkspace
+DerivedData/
+build/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Go
+vendor/
+*.xcuserdata

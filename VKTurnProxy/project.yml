@@ -1,0 +1,67 @@
+name: VKTurnProxy
+options:
+  bundleIdPrefix: com.vkturnproxy
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "16.2"
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: CDMQ33VFQC
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  VKTurnProxy:
+    type: application
+    platform: iOS
+    sources:
+      - path: VKTurnProxy
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app
+        CODE_SIGN_ENTITLEMENTS: VKTurnProxy/VKTurnProxy.entitlements
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: 2
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: "VK Turn Proxy"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: PacketTunnel
+        embed: true
+      - sdk: NetworkExtension.framework
+
+  PacketTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: PacketTunnel
+    info:
+      path: PacketTunnel/Info.plist
+      properties:
+        CFBundleDisplayName: "VK Turn Proxy Tunnel"
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app.tunnel
+        CODE_SIGN_ENTITLEMENTS: PacketTunnel/PacketTunnel.entitlements
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: 2
+        SKIP_INSTALL: YES
+        SWIFT_OBJC_BRIDGING_HEADER: PacketTunnel/BridgeHeader.h
+        OTHER_LDFLAGS:
+          - "-lresolv"
+        FRAMEWORK_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(PROJECT_DIR)/../WireGuardBridge/build"
+    dependencies:
+      - framework: ../WireGuardBridge/build/WireGuardTURN.xcframework
+      - sdk: NetworkExtension.framework
