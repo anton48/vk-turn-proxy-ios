@@ -22,6 +22,10 @@ pkg/proxy/            # Go proxy: DTLS+TURN tunnel, VK creds, PoW captcha solver
 go.mod, go.sum        # Go module dependencies
 ```
 
+## Installing
+
+[TestFlight](https://testflight.apple.com/join/ANm6cmDv)
+
 ## Building
 
 ### Prerequisites
