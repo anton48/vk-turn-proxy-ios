@@ -129,9 +129,19 @@ class TunnelManager: ObservableObject {
     /// through TUN would fail, preventing WebView from resolving VK hostnames).
     func suspendDNS() {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
-        guard let msg = "suspend_dns".data(using: .utf8) else { return }
+        // Ask extension to refresh captcha URL (fresh VK API call) AND suspend DNS.
+        // The extension returns the fresh URL in the response data.
+        guard let msg = "refresh_captcha_and_suspend_dns".data(using: .utf8) else { return }
         do {
-            try session.sendProviderMessage(msg) { _ in }
+            try session.sendProviderMessage(msg) { [weak self] responseData in
+                guard let self = self,
+                      let data = responseData,
+                      let freshURL = String(data: data, encoding: .utf8),
+                      !freshURL.isEmpty else { return }
+                DispatchQueue.main.async {
+                    self.captchaImageURL = freshURL
+                }
+            }
         } catch {}
     }
 

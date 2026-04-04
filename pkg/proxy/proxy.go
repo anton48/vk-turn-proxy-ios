@@ -3,11 +3,15 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	mathrand "math/rand"
 	"net"
+	neturl "net/url"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync"
@@ -443,6 +447,104 @@ func (p *Proxy) SolveCaptcha(answer string) {
 	default:
 		log.Printf("proxy: SolveCaptcha called but no captcha pending")
 	}
+}
+
+// RefreshCaptchaURL makes a fresh step2 VK API call to get a new captcha URL.
+// Called from Swift right before showing WebView, so the URL is guaranteed fresh.
+// Returns the new redirect_uri or empty string on failure.
+func (p *Proxy) RefreshCaptchaURL() string {
+	log.Printf("proxy: refreshing captcha URL for WebView")
+
+	linkID := p.linkID
+	if linkID == "" {
+		log.Printf("proxy: RefreshCaptchaURL: no linkID")
+		return ""
+	}
+
+	// Pick a random client_id for the fresh request
+	vc := vkCredentialsList[mathrand.Intn(len(vkCredentialsList))]
+	ua := randomUserAgent()
+	name := generateName()
+
+	client := newHTTPClient()
+	defer client.CloseIdleConnections()
+
+	// Step 1: get anon token
+	step1Data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s", vc.ClientID, vc.ClientSecret, vc.ClientID)
+	step1Resp, err := doSimplePost(client, step1Data, "https://login.vk.ru/?act=get_anonym_token", ua)
+	if err != nil {
+		log.Printf("proxy: RefreshCaptchaURL step1 failed: %v", err)
+		return ""
+	}
+	token1, ok := extractNestedString(step1Resp, "data", "access_token")
+	if !ok {
+		log.Printf("proxy: RefreshCaptchaURL step1 parse failed")
+		return ""
+	}
+
+	// Step 2: trigger captcha
+	step2URL := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.275&client_id=%s", vc.ClientID)
+	step2Data := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s",
+		linkID, neturl.QueryEscape(name), token1)
+	step2Resp, err := doSimplePost(client, step2Data, step2URL, ua)
+	if err != nil {
+		log.Printf("proxy: RefreshCaptchaURL step2 failed: %v", err)
+		return ""
+	}
+
+	sid, captchaURL, ts, attempt := extractCaptcha(step2Resp)
+	if sid == "" {
+		log.Printf("proxy: RefreshCaptchaURL: no captcha in response (maybe no captcha needed)")
+		return ""
+	}
+
+	log.Printf("proxy: RefreshCaptchaURL: got fresh captcha sid=%s", sid)
+	// Update stored captcha info
+	p.captchaImageURL.Store(captchaURL)
+	p.lastCaptchaSID.Store(sid)
+	p.lastCaptchaTs.Store(ts)
+	p.lastCaptchaAttempt.Store(attempt)
+	p.lastCaptchaToken1.Store(token1)
+
+	return captchaURL
+}
+
+// doSimplePost is a helper for RefreshCaptchaURL.
+func doSimplePost(client *http.Client, data, url, ua string) (map[string]interface{}, error) {
+	req, err := http.NewRequest("POST", url, strings.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// extractNestedString extracts a string from nested maps.
+func extractNestedString(m map[string]interface{}, keys ...string) (string, bool) {
+	var cur interface{} = m
+	for _, k := range keys {
+		mm, ok := cur.(map[string]interface{})
+		if !ok {
+			return "", false
+		}
+		cur = mm[k]
+	}
+	s, ok := cur.(string)
+	return s, ok
 }
 
 // TURNServerIP returns the TURN server IP discovered after connecting.

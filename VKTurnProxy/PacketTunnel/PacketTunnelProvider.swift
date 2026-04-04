@@ -272,6 +272,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: suspend_dns — removing VPN DNS so system uses provider DNS")
             suspendDNSForCaptcha()
             completionHandler?("ok".data(using: .utf8))
+        } else if msg == "refresh_captcha_and_suspend_dns" {
+            logMsg("handleAppMessage: refresh_captcha_and_suspend_dns — refreshing captcha URL and suspending DNS")
+            suspendDNSForCaptcha()
+            // Call wgRefreshCaptchaURL to get a fresh captcha URL from VK
+            var freshURL = ""
+            if tunnelHandle >= 0 {
+                if let ptr = wgRefreshCaptchaURL(tunnelHandle) {
+                    freshURL = String(cString: ptr)
+                    free(UnsafeMutableRawPointer(mutating: ptr))
+                    logMsg("refreshCaptchaURL: got fresh URL (\(freshURL.prefix(80))...)")
+                }
+            }
+            completionHandler?(freshURL.data(using: .utf8))
         } else if msg == "restore_dns" {
             logMsg("handleAppMessage: restore_dns — restoring VPN DNS after captcha")
             restoreDNSAfterCaptcha()

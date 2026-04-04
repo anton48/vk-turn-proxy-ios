@@ -43,6 +43,11 @@ void wgResume(int32_t tunnelHandle);
 /// Provide captcha answer to unblock pending credential fetch.
 void wgSolveCaptcha(int32_t tunnelHandle, const char *answer);
 
+/// Refresh captcha URL by making a fresh VK API request.
+/// Call this right before showing WebView to ensure the URL is not stale.
+/// @return Fresh captcha redirect_uri (caller must free), empty string on failure
+const char *wgRefreshCaptchaURL(int32_t tunnelHandle);
+
 /// Set the path to the shared log file (App Group container).
 /// Go log output will be appended to this file in addition to os_log.
 void wgSetLogFilePath(const char *path);

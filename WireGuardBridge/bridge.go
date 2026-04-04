@@ -274,6 +274,21 @@ func wgSolveCaptcha(tunnelHandle C.int32_t, answer *C.char) {
 	entry.proxy.SolveCaptcha(goAnswer)
 }
 
+//export wgRefreshCaptchaURL
+func wgRefreshCaptchaURL(tunnelHandle C.int32_t) *C.char {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok {
+		return C.CString("")
+	}
+
+	freshURL := entry.proxy.RefreshCaptchaURL()
+	return C.CString(freshURL)
+}
+
 //export wgVersion
 func wgVersion() *C.char {
 	return C.CString("0.1.0-turn")
