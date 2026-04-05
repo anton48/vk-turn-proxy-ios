@@ -248,8 +248,12 @@ func (p *Proxy) waitCaptchaAndRestart() {
 	select {
 	case answer := <-p.captchaCh:
 		p.captchaImageURL.Store("")
-		p.lastCaptchaKey.Store(answer)
-		log.Printf("proxy: captcha answered (%d chars), restarting connections (will use stored captcha_sid + key)", len(answer))
+		if answer != "" {
+			p.lastCaptchaKey.Store(answer)
+			log.Printf("proxy: captcha answered (%d chars), restarting connections (will use stored captcha_sid + key)", len(answer))
+		} else {
+			log.Printf("proxy: VK no longer requires captcha, restarting connections normally")
+		}
 		p.Resume()
 	case <-p.ctx.Done():
 		p.captchaImageURL.Store("")
@@ -275,6 +279,18 @@ func (p *Proxy) Pause() {
 // Always cancels the old session first — iOS may call wake() without sleep(),
 // or the process may have been frozen without any lifecycle callback.
 func (p *Proxy) Resume() {
+	// If captcha is pending, don't start new connections — there's already a
+	// waitCaptchaAndRestart goroutine that will handle it when the user solves
+	// the captcha. Starting new connections would just pile up goroutines that
+	// all block on the same captcha, leading to 100s of accumulated goroutines
+	// when iOS repeatedly wakes the extension during the night.
+	if v := p.captchaImageURL.Load(); v != nil {
+		if url, _ := v.(string); url != "" {
+			log.Printf("proxy: Resume — captcha pending, skipping (will resume after captcha solved)")
+			return
+		}
+	}
+
 	p.sessMu.Lock()
 	// Cancel any existing session to kill orphaned goroutines.
 	// This is critical: iOS can freeze the process and unfreeze it
@@ -296,6 +312,14 @@ func (p *Proxy) Resume() {
 // ForceReconnect tears down all connections and starts fresh.
 // Used by the watchdog when it detects a dead tunnel.
 func (p *Proxy) ForceReconnect() {
+	// Don't force reconnect while captcha is pending (same reason as Resume)
+	if v := p.captchaImageURL.Load(); v != nil {
+		if url, _ := v.(string); url != "" {
+			log.Printf("proxy: ForceReconnect — captcha pending, skipping")
+			return
+		}
+	}
+
 	p.sessMu.Lock()
 	if p.sessCancel != nil {
 		p.sessCancel()
@@ -328,6 +352,15 @@ func (p *Proxy) runWatchdog() {
 	for {
 		select {
 		case <-ticker.C:
+			// Don't force reconnect while captcha is pending — a goroutine is
+			// already waiting for the user to solve it. ForceReconnect would
+			// cancel that wait and start a new cycle that hits the same captcha.
+			if v := p.captchaImageURL.Load(); v != nil {
+				if url, _ := v.(string); url != "" {
+					continue // captcha pending, skip watchdog cycle
+				}
+			}
+
 			lastRecv := p.lastRecvTime.Load()
 			active := p.activeConns.Load()
 			expected := int32(p.config.NumConns)
@@ -494,7 +527,15 @@ func (p *Proxy) RefreshCaptchaURL() string {
 
 	sid, captchaURL, ts, attempt := extractCaptcha(step2Resp)
 	if sid == "" {
-		log.Printf("proxy: RefreshCaptchaURL: no captcha in response (maybe no captcha needed)")
+		log.Printf("proxy: RefreshCaptchaURL: no captcha in response — VK cooled down, unblocking reconnect")
+		// VK no longer requires captcha. Clear captcha state and unblock
+		// any goroutine waiting on captchaCh so it can retry normally.
+		p.captchaImageURL.Store("")
+		p.lastCaptchaSID.Store("")
+		select {
+		case p.captchaCh <- "": // empty answer signals "just retry, no captcha needed"
+		default:
+		}
 		return ""
 	}
 
@@ -594,7 +635,13 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				return err
 			}
 
-			if duration > 5*time.Minute {
+			// If the session ended because of a captcha requirement and
+			// it was already handled (solved or pending), don't count as failure.
+			var captchaErr *CaptchaRequiredError
+			if errors.As(err, &captchaErr) {
+				log.Printf("proxy: session ended with captcha requirement, not counting as failure")
+				shortFailures = 0
+			} else if duration > 5*time.Minute {
 				shortFailures = 0 // session was healthy
 			} else {
 				shortFailures++
@@ -851,6 +898,37 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				}
 				newAddr, newCreds, err := p.resolveTURNAddr(linkID, true)
 				if err != nil {
+					// Check if it's a captcha that needs human interaction.
+					// Instead of burning retries, freeze and wait for the user.
+					var captchaErr *CaptchaRequiredError
+					if errors.As(err, &captchaErr) {
+						log.Printf("proxy: TURN reconnect needs captcha (slider), freezing until user solves it")
+						p.captchaImageURL.Store(captchaErr.ImageURL)
+						p.lastCaptchaSID.Store(captchaErr.SID)
+						p.lastCaptchaTs.Store(captchaErr.CaptchaTs)
+						p.lastCaptchaAttempt.Store(captchaErr.CaptchaAttempt)
+						p.lastCaptchaToken1.Store(captchaErr.Token1)
+						// Block until user solves captcha or context cancelled
+						select {
+						case answer := <-p.captchaCh:
+							p.captchaImageURL.Store("")
+							if answer != "" {
+								p.lastCaptchaKey.Store(answer)
+								log.Printf("proxy: captcha solved during TURN reconnect (%d chars), retrying", len(answer))
+							} else {
+								// Empty answer = VK cooled down, no captcha needed anymore
+								log.Printf("proxy: VK no longer requires captcha, retrying normally")
+							}
+							// Don't increment retries — this wasn't a real failure
+							continue
+						case <-connCtx.Done():
+							p.captchaImageURL.Store("")
+							return
+						case <-p.ctx.Done():
+							p.captchaImageURL.Store("")
+							return
+						}
+					}
 					retries++
 					log.Printf("proxy: TURN creds fetch failed (attempt %d/5): %s", retries, err)
 					select {
