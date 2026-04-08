@@ -215,6 +215,13 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 
 				log.Printf("vk: PoW attempt %d/%d failed: %v", powTry, maxPoWRetries, powErr)
 
+				// If VK returned plain "ERROR" (not BOT, not ERROR_LIMIT),
+				// PoW is likely disabled entirely — don't waste time retrying.
+				if powErr != nil && strings.Contains(powErr.Error(), "status=ERROR ") {
+					log.Printf("vk: PoW appears disabled (status=ERROR), skipping remaining attempts")
+					break
+				}
+
 				if powTry < maxPoWRetries {
 					freshData := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", linkID, escapedName, token1)
 					freshResp, freshErr := doRequest(freshData, step2URL)

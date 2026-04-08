@@ -316,6 +316,14 @@ class TunnelManager: ObservableObject {
 
                         if hasCaptcha {
                             if !self.captchaPending {
+                                // Only show captcha UI if there are NO active connections.
+                                // If connections are alive, traffic flows and the Go-side
+                                // probe goroutine will handle captcha retry automatically.
+                                // Showing captcha sheet with active connections causes
+                                // annoying empty-sheet loops (VK returns stale URLs).
+                                if newStats.activeConns > 0 {
+                                    self.debugLog("captcha DETECTED but activeConns=\(newStats.activeConns), ignoring (connections alive)")
+                                } else {
                                 self.captchaPending = true
                                 self.captchaImageURL = captchaURL
                                 self.captchaSID = newStats.captchaSID
@@ -324,7 +332,8 @@ class TunnelManager: ObservableObject {
                                     self.suspendDNS()
                                     self.dnsSuspended = true
                                 }
-                                self.debugLog("captcha DETECTED, suspendDNS=\(self.status == .connected)")
+                                self.debugLog("captcha DETECTED, activeConns=0, suspendDNS=\(self.status == .connected)")
+                                }
                             } else if self.captchaImageURL != captchaURL {
                                 // URL changed (e.g., periodic probe got a fresh captcha URL)
                                 self.captchaImageURL = captchaURL

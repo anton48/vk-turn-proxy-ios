@@ -1316,7 +1316,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		Username:               creds.Username,
 		Password:               creds.Password,
 		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          &noopLoggerFactory{},
+		LoggerFactory:          &turnLoggerFactory{},
 	}
 
 	client, err := turn.NewClient(cfg)
@@ -1431,24 +1431,33 @@ func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	return c.Write(p)
 }
 
-// noopLoggerFactory suppresses all pion/turn logging to reduce CPU wakeups.
-// The pion logger creates per-message goroutines and timers which
-// contribute to iOS "waking the CPU" violations in Network Extensions.
-type noopLoggerFactory struct{}
+// turnLoggerFactory logs pion/turn refresh and error messages to help debug
+// TURN allocation lifetime issues. Only Warn/Error and refresh-related Debug
+// messages are logged; everything else is suppressed.
+type turnLoggerFactory struct{}
 
-func (f *noopLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
-	return &noopLogger{}
+func (f *turnLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
+	return &turnLogger{scope: scope}
 }
 
-type noopLogger struct{}
+type turnLogger struct{ scope string }
 
-func (l *noopLogger) Trace(msg string)                          {}
-func (l *noopLogger) Tracef(format string, args ...interface{}) {}
-func (l *noopLogger) Debug(msg string)                          {}
-func (l *noopLogger) Debugf(format string, args ...interface{}) {}
-func (l *noopLogger) Info(msg string)                           {}
-func (l *noopLogger) Infof(format string, args ...interface{})  {}
-func (l *noopLogger) Warn(msg string)                           {}
-func (l *noopLogger) Warnf(format string, args ...interface{})  {}
-func (l *noopLogger) Error(msg string)                          {}
-func (l *noopLogger) Errorf(format string, args ...interface{}) {}
+func (l *turnLogger) Trace(msg string)                          {}
+func (l *turnLogger) Tracef(format string, args ...interface{}) {}
+func (l *turnLogger) Debug(msg string) {
+	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") {
+		log.Printf("pion/%s: %s", l.scope, msg)
+	}
+}
+func (l *turnLogger) Debugf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") || strings.Contains(msg, "ifetime") {
+		log.Printf("pion/%s: %s", l.scope, msg)
+	}
+}
+func (l *turnLogger) Info(msg string)                           {}
+func (l *turnLogger) Infof(format string, args ...interface{})  {}
+func (l *turnLogger) Warn(msg string)                           { log.Printf("pion/%s: WARN: %s", l.scope, msg) }
+func (l *turnLogger) Warnf(format string, args ...interface{})  { log.Printf("pion/%s: WARN: %s", l.scope, fmt.Sprintf(format, args...)) }
+func (l *turnLogger) Error(msg string)                          { log.Printf("pion/%s: ERROR: %s", l.scope, msg) }
+func (l *turnLogger) Errorf(format string, args ...interface{}) { log.Printf("pion/%s: ERROR: %s", l.scope, fmt.Sprintf(format, args...)) }
