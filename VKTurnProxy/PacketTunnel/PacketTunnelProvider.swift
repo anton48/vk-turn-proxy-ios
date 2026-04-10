@@ -310,18 +310,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {
-        logMsg("sleep() — pausing proxy connections")
-        if tunnelHandle >= 0 {
-            wgPause(tunnelHandle)
-        }
+        // iOS calls sleep()/wake() extremely aggressively (observed: 105 times/hour,
+        // some cycles as short as 0.5s). Tearing down 10 DTLS+TURN connections on
+        // every sleep() and rebuilding them on wake() is catastrophic:
+        //   - each rebuild triggers a fresh VK credential fetch (+ slider captcha)
+        //   - sleep/wake cycles as short as 0.5s don't give us time to finish
+        //   - TURN allocations have a 10-min lifetime — they survive short freezes
+        //   - DTLS sessions use connection ID, so they tolerate IP changes too
+        //
+        // We now completely ignore sleep(). iOS may freeze the process anyway;
+        // when thawed, the watchdog (in Go) detects any actually-dead tunnels
+        // via lastRecvTime and forces a reconnect. Short freezes don't kill
+        // anything because TURN/DTLS state persists across them.
+        logMsg("sleep() — ignored (connections persist through iOS freeze)")
         completionHandler()
     }
 
     override func wake() {
-        logMsg("wake() — resuming proxy connections")
-        if tunnelHandle >= 0 {
-            wgResume(tunnelHandle)
-        }
+        logMsg("wake() — no-op (watchdog handles actually-dead tunnels)")
 
         // After wake, the network path may have changed (cell handoff, Wi-Fi switch).
         // Re-resolve VK domain IPs and refresh route exclusions so the captcha WebView

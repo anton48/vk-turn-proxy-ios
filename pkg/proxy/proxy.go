@@ -1101,10 +1101,12 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		for {
 			select {
 			case <-connCtx.Done():
+				log.Printf("proxy: [conn %d] DTLS send goroutine: ctx cancelled", connIdx)
 				return
 			case pkt := <-p.sendCh:
 				dtlsConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 				if _, err := dtlsConn.Write(pkt); err != nil {
+					log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
 					return
 				}
 			}
@@ -1112,21 +1114,46 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	}()
 
 	// Receive: dtlsConn → recvCh
-	// Uses 2-minute read deadline (reset on each successful read) to detect
-	// dead connections quickly after iOS freeze/thaw. The old 24h deadline
-	// meant dead connections persisted for hours.
+	// Use short read deadline (30s) to keep the goroutine active for iOS
+	// (Read syscalls count as visible activity). On timeout, check GLOBAL
+	// lastRecvTime — if the tunnel has received ANY packet recently via
+	// any connection, this connection is fine (just didn't happen to get
+	// the packet). Only reconnect if the entire tunnel is stale.
+	//
+	// This fixes the "sendCh contention starvation" problem: WireGuard
+	// keepalives arrive through one random connection, leaving others
+	// without packets. Instead of killing starving connections, we trust
+	// the global health check.
 	go func() {
 		defer wg.Done()
 		defer connCancel()
 		buf := make([]byte, 1600)
 		for {
-			dtlsConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+			dtlsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, err := dtlsConn.Read(buf)
 			if err != nil {
 				if connCtx.Err() != nil {
+					log.Printf("proxy: [conn %d] DTLS recv goroutine: ctx cancelled (err=%v)", connIdx, err)
 					return // context cancelled (Pause/Resume/Stop)
 				}
-				// Read error (timeout or dead connection) — reconnect
+				// On timeout, check if the tunnel is globally healthy.
+				// If any connection received a packet in the last 3 minutes,
+				// keep this connection alive too.
+				if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+					lastRecv := p.lastRecvTime.Load()
+					if lastRecv > 0 && time.Since(time.Unix(lastRecv, 0)) < 3*time.Minute {
+						// Tunnel alive, this connection just didn't get packets
+						continue
+					}
+					// Tunnel stale — reconnect
+					staleFor := "unknown"
+					if lastRecv > 0 {
+						staleFor = time.Since(time.Unix(lastRecv, 0)).Round(time.Second).String()
+					}
+					log.Printf("proxy: [conn %d] DTLS read timeout, tunnel stale (last recv %s ago), reconnecting", connIdx, staleFor)
+					return
+				}
+				// Real error (not timeout) — reconnect
 				log.Printf("proxy: [conn %d] DTLS read error: %v", connIdx, err)
 				return
 			}
@@ -1136,6 +1163,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			select {
 			case p.recvCh <- pkt:
 			case <-connCtx.Done():
+				log.Printf("proxy: [conn %d] DTLS recv goroutine: ctx cancelled during recvCh send", connIdx)
 				return
 			}
 		}
@@ -1361,10 +1389,16 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		for {
 			n, addr, err := conn2.ReadFrom(buf)
 			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("proxy: [conn %d] runTURN conn2→relay: ReadFrom error: %v (ctx=%v)", connIdx, err, ctx.Err())
+				}
 				return
 			}
 			peerAddr.Store(addr)
 			if _, err = relayConn.WriteTo(buf[:n], p.peer); err != nil {
+				if ctx.Err() == nil {
+					log.Printf("proxy: [conn %d] runTURN conn2→relay: WriteTo error: %v (ctx=%v)", connIdx, err, ctx.Err())
+				}
 				return
 			}
 		}
@@ -1378,13 +1412,20 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		for {
 			n, _, err := relayConn.ReadFrom(buf)
 			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("proxy: [conn %d] runTURN relay→conn2: ReadFrom error: %v (ctx=%v)", connIdx, err, ctx.Err())
+				}
 				return
 			}
 			addr, ok := peerAddr.Load().(net.Addr)
 			if !ok {
+				log.Printf("proxy: [conn %d] runTURN relay→conn2: peerAddr not set, exiting", connIdx)
 				return
 			}
 			if _, err = conn2.WriteTo(buf[:n], addr); err != nil {
+				if ctx.Err() == nil {
+					log.Printf("proxy: [conn %d] runTURN relay→conn2: WriteTo error: %v (ctx=%v)", connIdx, err, ctx.Err())
+				}
 				return
 			}
 		}
@@ -1445,13 +1486,15 @@ type turnLogger struct{ scope string }
 func (l *turnLogger) Trace(msg string)                          {}
 func (l *turnLogger) Tracef(format string, args ...interface{}) {}
 func (l *turnLogger) Debug(msg string) {
-	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") {
+	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") ||
+		strings.Contains(msg, "Failed to read") || strings.Contains(msg, "Failed to handle") || strings.Contains(msg, "Exiting loop") {
 		log.Printf("pion/%s: %s", l.scope, msg)
 	}
 }
 func (l *turnLogger) Debugf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") || strings.Contains(msg, "ifetime") {
+	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") || strings.Contains(msg, "ifetime") ||
+		strings.Contains(msg, "Failed to read") || strings.Contains(msg, "Failed to handle") || strings.Contains(msg, "Exiting loop") {
 		log.Printf("pion/%s: %s", l.scope, msg)
 	}
 }
