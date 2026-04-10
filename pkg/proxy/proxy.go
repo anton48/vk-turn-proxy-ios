@@ -194,7 +194,7 @@ func (p *Proxy) startConnections() error {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		err := p.runConnection(sessCtx, p.linkID, readyCh)
+		err := p.runConnection(sessCtx, p.linkID, readyCh, 0)
 		if err != nil {
 			select {
 			case errCh <- err:
@@ -243,7 +243,7 @@ func (p *Proxy) startConnections() error {
 			case <-sessCtx.Done():
 				return
 			}
-			p.runConnection(sessCtx, p.linkID, nil)
+			p.runConnection(sessCtx, p.linkID, nil, connIdx)
 		}()
 	}
 
@@ -695,7 +695,7 @@ func (p *Proxy) Stop() {
 // After 3 consecutive short-lived failures, goes dormant for up to 3 minutes.
 // This avoids hammering the TURN server (Allocation Quota Reached) while still
 // recovering without relying on iOS sleep()/wake() which are unreliable.
-func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh chan<- struct{}) error {
+func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh chan<- struct{}, connIdx int) error {
 	signaled := false
 	shortFailures := 0
 
@@ -711,13 +711,13 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		start := time.Now()
 		var err error
 		if p.config.UseDTLS {
-			err = p.runDTLSSession(sessCtx, linkID, readyCh, &signaled)
+			err = p.runDTLSSession(sessCtx, linkID, readyCh, &signaled, connIdx)
 		} else {
 			err = p.runDirectSession(sessCtx, linkID, readyCh, &signaled)
 		}
 		if err != nil {
 			duration := time.Since(start)
-			log.Printf("proxy: session ended after %s: %s", duration.Round(time.Second), err)
+			log.Printf("proxy: [conn %d] session ended after %s: %s", connIdx, duration.Round(time.Second), err)
 			if !signaled && readyCh != nil {
 				return err
 			}
@@ -869,7 +869,7 @@ func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, 
 // runDTLSSession runs a long-lived DTLS session.
 // DTLS stays alive while TURN reconnects underneath with fresh creds only on failure.
 // Only returns when DTLS itself fails (then the caller restarts everything).
-func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool) error {
+func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool, connIdx int) error {
 	connCtx, connCancel := context.WithCancel(sessCtx)
 	defer connCancel()
 
@@ -890,7 +890,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// The pion/turn client handles allocation refresh automatically.
 	turnDone := make(chan error, 1)
 	go func() {
-		turnDone <- p.runTURN(connCtx, turnAddr, creds, conn2)
+		turnDone <- p.runTURN(connCtx, turnAddr, creds, conn2, connIdx)
 	}()
 
 	// DTLS handshake — packets go through conn1 → conn2 → TURN relay → peer
@@ -933,7 +933,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// instead of immediately returning CaptchaRequiredError.
 	*signaled = true
 
-	log.Printf("proxy: DTLS+TURN session established")
+	log.Printf("proxy: [conn %d] DTLS+TURN session established", connIdx)
 
 	// TURN reconnection loop in background.
 	// Only reconnects when TURN actually fails (not proactively).
@@ -955,7 +955,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 
 			turnAge := time.Since(turnStart)
 			p.reconnects.Add(1)
-			log.Printf("proxy: TURN session ended after %s, reconnecting...", turnAge.Round(time.Second))
+			log.Printf("proxy: [conn %d] TURN session ended after %s, reconnecting...", connIdx, turnAge.Round(time.Second))
 
 			// If TURN session was short-lived, the credentials are likely expired.
 			// Invalidate cache so the next resolveTURNAddr fetches fresh creds.
@@ -963,7 +963,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				p.cachedCredsMu.Lock()
 				p.cachedCreds = nil
 				p.cachedCredsMu.Unlock()
-				log.Printf("proxy: short-lived TURN session (%s), invalidated credential cache", turnAge.Round(time.Second))
+				log.Printf("proxy: [conn %d] short-lived TURN session (%s), invalidated credential cache", connIdx, turnAge.Round(time.Second))
 			}
 
 			// Brief pause before reconnecting (longer for short-lived sessions)
@@ -1079,7 +1079,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				turnStart = time.Now()
 				turnDone = make(chan error, 1)
 				go func() {
-					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2)
+					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2, connIdx)
 				}()
 				break
 			}
@@ -1127,7 +1127,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					return // context cancelled (Pause/Resume/Stop)
 				}
 				// Read error (timeout or dead connection) — reconnect
-				log.Printf("proxy: DTLS read error: %v", err)
+				log.Printf("proxy: [conn %d] DTLS read error: %v", connIdx, err)
 				return
 			}
 			p.lastRecvTime.Store(time.Now().Unix())
@@ -1166,7 +1166,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 
 	turnDone := make(chan error, 1)
 	go func() {
-		turnDone <- p.runTURN(connCtx, turnAddr, creds, conn2)
+		turnDone <- p.runTURN(connCtx, turnAddr, creds, conn2, -1)
 	}()
 
 	if readyCh != nil && !*signaled {
@@ -1212,7 +1212,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				}
 				turnDone = make(chan error, 1)
 				go func() {
-					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2)
+					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2, -1)
 				}()
 				break
 			}
@@ -1274,7 +1274,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 // Runs until the relay fails or ctx is cancelled. No forced lifetime —
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
-func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn) error {
+func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int) error {
 	turnUDPAddr, err := net.ResolveUDPAddr("udp", turnAddr)
 	if err != nil {
 		return fmt.Errorf("resolve TURN: %w", err)
@@ -1337,7 +1337,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	defer relayConn.Close()
 	p.turnRTTns.Store(int64(time.Since(allocStart)))
 
-	log.Printf("proxy: TURN relay allocated: %s (RTT %dms)", relayConn.LocalAddr(), time.Since(allocStart).Milliseconds())
+	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms)", connIdx, relayConn.LocalAddr(), time.Since(allocStart).Milliseconds())
 
 	// Bidirectional forwarding: conn2 ↔ relayConn
 	var wg sync.WaitGroup
@@ -1457,7 +1457,11 @@ func (l *turnLogger) Debugf(format string, args ...interface{}) {
 }
 func (l *turnLogger) Info(msg string)                           {}
 func (l *turnLogger) Infof(format string, args ...interface{})  {}
-func (l *turnLogger) Warn(msg string)                           { log.Printf("pion/%s: WARN: %s", l.scope, msg) }
-func (l *turnLogger) Warnf(format string, args ...interface{})  { log.Printf("pion/%s: WARN: %s", l.scope, fmt.Sprintf(format, args...)) }
-func (l *turnLogger) Error(msg string)                          { log.Printf("pion/%s: ERROR: %s", l.scope, msg) }
-func (l *turnLogger) Errorf(format string, args ...interface{}) { log.Printf("pion/%s: ERROR: %s", l.scope, fmt.Sprintf(format, args...)) }
+func (l *turnLogger) Warn(msg string)                           { log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg)) }
+func (l *turnLogger) Warnf(format string, args ...interface{})  { log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(fmt.Sprintf(format, args...))) }
+func (l *turnLogger) Error(msg string)                          { log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg)) }
+func (l *turnLogger) Errorf(format string, args ...interface{}) { log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(fmt.Sprintf(format, args...))) }
+
+// sanitizeLog removes null bytes from log messages (VK TURN server
+// includes trailing \0 in STUN error reason phrases).
+func sanitizeLog(s string) string { return strings.ReplaceAll(s, "\x00", "") }
