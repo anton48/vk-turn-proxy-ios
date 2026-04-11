@@ -327,7 +327,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func wake() {
-        logMsg("wake() — no-op (watchdog handles actually-dead tunnels)")
+        logMsg("wake() — running fast-path health check")
+
+        // Ask Go to do a quick tunnel-health check with tighter thresholds
+        // than the normal 30-second watchdog: if even a couple of pion
+        // permission/binding errors accumulated while we were asleep, we'd
+        // rather force an immediate reconnect now (~5 seconds) than let
+        // the user tap Safari and hit a broken tunnel.
+        if tunnelHandle >= 0 {
+            wgWakeHealthCheck(tunnelHandle)
+        }
 
         // After wake, the network path may have changed (cell handoff, Wi-Fi switch).
         // Re-resolve VK domain IPs and refresh route exclusions so the captcha WebView

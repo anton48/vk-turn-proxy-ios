@@ -424,6 +424,33 @@ func (p *Proxy) ForceReconnect() {
 	go p.startConnections()
 }
 
+// WakeHealthCheck is called from Swift wake() whenever iOS resumes the
+// Network Extension. It runs a fast-path variant of the watchdog's
+// condition 3 with a lower threshold: if even 2 pion permission/binding
+// errors have accumulated since the last ForceReconnect, we immediately
+// tear down and rebuild everything, on the assumption that the user is
+// about to use the network and we'd rather spend ~5 seconds reconnecting
+// now than let them hit a broken tunnel.
+//
+// This complements the normal 30-second watchdog tick: the watchdog is
+// tuned for slow-moving degradation over minutes, while wake() fires
+// precisely when fast detection matters most. Without this hook, a
+// degradation that started during sleep could take several more minutes
+// of accumulated errors after wake before the normal watchdog triggers.
+func (p *Proxy) WakeHealthCheck() {
+	// Don't interfere with an in-progress captcha flow.
+	if v := p.captchaImageURL.Load(); v != nil {
+		if url, _ := v.(string); url != "" {
+			return
+		}
+	}
+	pionErrs := p.pionTransientErrors.Load()
+	if pionErrs >= 2 {
+		log.Printf("proxy: wake check — %d pion permission/binding errors accumulated, forcing urgent reconnect", pionErrs)
+		p.ForceReconnect()
+	}
+}
+
 // runWatchdog monitors tunnel health and forces reconnection when dead.
 // iOS freezes Network Extension processes without calling sleep()/wake().
 // After unfreeze, all TURN allocations are expired but goroutines sit on
@@ -477,9 +504,16 @@ func (p *Proxy) runWatchdog() {
 			// Trigger if we've accumulated enough errors AND they have been
 			// persisting for at least 90 seconds (avoids reacting to a single
 			// flaky cycle).
+			//
+			// Threshold 5 is tuned from observed vpn11.log: at 1 real VK
+			// rejection per 2-min permission refresh cycle, threshold 10
+			// took 16+ minutes to trigger (8 cycles to accumulate), leaving
+			// the tunnel broken too long before recovery. Threshold 5 cuts
+			// that to ~8 minutes, which is still slow enough to ignore a
+			// single transient cycle but fast enough to actually matter.
 			pionErrs := p.pionTransientErrors.Load()
 			firstErr := p.firstPionErrorTime.Load()
-			if pionErrs >= 10 && firstErr > 0 && time.Since(time.Unix(firstErr, 0)) > 90*time.Second {
+			if pionErrs >= 5 && firstErr > 0 && time.Since(time.Unix(firstErr, 0)) > 90*time.Second {
 				log.Printf("proxy: watchdog — %d pion permission/binding errors over %s, tunnel silently degraded, forcing reconnect",
 					pionErrs, time.Since(time.Unix(firstErr, 0)).Round(time.Second))
 				lowConnSince = time.Time{} // reset

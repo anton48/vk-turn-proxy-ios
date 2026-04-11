@@ -40,6 +40,12 @@ void wgPause(int32_t tunnelHandle);
 /// Resume proxy connections (call from wake()).
 void wgResume(int32_t tunnelHandle);
 
+/// Run a fast-path health check on the tunnel (call from wake()).
+/// If any pion permission/binding errors have accumulated, forces an
+/// immediate reconnect so the user doesn't hit a silently-degraded tunnel
+/// right after unlocking the phone.
+void wgWakeHealthCheck(int32_t tunnelHandle);
+
 /// Provide captcha answer to unblock pending credential fetch.
 void wgSolveCaptcha(int32_t tunnelHandle, const char *answer);
 

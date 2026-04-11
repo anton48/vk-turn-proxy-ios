@@ -258,6 +258,20 @@ func wgResume(tunnelHandle C.int32_t) {
 	entry.proxy.Resume()
 }
 
+//export wgWakeHealthCheck
+func wgWakeHealthCheck(tunnelHandle C.int32_t) {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	entry.proxy.WakeHealthCheck()
+}
+
 //export wgSolveCaptcha
 func wgSolveCaptcha(tunnelHandle C.int32_t, answer *C.char) {
 	id := int32(tunnelHandle)
