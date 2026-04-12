@@ -445,7 +445,7 @@ func (p *Proxy) WakeHealthCheck() {
 		}
 	}
 	pionErrs := p.pionTransientErrors.Load()
-	if pionErrs >= 2 {
+	if pionErrs >= 5 {
 		log.Printf("proxy: wake check — %d pion permission/binding errors accumulated, forcing urgent reconnect", pionErrs)
 		p.ForceReconnect()
 	}
