@@ -316,6 +316,13 @@ struct CaptchaWKWebView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
 
+        // Use an ephemeral data store so every CaptchaWKWebView instance starts
+        // with a clean cookie jar. VK's anti-abuse cookies otherwise persist
+        // across WebView recreations and cause the captcha page to return a
+        // pre-solved state ("green checkmark on open"), which leaves the user
+        // stuck — JS hooks never fire because the solve flow never runs.
+        config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
+
         let contentController = WKUserContentController()
         contentController.add(context.coordinator, name: "captchaToken")
 
@@ -387,24 +394,53 @@ struct CaptchaWKWebView: UIViewRepresentable {
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
         // Load captcha URL directly — no iframe needed
+        context.coordinator.lastLoadedURL = url.absoluteString
         webView.load(URLRequest(url: url))
         return webView
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        // When VK rejects a success_token and the Go side fetches a fresh
+        // captcha URL, SwiftUI rebinds this view with a new `url` but keeps
+        // the same underlying WKWebView alive. Without an explicit reload the
+        // user sees the stale page (still showing the green checkmark from
+        // the previous solve) and has no way to interact — the only escape
+        // is pressing Done. Detect the URL change and reload so the new
+        // captcha appears automatically.
+        let newURLStr = url.absoluteString
+        if context.coordinator.lastLoadedURL != newURLStr {
+            context.coordinator.log("URL changed, reloading WebView (\(String(newURLStr.prefix(80))))")
+            context.coordinator.lastLoadedURL = newURLStr
+            context.coordinator.resetForNewCaptcha()
+            uiView.load(URLRequest(url: url))
+        }
+    }
 
     class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let onTokenCaptured: (String) -> Void
         private var solved = false
         weak var webView: WKWebView?
+        // Tracks which URL we last handed to `webView.load(...)`. Used by
+        // updateUIView to detect real URL changes vs. SwiftUI re-renders with
+        // the same state — avoids redundant reloads.
+        var lastLoadedURL: String?
 
         init(onTokenCaptured: @escaping (String) -> Void) {
             self.onTokenCaptured = onTokenCaptured
         }
 
-        private func log(_ msg: String) {
+        func log(_ msg: String) {
             os_log("%{public}s", log: captchaLog, type: .default, msg)
             NSLog("[Captcha] %@", msg)
+        }
+
+        // Called by updateUIView when the captcha URL changes mid-flight
+        // (VK rejected a success_token and Go fetched a fresh captcha).
+        // Resets the one-shot `solved` guard so the next success_token from
+        // the new page is forwarded to the tunnel — otherwise the guard would
+        // silently swallow every token after the first.
+        func resetForNewCaptcha() {
+            solved = false
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {

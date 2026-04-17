@@ -56,9 +56,15 @@ func newHTTPClient() *http.Client {
 }
 
 // checkboxBurnedForSession is set the first time a checkbox-style
-// captchaNotRobot.check returns a non-OK status. Once set, all subsequent
+// captchaNotRobot.check returns status=ERROR, which is VK's explicit
+// "this captcha type is disabled" signal. Once set, all subsequent
 // solveCaptchaPoW calls in the current global session (Proxy instance)
 // will skip the checkbox check entirely and jump straight to the slider.
+//
+// Other non-OK statuses (BOT, ERROR_LIMIT, etc.) are transient — they mean
+// "try again later", not "this type is disabled" — so they do NOT burn the
+// checkbox; the next solveCaptchaPoW call will still attempt the checkbox.
+//
 // Reset to false by NewProxy() at the start of every connect cycle.
 var checkboxBurnedForSession atomic.Bool
 
@@ -390,11 +396,19 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 			return successToken, nil
 		}
 
-		// Checkbox check failed — burn it for the rest of this global session
-		// and fall through to the slider solver.
+		// Checkbox check failed. Only burn the checkbox path when VK explicitly
+		// signals that this captcha type is unavailable (status=ERROR). Other
+		// statuses like BOT or ERROR_LIMIT are transient ("try again later"),
+		// so we keep the checkbox enabled for future solveCaptchaPoW calls in
+		// this session. In both cases control falls through to the slider
+		// solver below as an in-call fallback.
 		showCaptchaType, _ := respObj["show_captcha_type"].(string)
-		log.Printf("pow: checkbox check failed (status=%s, show_captcha_type=%s) — burning checkbox for the rest of this session", status, showCaptchaType)
-		checkboxBurnedForSession.Store(true)
+		if status == "ERROR" {
+			log.Printf("pow: checkbox returned status=ERROR (captcha type disabled) — burning checkbox for the rest of this session, falling through to slider (show_captcha_type=%s)", showCaptchaType)
+			checkboxBurnedForSession.Store(true)
+		} else {
+			log.Printf("pow: checkbox transient failure (status=%s, show_captcha_type=%s) — falling through to slider; if all else fails, next solveCaptchaPoW call will attempt checkbox again", status, showCaptchaType)
+		}
 	}
 
 	// Try slider solver regardless of show_captcha_type — VK may not always
