@@ -70,18 +70,24 @@ var checkboxBurnedForSession atomic.Bool
 
 // solveCaptchaPoW attempts to solve a VK "Not Robot" captcha automatically
 // using proof-of-work, without any user interaction.
-func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent string) (string, error) {
+//
+// Returns (successToken, lastShowCaptchaType, err). lastShowCaptchaType is the
+// last known hint from VK about what captcha type should be presented to the
+// user — either from the API `captchaNotRobot.check` response or (when the
+// checkbox check is skipped) from the HTML page's window.init payload. The
+// caller (creds.go) uses it as a signal for retry/backoff decisions.
+func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent string) (string, string, error) {
 	captchaPowProfile = profileForUA(userAgent)
 	log.Printf("pow: attempting automatic captcha solve (UA: %s, platform: %s, Chrome/%d)",
 		captchaPowProfile.UserAgent, captchaPowProfile.Platform, captchaPowProfile.ChromeVersion)
 
 	parsed, err := url.Parse(redirectURI)
 	if err != nil {
-		return "", fmt.Errorf("parse redirect_uri: %w", err)
+		return "", "", fmt.Errorf("parse redirect_uri: %w", err)
 	}
 	sessionToken := parsed.Query().Get("session_token")
 	if sessionToken == "" {
-		return "", fmt.Errorf("no session_token in redirect_uri")
+		return "", "", fmt.Errorf("no session_token in redirect_uri")
 	}
 
 	// Single HTTP client with cookie jar for the entire captcha session.
@@ -93,13 +99,13 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 	select {
 	case <-time.After(delay):
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return "", "", ctx.Err()
 	}
 
 	// Step 1: Fetch captcha page and extract PoW parameters + cookies + slider settings
 	powInput, difficulty, htmlSettings, err := fetchPoW(ctx, client, redirectURI)
 	if err != nil {
-		return "", fmt.Errorf("fetch PoW: %w", err)
+		return "", "", fmt.Errorf("fetch PoW: %w", err)
 	}
 	log.Printf("pow: input=%s difficulty=%d htmlSettings=%v", powInput, difficulty, htmlSettings != nil)
 
@@ -116,7 +122,7 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 	// Step 2: Solve PoW (brute-force SHA-256)
 	hash := solvePoW(powInput, difficulty)
 	if hash == "" {
-		return "", fmt.Errorf("PoW: no solution found within 10M iterations")
+		return "", "", fmt.Errorf("PoW: no solution found within 10M iterations")
 	}
 	log.Printf("pow: solved hash=%s...%s", hash[:8], hash[len(hash)-8:])
 
@@ -124,13 +130,13 @@ func solveCaptchaPoW(ctx context.Context, redirectURI, captchaSID, userAgent str
 	time.Sleep(time.Duration(200+mathrand.Intn(300)) * time.Millisecond)
 
 	// Step 3: Call captchaNotRobot API sequence (using same client = same cookies)
-	successToken, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, hash, htmlSettings)
+	successToken, showType, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, hash, htmlSettings)
 	if err != nil {
-		return "", fmt.Errorf("captchaNotRobot API: %w", err)
+		return "", showType, fmt.Errorf("captchaNotRobot API: %w", err)
 	}
 
 	log.Printf("pow: success! token=%d chars", len(successToken))
-	return successToken, nil
+	return successToken, showType, nil
 }
 
 // fetchPoW fetches the captcha HTML page and extracts PoW parameters.
@@ -222,7 +228,10 @@ func solvePoW(powInput string, difficulty int) string {
 // callCaptchaNotRobotAPI performs the 4-step VK captchaNotRobot protocol.
 // Adapted from the reference implementation in PR #105 — uses simplified
 // sensor data (empty arrays) and longer timing delays.
-func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionToken, hash string, htmlSettings map[string]interface{}) (string, error) {
+//
+// Returns (successToken, lastShowCaptchaType, err). See solveCaptchaPoW for
+// the meaning of lastShowCaptchaType.
+func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionToken, hash string, htmlSettings map[string]interface{}) (string, string, error) {
 	vkReq := func(method, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 		req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
@@ -268,11 +277,32 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 	baseParams := fmt.Sprintf("session_token=%s&domain=%s&adFp=&access_token=",
 		url.QueryEscape(sessionToken), url.QueryEscape(domain))
 
+	// Extract HTML-level show_captcha_type hint. VK embeds a `window.init.data`
+	// payload in the captcha page that announces which challenge type VK plans
+	// to render. Empirically:
+	//   - "slider"   : VK is in slider-only mode (checkbox disabled). Every
+	//                  subsequent captchaNotRobot.check returns status=ERROR.
+	//                  Skipping the check saves ~3 seconds (2.5s artificial
+	//                  delay + HTTP round-trip) on every solveCaptchaPoW call.
+	//   - "checkbox" : normal mode, checkbox may succeed — proceed as usual.
+	htmlShowType := ""
+	if htmlSettings != nil {
+		if resp, ok := htmlSettings["response"].(map[string]interface{}); ok {
+			if s, ok := resp["show_captcha_type"].(string); ok {
+				htmlShowType = s
+			}
+		}
+	}
+	// lastShowType is what we return to the caller as the last known
+	// show_captcha_type signal. Seeded from the HTML hint; overwritten by the
+	// API check response if we make one.
+	lastShowType := htmlShowType
+
 	// 1/4: settings
 	log.Printf("pow: 1/4 captchaNotRobot.settings")
 	settingsResp, err := vkReq("captchaNotRobot.settings", baseParams)
 	if err != nil {
-		return "", fmt.Errorf("settings: %w", err)
+		return "", lastShowType, fmt.Errorf("settings: %w", err)
 	}
 
 	// Short delay after settings (100-200ms) — matches reference impl
@@ -306,18 +336,27 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 
 	_, err = vkReq("captchaNotRobot.componentDone", componentData)
 	if err != nil {
-		return "", fmt.Errorf("componentDone: %w", err)
+		return "", lastShowType, fmt.Errorf("componentDone: %w", err)
 	}
 
 	// 3/4: check (checkbox-style)
 	//
-	// Checkbox captcha is probed at most ONCE per global session (per Proxy
-	// instance). After the first time it fails, checkboxBurnedForSession is
-	// set and all subsequent solveCaptchaPoW calls in this session jump
-	// straight to the slider path, saving ~2-3 seconds of wait + HTTP per
-	// captcha.
-	if checkboxBurnedForSession.Load() {
-		log.Printf("pow: 3/4 skipping checkbox check (burned earlier this session), going straight to slider")
+	// We skip the checkbox check entirely in two cases:
+	//   1. checkboxBurnedForSession is already set — a previous call in this
+	//      global session got status=ERROR from VK, so checkbox is known to
+	//      be disabled.
+	//   2. HTML page says show_captcha_type="slider" — VK is in slider-only
+	//      mode and would return status=ERROR anyway. Burn proactively to
+	//      save time on both this and subsequent calls.
+	// Otherwise we do the check as usual.
+	skipCheckbox := checkboxBurnedForSession.Load()
+	if !skipCheckbox && htmlShowType == "slider" {
+		log.Printf("pow: 3/4 HTML indicates slider-only mode (show_captcha_type=%q) — skipping checkbox check, burning checkbox for the rest of this session", htmlShowType)
+		checkboxBurnedForSession.Store(true)
+		skipCheckbox = true
+	}
+	if skipCheckbox {
+		log.Printf("pow: 3/4 skipping checkbox check, going straight to slider")
 	} else {
 		// Longer pause before check (1950-3200ms) — matches reference HAR timing
 		checkDelay := time.Duration(1950+mathrand.Intn(1250)) * time.Millisecond
@@ -325,7 +364,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		select {
 		case <-time.After(checkDelay):
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", lastShowType, ctx.Err()
 		}
 
 		log.Printf("pow: 3/4 captchaNotRobot.check")
@@ -374,18 +413,22 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 
 		checkResp, err := vkReq("captchaNotRobot.check", checkData)
 		if err != nil {
-			return "", fmt.Errorf("check: %w", err)
+			return "", lastShowType, fmt.Errorf("check: %w", err)
 		}
 
 		respObj, ok := checkResp["response"].(map[string]interface{})
 		if !ok {
-			return "", fmt.Errorf("check: invalid response: %v", checkResp)
+			return "", lastShowType, fmt.Errorf("check: invalid response: %v", checkResp)
 		}
 		status, _ := respObj["status"].(string)
+		showCaptchaType, _ := respObj["show_captcha_type"].(string)
+		// Overwrite the HTML-seeded hint with VK's explicit API response.
+		lastShowType = showCaptchaType
+
 		if status == "OK" {
 			successToken, ok := respObj["success_token"].(string)
 			if !ok || successToken == "" {
-				return "", fmt.Errorf("check: no success_token in response")
+				return "", lastShowType, fmt.Errorf("check: no success_token in response")
 			}
 			time.Sleep(200 * time.Millisecond)
 			log.Printf("pow: 4/4 captchaNotRobot.endSession")
@@ -393,7 +436,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 			if err != nil {
 				log.Printf("pow: endSession failed (non-fatal): %v", err)
 			}
-			return successToken, nil
+			return successToken, lastShowType, nil
 		}
 
 		// Checkbox check failed. Only burn the checkbox path when VK explicitly
@@ -402,7 +445,6 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		// so we keep the checkbox enabled for future solveCaptchaPoW calls in
 		// this session. In both cases control falls through to the slider
 		// solver below as an in-call fallback.
-		showCaptchaType, _ := respObj["show_captcha_type"].(string)
 		if status == "ERROR" {
 			log.Printf("pow: checkbox returned status=ERROR (captcha type disabled) — burning checkbox for the rest of this session, falling through to slider (show_captcha_type=%s)", showCaptchaType)
 			checkboxBurnedForSession.Store(true)
@@ -430,14 +472,14 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		if err != nil {
 			log.Printf("pow: endSession failed (non-fatal): %v", err)
 		}
-		return sliderToken, nil
+		return sliderToken, lastShowType, nil
 	}
 	log.Printf("pow: slider solver failed: %v", sliderErr)
 
 	if checkboxBurnedForSession.Load() {
-		return "", fmt.Errorf("checkbox burned earlier this session, slider also failed: %v", sliderErr)
+		return "", lastShowType, fmt.Errorf("checkbox burned earlier this session, slider also failed: %v", sliderErr)
 	}
-	return "", fmt.Errorf("checkbox check failed and slider also failed: %v", sliderErr)
+	return "", lastShowType, fmt.Errorf("checkbox check failed and slider also failed: %v", sliderErr)
 }
 
 func min(a, b int) int {

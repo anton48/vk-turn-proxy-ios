@@ -197,11 +197,18 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			currentTs := captchaTs
 			currentAttempt := captchaAttempt
 			var lastPowErr error
+			// consecutiveEmptyShow tracks how many PoW attempts in a row came
+			// back with show_captcha_type="" from the checkbox check — an
+			// empirical signal that VK has no slider ready for this session.
+			// After 2 such attempts in a row we short-circuit to WebView
+			// instead of burning a third round-trip (saves ~3-5 seconds and
+			// one captcha API call that just inflates VK's rate-limit bucket).
+			consecutiveEmptyShow := 0
 
 			for powTry := 1; powTry <= maxPoWRetries; powTry++ {
 				log.Printf("vk: PoW attempt %d/%d", powTry, maxPoWRetries)
 				powCtx, powCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				powToken, powErr := solveCaptchaPoW(powCtx, currentImg, currentSID, ua)
+				powToken, showType, powErr := solveCaptchaPoW(powCtx, currentImg, currentSID, ua)
 				powCancel()
 				lastPowErr = powErr
 
@@ -213,7 +220,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 					break
 				}
 
-				log.Printf("vk: PoW attempt %d/%d failed: %v", powTry, maxPoWRetries, powErr)
+				log.Printf("vk: PoW attempt %d/%d failed (show_captcha_type=%q): %v", powTry, maxPoWRetries, showType, powErr)
 
 				// Only short-circuit to WebView when checkbox is provably
 				// disabled for this session — i.e. VK returned status=ERROR at
@@ -227,6 +234,20 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 				// previous one was rejected.
 				if powErr != nil && strings.Contains(powErr.Error(), "checkbox burned") {
 					log.Printf("vk: checkbox disabled (ERROR) and slider failed, skipping remaining attempts")
+					break
+				}
+
+				// Track consecutive empty show_captcha_type — a non-empty
+				// "slider" hint means VK is about to hand us an actual slider
+				// (next attempt has a real chance); a persistently empty hint
+				// means the slider isn't ready and retries are futile.
+				if showType == "" {
+					consecutiveEmptyShow++
+				} else {
+					consecutiveEmptyShow = 0
+				}
+				if consecutiveEmptyShow >= 2 {
+					log.Printf("vk: %d consecutive attempts with show_captcha_type=\"\" — VK has no slider ready, skipping remaining attempts", consecutiveEmptyShow)
 					break
 				}
 
