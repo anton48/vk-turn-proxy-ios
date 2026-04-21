@@ -102,29 +102,6 @@ class TunnelManager: ObservableObject {
                 "mtu": config.mtu
             ]
 
-            // Route APNs (push notifications) and cellular services through the
-            // VPN. Reported in issue #2: by default iOS routes APNs over a
-            // direct cellular connection even when a VPN is up. If the user is
-            // on Wi-Fi with no/weak cellular signal, APNs has no working path
-            // and notifications don't arrive.
-            //
-            // `includeAllNetworks = true` tells iOS this VPN intends to carry
-            // all traffic; that flag is also what activates the `exclude*`
-            // toggles below. `excludeLocalNetworks = true` keeps Wi-Fi printers
-            // / AirPlay / Bonjour working (traffic to the local subnet
-            // bypasses the tunnel).
-            proto.includeAllNetworks = true
-            proto.excludeLocalNetworks = true
-            if #available(iOS 16.4, *) {
-                // Both `excludeAPNs` and `excludeCellularServices` are iOS 16.4+.
-                // On 15.0–16.3 there is no API to toggle these; iOS uses its
-                // default behavior (which is the symptom described in the
-                // issue). The fix is therefore effective on iOS 16.4+; older
-                // devices keep the old behavior until Apple exposes the API.
-                proto.excludeAPNs = false
-                proto.excludeCellularServices = false
-            }
-
             manager.protocolConfiguration = proto
             manager.localizedDescription = "VK TURN Proxy"
             manager.isEnabled = true
