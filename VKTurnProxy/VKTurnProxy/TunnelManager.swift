@@ -80,8 +80,12 @@ class TunnelManager: ObservableObject {
         do {
             let manager = try await getOrCreateManager()
 
-            // Build UAPI config string for WireGuard
-            let wgConfig = buildUAPIConfig(config: config)
+            // Build UAPI config string for WireGuard. Throws KeyError with a
+            // user-readable message if any of the Base64 keys can't be decoded
+            // — caught below and surfaced via `errorMessage`, so the user sees
+            // "Private Key is not valid Base64…" instead of a cryptic
+            // "hex string does not fit the slice" from wireguard-go.
+            let wgConfig = try buildUAPIConfig(config: config)
 
             // Build proxy config JSON
             let proxyConfig = buildProxyConfig(config: config)
@@ -414,11 +418,57 @@ class TunnelManager: ObservableObject {
 
     // MARK: - Config Builders
 
-    private func buildUAPIConfig(config: TunnelConfig) -> String {
+    /// Thrown by parseWireGuardKey when the user-entered key can't be decoded
+    /// to a 32-byte WireGuard key. `localizedDescription` is surfaced via
+    /// `TunnelManager.errorMessage` and shown in the UI, so it must be
+    /// understandable by a non-technical user.
+    enum KeyError: Error, LocalizedError {
+        case empty(field: String)
+        case invalidBase64(field: String)
+        case wrongLength(field: String, got: Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .empty(let f):
+                return "\(f) is empty. Paste the Base64 key from your WireGuard config."
+            case .invalidBase64(let f):
+                return "\(f) is not valid Base64. Expected 44 characters ending with '=' (output of `wg genkey`)."
+            case .wrongLength(let f, let got):
+                return "\(f) decoded to \(got) bytes, expected 32. Did you paste the wrong key?"
+            }
+        }
+    }
+
+    /// Convert a user-entered WireGuard key from Base64 to hex (required by
+    /// wireguard-go UAPI). Tolerant of:
+    ///   - leading/trailing whitespace and newlines (common when pasting
+    ///     from `.conf` files or `wg genkey | pbcopy`),
+    ///   - URL-safe Base64 (`-_` instead of `+/`),
+    ///   - internal whitespace (via `.ignoreUnknownCharacters`).
+    /// Returns a 64-char hex string on success; throws a KeyError otherwise.
+    private func parseWireGuardKey(_ input: String, field: String) throws -> String {
+        var cleaned = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty {
+            throw KeyError.empty(field: field)
+        }
+        // Accept URL-safe Base64 by normalizing to standard alphabet.
+        cleaned = cleaned
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        guard let data = Data(base64Encoded: cleaned, options: [.ignoreUnknownCharacters]) else {
+            throw KeyError.invalidBase64(field: field)
+        }
+        guard data.count == 32 else {
+            throw KeyError.wrongLength(field: field, got: data.count)
+        }
+        return data.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func buildUAPIConfig(config: TunnelConfig) throws -> String {
         var lines: [String] = []
-        lines.append("private_key=\(hexKey(base64: config.privateKey))")
+        lines.append("private_key=\(try parseWireGuardKey(config.privateKey, field: "Private Key"))")
         lines.append("replace_peers=true")
-        lines.append("public_key=\(hexKey(base64: config.peerPublicKey))")
+        lines.append("public_key=\(try parseWireGuardKey(config.peerPublicKey, field: "Peer Public Key"))")
 
         // Endpoint -- this is the "fake" endpoint that WireGuard will use.
         // TURNBind intercepts it, so the actual value doesn't matter much,
@@ -434,7 +484,7 @@ class TunnelManager: ObservableObject {
         }
 
         if let psk = config.presharedKey, !psk.isEmpty {
-            lines.append("preshared_key=\(hexKey(base64: psk))")
+            lines.append("preshared_key=\(try parseWireGuardKey(psk, field: "Preshared Key"))")
         }
 
         return lines.joined(separator: "\n")
@@ -458,11 +508,6 @@ class TunnelManager: ObservableObject {
         return str
     }
 
-    /// Convert base64 WireGuard key to hex string.
-    private func hexKey(base64: String) -> String {
-        guard let data = Data(base64Encoded: base64) else { return "" }
-        return data.map { String(format: "%02x", $0) }.joined()
-    }
 }
 
 // MARK: - Tunnel Configuration Model
