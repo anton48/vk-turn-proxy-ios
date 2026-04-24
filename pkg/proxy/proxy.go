@@ -245,6 +245,13 @@ func (p *Proxy) Start() error {
 	// calling sleep()/wake() which is unreliable.
 	go p.runWatchdog()
 
+	// Background cred-pool grower: fills empty slots over time without
+	// blocking conn startup. Conn 0 still does an inline fetch (needs at
+	// least one cred to bootstrap). Conns 1-N use fallback to whichever
+	// slots are fresh; the grower backfills pool[1..N-1] slowly so the
+	// pool eventually reaches full insurance coverage.
+	go p.growCredPool(p.ctx)
+
 	err = p.startConnections()
 	if err != nil {
 		// Fatal failure before any conn came up — wake any bootstrap waiters
@@ -255,6 +262,60 @@ func (p *Proxy) Start() error {
 	// WaitBootstrap reflects reality even in the captcha-retry path where
 	// startConnections returns nil while the first conn is still coming up.
 	return err
+}
+
+// growCredPool runs a background loop that opportunistically fills
+// empty/stale slots in the cred pool. Behaviour:
+//   - Waits for bootstrap to be ready before starting (no point fetching
+//     more creds while conn 0 is still trying to establish the first).
+//   - Pauses while captcha is pending — adding another fetch would
+//     pressure VK and potentially invalidate the current captcha session.
+//   - Uses allowCaptchaBlock=false so a background fetch hitting captcha
+//     records a cooldown instead of blocking on user input.
+//   - Fast poll (2s) while there is work to do, slow poll (30s) when all
+//     slots are full or on cooldown.
+// Lifetime = p.ctx (stops on Proxy.Stop).
+func (p *Proxy) growCredPool(ctx context.Context) {
+	// Wait until the first conn has a live DTLS+TURN session. There's no
+	// value in populating more slots before the tunnel actually works.
+	if err := p.WaitBootstrap(2 * time.Minute); err != nil {
+		log.Printf("credpool-grow: bootstrap did not succeed within 2m (%v), grower exiting", err)
+		return
+	}
+
+	const (
+		fastInterval = 2 * time.Second
+		slowInterval = 30 * time.Second
+	)
+	interval := fastInterval
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+
+		// Don't add VK pressure while captcha is pending.
+		if v := p.captchaImageURL.Load(); v != nil {
+			if s, _ := v.(string); s != "" {
+				interval = slowInterval
+				continue
+			}
+		}
+
+		slot := p.credPool.pickSlotToFill()
+		if slot < 0 {
+			// Everything filled or on cooldown — idle poll.
+			interval = slowInterval
+			continue
+		}
+
+		// tryFill returns fast whether success or failure; it handles
+		// cooldown bookkeeping internally.
+		p.credPool.tryFill(slot, false)
+		interval = fastInterval
+	}
 }
 
 // startConnections launches all connection goroutines using the current session context.
@@ -364,7 +425,7 @@ func (p *Proxy) waitCaptchaAndRestart() {
 			}
 			log.Printf("proxy: probing if VK still requires captcha (interval was %s)...", probeInterval)
 			p.credPool.invalidate()
-			_, _, probeErr := p.resolveTURNAddr(-1, false)
+			_, _, _, probeErr := p.resolveTURNAddr(-1, false)
 			if probeErr == nil {
 				log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 				p.captchaImageURL.Store("")
@@ -902,13 +963,18 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 	}
 }
 
-// resolveTURNAddr returns a TURN host:port + credentials for the given
-// connection slot. Delegates to credPool, which may serve a cached
-// cred, fetch a fresh one, or fall back to another conn's fresh cred on
-// captcha / 403. allowCaptchaBlock gates whether the underlying fetcher
-// may block a CaptchaSolver waiting on user input; when false, captcha
-// surfaces as CaptchaRequiredError.
-func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, error) {
+// resolveTURNAddr returns (addr, creds, credSlot, err) for the given
+// connection slot. credSlot identifies which pool slot ultimately
+// provided the cred — either connIdx itself (own or freshly-fetched)
+// or another slot's index (fallback). Used by short-session detection
+// to invalidate the correct slot, and by logging to show which cred
+// each TURN session runs on.
+//
+// Delegates to credPool. allowCaptchaBlock gates whether the underlying
+// fetcher may block a CaptchaSolver waiting on user input; when false,
+// captcha surfaces as CaptchaRequiredError (which the pool may swallow
+// via fallback).
+func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
 	return p.credPool.get(connIdx, allowCaptchaBlock)
 }
 
@@ -984,8 +1050,12 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	defer conn1.Close()
 	defer conn2.Close()
 
-	// Get initial credentials and start first TURN relay
-	turnAddr, creds, err := p.resolveTURNAddr(connIdx, *signaled)
+	// Get initial credentials and start first TURN relay. credSlot tells
+	// us which pool slot actually provided the cred — may equal connIdx
+	// (own slot / fresh fetch) or some other slot's index (fallback).
+	// We track it so a short-lived session can invalidate the slot that
+	// actually carried the bad cred, not this conn's nominal slot.
+	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, *signaled)
 	if err != nil {
 		return err
 	}
@@ -1042,7 +1112,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// every successful reconnect — sync.Once drops all calls after the first.
 	p.signalBootstrapDone(nil)
 
-	log.Printf("proxy: [conn %d] DTLS+TURN session established", connIdx)
+	log.Printf("proxy: [conn %d, cred %d] DTLS+TURN session established", connIdx, credSlot)
 
 	// TURN reconnection loop in background.
 	// Only reconnects when TURN actually fails (not proactively).
@@ -1066,13 +1136,15 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			p.reconnects.Add(1)
 			log.Printf("proxy: [conn %d] TURN session ended after %s, reconnecting...", connIdx, turnAge.Round(time.Second))
 
-			// If TURN session was short-lived, THIS slot's creds are likely
-			// server-side expired. Invalidate just this entry so the next
-			// resolveTURNAddr(connIdx, ...) refetches for this slot, while
-			// other conns' still-fresh creds stay available for fallback.
+			// If TURN session was short-lived, the cred that carried it is
+			// likely server-side expired. Invalidate the pool slot that
+			// actually produced that cred (may differ from connIdx if we
+			// were running on a fallback) so only the bad cred is dropped;
+			// other conns sharing a different cred stay fresh.
 			if turnAge < 30*time.Second {
-				p.credPool.invalidateEntry(connIdx)
-				log.Printf("proxy: [conn %d] short-lived TURN session (%s), invalidated its slot in pool", connIdx, turnAge.Round(time.Second))
+				p.credPool.invalidateEntry(credSlot)
+				log.Printf("proxy: [conn %d] short-lived TURN session (%s), invalidated cred slot %d",
+					connIdx, turnAge.Round(time.Second), credSlot)
 			}
 
 			// Brief pause before reconnecting (longer for short-lived sessions)
@@ -1092,7 +1164,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				if connCtx.Err() != nil {
 					return
 				}
-				newAddr, newCreds, err := p.resolveTURNAddr(connIdx, true)
+				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, true)
 				if err != nil {
 					// Check if it's a captcha that needs human interaction.
 					// Instead of burning retries, freeze and wait for the user.
@@ -1137,7 +1209,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 								}
 								log.Printf("proxy: captcha wait timeout, probing (interval was %s)...", turnProbeInterval)
 								p.credPool.invalidate()
-								_, _, probeErr := p.resolveTURNAddr(connIdx, false)
+								_, _, _, probeErr := p.resolveTURNAddr(connIdx, false)
 								if probeErr == nil {
 									log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 									p.captchaImageURL.Store("")
@@ -1182,7 +1254,12 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					continue
 				}
 
-				log.Printf("proxy: starting new TURN session (attempt %d)", retries+1)
+				// Track which cred slot this new TURN session will run on
+				// so the next short-session detection invalidates the right
+				// slot rather than the nominal connIdx.
+				credSlot = newSlot
+
+				log.Printf("proxy: [conn %d, cred %d] starting new TURN session (attempt %d)", connIdx, credSlot, retries+1)
 				turnStart = time.Now()
 				turnDone = make(chan error, 1)
 				go func() {
@@ -1294,7 +1371,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 		conn1.Close()
 	})
 
-	turnAddr, creds, err := p.resolveTURNAddr(connIdx, *signaled)
+	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, *signaled)
 	if err != nil {
 		return err
 	}
@@ -1314,6 +1391,8 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	// Signal proxy-lifetime bootstrap ready (sync.Once, idempotent).
 	p.signalBootstrapDone(nil)
 
+	log.Printf("proxy: [conn %d, cred %d] direct TURN session established", connIdx, credSlot)
+
 	// TURN reconnection loop (same as DTLS version but without DTLS)
 	go func() {
 		defer connCancel()
@@ -1326,7 +1405,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			if connCtx.Err() != nil {
 				return
 			}
-			log.Printf("proxy: direct TURN ended, reconnecting...")
+			log.Printf("proxy: [conn %d, cred %d] direct TURN ended, reconnecting...", connIdx, credSlot)
 			select {
 			case <-time.After(500 * time.Millisecond):
 			case <-connCtx.Done():
@@ -1337,7 +1416,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				if connCtx.Err() != nil {
 					return
 				}
-				newAddr, newCreds, err := p.resolveTURNAddr(connIdx, true)
+				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, true)
 				if err != nil {
 					retries++
 					select {
@@ -1347,6 +1426,8 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 					}
 					continue
 				}
+				credSlot = newSlot
+				log.Printf("proxy: [conn %d, cred %d] starting new direct TURN session", connIdx, credSlot)
 				turnDone = make(chan error, 1)
 				go func() {
 					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2, -1)
