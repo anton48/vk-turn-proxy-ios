@@ -34,6 +34,7 @@ type Config struct {
 	UseDTLS       bool          // true = DTLS obfuscation (default mode)
 	UseUDP        bool          // true = UDP to TURN, false = TCP
 	NumConns      int           // number of concurrent connections (default 1)
+	CredPoolTTL   time.Duration // per-entry freshness in the cred pool; <=0 → default 10m
 	CaptchaSolver CaptchaSolver // called when VK requires captcha (may be nil)
 }
 
@@ -170,7 +171,8 @@ func NewProxy(cfg Config) *Proxy {
 	// parses the TURN host:port. Pool size = max(2, ceil(NumConns/3)) —
 	// enough insurance slots to keep the tunnel alive through mid-session
 	// captcha without the full per-conn PoW cost of a size=NumConns pool.
-	p.credPool = newCredPool(poolSizeForNumConns(cfg.NumConns), 10*time.Minute, p.fetchFreshCreds)
+	// TTL comes from Config; newCredPool falls back to 10m if <= 0.
+	p.credPool = newCredPool(poolSizeForNumConns(cfg.NumConns), cfg.CredPoolTTL, p.fetchFreshCreds)
 	return p
 }
 

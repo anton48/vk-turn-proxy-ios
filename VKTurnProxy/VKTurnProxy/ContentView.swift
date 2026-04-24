@@ -19,6 +19,7 @@ struct ContentView: View {
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
     @AppStorage("numConnections") private var numConnections = 10
+    @AppStorage("credPoolTTLMinutes") private var credPoolTTLMinutes = 10
 
     var body: some View {
         NavigationView {
@@ -66,7 +67,8 @@ struct ContentView: View {
                             vkLink: vkLink,
                             peerAddress: peerAddress,
                             useDTLS: useDTLS,
-                            numConnections: numConnections
+                            numConnections: numConnections,
+                            credPoolTTLSeconds: credPoolTTLMinutes * 60
                         )
                         Task {
                             await tunnel.connect(config: config)
@@ -173,6 +175,7 @@ struct SettingsView: View {
     @AppStorage("peerAddress") private var peerAddress = ""
     @AppStorage("useDTLS") private var useDTLS = true
     @AppStorage("numConnections") private var numConnections = 10
+    @AppStorage("credPoolTTLMinutes") private var credPoolTTLMinutes = 10
 
     var body: some View {
         Form {
@@ -189,6 +192,8 @@ struct SettingsView: View {
                 Toggle("DTLS Obfuscation", isOn: $useDTLS)
 
                 Stepper("Connections: \(numConnections)", value: $numConnections, in: 1...64)
+
+                Stepper("Cred pool TTL: \(credPoolTTLMinutes) min", value: $credPoolTTLMinutes, in: 2...60)
             }
 
             Section("WireGuard") {

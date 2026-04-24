@@ -641,6 +641,7 @@ class TunnelManager: ObservableObject {
             "use_dtls": config.useDTLS,
             "use_udp": config.useUDP,
             "num_conns": config.numConnections,
+            "cred_pool_ttl_seconds": config.credPoolTTLSeconds,
             "turn_server": config.turnServerOverride ?? "",
             "turn_port": config.turnPortOverride ?? ""
         ]
@@ -673,6 +674,12 @@ struct TunnelConfig {
     var useDTLS: Bool = true
     var useUDP: Bool = true
     var numConnections: Int = 10 // configurable from Settings (VK allows max ~10 allocations)
+    // Per-entry TTL for the cred pool. Drives when the background grower
+    // considers a slot "stale" and tries to refetch it, and when a get()
+    // / fallback stops treating a slot as fresh. Default 600s (10 min).
+    // Longer = less PoW/VK pressure but more risk of caching creds past
+    // their server-side validity.
+    var credPoolTTLSeconds: Int = 600
     var turnServerOverride: String?
     var turnPortOverride: String?
 }
