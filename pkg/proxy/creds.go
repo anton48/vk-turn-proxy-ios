@@ -439,6 +439,32 @@ type credPool struct {
 	fetch func(allowCaptchaBlock bool) (string, *TURNCreds, error)
 }
 
+// poolSizeForNumConns derives the insurance pool size from the configured
+// number of tunnel connections. The policy is max(2, ceil(n/3)):
+//
+//   - Scale with n so heavier-use setups get more independent creds.
+//   - Keep the minimum at 2 so that the "mid-session captcha on one slot,
+//     others keep the tunnel alive" behaviour always has something to
+//     fall back to. With only 1 slot, a mid-session refetch that hits
+//     captcha would have no fallback and surface as a user-facing
+//     WebView — defeating the purpose of the pool.
+//   - Staying below n (default=10 → pool=4) keeps background PoW /
+//     VK-fetch pressure low: TTL-rotation touches each slot once per
+//     TTL, so fewer slots = fewer periodic fetches.
+//
+// Examples: n=1..3 → 2, n=4..6 → 2, n=7..9 → 3, n=10..12 → 4,
+//           n=13..15 → 5, n=30 → 10.
+func poolSizeForNumConns(n int) int {
+	if n <= 0 {
+		n = 1
+	}
+	size := (n + 2) / 3 // integer ceiling of n/3
+	if size < 2 {
+		size = 2
+	}
+	return size
+}
+
 // newCredPool builds a pool sized to `size` conns with per-entry `ttl`.
 // The post-failure cooldown is fixed at 5 minutes.
 func newCredPool(size int, ttl time.Duration, fetch func(bool) (string, *TURNCreds, error)) *credPool {
@@ -448,12 +474,14 @@ func newCredPool(size int, ttl time.Duration, fetch func(bool) (string, *TURNCre
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	return &credPool{
+	cp := &credPool{
 		size:     size,
 		ttl:      ttl,
 		cooldown: 5 * time.Minute,
 		fetch:    fetch,
 	}
+	log.Printf("credpool: initialized with %d slots (ttl=%s, cooldown=%s)", size, ttl, cp.cooldown)
+	return cp
 }
 
 // get returns (addr, creds, credSlot, err) for the given connIdx.
@@ -476,24 +504,30 @@ func newCredPool(size int, ttl time.Duration, fetch func(bool) (string, *TURNCre
 func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
 	cp.mu.Lock()
 
-	if connIdx < 0 {
-		connIdx = 0
+	// Pool size may be smaller than NumConns (policy: max(2, ceil(n/3))),
+	// so multiple conns beyond the pool size collapse onto the last slot
+	// as their "own slot". Keep connIdx as-is for logs (so the actual
+	// calling conn is visible) and derive a clamped `ownSlot` for the
+	// pool indexing math.
+	ownSlot := connIdx
+	if ownSlot < 0 {
+		ownSlot = 0
 	}
-	if connIdx >= cp.size {
-		connIdx = cp.size - 1
+	if ownSlot >= cp.size {
+		ownSlot = cp.size - 1
 	}
-	// Make pool[connIdx] addressable.
-	for len(cp.pool) <= connIdx {
+	// Make pool[ownSlot] addressable.
+	for len(cp.pool) <= ownSlot {
 		cp.pool = append(cp.pool, credPoolEntry{})
 	}
 
 	// 1. Own slot fresh?
-	if cp.isFreshLocked(connIdx) {
-		e := cp.pool[connIdx]
+	if cp.isFreshLocked(ownSlot) {
+		e := cp.pool[ownSlot]
 		cp.mu.Unlock()
 		log.Printf("credpool: conn %d using cached cred from slot %d (age %s)",
-			connIdx, connIdx, time.Since(e.ts).Round(time.Second))
-		return e.addr, e.creds, connIdx, nil
+			connIdx, ownSlot, time.Since(e.ts).Round(time.Second))
+		return e.addr, e.creds, ownSlot, nil
 	}
 
 	// 2. Any other fresh slot — fallback without fetching.
@@ -508,41 +542,41 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// 3. Own slot on cooldown and no fresh fallback — propagate so the
 	//    caller's reconnect loop backs off instead of hammering us.
 	now := time.Now()
-	if now.Before(cp.pool[connIdx].cooldownUntil) {
-		until := cp.pool[connIdx].cooldownUntil
+	if now.Before(cp.pool[ownSlot].cooldownUntil) {
+		until := cp.pool[ownSlot].cooldownUntil
 		cp.mu.Unlock()
 		return "", nil, -1, fmt.Errorf("credpool: slot %d on cooldown for %s and no fresh fallback",
-			connIdx, until.Sub(now).Round(time.Second))
+			ownSlot, until.Sub(now).Round(time.Second))
 	}
 
 	// 4. Another goroutine is already fetching into this slot; don't
 	//    duplicate work. Return an error so the caller retries (by then
 	//    the other fetch may have filled the slot or a fallback).
-	if cp.pool[connIdx].fetching {
+	if cp.pool[ownSlot].fetching {
 		cp.mu.Unlock()
-		return "", nil, -1, fmt.Errorf("credpool: slot %d fetch already in progress", connIdx)
+		return "", nil, -1, fmt.Errorf("credpool: slot %d fetch already in progress", ownSlot)
 	}
-	cp.pool[connIdx].fetching = true
+	cp.pool[ownSlot].fetching = true
 	cp.mu.Unlock()
 
 	// Inline fetch — runs WITHOUT mu so get() on other slots stays fast.
 	addr, creds, fetchErr := cp.fetch(allowCaptchaBlock)
 
 	cp.mu.Lock()
-	cp.pool[connIdx].fetching = false
+	cp.pool[ownSlot].fetching = false
 	if fetchErr == nil {
-		cp.pool[connIdx] = credPoolEntry{addr: addr, creds: creds, ts: time.Now()}
+		cp.pool[ownSlot] = credPoolEntry{addr: addr, creds: creds, ts: time.Now()}
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()
 		log.Printf("credpool: conn %d fetched fresh cred into slot %d (%d/%d slots filled)",
-			connIdx, connIdx, filled, cp.size)
-		return addr, creds, connIdx, nil
+			connIdx, ownSlot, filled, cp.size)
+		return addr, creds, ownSlot, nil
 	}
 
 	// Fetch failed. Set cooldown so this slot doesn't get hammered on
 	// every reconnect. Then check once more for a fresh fallback: the
 	// background grower may have filled another slot while we waited.
-	cp.pool[connIdx].cooldownUntil = time.Now().Add(cp.cooldown)
+	cp.pool[ownSlot].cooldownUntil = time.Now().Add(cp.cooldown)
 	if pick, ok := cp.pickFreshFallbackLocked(); ok {
 		e := cp.pool[pick]
 		cp.mu.Unlock()

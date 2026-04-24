@@ -167,8 +167,10 @@ func NewProxy(cfg Config) *Proxy {
 		p.config.CaptchaSolver = p.waitForCaptchaAnswer
 	}
 	// Build the cred pool with a closure that does the VK API work and
-	// parses the TURN host:port. The pool handles caching + fallback.
-	p.credPool = newCredPool(cfg.NumConns, 10*time.Minute, p.fetchFreshCreds)
+	// parses the TURN host:port. Pool size = max(2, ceil(NumConns/3)) —
+	// enough insurance slots to keep the tunnel alive through mid-session
+	// captcha without the full per-conn PoW cost of a size=NumConns pool.
+	p.credPool = newCredPool(poolSizeForNumConns(cfg.NumConns), 10*time.Minute, p.fetchFreshCreds)
 	return p
 }
 
