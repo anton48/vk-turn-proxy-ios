@@ -262,6 +262,17 @@ class TunnelManager: ObservableObject {
         captchaAutoRefreshTimer?.invalidate()
         captchaAutoRefreshTimer = nil
         captchaLimitReached = false
+        // Clear any "VK временно ограничивает запросы" message set by a
+        // previous exhausted cycle. This runs in two recovery cases:
+        //   - onCaptchaReady: a subsequent auto-refresh attempt found a
+        //     solvable captcha — the rate limit has lifted, so the old
+        //     message is stale.
+        //   - onCaptchaSheetDismissed: user closed the WebView; the
+        //     message served its purpose (explained why they're seeing the
+        //     "attempt limit reached" page) and no longer needs to persist.
+        // Note: triggerCaptchaRefresh sets errorMessage AFTER calling us, so
+        // clearing it here doesn't interfere with the exhausted-cycle path.
+        errorMessage = nil
         // captchaRefreshAttempt intentionally not reset — makes it easier to
         // see the final attempt count in logs / debugger. Zeroed on next
         // onCaptchaLimitDetected() call.
@@ -341,6 +352,12 @@ class TunnelManager: ObservableObject {
                 case .connected:
                     // (Re)start polling, preserving captcha state across reconnects
                     self.startStatsPolling(reset: false)
+                    // Once the tunnel is actually up, any error message left
+                    // over from a captcha-limit exhaustion or other transient
+                    // failure is stale — clear it so the user isn't told
+                    // "VK временно ограничивает запросы" while staring at a
+                    // green 10/10 Connected status.
+                    self.errorMessage = nil
                 case .disconnected, .invalid:
                     // Terminal states — full cleanup
                     self.stopStatsPolling()
