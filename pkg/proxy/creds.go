@@ -11,6 +11,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -356,6 +357,186 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 		Password: pass,
 		Address:  address,
 	}, nil
+}
+
+// --- credPool: per-conn TURN credential cache ---
+//
+// Ported from turnbridge's poolCreds:
+//
+//   Commit that introduced it:
+//     https://github.com/nullcstring/turnbridge/commit/72cd1d4a8f04eec0e5e210388d415a84777cd2e6
+//   Current version:
+//     https://github.com/nullcstring/turnbridge/blob/main/wireguard-apple/Sources/WireGuardKitGo/turn_proxy.go
+//     (function poolCreds, ~lines 602-647 at time of porting)
+//
+// Adaptations for this codebase:
+// - Per-connection affinity: each conn has its own slot in the pool. When
+//   a conn's cred goes stale (per-entry TTL), only that conn refetches,
+//   leaving other conns' fresh creds untouched. This is the key property
+//   that keeps the tunnel alive while one conn's refetch is stuck waiting
+//   for the user to solve captcha.
+// - Degraded-mode fallback: if a conn's own fetch fails (captcha or 403),
+//   fall back to round-robin over ANY fresh entry so the conn can still
+//   come back up using another conn's cred.
+// - Per-entry TTL (each slot tracks its own ts) instead of turnbridge's
+//   global "wipe when any entry is 10 min old". Entries refresh independently.
+
+// credPoolEntry is one slot in the pool — either filled (creds != nil)
+// or empty.
+type credPoolEntry struct {
+	addr  string
+	creds *TURNCreds
+	ts    time.Time // time the entry was filled; zero for empty slots
+}
+
+// credPool holds up to `size` independent TURN credential slots, one per
+// connection index. All access is serialized via mu; callers that need
+// to refetch block briefly on pool-level contention but not on each
+// others' VK API calls mid-flight (the fetcher callback holds the lock
+// while doing its HTTP work — VK rate limiting makes true parallelism
+// pointless anyway).
+type credPool struct {
+	mu   sync.Mutex
+	pool []credPoolEntry // indexed by connIdx; grown lazily up to size
+	idx  int             // round-robin cursor for fallback mode
+	size int             // pool capacity = Config.NumConns
+	ttl  time.Duration   // per-entry freshness (default 10m)
+
+	// fetch is the underlying credential fetcher. It must do all the work
+	// previously inlined in resolveTURNAddr: build solver + pending-captcha
+	// params, call GetVKCreds, parse TURN host:port, publish turnServerIP.
+	// Returns (address "host:port", creds, err). On CaptchaRequiredError
+	// the pool may choose to fall back to an existing entry instead of
+	// surfacing the error.
+	fetch func(allowCaptchaBlock bool) (string, *TURNCreds, error)
+}
+
+// newCredPool builds a pool sized to `size` conns, with `ttl` per-entry
+// freshness. `fetch` is invoked whenever a fresh cred is needed.
+func newCredPool(size int, ttl time.Duration, fetch func(bool) (string, *TURNCreds, error)) *credPool {
+	if size < 1 {
+		size = 1
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	return &credPool{
+		size:  size,
+		ttl:   ttl,
+		fetch: fetch,
+	}
+}
+
+// get returns a TURN address + creds for the given connIdx. Semantics:
+//  1. If pool has a fresh entry for connIdx, return it (no VK call).
+//  2. Otherwise invoke fetch(allowCaptchaBlock) to get a fresh cred.
+//     On success, store it at pool[connIdx] and return.
+//  3. On fetch failure (including CaptchaRequiredError), fall back to
+//     round-robin over all currently fresh entries. If none exist,
+//     propagate the original fetch error so the caller can surface
+//     captcha / retry as appropriate.
+//
+// connIdx < 0 or >= size is clamped to size-1 (used by probe callers
+// that don't belong to a specific slot; they'll refresh whatever slot
+// was most recently seen).
+func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, error) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	if connIdx < 0 {
+		connIdx = 0
+	}
+	if connIdx >= cp.size {
+		connIdx = cp.size - 1
+	}
+
+	// 1. Fast path: this conn's own cred is fresh.
+	if connIdx < len(cp.pool) {
+		e := cp.pool[connIdx]
+		if e.creds != nil && time.Since(e.ts) < cp.ttl {
+			log.Printf("credpool: conn %d using cached cred (age %s)", connIdx, time.Since(e.ts).Round(time.Second))
+			return e.addr, e.creds, nil
+		}
+	}
+
+	// 2. Try fresh fetch.
+	addr, creds, err := cp.fetch(allowCaptchaBlock)
+	if err == nil {
+		// Grow backing slice as needed so pool[connIdx] is addressable.
+		for len(cp.pool) <= connIdx {
+			cp.pool = append(cp.pool, credPoolEntry{})
+		}
+		cp.pool[connIdx] = credPoolEntry{addr: addr, creds: creds, ts: time.Now()}
+		log.Printf("credpool: conn %d registered fresh cred (%d/%d slots filled)", connIdx, cp.countFreshLocked(), cp.size)
+		return addr, creds, nil
+	}
+
+	// 3. Fetch failed — look for any fresh entry to reuse.
+	fresh := cp.freshIndicesLocked()
+	if len(fresh) > 0 {
+		pick := fresh[cp.idx%len(fresh)]
+		cp.idx++
+		e := cp.pool[pick]
+		log.Printf("credpool: conn %d fetch failed (%v), falling back to conn %d's cred (age %s)",
+			connIdx, err, pick, time.Since(e.ts).Round(time.Second))
+		return e.addr, e.creds, nil
+	}
+
+	// Pool empty or all-stale — surface the error (caller handles captcha).
+	log.Printf("credpool: conn %d fetch failed and no fresh fallback: %v", connIdx, err)
+	return "", nil, err
+}
+
+// invalidate drops every entry so the next get() refetches. Used on
+// explicit session resets (Pause/Resume/ForceReconnect) and on captcha
+// probes that need to force a fresh VK session.
+func (cp *credPool) invalidate() {
+	cp.mu.Lock()
+	n := len(cp.pool)
+	cp.pool = nil
+	cp.idx = 0
+	cp.mu.Unlock()
+	if n > 0 {
+		log.Printf("credpool: invalidated %d entries", n)
+	}
+}
+
+// invalidateEntry drops just one slot so that conn refetches next time.
+// Used when a TURN session for a specific conn was short-lived — the
+// entry's creds are likely server-side-expired, but other slots may
+// still be valid.
+func (cp *credPool) invalidateEntry(connIdx int) {
+	if connIdx < 0 {
+		return
+	}
+	cp.mu.Lock()
+	if connIdx < len(cp.pool) {
+		cp.pool[connIdx] = credPoolEntry{}
+	}
+	cp.mu.Unlock()
+}
+
+// countFreshLocked assumes cp.mu is held.
+func (cp *credPool) countFreshLocked() int {
+	n := 0
+	for _, e := range cp.pool {
+		if e.creds != nil && time.Since(e.ts) < cp.ttl {
+			n++
+		}
+	}
+	return n
+}
+
+// freshIndicesLocked assumes cp.mu is held. Returns indices of currently
+// fresh entries in pool order.
+func (cp *credPool) freshIndicesLocked() []int {
+	out := make([]int, 0, len(cp.pool))
+	for i, e := range cp.pool {
+		if e.creds != nil && time.Since(e.ts) < cp.ttl {
+			out = append(out, i)
+		}
+	}
+	return out
 }
 
 // extractCaptcha checks if a VK API response contains error code 14 (captcha required).

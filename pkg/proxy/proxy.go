@@ -86,13 +86,12 @@ type Proxy struct {
 	lastCaptchaAttempt atomic.Value // stores float64: captcha_attempt from error response
 	lastCaptchaToken1  atomic.Value // stores string: step1 access_token to reuse on retry
 
-	// Cached TURN credentials: shared across all connections so only one
-	// GetVKCreds call is needed (avoids per-connection captcha).
-	cachedCredsMu   sync.Mutex // protects read/write of cached creds
-	credsFetchMu    sync.Mutex // serializes GetVKCreds calls (may block on captcha)
-	cachedTURNAddr  string
-	cachedCreds     *TURNCreds
-	cachedCredsTime time.Time
+	// Pool of independent TURN credentials, one per connection index.
+	// Each slot has its own per-entry TTL (10 minutes). When a conn's own
+	// cred is stale it refetches; when that refetch hits captcha or a 403
+	// it falls back to round-robin over any other fresh slot, so a single
+	// slot's trouble does not tear down the whole tunnel. See creds.go.
+	credPool *credPool
 
 	// Watchdog: last time a packet was received (unix seconds).
 	// Used to detect dead tunnels after iOS freeze/thaw.
@@ -167,6 +166,9 @@ func NewProxy(cfg Config) *Proxy {
 	if p.config.CaptchaSolver == nil {
 		p.config.CaptchaSolver = p.waitForCaptchaAnswer
 	}
+	// Build the cred pool with a closure that does the VK API work and
+	// parses the TURN host:port. The pool handles caching + fallback.
+	p.credPool = newCredPool(cfg.NumConns, 10*time.Minute, p.fetchFreshCreds)
 	return p
 }
 
@@ -361,10 +363,8 @@ func (p *Proxy) waitCaptchaAndRestart() {
 				}
 			}
 			log.Printf("proxy: probing if VK still requires captcha (interval was %s)...", probeInterval)
-			p.cachedCredsMu.Lock()
-			p.cachedCreds = nil
-			p.cachedCredsMu.Unlock()
-			_, _, probeErr := p.resolveTURNAddr(p.linkID, false)
+			p.credPool.invalidate()
+			_, _, probeErr := p.resolveTURNAddr(-1, false)
 			if probeErr == nil {
 				log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 				p.captchaImageURL.Store("")
@@ -406,10 +406,8 @@ func (p *Proxy) Pause() {
 		p.sessCancel()
 	}
 	p.sessMu.Unlock()
-	// Invalidate cached creds so Resume fetches fresh ones
-	p.cachedCredsMu.Lock()
-	p.cachedCreds = nil
-	p.cachedCredsMu.Unlock()
+	// Invalidate creds so Resume fetches fresh ones
+	p.credPool.invalidate()
 	log.Printf("proxy: Pause — all connections cancelled")
 }
 
@@ -439,10 +437,8 @@ func (p *Proxy) Resume() {
 	}
 	p.sessCtx, p.sessCancel = context.WithCancel(p.ctx)
 	p.sessMu.Unlock()
-	// Invalidate cached creds — after sleep, TURN allocations expired
-	p.cachedCredsMu.Lock()
-	p.cachedCreds = nil
-	p.cachedCredsMu.Unlock()
+	// Invalidate creds — after sleep, TURN allocations expired
+	p.credPool.invalidate()
 	log.Printf("proxy: Resume — cancelled old session, starting fresh connections")
 	go p.startConnections()
 }
@@ -464,9 +460,7 @@ func (p *Proxy) ForceReconnect() {
 	}
 	p.sessCtx, p.sessCancel = context.WithCancel(p.ctx)
 	p.sessMu.Unlock()
-	p.cachedCredsMu.Lock()
-	p.cachedCreds = nil
-	p.cachedCredsMu.Unlock()
+	p.credPool.invalidate()
 	// Clear the silent-degradation counters so the new session starts fresh.
 	p.pionTransientErrors.Store(0)
 	p.firstPionErrorTime.Store(0)
@@ -849,7 +843,7 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		if p.config.UseDTLS {
 			err = p.runDTLSSession(sessCtx, linkID, readyCh, &signaled, connIdx)
 		} else {
-			err = p.runDirectSession(sessCtx, linkID, readyCh, &signaled)
+			err = p.runDirectSession(sessCtx, linkID, readyCh, &signaled, connIdx)
 		}
 		if err != nil {
 			duration := time.Since(start)
@@ -883,10 +877,9 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				case <-time.After(dormantDuration):
 					shortFailures = 0 // reset after dormancy
 					log.Printf("proxy: waking from dormancy, retrying connection")
-					// Invalidate cached creds so we get fresh ones
-					p.cachedCredsMu.Lock()
-					p.cachedCreds = nil
-					p.cachedCredsMu.Unlock()
+					// Invalidate all cached creds so we get fresh ones after
+					// dormancy (entire TURN pool likely gone server-side by now).
+					p.credPool.invalidate()
 				case <-sessCtx.Done():
 					return sessCtx.Err()
 				case <-p.ctx.Done():
@@ -909,56 +902,40 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 	}
 }
 
-// resolveTURNAddr fetches VK credentials and resolves the TURN server address.
-// Uses cached credentials if available (< 5min old) to avoid per-connection captcha.
-// Serializes VK API calls via credsFetchMu so only one goroutine fetches at a time.
-// If allowCaptchaBlock is false, captcha returns an error instead of blocking.
-func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, *TURNCreds, error) {
-	// Fast path: check cache (read lock)
-	p.cachedCredsMu.Lock()
-	if p.cachedCreds != nil && time.Since(p.cachedCredsTime) < 5*time.Minute {
-		addr := p.cachedTURNAddr
-		creds := p.cachedCreds
-		p.cachedCredsMu.Unlock()
-		log.Printf("proxy: using cached TURN creds (age %s)", time.Since(p.cachedCredsTime).Round(time.Second))
-		return addr, creds, nil
-	}
-	p.cachedCredsMu.Unlock()
+// resolveTURNAddr returns a TURN host:port + credentials for the given
+// connection slot. Delegates to credPool, which may serve a cached
+// cred, fetch a fresh one, or fall back to another conn's fresh cred on
+// captcha / 403. allowCaptchaBlock gates whether the underlying fetcher
+// may block a CaptchaSolver waiting on user input; when false, captcha
+// surfaces as CaptchaRequiredError.
+func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, error) {
+	return p.credPool.get(connIdx, allowCaptchaBlock)
+}
 
-	// Slow path: serialize credential fetching so only one goroutine calls GetVKCreds.
-	// cachedCredsMu is NOT held during fetch — this avoids blocking all goroutines
-	// when the solver waits for the user to solve captcha (which can take minutes).
-	p.credsFetchMu.Lock()
-	defer p.credsFetchMu.Unlock()
-
-	// Re-check cache — another goroutine may have populated it while we waited.
-	p.cachedCredsMu.Lock()
-	if p.cachedCreds != nil && time.Since(p.cachedCredsTime) < 5*time.Minute {
-		addr := p.cachedTURNAddr
-		creds := p.cachedCreds
-		p.cachedCredsMu.Unlock()
-		log.Printf("proxy: using cached TURN creds (age %s)", time.Since(p.cachedCredsTime).Round(time.Second))
-		return addr, creds, nil
-	}
-	p.cachedCredsMu.Unlock()
-
+// fetchFreshCreds is the pool's underlying VK fetcher. It wraps GetVKCreds
+// with captcha-token bookkeeping and TURN host:port parsing. Serialized
+// under credPool.mu, so only one fetch runs at a time — VK rate limiting
+// makes real parallelism pointless anyway.
+func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool) (string, *TURNCreds, error) {
 	var solver CaptchaSolver
 	if allowCaptchaBlock {
 		solver = p.config.CaptchaSolver
 	}
-	// Check if we have a solved captcha (success_token from captchaNotRobot.check)
+
+	// Consume any pre-solved captcha tokens (one-shot — the success_token
+	// is only valid for the exact next step2 call).
 	var solvedSID, solvedKey string
 	var solvedTs, solvedAttempt float64
 	if v := p.lastCaptchaSID.Load(); v != nil {
 		solvedSID, _ = v.(string)
 		if solvedSID != "" {
-			p.lastCaptchaSID.Store("") // consume it (one-time use)
+			p.lastCaptchaSID.Store("")
 		}
 	}
 	if v := p.lastCaptchaKey.Load(); v != nil {
 		solvedKey, _ = v.(string)
 		if solvedKey != "" {
-			p.lastCaptchaKey.Store("") // consume it
+			p.lastCaptchaKey.Store("")
 		}
 	}
 	if v := p.lastCaptchaTs.Load(); v != nil {
@@ -971,11 +948,12 @@ func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, 
 	if v := p.lastCaptchaToken1.Load(); v != nil {
 		savedToken1, _ = v.(string)
 		if savedToken1 != "" {
-			p.lastCaptchaToken1.Store("") // consume it
+			p.lastCaptchaToken1.Store("")
 		}
 	}
-	// solver=nil → CaptchaRequiredError if captcha needed (non-blocking)
-	creds, err := GetVKCreds(linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1)
+
+	// solver=nil → CaptchaRequiredError surfaces instead of blocking.
+	creds, err := GetVKCreds(p.linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1)
 	if err != nil {
 		return "", nil, fmt.Errorf("get VK creds: %w", err)
 	}
@@ -990,16 +968,7 @@ func (p *Proxy) resolveTURNAddr(linkID string, allowCaptchaBlock bool) (string, 
 		turnPort = p.config.TurnPort
 	}
 	p.turnServerIP.Store(turnHost)
-	addr := net.JoinHostPort(turnHost, turnPort)
-
-	// Cache the credentials for other connections to reuse
-	p.cachedCredsMu.Lock()
-	p.cachedTURNAddr = addr
-	p.cachedCreds = creds
-	p.cachedCredsTime = time.Now()
-	p.cachedCredsMu.Unlock()
-
-	return addr, creds, nil
+	return net.JoinHostPort(turnHost, turnPort), creds, nil
 }
 
 // runDTLSSession runs a long-lived DTLS session.
@@ -1016,7 +985,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	defer conn2.Close()
 
 	// Get initial credentials and start first TURN relay
-	turnAddr, creds, err := p.resolveTURNAddr(linkID, *signaled)
+	turnAddr, creds, err := p.resolveTURNAddr(connIdx, *signaled)
 	if err != nil {
 		return err
 	}
@@ -1097,13 +1066,13 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			p.reconnects.Add(1)
 			log.Printf("proxy: [conn %d] TURN session ended after %s, reconnecting...", connIdx, turnAge.Round(time.Second))
 
-			// If TURN session was short-lived, the credentials are likely expired.
-			// Invalidate cache so the next resolveTURNAddr fetches fresh creds.
+			// If TURN session was short-lived, THIS slot's creds are likely
+			// server-side expired. Invalidate just this entry so the next
+			// resolveTURNAddr(connIdx, ...) refetches for this slot, while
+			// other conns' still-fresh creds stay available for fallback.
 			if turnAge < 30*time.Second {
-				p.cachedCredsMu.Lock()
-				p.cachedCreds = nil
-				p.cachedCredsMu.Unlock()
-				log.Printf("proxy: [conn %d] short-lived TURN session (%s), invalidated credential cache", connIdx, turnAge.Round(time.Second))
+				p.credPool.invalidateEntry(connIdx)
+				log.Printf("proxy: [conn %d] short-lived TURN session (%s), invalidated its slot in pool", connIdx, turnAge.Round(time.Second))
 			}
 
 			// Brief pause before reconnecting (longer for short-lived sessions)
@@ -1123,7 +1092,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				if connCtx.Err() != nil {
 					return
 				}
-				newAddr, newCreds, err := p.resolveTURNAddr(linkID, true)
+				newAddr, newCreds, err := p.resolveTURNAddr(connIdx, true)
 				if err != nil {
 					// Check if it's a captcha that needs human interaction.
 					// Instead of burning retries, freeze and wait for the user.
@@ -1167,10 +1136,8 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 									}
 								}
 								log.Printf("proxy: captcha wait timeout, probing (interval was %s)...", turnProbeInterval)
-								p.cachedCredsMu.Lock()
-								p.cachedCreds = nil
-								p.cachedCredsMu.Unlock()
-								_, _, probeErr := p.resolveTURNAddr(linkID, false)
+								p.credPool.invalidate()
+								_, _, probeErr := p.resolveTURNAddr(connIdx, false)
 								if probeErr == nil {
 									log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 									p.captchaImageURL.Store("")
@@ -1315,7 +1282,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 
 // runDirectSession runs a direct TURN session (no DTLS).
 // TURN reconnects with fresh creds only on failure.
-func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool) error {
+func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool, connIdx int) error {
 	connCtx, connCancel := context.WithCancel(sessCtx)
 	defer connCancel()
 
@@ -1327,7 +1294,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 		conn1.Close()
 	})
 
-	turnAddr, creds, err := p.resolveTURNAddr(linkID, *signaled)
+	turnAddr, creds, err := p.resolveTURNAddr(connIdx, *signaled)
 	if err != nil {
 		return err
 	}
@@ -1370,7 +1337,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				if connCtx.Err() != nil {
 					return
 				}
-				newAddr, newCreds, err := p.resolveTURNAddr(linkID, true)
+				newAddr, newCreds, err := p.resolveTURNAddr(connIdx, true)
 				if err != nil {
 					retries++
 					select {
