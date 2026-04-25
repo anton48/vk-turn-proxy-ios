@@ -116,8 +116,28 @@ class TunnelManager: ObservableObject {
             // "hex string does not fit the slice" from wireguard-go.
             let wgConfig = try buildUAPIConfig(config: config)
 
+            // Resolve VK API hostnames here, in the main-app process — the
+            // extension can't do this reliably itself before
+            // setTunnelNetworkSettings (and we defer that until after
+            // bootstrap). Run on a background queue so the UI thread isn't
+            // blocked by CFHost (~30-100 ms per host on a healthy network).
+            let vkHostIPs = await Task.detached(priority: .userInitiated) { [self] in
+                self.resolveVKHosts()
+            }.value
+            if !vkHostIPs.isEmpty {
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: pre-resolved VK hosts: \(vkHostIPs)")
+                // Diagnostic: probe whether main app can actually reach
+                // these IPs over TCP/443. If main app fails too — the IPs
+                // are genuinely unreachable (network/ISP/whitelist). If
+                // main app succeeds and extension still fails — it's an
+                // extension-process routing issue.
+                diagnoseIPReachability(vkHostIPs)
+            } else {
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: WARNING — pre-resolved VK hosts list is empty")
+            }
+
             // Build proxy config JSON
-            let proxyConfig = buildProxyConfig(config: config)
+            let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs)
 
             // Pick serverAddress. Prefer the TURN relay IP cached from a
             // previous session by the extension (via AppGroup UserDefaults):
@@ -402,13 +422,30 @@ class TunnelManager: ObservableObject {
                     // "VK временно ограничивает запросы" while staring at a
                     // green 10/10 Connected status.
                     self.errorMessage = nil
+                case .connecting, .reasserting:
+                    // CRITICAL for Step 4 architecture (deferred-setTunnelNetworkSettings):
+                    // When the PoW auto-solver fails on a captcha it can't crack, the
+                    // proxy goroutine surfaces the captcha redirect_uri via get_stats
+                    // and waits (proxy: "captcha required during startup, waiting for
+                    // solution"). The wgWaitBootstrapReady call in the extension's
+                    // startTunnel blocks for up to 120s on this. If the main-app
+                    // WebView path doesn't poll during .connecting, captchaImageURL
+                    // is never surfaced, the WebView never appears, and bootstrap
+                    // times out — user sees a silent failure with no chance to solve
+                    // the captcha. Polling here closes the loop: main-app sees the
+                    // URL, shows the WebView, user solves captcha, solve_captcha
+                    // message unblocks the goroutine, bootstrap completes.
+                    //
+                    // .reasserting included for the same reason — when iOS triggers
+                    // a tunnel re-establishment mid-session (e.g. network change),
+                    // we go through bootstrap again and may need a fresh captcha.
+                    self.startStatsPolling(reset: false)
                 case .disconnected, .invalid:
                     // Terminal states — full cleanup
                     self.stopStatsPolling()
                     self.resetCaptchaState()
                 default:
-                    // Transient states (.connecting, .disconnecting, .reasserting)
-                    // Do NOT stop polling or clear captcha state — the tunnel
+                    // .disconnecting only — keep polling/state, the tunnel
                     // may recover momentarily (e.g., sleep/wake cycle).
                     break
                 }
@@ -517,6 +554,14 @@ class TunnelManager: ObservableObject {
                                     // rendering the WebView). Does not block.
                                     self.refreshCaptchaURL()
                                     self.debugLog("captcha DETECTED, activeConns=0, refreshed URL")
+                                    // DIAGNOSTIC: try URLSession to the same URL the
+                                    // WebView is about to load. If URLSession works
+                                    // while WebView reports "offline", the issue is
+                                    // specific to WKWebView's Web Content Process,
+                                    // not main-app network access.
+                                    if let urlStr = captchaURL {
+                                        self.runCaptchaURLSessionDiagnostic(urlString: urlStr)
+                                    }
                                 }
                             } else if self.captchaImageURL != captchaURL {
                                 // URL changed (e.g., periodic probe got a fresh captcha URL)
@@ -672,8 +717,8 @@ class TunnelManager: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
-    private func buildProxyConfig(config: TunnelConfig) -> String {
-        let dict: [String: Any] = [
+    private func buildProxyConfig(config: TunnelConfig, vkHostIPs: [String: [String]] = [:]) -> String {
+        var dict: [String: Any] = [
             "vk_link": config.vkLink,
             "peer_addr": config.peerAddress,
             "use_dtls": config.useDTLS,
@@ -683,12 +728,184 @@ class TunnelManager: ObservableObject {
             "turn_server": config.turnServerOverride ?? "",
             "turn_port": config.turnPortOverride ?? ""
         ]
+        if !vkHostIPs.isEmpty {
+            dict["vk_host_ips"] = vkHostIPs
+        }
 
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
               let str = String(data: data, encoding: .utf8) else {
             return "{}"
         }
         return str
+    }
+
+    /// Resolve VK API hostnames in the main-app process, where we have a
+    /// fully-populated network context (DHCP/carrier DNS, sandbox-readable
+    /// resolv.conf, working SCDynamicStore, etc.). The resulting host→IP
+    /// map is passed to the extension via providerConfiguration so it can
+    /// dial these hosts by IP — its own DNS resolution is unreliable
+    /// before setTunnelNetworkSettings is called, and we deliberately
+    /// don't call setTunnelNetworkSettings until after VK bootstrap.
+    ///
+    /// Synchronous CFHost: each host typically resolves in 10-50 ms on a
+    /// healthy network. With three hosts and a strict 2s budget it adds
+    /// well under a second to the connect path. If resolution fails for
+    /// some host we just skip it — the extension will get whatever subset
+    /// resolved and may still succeed (e.g. login.vk.ru resolved, the
+    /// rest will be looked up if needed).
+    /// Diagnostic: try several network paths from the main-app process
+    /// at the moment captcha is detected (status = .connecting, captcha
+    /// pending). The extension can clearly reach VK at this point (it's
+    /// solving PoW / fetching captcha API), so the question is which
+    /// main-app path also works:
+    ///
+    ///   1. URLSession (default) — uses iOS Reachability monitor, fast-
+    ///      fails with -1009 if monitor says "no network". This is what
+    ///      WKWebView uses under the hood and what fails today.
+    ///   2. URLSession with waitsForConnectivity=true — tells iOS NOT to
+    ///      fail on reachability, attempt the connect anyway.
+    ///   3. NWConnection raw TCP — Network framework, lowest level the
+    ///      main app can reach without dropping to POSIX sockets. If
+    ///      this works while (1) fails, we know the network path is
+    ///      open and only the Reachability monitor is lying.
+    ///
+    /// All three fire in parallel so we see which combination works.
+    nonisolated private func runCaptchaURLSessionDiagnostic(urlString: String) {
+        guard let url = URL(string: urlString), let host = url.host else { return }
+        SharedLogger.shared.log("[AppDebug] [diag] starting 3-way diagnostic → \(host)")
+
+        // 1. Default URLSession — same behavior as WKWebView.
+        var request1 = URLRequest(url: url)
+        request1.timeoutInterval = 8
+        let session1 = URLSession(configuration: .ephemeral)
+        session1.dataTask(with: request1) { _, response, error in
+            if let error = error as NSError? {
+                SharedLogger.shared.log("[AppDebug] [diag] (1) URLSession default: FAIL \(error.domain) code=\(error.code) — \(error.localizedDescription)")
+            } else if let http = response as? HTTPURLResponse {
+                SharedLogger.shared.log("[AppDebug] [diag] (1) URLSession default: OK HTTP \(http.statusCode)")
+            }
+        }.resume()
+
+        // 2. URLSession with waitsForConnectivity=true — bypass the
+        // Reachability fast-fail, attempt connect even if monitor says
+        // "offline". timeoutIntervalForResource caps total wait so we
+        // don't hang forever if the path really is dead.
+        let cfg2 = URLSessionConfiguration.ephemeral
+        cfg2.waitsForConnectivity = true
+        cfg2.timeoutIntervalForRequest = 8
+        cfg2.timeoutIntervalForResource = 10
+        let session2 = URLSession(configuration: cfg2)
+        var request2 = URLRequest(url: url)
+        request2.timeoutInterval = 8
+        session2.dataTask(with: request2) { _, response, error in
+            if let error = error as NSError? {
+                SharedLogger.shared.log("[AppDebug] [diag] (2) URLSession waitsForConnectivity=true: FAIL \(error.domain) code=\(error.code) — \(error.localizedDescription)")
+            } else if let http = response as? HTTPURLResponse {
+                SharedLogger.shared.log("[AppDebug] [diag] (2) URLSession waitsForConnectivity=true: OK HTTP \(http.statusCode)")
+            }
+        }.resume()
+
+        // 3. Raw NWConnection TCP — Network framework, sidesteps URLSession's
+        // pre-flight Reachability check. Just opens a TLS connection and
+        // reports whether it gets to "ready" state.
+        let port = NWEndpoint.Port(integerLiteral: UInt16(url.port ?? 443))
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port)
+        let conn = NWConnection(to: endpoint, using: .tls)
+        let started = Date()
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
+                SharedLogger.shared.log("[AppDebug] [diag] (3) NWConnection TLS: READY in \(ms)ms")
+                conn.cancel()
+            case .failed(let err):
+                SharedLogger.shared.log("[AppDebug] [diag] (3) NWConnection TLS: FAIL \(err.localizedDescription)")
+                conn.cancel()
+            case .waiting(let err):
+                SharedLogger.shared.log("[AppDebug] [diag] (3) NWConnection TLS: WAITING — \(err.localizedDescription)")
+            default:
+                break
+            }
+        }
+        conn.start(queue: .global(qos: .userInitiated))
+        // Hard cap — cancel after 8s if we never reached ready/failed.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 8) {
+            if conn.state != .cancelled {
+                SharedLogger.shared.log("[AppDebug] [diag] (3) NWConnection TLS: TIMED OUT in current state \(conn.state)")
+                conn.cancel()
+            }
+        }
+    }
+
+    /// Resolve VK API hostnames in the main-app process. Returns the
+    /// FULL list of IPv4 addresses for each host so the extension can
+    /// fall through them on connect failure — relying on a single IP
+    /// is brittle when VK rotates DNS A-records or when an upstream
+    /// network path to one specific IP is temporarily unreachable.
+    nonisolated private func resolveVKHosts() -> [String: [String]] {
+        let hosts = ["login.vk.ru", "api.vk.ru", "id.vk.ru"]
+        var resolved: [String: [String]] = [:]
+
+        for host in hosts {
+            let cfhost = CFHostCreateWithName(nil, host as CFString).takeRetainedValue()
+            var info: DarwinBoolean = false
+            guard CFHostStartInfoResolution(cfhost, .addresses, nil),
+                  let addrs = CFHostGetAddressing(cfhost, &info)?.takeUnretainedValue() as? [Data] else {
+                continue
+            }
+            var ips: [String] = []
+            for addrData in addrs {
+                let ip: String? = addrData.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> String? in
+                    guard let saPtr = ptr.baseAddress?.assumingMemoryBound(to: sockaddr.self) else {
+                        return nil
+                    }
+                    if saPtr.pointee.sa_family == sa_family_t(AF_INET) {
+                        let sin = saPtr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+                        var addr = sin.sin_addr
+                        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                        if inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                            return String(cString: buf)
+                        }
+                    }
+                    return nil
+                }
+                if let ip = ip, !ips.contains(ip) {
+                    ips.append(ip)
+                }
+            }
+            if !ips.isEmpty {
+                resolved[host] = ips
+            }
+        }
+
+        return resolved
+    }
+
+    /// Diagnostic: try a TCP+TLS handshake from the main-app process to
+    /// each pre-resolved IP. Logs whether the IP is reachable from this
+    /// network. If main app reports the same "no route to host" — the IP
+    /// genuinely isn't reachable, not an extension routing bug.
+    nonisolated private func diagnoseIPReachability(_ hostIPs: [String: [String]]) {
+        for (host, ips) in hostIPs {
+            for ip in ips {
+                guard let url = URL(string: "https://\(ip)/") else { continue }
+                var request = URLRequest(url: url)
+                request.setValue(host, forHTTPHeaderField: "Host")
+                request.timeoutInterval = 5
+                let session = URLSession(configuration: .ephemeral)
+                SharedLogger.shared.log("[AppDebug] [diag] reachability ping → \(host) @ \(ip)")
+                let task = session.dataTask(with: request) { _, response, error in
+                    if let error = error as NSError? {
+                        SharedLogger.shared.log("[AppDebug] [diag] \(host) @ \(ip): FAIL \(error.domain) code=\(error.code) — \(error.localizedDescription)")
+                    } else if let http = response as? HTTPURLResponse {
+                        SharedLogger.shared.log("[AppDebug] [diag] \(host) @ \(ip): OK HTTP \(http.statusCode)")
+                    } else {
+                        SharedLogger.shared.log("[AppDebug] [diag] \(host) @ \(ip): no response, no error")
+                    }
+                }
+                task.resume()
+            }
+        }
     }
 
 }

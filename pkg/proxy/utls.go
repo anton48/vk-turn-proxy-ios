@@ -7,11 +7,67 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )
+
+// vkHostIPs is a host→IP map populated by the main app right before
+// startVPNTunnel. It lets the extension dial VK API endpoints without
+// depending on a working DNS resolver inside the extension process.
+//
+// Why this approach:
+//
+//   - CGo getaddrinfo (Go's default on iOS) returns "no such host" in a
+//     fresh Network Extension before setTunnelNetworkSettings — iOS
+//     hasn't wired up the per-process resolver context yet.
+//
+//   - Pure-Go resolver fails too: there's no usable /etc/resolv.conf in
+//     the extension sandbox, so it falls back to [::1]:53 ("connection
+//     refused").
+//
+//   - SCDynamicStore (which would give us the DNS servers iOS itself is
+//     using) is explicitly marked unavailable on iOS — Apple blocks it
+//     entirely.
+//
+//   - Hardcoded public resolvers (1.1.1.1 / 8.8.8.8) defeat the purpose:
+//     the deployment target is whitelist networks that allow VK + a few
+//     other resources; those networks block public DNS by design.
+//
+// The main-app process, in contrast, has a fully-populated network
+// context before it triggers startVPNTunnel — its standard CFHost /
+// getaddrinfo resolves through whichever DNS the system is currently
+// using (DHCP / carrier), which is by definition reachable in the
+// user's environment. So we let it resolve VK hosts there, pass the
+// IPs through providerConfiguration, and the extension dials by IP
+// while keeping the original hostname in TLS SNI / Host headers.
+var (
+	vkHostIPsMu sync.RWMutex
+	vkHostIPs   = make(map[string][]string) // host (no port) → list of IPs (all A-records)
+)
+
+// SetVKHostIPs replaces the host→[]IP map. Called from bridge.go's
+// wgStartVKBootstrap when proxyConfig is unmarshalled.
+func SetVKHostIPs(m map[string][]string) {
+	vkHostIPsMu.Lock()
+	defer vkHostIPsMu.Unlock()
+	vkHostIPs = make(map[string][]string, len(m))
+	for h, ips := range m {
+		cp := make([]string, len(ips))
+		copy(cp, ips)
+		vkHostIPs[h] = cp
+	}
+}
+
+// resolvedVKHostIPs returns the pre-resolved IPs for host, or nil if the
+// host wasn't pre-resolved by the main app.
+func resolvedVKHostIPs(host string) []string {
+	vkHostIPsMu.RLock()
+	defer vkHostIPsMu.RUnlock()
+	return vkHostIPs[host]
+}
 
 // chromeRoundTripper routes requests through HTTP/2 or HTTP/1.1 based
 // on what the server negotiates via ALPN. Uses uTLS to mimic Chrome's
@@ -87,19 +143,45 @@ func (rt *chromeRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 // (for use with Go's http.Transport which can't handle h2 frames).
 // If forceH1 is false, ALPN keeps Chrome's default: ["h2", "http/1.1"].
 func dialChromeTLS(ctx context.Context, network, addr string, forceH1 bool) (*utls.UConn, error) {
-	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	rawConn, err := dialer.DialContext(ctx, network, addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
+		return nil, fmt.Errorf("split host:port %q: %w", addr, err)
 	}
 
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, fmt.Errorf("split host:port %q: %w", addr, err)
+	// Build the list of dial addresses. If the main app pre-resolved
+	// this host, walk all A-records in order — first reachable IP wins.
+	// Otherwise just dial the original addr (lets system DNS try; will
+	// usually fail in the extension, but this is consistent fallback
+	// behavior rather than a hidden silent path).
+	var dialAddrs []string
+	if ips := resolvedVKHostIPs(host); len(ips) > 0 {
+		for _, ip := range ips {
+			dialAddrs = append(dialAddrs, net.JoinHostPort(ip, port))
+		}
+	} else {
+		dialAddrs = []string{addr}
+	}
+
+	dialer := &net.Dialer{
+		// Per-IP connect timeout — short enough that walking 4-5 IPs
+		// stays well under the outer request budget.
+		Timeout:   8 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	var rawConn net.Conn
+	var lastErr error
+	for _, da := range dialAddrs {
+		rawConn, err = dialer.DialContext(ctx, network, da)
+		if err == nil {
+			break
+		}
+		log.Printf("utls: dial %s (%s) failed: %v — trying next IP", da, host, err)
+		lastErr = err
+		rawConn = nil
+	}
+	if rawConn == nil {
+		return nil, fmt.Errorf("dial %s: all %d IPs failed, last error: %w", host, len(dialAddrs), lastErr)
 	}
 
 	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)

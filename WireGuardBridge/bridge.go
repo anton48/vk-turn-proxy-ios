@@ -61,14 +61,23 @@ var (
 
 // ProxyConfig is the JSON config passed from Swift.
 type ProxyConfig struct {
-	VKLink              string `json:"vk_link"`
-	PeerAddr            string `json:"peer_addr"`
-	TurnServer          string `json:"turn_server,omitempty"`
-	TurnPort            string `json:"turn_port,omitempty"`
-	UseDTLS             bool   `json:"use_dtls"`
-	UseUDP              bool   `json:"use_udp"`
-	NumConns            int    `json:"num_conns,omitempty"`
-	CredPoolTTLSeconds  int    `json:"cred_pool_ttl_seconds,omitempty"`
+	VKLink              string            `json:"vk_link"`
+	PeerAddr            string            `json:"peer_addr"`
+	TurnServer          string            `json:"turn_server,omitempty"`
+	TurnPort            string            `json:"turn_port,omitempty"`
+	UseDTLS             bool              `json:"use_dtls"`
+	UseUDP              bool              `json:"use_udp"`
+	NumConns            int               `json:"num_conns,omitempty"`
+	CredPoolTTLSeconds  int               `json:"cred_pool_ttl_seconds,omitempty"`
+	// VKHostIPs is a hostname→[]IP map pre-resolved by the main app
+	// before startVPNTunnel. The extension can't resolve VK hosts on
+	// its own (no usable DNS context until setTunnelNetworkSettings,
+	// which we deliberately defer until bootstrap completes), so the
+	// main app — which has full network context — does the lookup
+	// and hands us all A-records. The dialer (utls.go) tries each IP
+	// in order until one accepts the connection, mirroring how the
+	// system resolver normally walks an A-record set.
+	VKHostIPs map[string][]string `json:"vk_host_ips,omitempty"`
 }
 
 //export wgTurnOnWithTURN
@@ -89,6 +98,12 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	}
 	if pcfg.NumConns <= 0 {
 		pcfg.NumConns = 1
+	}
+
+	// Apply pre-resolved VK host IPs (set by main app before startVPNTunnel).
+	if len(pcfg.VKHostIPs) > 0 {
+		log.Printf("wgTurnOnWithTURN: using %d pre-resolved VK host IPs from main app", len(pcfg.VKHostIPs))
+		proxy.SetVKHostIPs(pcfg.VKHostIPs)
 	}
 
 	// Create proxy
@@ -191,6 +206,12 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	}
 	if pcfg.NumConns <= 0 {
 		pcfg.NumConns = 1
+	}
+
+	// Apply pre-resolved VK host IPs (set by main app before startVPNTunnel).
+	if len(pcfg.VKHostIPs) > 0 {
+		log.Printf("wgStartVKBootstrap: using %d pre-resolved VK host IPs from main app", len(pcfg.VKHostIPs))
+		proxy.SetVKHostIPs(pcfg.VKHostIPs)
 	}
 
 	p := proxy.NewProxy(proxy.Config{

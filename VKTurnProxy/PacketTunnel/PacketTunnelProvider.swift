@@ -79,24 +79,36 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // ------------------------------------------------------------------
         // Deferred-setTunnelNetworkSettings bootstrap flow (Step 4 of the
-        // APNs-through-tunnel refactor). Unlike the legacy Phase 1 / Phase 2
-        // split, we do NOT call setTunnelNetworkSettings before Go knows the
-        // TURN server IP and has a live DTLS+TURN session. Sequence:
+        // APNs-through-tunnel refactor). We do NOT call setTunnelNetworkSettings
+        // before Go has a live DTLS+TURN session.
         //
+        // The reason this matters: iOS treats `setTunnelNetworkSettings(_)` as
+        // "tunnel up" — that's the moment includeAllNetworks=true starts
+        // capturing main-app traffic into the (still-unattached) TUN. If we
+        // were to call it early to give the extension a DNS context, the
+        // captcha WebView in the main app would lose all network access
+        // ("offline") for the duration of bootstrap. Instead, the extension
+        // resolves VK hosts via vkDirectResolver (Cloudflare 1.1.1.1:53 over
+        // UDP) — see pkg/proxy/utls.go — bypassing the iOS system resolver
+        // entirely. UDP to 1.1.1.1 works fine on the physical interface
+        // before any routes are installed.
+        //
+        // Sequence:
         //   1. wgStartVKBootstrap      — launches the Go proxy in a goroutine
         //                                (VK API + TURN alloc + DTLS). No TUN.
         //   2. wgWaitBootstrapReady    — blocks up to 120s for the first conn
-        //                                to report ready. This is the window
-        //                                during which the main app shows the
-        //                                captcha WebView if needed; since TUN
-        //                                is not yet up, iOS has no way to
-        //                                capture the WebView's VK traffic, so
-        //                                it reaches VK via the physical
-        //                                interface naturally.
+        //                                to report ready. Main-app polls
+        //                                get_stats during .connecting status
+        //                                so captchaImageURL surfaces in time
+        //                                to show the WebView (the WebView
+        //                                works because TUN doesn't exist yet,
+        //                                so includeAllNetworks=true has
+        //                                nothing to enforce — main-app
+        //                                traffic flows via the physical
+        //                                interface naturally).
         //   3. setTunnelNetworkSettings — applied ONCE with the full routes.
         //                                Only now does iOS honor
-        //                                includeAllNetworks=true (set on the
-        //                                NEVPNProtocol in the main app).
+        //                                includeAllNetworks=true.
         //   4. wgAttachWireGuard       — opens the TUN fd and hands it to
         //                                WireGuard, which starts forwarding
         //                                packets through the already-live
@@ -312,7 +324,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         address: String,
         dns: String,
         mtu: String,
-        tunnelRemoteAddress: String
+        tunnelRemoteAddress: String,
+        includeDefaultRoute: Bool = true
     ) -> NEPacketTunnelNetworkSettings {
         let parts = address.split(separator: "/")
         let ip = String(parts[0])
@@ -326,7 +339,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: tunnelRemoteAddress)
 
         let ipv4 = NEIPv4Settings(addresses: [ip], subnetMasks: [prefixToSubnet(prefix)])
-        ipv4.includedRoutes = [NEIPv4Route.default()]
+        // includeDefaultRoute=false is for the Phase 1 "DNS-only" call: we
+        // need iOS to give the extension a DNS resolver context so Go-side
+        // dial(login.vk.ru) works during bootstrap, but we don't want to
+        // capture system traffic into the tunnel before TUN is actually
+        // attached. With includeAllNetworks=true on the VPN profile, an
+        // empty includedRoutes here keeps the tunnel routing-inert — iOS
+        // doesn't have a default route to enforce yet.
+        ipv4.includedRoutes = includeDefaultRoute ? [NEIPv4Route.default()] : []
         // No excludedRoutes: with includeAllNetworks=true on the VPN profile,
         // iOS ignores excludedRoutes entirely (Apple docs). The only
         // always-excluded destination is the serverAddress (see above), plus
