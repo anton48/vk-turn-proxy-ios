@@ -94,8 +94,16 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 	// if EVERY client_id failed with such an error in the same wave; as soon
 	// as one client_id reaches VK and gets a real response (success, captcha,
 	// or HTTP/parse error), the network is up and further retries are wasted.
-	const maxNetworkRetries = 5
-	const retryDelay = 2 * time.Second
+	//
+	// Budget: 12 attempts × 4s delay between waves = up to ~44s of waiting,
+	// well within the wgWaitBootstrapReady 120s budget (which itself has to
+	// cover captcha-solver time after DNS comes back). Empirically the iOS
+	// resolver after an airplane-mode toggle can take 30-60s before login.vk.ru
+	// resolves cleanly — a 21s budget (the previous 8×3s setting) was observed
+	// to give up while DNS was still recovering. The wider window absorbs that
+	// without forcing the user to manually retry Connect.
+	const maxNetworkRetries = 12
+	const retryDelay = 4 * time.Second
 
 	var lastErr error
 	for retry := 0; retry < maxNetworkRetries; retry++ {
