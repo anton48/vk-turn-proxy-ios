@@ -21,7 +21,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app
         CODE_SIGN_ENTITLEMENTS: VKTurnProxy/VKTurnProxy.entitlements
         MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: 2
+        CURRENT_PROJECT_VERSION: 26
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: "VK Turn Proxy"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
@@ -45,7 +45,15 @@ targets:
       - target: PacketTunnel
         embed: true
       - sdk: NetworkExtension.framework
+      # Main-app links against the xcframework (calls wgProbeVKCreds for
+      # the pre-bootstrap captcha probe) but must NOT embed it: the
+      # underlying file is a static archive (libwg-turn-ios-arm64.a), and
+      # App Store Connect rejects archives in Frameworks/ with
+      # ITMS-90432/ITMS-90171. The PacketTunnel extension already embeds
+      # the xcframework into its own bundle for runtime; the main app
+      # just links the symbols at build time.
       - framework: ../WireGuardBridge/build/WireGuardTURN.xcframework
+        embed: false
 
   PacketTunnel:
     type: app-extension
@@ -70,7 +78,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app.tunnel
         CODE_SIGN_ENTITLEMENTS: PacketTunnel/PacketTunnel.entitlements
         MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: 2
+        CURRENT_PROJECT_VERSION: 26
         SKIP_INSTALL: YES
         SWIFT_OBJC_BRIDGING_HEADER: PacketTunnel/BridgeHeader.h
         OTHER_LDFLAGS:
