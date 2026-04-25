@@ -24,6 +24,14 @@ targets:
         CURRENT_PROJECT_VERSION: 26
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: "VK Turn Proxy"
+        # Declare that we don't use non-exempt encryption — only standard
+        # crypto exposed through Apple system APIs (CommonCrypto,
+        # Security.framework, Network.framework DTLS/TLS), all exempt
+        # under U.S. export Category 5 Part 2. Without this, App Store
+        # Connect blocks every TestFlight build with "Encryption export
+        # compliance documentation needed" + a France-specific prompt.
+        # Was lost in an earlier xcodegen regenerate; pinned here now.
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
