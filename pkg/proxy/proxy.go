@@ -350,29 +350,80 @@ func (p *Proxy) growCredPool(ctx context.Context) {
 }
 
 // startConnections launches all connection goroutines using the current session context.
+// isIOSSocketRaceError matches the kernel-level error pattern that
+// surfaces when iOS applies VPN network policy mid-DTLS-handshake on
+// startTunnel: the extension's UDP socket is closed under it (errno
+// EBADF/EPIPE), and the pion turnc reader/writer goroutines surface
+// it as "use of closed network connection" / "broken pipe". Triggers
+// the conn 0 retry path in startConnections — see vpn.wifi.33/35/37
+// for the empirical pattern (1.5s settle delay alone is not always
+// enough; a single short retry after the race window passes works).
+func isIOSSocketRaceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "broken pipe")
+}
+
 func (p *Proxy) startConnections() error {
 	p.sessMu.Lock()
 	sessCtx := p.sessCtx
 	p.sessMu.Unlock()
 
-	readyCh := make(chan struct{}, 1)
-	errCh := make(chan error, 1)
+	// Spawns conn 0; returns nil on success (readyCh fired), the error
+	// otherwise. Pulled out so the iOS-network-race retry below can re-
+	// run it without code duplication.
+	spawnConn0 := func() error {
+		readyCh := make(chan struct{}, 1)
+		errCh := make(chan error, 1)
 
-	p.wg.Add(1)
-	go func() {
-		defer p.wg.Done()
-		err := p.runConnection(sessCtx, p.linkID, readyCh, 0)
-		if err != nil {
-			select {
-			case errCh <- err:
-			default:
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			err := p.runConnection(sessCtx, p.linkID, readyCh, 0)
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
 			}
-		}
-	}()
+		}()
 
-	select {
-	case <-readyCh:
-	case err := <-errCh:
+		select {
+		case <-readyCh:
+			return nil
+		case err := <-errCh:
+			return err
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		}
+	}
+
+	err := spawnConn0()
+	// iOS race — see settle-delay comment in bridge.go. Even a 1.5s sleep
+	// before the first DTLS attempt is not always enough: if the kernel
+	// happens to apply VPN policy mid-connect, the extension's UDP socket
+	// to the TURN server is closed (errno EBADF, surfaced as "use of
+	// closed network connection" / "broken pipe"). The seeded TURN creds
+	// themselves are still valid, so a retry after a longer delay
+	// usually succeeds with the same creds.
+	if err != nil && isIOSSocketRaceError(err) {
+		const retryDelay = 3 * time.Second
+		log.Printf("proxy: first DTLS failed with iOS network race (%v), retrying conn 0 after %s", err, retryDelay)
+		select {
+		case <-time.After(retryDelay):
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		}
+		err = spawnConn0()
+		if err == nil {
+			log.Printf("proxy: conn 0 retry succeeded — iOS race recovered")
+		}
+	}
+
+	if err != nil {
 		// If captcha is required during initial connection, don't fail —
 		// publish the captcha and wait for the user to solve it.
 		var captchaErr *CaptchaRequiredError
@@ -393,8 +444,6 @@ func (p *Proxy) startConnections() error {
 			return nil // tunnel "starts" in captcha-pending mode
 		}
 		return fmt.Errorf("first connection failed: %w", err)
-	case <-p.ctx.Done():
-		return p.ctx.Err()
 	}
 
 	for i := 1; i < p.config.NumConns; i++ {

@@ -509,7 +509,17 @@ class TunnelManager: ObservableObject {
         if captchaRefreshAttempt > maxCaptchaRefreshAttempts {
             debugLog("captcha auto-refresh: exhausted (\(maxCaptchaRefreshAttempts) attempts), giving up")
             stopCaptchaAutoRefresh()
-            errorMessage = "VK временно ограничивает запросы. Подождите минуту и попробуйте снова."
+            // Only surface the error if the tunnel isn't actually up. If
+            // we're connected, the captcha refresh was for a stale request
+            // that's no longer relevant — showing red "rate-limited" text
+            // next to a green Connected status confuses the user. Verified
+            // empirically in vpn.wifi.36.log where bootstrap finished
+            // successfully and tunnel reached .connected, then auto-refresh
+            // (still running for the dismissed pre-bootstrap captcha)
+            // exhausted and put the error on screen.
+            if status != .connected {
+                errorMessage = "VK временно ограничивает запросы. Подождите минуту и попробуйте снова."
+            }
             return
         }
         debugLog("captcha auto-refresh: attempt \(captchaRefreshAttempt)/\(maxCaptchaRefreshAttempts) (reason: \(reason)) — requesting fresh URL")
@@ -614,6 +624,18 @@ class TunnelManager: ObservableObject {
                     // "VK временно ограничивает запросы" while staring at a
                     // green 10/10 Connected status.
                     self.errorMessage = nil
+                    // Cancel any auto-refresh timer still running for the
+                    // pre-bootstrap captcha session: the tunnel got up via
+                    // a different path (PoW succeeded on a later probe, or
+                    // user solved on a fresh probe iteration), the original
+                    // captcha sheet is moot. Without this the timer would
+                    // continue ticking until exhaust, then set errorMessage
+                    // back to the "rate-limited" text on top of a green
+                    // Connected status.
+                    if self.captchaAutoRefreshTimer != nil {
+                        self.debugLog("captcha auto-refresh: tunnel reached .connected — cancelling pending refresh timer")
+                        self.stopCaptchaAutoRefresh()
+                    }
                 case .connecting, .reasserting:
                     // CRITICAL for Step 4 architecture (deferred-setTunnelNetworkSettings):
                     // When the PoW auto-solver fails on a captcha it can't crack, the
