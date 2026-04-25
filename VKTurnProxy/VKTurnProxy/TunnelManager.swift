@@ -51,11 +51,19 @@ class TunnelManager: ObservableObject {
     @Published var captchaImageURL: String?
     @Published var captchaSID: String?
 
+    /// Result of a pre-bootstrap WebView captcha session. Reported back
+    /// to the connect() probe loop via `preBootstrapResolver`.
+    enum PreBootstrapCaptchaResult {
+        case solved(token: String)  // user solved → success_token
+        case refresh                // JS posted state:limit → re-probe fresh
+        case dismissed              // user pressed Done / abort
+    }
+
     // Pre-bootstrap captcha resolver — set when connect() is awaiting a
     // captcha solution from the WebView before calling startVPNTunnel.
     // Reuses the same captchaPending sheet but routes solveCaptcha into
     // the continuation instead of the extension IPC path.
-    private var preBootstrapResolver: CheckedContinuation<String, Never>?
+    private var preBootstrapResolver: CheckedContinuation<PreBootstrapCaptchaResult, Never>?
 
     // True from the moment connect() starts the pre-bootstrap probe loop
     // until either startVPNTunnel is called (NEVPNStatus takes over) or
@@ -117,6 +125,15 @@ class TunnelManager: ObservableObject {
     // MARK: - Public API
 
     func connect(config: TunnelConfig) async {
+        // Single-flight: if a connect() is already running (probe loop in
+        // progress), drop the new request. Without this, repeatedly tapping
+        // Connect during the Preparing phase spawns concurrent probe loops
+        // that compete for the captchaPending sheet and burn through VK
+        // rate-limit budget in parallel.
+        if preBootstrapInProgress {
+            SharedLogger.shared.log("[AppDebug] TunnelManager.connect: already in progress, ignoring duplicate")
+            return
+        }
         errorMessage = nil
         preBootstrapInProgress = true
         defer { preBootstrapInProgress = false }
@@ -211,18 +228,40 @@ class TunnelManager: ObservableObject {
                         return
                     }
                     SharedLogger.shared.log("[AppDebug] pre-bootstrap: captcha required (sid=\(sid), client_id=\(clientID)), showing WebView")
-                    let solvedKey = await awaitPreBootstrapCaptcha(url: url)
-                    if solvedKey.isEmpty {
+                    let webViewResult = await awaitPreBootstrapCaptcha(url: url)
+                    switch webViewResult {
+                    case .solved(let solvedKey):
+                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: user solved captcha (\(solvedKey.count) chars), retrying probe")
+                        savedSID = sid
+                        savedKey = solvedKey
+                        savedToken1 = token1
+                        savedClientID = clientID
+                        savedTs = ts
+                        savedAttempt = captchaAttempt
+                    case .refresh:
+                        // VK rate-limited the current session (state:limit
+                        // in WebView). Drop saved state — next probe gets
+                        // a brand-new VK session via wgProbeVKCreds and
+                        // hopefully a non-ERROR_LIMIT captcha.
+                        //
+                        // Wait 10s before the next probe. The old build's
+                        // mid-session auto-refresh used the same cadence and
+                        // it eventually got VK to return a non-rate-limited
+                        // captcha; spamming probes back-to-back keeps the
+                        // rate-limit window active and VK keeps returning
+                        // ERROR_LIMIT every time.
+                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: re-probing with fresh session after state:limit (waiting 10s for VK rate-limit to ease)")
+                        savedSID = ""
+                        savedKey = ""
+                        savedToken1 = ""
+                        savedClientID = ""
+                        savedTs = 0
+                        savedAttempt = 0
+                        try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    case .dismissed:
                         SharedLogger.shared.log("[AppDebug] pre-bootstrap: user dismissed captcha — aborting")
                         return
                     }
-                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: user solved captcha (\(solvedKey.count) chars), retrying probe")
-                    savedSID = sid
-                    savedKey = solvedKey
-                    savedToken1 = token1
-                    savedClientID = clientID
-                    savedTs = ts
-                    savedAttempt = captchaAttempt
                 case .error(let msg):
                     SharedLogger.shared.log("[AppDebug] pre-bootstrap: error: \(msg)")
                     errorMessage = "Не удалось подключиться: \(msg)"
@@ -386,6 +425,23 @@ class TunnelManager: ObservableObject {
     /// limit-reached state. Idempotent — multiple calls while a timer is
     /// already running are no-ops.
     func onCaptchaLimitDetected() {
+        // Pre-bootstrap mode: extension has no active Proxy, so its
+        // wgRefreshCaptchaURL would return "" and the auto-refresh timer
+        // would just bang on a stale state for 60 seconds. Skip the timer
+        // entirely; instead resolve the continuation with .refresh so
+        // connect()'s probe loop iterates with a fresh probe (which goes
+        // through wgProbeVKCreds and gets a brand-new captcha session
+        // from VK directly — same effect as old build's mid-session
+        // refresh, but routed through the right call path for Step 4).
+        if let resolver = preBootstrapResolver {
+            debugLog("pre-bootstrap captcha: state:limit detected → re-probing with fresh session")
+            preBootstrapResolver = nil
+            captchaPending = false
+            captchaImageURL = nil
+            resolver.resume(returning: .refresh)
+            return
+        }
+
         if captchaAutoRefreshTimer != nil {
             debugLog("captcha auto-refresh: limit_detected arrived while timer already running, ignoring duplicate")
             return
@@ -420,11 +476,11 @@ class TunnelManager: ObservableObject {
             stopCaptchaAutoRefresh()
         }
         // Pre-bootstrap path: user gave up. Resolve continuation with
-        // empty string so connect() unwinds cleanly without leaking
-        // the awaiter.
+        // .dismissed so connect() unwinds cleanly without leaking the
+        // awaiter.
         if let resolver = preBootstrapResolver {
             preBootstrapResolver = nil
-            resolver.resume(returning: "")
+            resolver.resume(returning: .dismissed)
         }
     }
 
@@ -472,7 +528,7 @@ class TunnelManager: ObservableObject {
             preBootstrapResolver = nil
             captchaPending = false
             captchaImageURL = nil
-            resolver.resume(returning: answer)
+            resolver.resume(returning: .solved(token: answer))
             return
         }
         // Existing mid-session path: forward to extension via IPC.
@@ -491,18 +547,23 @@ class TunnelManager: ObservableObject {
         }
     }
 
-    /// Show the captcha WebView and await the user's success_token. Used
-    /// by the pre-bootstrap captcha flow in connect(): we cycle until the
-    /// Go-side probe accepts our solution. Empty string = user dismissed.
-    func awaitPreBootstrapCaptcha(url: String) async -> String {
-        let token: String = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+    /// Show the captcha WebView and await the user's response. Returns
+    /// one of three outcomes (see PreBootstrapCaptchaResult):
+    ///   - .solved(token):  user passed the captcha; success_token captured
+    ///   - .refresh:        JS detector reported state:limit (VK rate-
+    ///                      limited the current session) → connect()'s
+    ///                      probe loop should iterate with a fresh probe
+    ///                      instead of trying to resolve the stale URL
+    ///   - .dismissed:      user pressed Done / aborted
+    func awaitPreBootstrapCaptcha(url: String) async -> PreBootstrapCaptchaResult {
+        let result: PreBootstrapCaptchaResult = await withCheckedContinuation { (cont: CheckedContinuation<PreBootstrapCaptchaResult, Never>) in
             DispatchQueue.main.async {
                 self.preBootstrapResolver = cont
                 self.captchaImageURL = url
                 self.captchaPending = true
             }
         }
-        return token
+        return result
     }
 
     // MARK: - Private

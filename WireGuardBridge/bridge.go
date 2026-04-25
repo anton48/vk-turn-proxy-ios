@@ -253,6 +253,19 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	// occurs; run it in a goroutine so this export returns immediately.
 	// Start() already signals bootstrapDoneCh with the outcome.
 	go func() {
+		// Pre-bootstrap path: with seeded TURN creds the very first
+		// conn would otherwise try its DTLS handshake within ~5ms of
+		// extension launch, racing with iOS still applying the VPN
+		// network policy on .connecting transition. The kernel kills
+		// the UDP socket mid-handshake ("use of closed network
+		// connection"), DTLS times out 30s later, tunnel fails.
+		// Without seeded creds the extension's own VK API fetch takes
+		// 1-3s and provides this delay implicitly. Add an explicit
+		// 1.5s settle delay when we skipped that fetch.
+		if seededTURN != nil {
+			log.Printf("wgStartVKBootstrap: seeded-TURN path — sleeping 1.5s before first DTLS to let iOS network policy settle")
+			time.Sleep(1500 * time.Millisecond)
+		}
 		if err := p.Start(); err != nil {
 			log.Printf("wgStartVKBootstrap: proxy.Start failed: %v", err)
 			// Proxy.Start already called signalBootstrapDone(err), so
