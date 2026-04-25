@@ -59,6 +59,28 @@ type TURNCreds struct {
 	Address  string // host:port
 }
 
+// isTransientNetworkError reports whether err looks like a transient network
+// or DNS issue that may resolve itself within seconds. Empirically, on iOS
+// the Network Extension's first DNS lookups right after startTunnel can fail
+// with NXDOMAIN ("no such host") for the first ~30-100ms while the system
+// resolver hasn't fully repointed at the physical Wi-Fi DNS yet — the same
+// hostname resolves fine a second later. This predicate distinguishes those
+// from genuine VK-side errors (HTTP 4xx/5xx, parse errors, etc.) so the
+// retry loop in GetVKCreds only kicks in when retrying is plausibly useful.
+func isTransientNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "no such host") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "network is unreachable") ||
+		strings.Contains(s, "no route to host") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "deadline exceeded") ||
+		strings.Contains(s, "connection reset")
+}
+
 // GetVKCreds fetches TURN credentials from VK using a call invite link ID.
 // captchaSolver may be nil; if nil and captcha is required, an error is returned.
 // solvedCaptchaSID/solvedCaptchaKey: if non-empty, are from a previous captcha solve.
@@ -67,28 +89,54 @@ type TURNCreds struct {
 // savedToken1: if non-empty, reuse this access_token from step1 instead of fetching a new one
 // (the captcha is tied to the original step2 call which used this token1).
 func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1 string) (*TURNCreds, error) {
-	// Rotate through client_id/client_secret pairs to reduce per-app rate limiting.
-	// Shuffle the list so each connection attempt uses a different order.
-	creds := make([]vkCredentials, len(vkCredentialsList))
-	copy(creds, vkCredentialsList)
-	mathrand.Shuffle(len(creds), func(i, j int) { creds[i], creds[j] = creds[j], creds[i] })
+	// Outer retry loop guards against transient network/DNS errors at the very
+	// start of an extension launch — see isTransientNetworkError. We only loop
+	// if EVERY client_id failed with such an error in the same wave; as soon
+	// as one client_id reaches VK and gets a real response (success, captcha,
+	// or HTTP/parse error), the network is up and further retries are wasted.
+	const maxNetworkRetries = 5
+	const retryDelay = 2 * time.Second
 
 	var lastErr error
-	for credIdx, vc := range creds {
-		log.Printf("vk: trying credentials %d/%d: client_id=%s", credIdx+1, len(creds), vc.ClientID)
-		result, err := getVKCredsWithClientID(linkID, vc, captchaSolver, solvedCaptchaSID, solvedCaptchaKey, solvedCaptchaTs, solvedCaptchaAttempt, savedToken1)
-		if err == nil {
-			log.Printf("vk: success with client_id=%s", vc.ClientID)
-			return result, nil
+	for retry := 0; retry < maxNetworkRetries; retry++ {
+		// Rotate through client_id/client_secret pairs to reduce per-app rate limiting.
+		// Shuffle the list so each connection attempt uses a different order.
+		creds := make([]vkCredentials, len(vkCredentialsList))
+		copy(creds, vkCredentialsList)
+		mathrand.Shuffle(len(creds), func(i, j int) { creds[i], creds[j] = creds[j], creds[i] })
+
+		allTransient := true
+		for credIdx, vc := range creds {
+			log.Printf("vk: trying credentials %d/%d: client_id=%s", credIdx+1, len(creds), vc.ClientID)
+			result, err := getVKCredsWithClientID(linkID, vc, captchaSolver, solvedCaptchaSID, solvedCaptchaKey, solvedCaptchaTs, solvedCaptchaAttempt, savedToken1)
+			if err == nil {
+				log.Printf("vk: success with client_id=%s", vc.ClientID)
+				return result, nil
+			}
+			// If it's a CaptchaRequiredError (needs WebView), return immediately — don't try other client_ids
+			if _, isCaptcha := err.(*CaptchaRequiredError); isCaptcha {
+				return nil, err
+			}
+			log.Printf("vk: failed with client_id=%s: %v", vc.ClientID, err)
+			lastErr = err
+			if !isTransientNetworkError(err) {
+				allTransient = false
+			}
 		}
-		// If it's a CaptchaRequiredError (needs WebView), return immediately — don't try other client_ids
-		if _, isCaptcha := err.(*CaptchaRequiredError); isCaptcha {
-			return nil, err
+
+		// At least one client_id got a non-transient response from VK — the
+		// network is fine, the issue is on VK's side. No point in retrying.
+		if !allTransient {
+			break
 		}
-		log.Printf("vk: failed with client_id=%s: %v", vc.ClientID, err)
-		lastErr = err
+
+		if retry < maxNetworkRetries-1 {
+			log.Printf("vk: all %d client_ids failed with transient network error, retrying in %s (network retry %d/%d)",
+				len(creds), retryDelay, retry+1, maxNetworkRetries-1)
+			time.Sleep(retryDelay)
+		}
 	}
-	return nil, fmt.Errorf("all %d client_ids failed, last error: %w", len(creds), lastErr)
+	return nil, fmt.Errorf("all %d client_ids failed, last error: %w", len(vkCredentialsList), lastErr)
 }
 
 func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1 string) (*TURNCreds, error) {
