@@ -425,20 +425,33 @@ class TunnelManager: ObservableObject {
     /// limit-reached state. Idempotent — multiple calls while a timer is
     /// already running are no-ops.
     func onCaptchaLimitDetected() {
-        // Pre-bootstrap mode: extension has no active Proxy, so its
-        // wgRefreshCaptchaURL would return "" and the auto-refresh timer
-        // would just bang on a stale state for 60 seconds. Skip the timer
-        // entirely; instead resolve the continuation with .refresh so
-        // connect()'s probe loop iterates with a fresh probe (which goes
-        // through wgProbeVKCreds and gets a brand-new captcha session
-        // from VK directly — same effect as old build's mid-session
-        // refresh, but routed through the right call path for Step 4).
-        if let resolver = preBootstrapResolver {
-            debugLog("pre-bootstrap captcha: state:limit detected → re-probing with fresh session")
-            preBootstrapResolver = nil
-            captchaPending = false
-            captchaImageURL = nil
-            resolver.resume(returning: .refresh)
+        // Pre-bootstrap mode owns ALL captcha state — JS in the WebView
+        // posts state:limit twice for the same captcha (once from the
+        // captchaNotRobot.check fetch hook on ERROR_LIMIT, once from the
+        // 2.5s DOM heuristic). The first call resolves the continuation
+        // with .refresh and nils the resolver; the second arrives ~470ms
+        // later. Without this guard, the second call fell through into
+        // the mid-session auto-refresh timer (max 6 × 10s), which then
+        // ran in parallel with pre-bootstrap's own 10s wait + next
+        // probe — surfacing a stale "3/6 attempts" UI on a captcha that
+        // pre-bootstrap had already moved past.
+        //
+        // Mid-session auto-refresh timer is for the OLD build's
+        // mid-session captcha path, where Proxy is already running and
+        // wgRefreshCaptchaURL returns a fresh URL from the proxy. In
+        // pre-bootstrap mode there's no Proxy yet — wgRefreshCaptchaURL
+        // returns "" — and the right re-fetch path is wgProbeVKCreds,
+        // which the connect() probe loop already drives.
+        if preBootstrapInProgress {
+            if let resolver = preBootstrapResolver {
+                debugLog("pre-bootstrap captcha: state:limit detected → re-probing with fresh session")
+                preBootstrapResolver = nil
+                captchaPending = false
+                captchaImageURL = nil
+                resolver.resume(returning: .refresh)
+            } else {
+                debugLog("pre-bootstrap captcha: duplicate state:limit ignored (resolver already consumed)")
+            }
             return
         }
 
