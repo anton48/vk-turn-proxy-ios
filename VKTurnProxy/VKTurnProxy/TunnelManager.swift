@@ -943,6 +943,7 @@ class TunnelManager: ObservableObject {
             "use_udp": config.useUDP,
             "num_conns": config.numConnections,
             "cred_pool_ttl_seconds": config.credPoolTTLSeconds,
+            "cred_pool_cooldown_seconds": config.credPoolCooldownSeconds,
             "turn_server": config.turnServerOverride ?? "",
             "turn_port": config.turnPortOverride ?? ""
         ]
@@ -1229,6 +1230,11 @@ struct TunnelConfig {
     // Longer = less PoW/VK pressure but more risk of caching creds past
     // their server-side validity.
     var credPoolTTLSeconds: Int = 600
+    // Per-slot cooldown after a failed fetch (typically captcha required).
+    // Slot stays in cooldown for this long before being eligible to retry.
+    // Shorter = pool recovers faster when VK cools down, longer = less VK
+    // pressure but slower recovery. Default 120s.
+    var credPoolCooldownSeconds: Int = 120
     var turnServerOverride: String?
     var turnPortOverride: String?
 }

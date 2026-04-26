@@ -67,8 +67,9 @@ type ProxyConfig struct {
 	TurnPort            string            `json:"turn_port,omitempty"`
 	UseDTLS             bool              `json:"use_dtls"`
 	UseUDP              bool              `json:"use_udp"`
-	NumConns            int               `json:"num_conns,omitempty"`
-	CredPoolTTLSeconds  int               `json:"cred_pool_ttl_seconds,omitempty"`
+	NumConns                int `json:"num_conns,omitempty"`
+	CredPoolTTLSeconds      int `json:"cred_pool_ttl_seconds,omitempty"`
+	CredPoolCooldownSeconds int `json:"cred_pool_cooldown_seconds,omitempty"`
 	// VKHostIPs is a hostname→[]IP map pre-resolved by the main app
 	// before startVPNTunnel. The extension can't resolve VK hosts on
 	// its own (no usable DNS context until setTunnelNetworkSettings,
@@ -120,14 +121,15 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 
 	// Create proxy
 	p := proxy.NewProxy(proxy.Config{
-		PeerAddr:     pcfg.PeerAddr,
-		TurnServer:   pcfg.TurnServer,
-		TurnPort:     pcfg.TurnPort,
-		VKLink:       pcfg.VKLink,
-		UseDTLS:      pcfg.UseDTLS,
-		UseUDP:       pcfg.UseUDP,
-		NumConns:     pcfg.NumConns,
-		CredPoolTTL:  time.Duration(pcfg.CredPoolTTLSeconds) * time.Second,
+		PeerAddr:         pcfg.PeerAddr,
+		TurnServer:       pcfg.TurnServer,
+		TurnPort:         pcfg.TurnPort,
+		VKLink:           pcfg.VKLink,
+		UseDTLS:          pcfg.UseDTLS,
+		UseUDP:           pcfg.UseUDP,
+		NumConns:         pcfg.NumConns,
+		CredPoolTTL:      time.Duration(pcfg.CredPoolTTLSeconds) * time.Second,
+		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
 	})
 
 	// Create TURN bind
@@ -238,15 +240,16 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	}
 
 	p := proxy.NewProxy(proxy.Config{
-		PeerAddr:     pcfg.PeerAddr,
-		TurnServer:   pcfg.TurnServer,
-		TurnPort:     pcfg.TurnPort,
-		VKLink:       pcfg.VKLink,
-		UseDTLS:      pcfg.UseDTLS,
-		UseUDP:       pcfg.UseUDP,
-		NumConns:     pcfg.NumConns,
-		CredPoolTTL:  time.Duration(pcfg.CredPoolTTLSeconds) * time.Second,
-		SeededTURN:   seededTURN,
+		PeerAddr:         pcfg.PeerAddr,
+		TurnServer:       pcfg.TurnServer,
+		TurnPort:         pcfg.TurnPort,
+		VKLink:           pcfg.VKLink,
+		UseDTLS:          pcfg.UseDTLS,
+		UseUDP:           pcfg.UseUDP,
+		NumConns:         pcfg.NumConns,
+		CredPoolTTL:      time.Duration(pcfg.CredPoolTTLSeconds) * time.Second,
+		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
+		SeededTURN:       seededTURN,
 	})
 
 	// Proxy.Start blocks until the first conn is ready or a fatal error

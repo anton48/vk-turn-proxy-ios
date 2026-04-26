@@ -33,9 +33,10 @@ type Config struct {
 	VKLink        string        // VK call invite link or link ID
 	UseDTLS       bool          // true = DTLS obfuscation (default mode)
 	UseUDP        bool          // true = UDP to TURN, false = TCP
-	NumConns      int           // number of concurrent connections (default 1)
-	CredPoolTTL   time.Duration // per-entry freshness in the cred pool; <=0 → default 10m
-	CaptchaSolver CaptchaSolver // called when VK requires captcha (may be nil)
+	NumConns         int           // number of concurrent connections (default 1)
+	CredPoolTTL      time.Duration // per-entry freshness in the cred pool; <=0 → default 10m
+	CredPoolCooldown time.Duration // post-failure cooldown per slot in the cred pool; <=0 → default 2m
+	CaptchaSolver    CaptchaSolver // called when VK requires captcha (may be nil)
 	// SeededTURN, if non-nil, pre-populates credPool slot 0 with these
 	// credentials so the first conn establishes immediately without
 	// hitting VK's API. Used by the pre-bootstrap captcha flow.
@@ -175,8 +176,9 @@ func NewProxy(cfg Config) *Proxy {
 	// parses the TURN host:port. Pool size = max(2, ceil(NumConns/3)) —
 	// enough insurance slots to keep the tunnel alive through mid-session
 	// captcha without the full per-conn PoW cost of a size=NumConns pool.
-	// TTL comes from Config; newCredPool falls back to 10m if <= 0.
-	p.credPool = newCredPool(poolSizeForNumConns(cfg.NumConns), cfg.CredPoolTTL, p.fetchFreshCreds)
+	// TTL/cooldown come from Config; newCredPool falls back to defaults
+	// (10m TTL, 2m cooldown) if <= 0.
+	p.credPool = newCredPool(poolSizeForNumConns(cfg.NumConns), cfg.CredPoolTTL, cfg.CredPoolCooldown, p.fetchFreshCreds)
 
 	// Seed slot 0 with pre-fetched TURN creds (from main app's pre-bootstrap
 	// captcha flow). The first conn's get() returns these without an API

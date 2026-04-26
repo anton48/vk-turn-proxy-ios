@@ -558,8 +558,9 @@ func poolSizeForNumConns(n int) int {
 	return size
 }
 
-// newCredPool builds a pool sized to `size` conns with per-entry `ttl`.
-// The post-failure cooldown is fixed at 5 minutes.
+// newCredPool builds a pool sized to `size` conns with per-entry `ttl`
+// and post-failure `cooldown` (the time a slot waits after a failed fetch
+// before being eligible to retry).
 // seedSlot fills `slot` with externally-provided credentials, marked fresh
 // (ts=now). Used by NewProxy when the main app's pre-bootstrap captcha
 // flow already obtained TURN creds via wgProbeVKCreds — we plant them in
@@ -580,17 +581,20 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	log.Printf("credpool: seeded slot %d with externally-provided creds (addr=%s)", slot, addr)
 }
 
-func newCredPool(size int, ttl time.Duration, fetch func(bool) (string, *TURNCreds, error)) *credPool {
+func newCredPool(size int, ttl time.Duration, cooldown time.Duration, fetch func(bool) (string, *TURNCreds, error)) *credPool {
 	if size < 1 {
 		size = 1
 	}
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
+	if cooldown <= 0 {
+		cooldown = 2 * time.Minute
+	}
 	cp := &credPool{
 		size:     size,
 		ttl:      ttl,
-		cooldown: 5 * time.Minute,
+		cooldown: cooldown,
 		fetch:    fetch,
 	}
 	log.Printf("credpool: initialized with %d slots (ttl=%s, cooldown=%s)", size, ttl, cp.cooldown)
