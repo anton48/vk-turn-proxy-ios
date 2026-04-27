@@ -607,7 +607,20 @@ func (p *Proxy) ForceReconnect() {
 	}
 	p.sessCtx, p.sessCancel = context.WithCancel(p.ctx)
 	p.sessMu.Unlock()
-	p.credPool.invalidate()
+	// DON'T wholesale-invalidate the pool here. The watchdog only knows
+	// the tunnel is silent — it doesn't know whether the underlying TURN
+	// creds are server-side stale. Most often the silence is from a
+	// kernel-side socket kill (DHCP renewal, network handover) while
+	// allocations remain valid on the TURN server. Keeping cached creds
+	// lets the new bootstrap try a DTLS handshake with the existing slot 0
+	// cred immediately, succeeding within ~100ms in the common case.
+	//
+	// If the cred IS actually stale, the new conn 0's TURN session goes
+	// short-lived (<30s), the existing per-slot invalidateEntry path
+	// drops just that slot, and bootstrap retry (4 × 15s + 10s backoffs,
+	// see startConnections) gets a fresh fetch on the next attempt.
+	// Either way we don't pay the cost of a fresh VK API call before
+	// even trying to reconnect.
 	// Clear the silent-degradation counters so the new session starts fresh.
 	p.pionTransientErrors.Store(0)
 	p.firstPionErrorTime.Store(0)
