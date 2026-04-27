@@ -1251,9 +1251,23 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				return
 			}
 
-			// Get fresh VK credentials and reconnect TURN
+			// Get fresh VK credentials and reconnect TURN.
+			//
+			// Retry budget is wide because mass-failure events (e.g. iOS DHCP
+			// renewal kills all 10 sockets simultaneously, observed every ~2h
+			// on routers with short lease) put every conn into reconnect at
+			// once with an empty/cooldown pool. Pool grower runs in the
+			// background at ~15% PoW success rate, so a working cred typically
+			// arrives within 30-60s — but only if our retry loop hasn't
+			// already given up.
+			//
+			// 12 attempts × linear backoff capped at 30s ≈ 2.5 min total wait
+			// budget per conn. Long enough to outlast a typical pool refill,
+			// short enough that runConnection's outer loop still kicks in if
+			// we've truly hit a dead-end.
+			const maxTurnReconnectRetries = 12
 			retries := 0
-			for retries < 5 {
+			for retries < maxTurnReconnectRetries {
 				if connCtx.Err() != nil {
 					return
 				}
@@ -1348,9 +1362,17 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 						continue
 					}
 					retries++
-					log.Printf("proxy: TURN creds fetch failed (attempt %d/5): %s", retries, err)
+					log.Printf("proxy: TURN creds fetch failed (attempt %d/%d): %s", retries, maxTurnReconnectRetries, err)
+					// Linear backoff capped at 30s. With maxTurnReconnectRetries=12
+					// the per-attempt waits are 2,4,6,8,10,12,14,16,18,20,22,24
+					// (caps don't kick in but the cap is defensive). Total
+					// ~156s ≈ 2.5 min wait budget.
+					backoff := time.Duration(retries*2) * time.Second
+					if backoff > 30*time.Second {
+						backoff = 30 * time.Second
+					}
 					select {
-					case <-time.After(time.Duration(retries) * 2 * time.Second):
+					case <-time.After(backoff):
 					case <-connCtx.Done():
 						return
 					}
@@ -1370,8 +1392,8 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				}()
 				break
 			}
-			if retries >= 5 {
-				log.Printf("proxy: TURN reconnection failed after 5 attempts, giving up")
+			if retries >= maxTurnReconnectRetries {
+				log.Printf("proxy: TURN reconnection failed after %d attempts, giving up", maxTurnReconnectRetries)
 				return // session dies → runConnection will wait 5 min or ForceReconnect
 			}
 		}
