@@ -308,21 +308,6 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 
 				log.Printf("vk: PoW attempt %d/%d failed (show_captcha_type=%q): %v", powTry, maxPoWRetries, showType, powErr)
 
-				// Only short-circuit to WebView when checkbox is provably
-				// disabled for this session — i.e. VK returned status=ERROR at
-				// least once, so `checkboxBurnedForSession` is set and the
-				// error message includes "checkbox burned". In that case both
-				// auto paths are dead and further retries are wasted work.
-				//
-				// For transient failures (status=BOT, ERROR_LIMIT, …) we DO
-				// retry up to maxPoWRetries times with a fresh captcha URL —
-				// the next captcha session often succeeds even when the
-				// previous one was rejected.
-				if powErr != nil && strings.Contains(powErr.Error(), "checkbox burned") {
-					log.Printf("vk: checkbox disabled (ERROR) and slider failed, skipping remaining attempts")
-					break
-				}
-
 				// Track consecutive empty show_captcha_type — a non-empty
 				// "slider" hint means VK is about to hand us an actual slider
 				// (next attempt has a real chance); a persistently empty hint

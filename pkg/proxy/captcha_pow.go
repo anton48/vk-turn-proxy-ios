@@ -17,7 +17,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -54,19 +53,6 @@ func newHTTPClient() *http.Client {
 		Transport: newChromeTransport(),
 	}
 }
-
-// checkboxBurnedForSession is set the first time a checkbox-style
-// captchaNotRobot.check returns status=ERROR, which is VK's explicit
-// "this captcha type is disabled" signal. Once set, all subsequent
-// solveCaptchaPoW calls in the current global session (Proxy instance)
-// will skip the checkbox check entirely and jump straight to the slider.
-//
-// Other non-OK statuses (BOT, ERROR_LIMIT, etc.) are transient — they mean
-// "try again later", not "this type is disabled" — so they do NOT burn the
-// checkbox; the next solveCaptchaPoW call will still attempt the checkbox.
-//
-// Reset to false by NewProxy() at the start of every connect cycle.
-var checkboxBurnedForSession atomic.Bool
 
 // solveCaptchaPoW attempts to solve a VK "Not Robot" captcha automatically
 // using proof-of-work, without any user interaction.
@@ -339,25 +325,19 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		return "", lastShowType, fmt.Errorf("componentDone: %w", err)
 	}
 
-	// 3/4: check (checkbox-style)
+	// 3/4: check (checkbox-style).
 	//
-	// We skip the checkbox check entirely in two cases:
-	//   1. checkboxBurnedForSession is already set — a previous call in this
-	//      global session got status=ERROR from VK, so checkbox is known to
-	//      be disabled.
-	//   2. HTML page says show_captcha_type="slider" — VK is in slider-only
-	//      mode and would return status=ERROR anyway. Burn proactively to
-	//      save time on both this and subsequent calls.
-	// Otherwise we do the check as usual.
-	skipCheckbox := checkboxBurnedForSession.Load()
-	if !skipCheckbox && htmlShowType == "slider" {
-		log.Printf("pow: 3/4 HTML indicates slider-only mode (show_captcha_type=%q) — skipping checkbox check, burning checkbox for the rest of this session", htmlShowType)
-		checkboxBurnedForSession.Store(true)
-		skipCheckbox = true
-	}
-	if skipCheckbox {
-		log.Printf("pow: 3/4 skipping checkbox check, going straight to slider")
-	} else {
+	// We always attempt the checkbox check regardless of past responses.
+	// Empirically VK's status=ERROR is transient ("captcha type unavailable
+	// right now") rather than permanent — a previous version cached a
+	// session-wide "burned" flag on the first ERROR and skipped checkbox
+	// forever, but that wedged the pool grower whenever VK returned a
+	// single ERROR (slider also fails ~100% in our environment, so once
+	// burned, every subsequent solveCaptchaPoW returned an error and the
+	// pool decayed to empty). Now we just retry the checkbox each call;
+	// if it returns ERROR/BOT/ERROR_LIMIT we still fall through to the
+	// slider attempt within the same call.
+	{
 		// Longer pause before check (1950-3200ms) — matches reference HAR timing
 		checkDelay := time.Duration(1950+mathrand.Intn(1250)) * time.Millisecond
 		log.Printf("pow: waiting %s before check", checkDelay.Round(time.Millisecond))
@@ -439,18 +419,10 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 			return successToken, lastShowType, nil
 		}
 
-		// Checkbox check failed. Only burn the checkbox path when VK explicitly
-		// signals that this captcha type is unavailable (status=ERROR). Other
-		// statuses like BOT or ERROR_LIMIT are transient ("try again later"),
-		// so we keep the checkbox enabled for future solveCaptchaPoW calls in
-		// this session. In both cases control falls through to the slider
-		// solver below as an in-call fallback.
-		if status == "ERROR" {
-			log.Printf("pow: checkbox returned status=ERROR (captcha type disabled) — burning checkbox for the rest of this session, falling through to slider (show_captcha_type=%s)", showCaptchaType)
-			checkboxBurnedForSession.Store(true)
-		} else {
-			log.Printf("pow: checkbox transient failure (status=%s, show_captcha_type=%s) — falling through to slider; if all else fails, next solveCaptchaPoW call will attempt checkbox again", status, showCaptchaType)
-		}
+		// Checkbox check failed. ALL non-OK statuses are treated as transient
+		// — a future solveCaptchaPoW call will retry the checkbox. Falls
+		// through to the slider attempt below as an in-call fallback.
+		log.Printf("pow: checkbox failure (status=%s, show_captcha_type=%s) — falling through to slider; next solveCaptchaPoW call will retry checkbox", status, showCaptchaType)
 	}
 
 	// Try slider solver regardless of show_captcha_type — VK may not always
@@ -475,10 +447,6 @@ func callCaptchaNotRobotAPI(ctx context.Context, client *http.Client, sessionTok
 		return sliderToken, lastShowType, nil
 	}
 	log.Printf("pow: slider solver failed: %v", sliderErr)
-
-	if checkboxBurnedForSession.Load() {
-		return "", lastShowType, fmt.Errorf("checkbox burned earlier this session, slider also failed: %v", sliderErr)
-	}
 	return "", lastShowType, fmt.Errorf("checkbox check failed and slider also failed: %v", sliderErr)
 }
 

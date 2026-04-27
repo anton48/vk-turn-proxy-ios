@@ -149,8 +149,6 @@ func NewProxy(cfg Config) *Proxy {
 	if cfg.NumConns <= 0 {
 		cfg.NumConns = 1
 	}
-	// Fresh global session — checkbox captcha is allowed again until it fails once.
-	checkboxBurnedForSession.Store(false)
 	// Fresh global session — clear any leftover pion-degradation counters.
 	// (atomic.Int64 zero values are fine for a brand-new struct, but explicit
 	//  for clarity in case Proxy is ever pooled in the future.)
