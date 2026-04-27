@@ -350,23 +350,6 @@ func (p *Proxy) growCredPool(ctx context.Context) {
 }
 
 // startConnections launches all connection goroutines using the current session context.
-// isIOSSocketRaceError matches the kernel-level error pattern that
-// surfaces when iOS applies VPN network policy mid-DTLS-handshake on
-// startTunnel: the extension's UDP socket is closed under it (errno
-// EBADF/EPIPE), and the pion turnc reader/writer goroutines surface
-// it as "use of closed network connection" / "broken pipe". Triggers
-// the conn 0 retry path in startConnections — see vpn.wifi.33/35/37
-// for the empirical pattern (1.5s settle delay alone is not always
-// enough; a single short retry after the race window passes works).
-func isIOSSocketRaceError(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return strings.Contains(s, "use of closed network connection") ||
-		strings.Contains(s, "broken pipe")
-}
-
 func (p *Proxy) startConnections() error {
 	p.sessMu.Lock()
 	sessCtx := p.sessCtx
@@ -401,25 +384,42 @@ func (p *Proxy) startConnections() error {
 		}
 	}
 
+	// Bootstrap retry loop — conn 0's first DTLS+TURN handshake can fail
+	// transiently for several network reasons:
+	//   - iOS VPN policy applied mid-handshake (kernel closes the UDP
+	//     socket under us; surfaces as "broken pipe" / "use of closed
+	//     network connection"). The 1.5s settle delay in
+	//     wgStartVKBootstrap isn't always enough.
+	//   - WiFi handover / DHCP setup not finished when bootstrap begins.
+	//   - Carrier-grade NAT mapping warmup on cellular reconnect.
+	//   - Slow DNS or routing convergence on a fresh network.
+	//
+	// Up to 4 attempts × 15s DTLS handshake timeout + 3 backoffs × 10s
+	// = ~90s total. Linear backoff (not exponential): each attempt has
+	// the same cost, so spreading evenly is fine.
+	//
+	// Retry triggers on ANY error EXCEPT captcha — captcha needs a user
+	// answer, retrying immediately just burns budget. Captcha-required
+	// drops out of this loop and surfaces via the captcha-pending path
+	// below.
+	const maxBootstrapAttempts = 4
+	const bootstrapBackoff = 10 * time.Second
 	err := spawnConn0()
-	// iOS race — see settle-delay comment in bridge.go. Even a 1.5s sleep
-	// before the first DTLS attempt is not always enough: if the kernel
-	// happens to apply VPN policy mid-connect, the extension's UDP socket
-	// to the TURN server is closed (errno EBADF, surfaced as "use of
-	// closed network connection" / "broken pipe"). The seeded TURN creds
-	// themselves are still valid, so a retry after a longer delay
-	// usually succeeds with the same creds.
-	if err != nil && isIOSSocketRaceError(err) {
-		const retryDelay = 3 * time.Second
-		log.Printf("proxy: first DTLS failed with iOS network race (%v), retrying conn 0 after %s", err, retryDelay)
+	for attempt := 1; err != nil && attempt < maxBootstrapAttempts; attempt++ {
+		var captchaErr *CaptchaRequiredError
+		if errors.As(err, &captchaErr) {
+			break
+		}
+		log.Printf("proxy: bootstrap attempt %d/%d failed (%v), retrying conn 0 after %s",
+			attempt, maxBootstrapAttempts, err, bootstrapBackoff)
 		select {
-		case <-time.After(retryDelay):
+		case <-time.After(bootstrapBackoff):
 		case <-p.ctx.Done():
 			return p.ctx.Err()
 		}
 		err = spawnConn0()
 		if err == nil {
-			log.Printf("proxy: conn 0 retry succeeded — iOS race recovered")
+			log.Printf("proxy: bootstrap attempt %d/%d succeeded", attempt+1, maxBootstrapAttempts)
 		}
 	}
 
@@ -1820,7 +1820,13 @@ func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) 
 	if err != nil {
 		return nil, err
 	}
-	hsCtx, hsCancel := context.WithTimeout(ctx, 30*time.Second)
+	// 15s timeout: shorter than the 30s default so the bootstrap retry
+	// loop (see startConnections) gets ~4 chances within ~90s instead of
+	// burning ~60s on two long timeouts. Real-world DTLS handshakes
+	// complete in ~50-300ms (see "DTLS HS" in stats), so 15s is plenty
+	// of headroom for slow networks while still failing fast on transient
+	// network breaks worth retrying.
+	hsCtx, hsCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer hsCancel()
 	if err := dtlsConn.HandshakeContext(hsCtx); err != nil {
 		dtlsConn.Close()
