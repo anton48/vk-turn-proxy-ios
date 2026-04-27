@@ -1271,7 +1271,20 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				if connCtx.Err() != nil {
 					return
 				}
-				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, true)
+				// allowCaptchaBlock=false: surface CaptchaRequiredError instead
+				// of letting cp.fetch invoke the user solver (waitForCaptchaAnswer)
+				// which would block indefinitely on captchaCh until a user
+				// answer arrives. The CaptchaRequiredError is then caught a
+				// few lines below and handled via the explicit captcha-wait
+				// probe loop, which periodically probes the pool every 2 min
+				// and exits as soon as background grower fills any slot.
+				//
+				// Without this, a single conn whose TURN goes short-lived at
+				// a moment when VK requires captcha would silently sit blocked
+				// in the solver forever (observed: conn 0 in vpn.wifi.3.log
+				// stuck from 12:51:41 onward, missed every subsequent network
+				// reconnect event).
+				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, false)
 				if err != nil {
 					// Check if it's a captcha that needs human interaction.
 					// Instead of burning retries, freeze and wait for the user.
