@@ -357,6 +357,36 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			isRateLimit := lastPowErr != nil && strings.Contains(lastPowErr.Error(), "ERROR_LIMIT")
 			log.Printf("vk: all %d PoW attempts failed, returning CaptchaRequiredError to caller (rateLimit=%v)", maxPoWRetries, isRateLimit)
 
+			// CRITICAL: PoW solver consumed the captchaNotRobot.* API calls on
+			// the current session_token (`baseParams := "session_token=%s..."`
+			// in captcha_pow.go uses the same token that's embedded in the
+			// captcha page URL). If we hand currentImg/currentSID to a
+			// WebView for user solve, VK responds ERROR_LIMIT to that WebView's
+			// captchaNotRobot.check because the session is burned. Fetch ONE
+			// MORE fresh captcha (untouched by PoW) for whoever consumes this
+			// error — WebView or stats-derived UI.
+			//
+			// Without this fix, every WebView open produced ERROR_LIMIT
+			// (audit of 27-28.04 logs: 22/22 captcha-view JS check responses
+			// were ERROR_LIMIT, 0 success_tokens, 0 user-solved captchas).
+			//
+			// Note: VK captcha bundle (not_robot_captcha.js) does have
+			// anti-bot tooling (sandbox iframe pure fetch check) but it's
+			// for analytics instrumentation, not bot blocking. The actual
+			// issue is purely session_token consumption.
+			freshData := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", linkID, escapedName, token1)
+			if freshResp, freshErr := doRequest(freshData, step2URL); freshErr == nil {
+				if fSID, fImg, fTs, fAttempt := extractCaptcha(freshResp); fSID != "" {
+					log.Printf("vk: fetched untouched captcha for caller (was sid=%s, now sid=%s)", currentSID, fSID)
+					currentSID = fSID
+					currentImg = fImg
+					currentTs = fTs
+					currentAttempt = fAttempt
+				}
+			} else {
+				log.Printf("vk: failed to fetch fresh captcha for caller (%v); returning burned one", freshErr)
+			}
+
 			if captchaSolver == nil {
 				return nil, &CaptchaRequiredError{
 					ImageURL:       currentImg,
