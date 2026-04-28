@@ -1822,12 +1822,30 @@ func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) 
 	if err != nil {
 		return nil, err
 	}
+	// CipherSuites order is chosen to overlap with Apple WebRTC's ClientHello
+	// (captured via Wireshark on a real VK call): c02b, c02f, c00a, c014 are
+	// the four Apple ciphers that pion/dtls v3 actually implements. Goal is to
+	// shift our JA4 fingerprint away from the unique "single cipher" signature
+	// that VK could trivially whitelist against. We don't include Apple's
+	// TLS 1.3 ciphers (1301/1302/1303), CHACHA20 (cca8/cca9), AES-128-CBC
+	// (c009/c013) or RSA-only (009c/002f/0035) because pion can't fulfil the
+	// handshake if the server picks one. Server picks first compatible match,
+	// which is c02b (same as before).
+	//
+	// ConnectionIDGenerator removed: Apple WebRTC does not advertise the
+	// connection_id extension in its ClientHello at all. OnlySendCIDGenerator
+	// caused us to send a CID extension nobody else sends — distinctive enough
+	// to fingerprint by itself.
 	config := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		InsecureSkipVerify:    true,
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
+		Certificates:         []tls.Certificate{certificate},
+		InsecureSkipVerify:   true,
+		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+		CipherSuites: []dtls.CipherSuiteID{
+			dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, // 0xc02b
+			dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,   // 0xc02f
+			dtls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,    // 0xc00a
+			dtls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,      // 0xc014
+		},
 	}
 	dtlsConn, err := dtls.Client(transport, peer, config)
 	if err != nil {
