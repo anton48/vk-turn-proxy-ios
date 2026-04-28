@@ -548,29 +548,47 @@ type credPool struct {
 }
 
 // poolSizeForNumConns derives the insurance pool size from the configured
-// number of tunnel connections. The policy is max(2, ceil(n/3)):
+// number of tunnel connections.
 //
-//   - Scale with n so heavier-use setups get more independent creds.
-//   - Keep the minimum at 2 so that the "mid-session captcha on one slot,
-//     others keep the tunnel alive" behaviour always has something to
-//     fall back to. With only 1 slot, a mid-session refetch that hits
-//     captcha would have no fallback and surface as a user-facing
-//     WebView — defeating the purpose of the pool.
-//   - Staying below n (default=10 → pool=4) keeps background PoW /
-//     VK-fetch pressure low: TTL-rotation touches each slot once per
-//     TTL, so fewer slots = fewer periodic fetches.
+// The pool exists for hot-swap during cred refresh, not for parallelism.
+// VK's TURN allocation quota behaves like a refilling token bucket on a
+// single cred set (initial burst of ~10, refill ~1 token / 20-30s),
+// confirmed empirically in vpn.wifi.18.log: 16 simultaneous allocations
+// on a single seeded cred (slot 0). So one cred set can serve many
+// conns when allocation requests are properly time-staged — we do NOT
+// need one pool slot per ~3 conns to handle parallelism.
 //
-// Examples: n=1..3 → 2, n=4..6 → 2, n=7..9 → 3, n=10..12 → 4,
-//           n=13..15 → 5, n=30 → 10.
+// What the pool actually buys us:
+//   - Hot-swap during TTL refresh: while slot N goes fetching fresh
+//     creds (which may block on captcha), other slots continue serving.
+//   - Spare capacity for cred-stale events: if VK rotates TURN
+//     infrastructure or our cred is auth-rejected, fallback slot
+//     keeps the tunnel alive while the stale slot refetches.
+//
+// Formula: 3 + floor((n-1)/20).
+//   - 3 = base (1 active + 1 warm spare + 1 in TTL rotation).
+//   - +1 per 20 conns to absorb proportionally higher cred-invalidation
+//     rate under heavy use (more conns → more reconnect events → more
+//     chances one of them hits an auth error that drains the active slot).
+//
+// Examples: n=1..20 → 3, n=21..40 → 4, n=41..60 → 5, n=61+ → 6.
+//
+// Compared to the previous max(2, ceil(n/3)):
+//   - n=10: was 4, now 3   (slightly fewer fetches per TTL cycle)
+//   - n=16: was 6, now 3   (half the background PoW load)
+//   - n=30: was 10, now 4
+//   - n=50: was 17, now 5
+//   - n=64: was 22, now 6
+//
+// The previous formula assumed pool size scaled with parallelism need,
+// which we now know was wrong: large pools just multiplied background
+// VK API pressure (more captcha encounters during TTL rotation) without
+// buying any throughput, since one cred can serve many conns anyway.
 func poolSizeForNumConns(n int) int {
 	if n <= 0 {
 		n = 1
 	}
-	size := (n + 2) / 3 // integer ceiling of n/3
-	if size < 2 {
-		size = 2
-	}
-	return size
+	return 3 + (n-1)/20
 }
 
 // newCredPool builds a pool sized to `size` conns with per-entry `ttl`
