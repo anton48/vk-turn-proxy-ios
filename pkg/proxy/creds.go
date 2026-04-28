@@ -547,48 +547,52 @@ type credPool struct {
 	fetch func(allowCaptchaBlock bool) (string, *TURNCreds, error)
 }
 
-// poolSizeForNumConns derives the insurance pool size from the configured
+// poolSizeForNumConns derives the cred pool size from the configured
 // number of tunnel connections.
 //
-// The pool exists for hot-swap during cred refresh, not for parallelism.
-// VK's TURN allocation quota behaves like a refilling token bucket on a
-// single cred set (initial burst of ~10, refill ~1 token / 20-30s),
-// confirmed empirically in vpn.wifi.18.log: 16 simultaneous allocations
-// on a single seeded cred (slot 0). So one cred set can serve many
-// conns when allocation requests are properly time-staged — we do NOT
-// need one pool slot per ~3 conns to handle parallelism.
+// VK enforces a STRICT allocation quota of 10 simultaneous TURN
+// allocations per cred set. This is not a refilling token bucket — once
+// 10 allocations are in flight on a cred, the 11th attempt gets 486
+// Allocation Quota Reached and stays 486 until one of the 10 active
+// allocations is released (TTL expiry, network change invalidating the
+// 5-tuple, or explicit close).
 //
-// What the pool actually buys us:
-//   - Hot-swap during TTL refresh: while slot N goes fetching fresh
-//     creds (which may block on captcha), other slots continue serving.
-//   - Spare capacity for cred-stale events: if VK rotates TURN
-//     infrastructure or our cred is auth-rejected, fallback slot
-//     keeps the tunnel alive while the stale slot refetches.
+// Empirical confirmation in vpn.wifi.19.1.log:
+//   - conns 0-9 used cred 0, established 23:42:39-41
+//   - conns 11-15 came from cred 1 (a separate cred set fetched by the
+//     pool's background grower 10+ minutes later); none of them succeeded
+//     by retrying on cred 0, even after dozens of 486 attempts
+//   - conn 10 also eventually landed on cred 1
 //
-// Formula: 3 + floor((n-1)/20).
-//   - 3 = base (1 active + 1 warm spare + 1 in TTL rotation).
-//   - +1 per 20 conns to absorb proportionally higher cred-invalidation
-//     rate under heavy use (more conns → more reconnect events → more
-//     chances one of them hits an auth error that drains the active slot).
+// Earlier vpn.wifi.18.log showed the same pattern (conn 11+ used cred 3
+// from background grower, not cred 0), but I misread the cred-suffix in
+// the log line and concluded VK had a refilling per-cred bucket. That
+// was wrong. The pool's previous formula (3 + (n-1)/20, committed in
+// 260d8bc on this same misreading) is reverted here.
 //
-// Examples: n=1..20 → 3, n=21..40 → 4, n=41..60 → 5, n=61+ → 6.
+// Correct formula: ceil(n/10) + 1. One cred per 10 conns (matches the
+// hard quota) plus one spare for refresh insurance — when slot K is
+// fetching fresh creds (blocked on captcha for many seconds, sometimes
+// minutes), the spare slot has a fresh cred ready to absorb conns.
 //
-// Compared to the previous max(2, ceil(n/3)):
-//   - n=10: was 4, now 3   (slightly fewer fetches per TTL cycle)
-//   - n=16: was 6, now 3   (half the background PoW load)
-//   - n=30: was 10, now 4
-//   - n=50: was 17, now 5
-//   - n=64: was 22, now 6
+// Examples:
+//   n=1..10  → 2 (1 cred for the conns + 1 spare)
+//   n=11..20 → 3
+//   n=21..30 → 4
+//   n=31..40 → 5
+//   n=41..50 → 6
+//   n=51..60 → 7
+//   n=61..64 → 8
 //
-// The previous formula assumed pool size scaled with parallelism need,
-// which we now know was wrong: large pools just multiplied background
-// VK API pressure (more captcha encounters during TTL rotation) without
-// buying any throughput, since one cred can serve many conns anyway.
+// The "+1 spare" assumes single-slot-at-a-time refresh. If experience
+// shows multiple concurrent refreshes (e.g. captcha storm invalidating
+// multiple creds at once), the spare count may need to grow — that's an
+// empirical question pending more multi-cred runs.
 func poolSizeForNumConns(n int) int {
 	if n <= 0 {
 		n = 1
 	}
-	return 3 + (n-1)/20
+	return (n+9)/10 + 1 // ceil(n/10) + 1
 }
 
 // newCredPool builds a pool sized to `size` conns with per-entry `ttl`
