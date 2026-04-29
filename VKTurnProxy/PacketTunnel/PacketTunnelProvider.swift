@@ -57,6 +57,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         logMsg("startTunnel called")
         startPathMonitoring()
 
+        // Set Go timezone BEFORE wgSetLogFilePath so the first Go log line
+        // ("wgSetLogFilePath: ...") gets a local-time timestamp. Reversed
+        // order leaves the first line stamped in UTC (and any other Go
+        // logs that fire between the two calls).
+        wgSetTimezoneOffset(Int32(TimeZone.current.secondsFromGMT()))
+
         // Configure Go log file path so Go logs also go to the shared file
         if let path = SharedLogger.shared.logFilePath {
             path.withCString { ptr in
@@ -64,10 +70,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             logMsg("Go log file path set: \(path)")
         }
-
-        // Tell Go the local timezone offset so log timestamps match Swift logs
-        let tzOffset = TimeZone.current.secondsFromGMT()
-        wgSetTimezoneOffset(Int32(tzOffset))
 
         guard let config = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration else {
             logMsg("ERROR: no provider configuration")

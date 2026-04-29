@@ -138,6 +138,13 @@ class TunnelManager: ObservableObject {
         preBootstrapInProgress = true
         defer { preBootstrapInProgress = false }
 
+        // Set Go timezone BEFORE wgSetLogFilePath so the logger's first
+        // line ("wgSetLogFilePath: ...") gets a local-time timestamp.
+        // Without this, the first ~17 seconds of a session's logs are in
+        // UTC because wgSetLogFilePath logs immediately and timezone gets
+        // set later by the extension's startTunnel callback.
+        wgSetTimezoneOffset(Int32(TimeZone.current.secondsFromGMT()))
+
         // Redirect Go log output (from wgProbeVKCreds and downstream) to the
         // shared SharedLogger file. The Go runtime in the main-app process is
         // SEPARATE from the one in the Network Extension, and the extension's
