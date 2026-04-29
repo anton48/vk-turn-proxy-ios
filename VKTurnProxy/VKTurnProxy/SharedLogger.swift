@@ -90,8 +90,19 @@ class SharedLogger {
     /// Without this, Share-sheet sent ONLY the current vpn.log and
     /// silently dropped vpn.log.1, hiding however-many hours of
     /// pre-rotation history the archive still held.
+    ///
+    /// queue.sync barrier: flushes pending writes from the logger
+    /// queue before reading. Without it, events that happened in the
+    /// last fraction of a second before Share was tapped (typically
+    /// disconnect-related lines from a "Disconnect → Share" flow) sat
+    /// in the queue and didn't make it into the exported snapshot.
+    /// The queue is serial, so an empty sync block runs after every
+    /// previously-queued write has finished. Safe because this method
+    /// is called from the UI thread, never from inside the queue
+    /// itself — no risk of deadlock.
     func exportSnapshotURL() -> URL? {
         guard let url = fileURL else { return nil }
+        queue.sync {} // flush pending appendData writes
         let combined = readLogs() // archive + current concatenated
         let dst = FileManager.default.temporaryDirectory
             .appendingPathComponent("vpn-export.log")
