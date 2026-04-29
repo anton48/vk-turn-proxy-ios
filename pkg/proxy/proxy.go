@@ -1390,18 +1390,40 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// stop sending probes.
 					return
 				}
-				// Zombie check, only after we've ever seen a pong from
-				// the server. With an unpatched server pings go out
-				// but no pongs come back, serverProbeable stays false,
-				// and this branch is dead — preserves backward compat.
+				// Zombie check — currently DETECT-ONLY, no kill.
+				//
+				// Reason for not killing: when a network handover (e.g.
+				// WiFi→LTE) zombifies all 30 conns simultaneously, mass-
+				// killing leads to a recovery storm:
+				//   1. All 30 conns reconnect simultaneously
+				//   2. Each tries ownSlot, gets 486 (cred quota saturated
+				//      server-side by old NAT mapping's allocations,
+				//      lifetime ~10 min)
+				//   3. markSaturated → fallback → next slot also 486 →
+				//      eventually all 4 cred slots VK-saturated
+				//   4. Phase 2 → fresh fetch → captcha required
+				//   5. Captcha WebView page is hosted on id.vk.ru, which
+				//      is routed THROUGH the tunnel (iOS ignores
+				//      excludedRoutes when includeAllNetworks=true — our
+				//      vpn-routing-diag project verified this) — so with
+				//      0 alive conns, the WebView request can't reach VK.
+				//      User sees blank captcha, infinite stuck.
+				//
+				// Without kill: 30 conns stay "active" with high packet
+				// loss (35%), tunnel is degraded but the user can still
+				// see/fix it. Better UX than total deadlock.
+				//
+				// Re-enable when we have a captcha-during-broken-tunnel
+				// recovery path — e.g., extension-side captcha rendering
+				// + WKURLSchemeHandler bypass, or cancelTunnelWithError +
+				// trigger pre-bootstrap from main app.
 				if p.serverProbeable.Load() && connIdx >= 0 && connIdx < len(p.lastPongTimes) {
 					lastPong := time.Unix(p.lastPongTimes[connIdx].Load(), 0)
 					stale := time.Since(lastPong)
 					if stale > probeStaleThreshold {
-						log.Printf("proxy: [conn %d] zombie detected (no pong for %s), killing",
+						log.Printf("proxy: [conn %d] zombie detected (no pong for %s) — kill disabled, see comment in proxy.go",
 							connIdx, stale.Round(time.Second))
-						connCancel()
-						return
+						// connCancel()  // NOT called — see comment above.
 					}
 				}
 			case <-connCtx.Done():
