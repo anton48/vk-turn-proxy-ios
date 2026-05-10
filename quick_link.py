@@ -92,7 +92,7 @@ def load_config(argv):
     if len(argv) > 1:
         path = argv[1]
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return json.load(f)["settings"]
     return CONFIG
 
 
