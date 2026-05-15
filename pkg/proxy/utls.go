@@ -106,15 +106,23 @@ type chromeRoundTripper struct {
 //     uses standard http.Transport.
 //
 // This gives us:
-//   - Chrome JA3 fingerprint (cipher suites, extensions, key shares)
+//   - JA3/JA4 fingerprint matching the requested browser (Chrome or Safari iOS)
 //   - Proper h2 protocol when server supports it (VK does)
 //   - Automatic fallback for h1-only servers
-func newChromeTransport() http.RoundTripper {
+//
+// helloID picks the browser fingerprint. Use utls.HelloChrome_Auto for
+// Chrome desktop UA flows (creds.go / proxy.go VK API calls), and
+// utls.HelloIOS_Auto for the captcha session (UA = Safari iOS, must
+// match TLS fingerprint or VK detects mismatch). Pre-build-95 we used
+// Chrome TLS for everything including captcha — confirmed BOT signal
+// during 2026-05-15 PoW regression: Safari UA + Chrome JA3 = trivial
+// detection.
+func newBrowserTransport(helloID utls.ClientHelloID) http.RoundTripper {
 	rt := &chromeRoundTripper{}
 
 	rt.h2 = &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			conn, err := dialChromeTLS(ctx, network, addr, false)
+			conn, err := dialBrowserTLS(ctx, network, addr, false, helloID)
 			if err != nil {
 				return nil, err
 			}
@@ -129,7 +137,7 @@ func newChromeTransport() http.RoundTripper {
 
 	rt.h1 = &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialChromeTLS(ctx, network, addr, true)
+			conn, err := dialBrowserTLS(ctx, network, addr, true, helloID)
 			if err != nil {
 				return nil, err
 			}
@@ -144,6 +152,20 @@ func newChromeTransport() http.RoundTripper {
 	return rt
 }
 
+// newChromeTransport — Chrome JA3 fingerprint. Use for Chrome-UA flows.
+func newChromeTransport() http.RoundTripper {
+	return newBrowserTransport(utls.HelloChrome_Auto)
+}
+
+// newSafariTransport — Safari iOS JA3 fingerprint. Use for Safari-UA flows
+// (the captcha session, where we send iPhone Safari UA + captured iOS
+// browser_fp). Phase 4 of 2026-05-15 PoW regression investigation:
+// matches the TLS fingerprint to the User-Agent so VK can't detect
+// us as bot via UA+JA3 mismatch.
+func newSafariTransport() http.RoundTripper {
+	return newBrowserTransport(utls.HelloIOS_Auto)
+}
+
 func (rt *chromeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := rt.h2.RoundTrip(req)
 	if err == nil {
@@ -154,13 +176,13 @@ func (rt *chromeRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	return rt.h1.RoundTrip(req)
 }
 
-// dialChromeTLS establishes a TLS connection using uTLS with Chrome's
-// ClientHello fingerprint.
+// dialBrowserTLS establishes a TLS connection using uTLS with the
+// specified browser ClientHello fingerprint.
 //
 // If forceH1 is true, ALPN is overridden to only advertise http/1.1
 // (for use with Go's http.Transport which can't handle h2 frames).
-// If forceH1 is false, ALPN keeps Chrome's default: ["h2", "http/1.1"].
-func dialChromeTLS(ctx context.Context, network, addr string, forceH1 bool) (*utls.UConn, error) {
+// If forceH1 is false, ALPN keeps the browser's default: ["h2", "http/1.1"].
+func dialBrowserTLS(ctx context.Context, network, addr string, forceH1 bool, helloID utls.ClientHelloID) (*utls.UConn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("split host:port %q: %w", addr, err)
@@ -202,10 +224,10 @@ func dialChromeTLS(ctx context.Context, network, addr string, forceH1 bool) (*ut
 		return nil, fmt.Errorf("dial %s: all %d IPs failed, last error: %w", host, len(dialAddrs), lastErr)
 	}
 
-	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	spec, err := utls.UTLSIdToSpec(helloID)
 	if err != nil {
 		_ = rawConn.Close()
-		return nil, fmt.Errorf("get Chrome spec: %w", err)
+		return nil, fmt.Errorf("get TLS spec for %v: %w", helloID, err)
 	}
 
 	if forceH1 {
