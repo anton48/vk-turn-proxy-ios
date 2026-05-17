@@ -159,6 +159,24 @@ func isTransientNetworkError(err error) bool {
 // (the saved token1 is bound to a specific client_id, so on a captcha-retry we MUST
 // reuse the same client). When empty, the normal client_id rotation+shuffle applies.
 func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1, savedClientID string) (*TURNCreds, error) {
+	// VK Calls captcha-free path (added 2026-05-17 — see creds_vkcalls.go).
+	//
+	// Try this first on FRESH fetches only. Skip on captcha retry because:
+	//   - savedToken1 is a login.vk.ru access_token bound to a vkCredentialsList
+	//     client_id; VK Calls path uses a different VK Connect anonymous_token.
+	//   - solvedCaptchaSID/Key are bound to a captchaNotRobot session that
+	//     only exists on the legacy api.vk.ru/calls.getAnonymousToken path.
+	// On any failure (including unexpected captcha gate appearing on the new
+	// path), fall through to the legacy multi-client_id retry loop below.
+	if savedToken1 == "" && solvedCaptchaSID == "" && savedClientID == "" {
+		creds, err := getVKCredsViaVKCallsPath(linkID)
+		if err == nil {
+			log.Printf("vk: success via VK Calls captcha-free path")
+			return creds, nil
+		}
+		log.Printf("vk: VK Calls path failed, falling back to legacy: %v", err)
+	}
+
 	// Outer retry loop guards against transient network/DNS errors at the very
 	// start of an extension launch — see isTransientNetworkError. We only loop
 	// if EVERY client_id failed with such an error in the same wave; as soon
