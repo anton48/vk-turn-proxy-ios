@@ -3461,38 +3461,32 @@ const (
 	// by VK; reallocating on the same cred has a fresh ~17% chance of
 	// hitting it again.
 	//
-	// Burst parameters (variant b1, build 111+): 30 probes × 1280 bytes
-	// spread over 1.5s = ~25.6 KB/s nominal send rate. Chosen to be:
-	//   - Well above the ~9 KB/s shaped ceiling, so shape cap kicks in
-	//     for shaped allocations (server gets only ~9 KB/s of probes).
-	//   - Well within iOS NE TCP send capacity (build 110's 42 KB/s
-	//     burst overwhelmed iOS NE TCP buffers, causing artificially
-	//     low pong counts on full-speed conns and false SHAPED
-	//     classification for ~all probes — see vpn.wifi.1.log on
-	//     2026-05-19: 66 SHAPED out of 67, but most should have been
-	//     OK per yesterday's MacBook UDP test ratio).
+	// Burst parameters (variant b2, build 112+): 100 probes × 1280 bytes
+	// spread over 5s = ~25.6 KB/s nominal send rate, extended from
+	// build 111's 1.5s burst. Hypothesis: build 111's 1.5s window may
+	// have been too short for full-speed conns to reach steady-state
+	// (TCP slow-start not done yet on iOS NE TCP-control transport
+	// introduced in build 109), causing false SHAPED classification.
+	// Extending to 5s gives slow-start time to settle and provides a
+	// larger statistical sample (100 probes vs 30) to discriminate
+	// shape from full-speed.
 	//
-	// Expected pong counts in 2s window (1.5s burst + 0.5s tail):
-	//   - Full-speed conn: ~30 pongs (= send rate limit, all delivered)
-	//     → ~19.2 KB/s observed rate
-	//   - Shaped conn: ~14 pongs (= 9 KB/s × 2s / 1280 = 14)
-	//     → ~9 KB/s observed rate
-	//   - Blackhole conn: 0 (but blackhole filters out at DTLS handshake
-	//     before probe runs)
-	//
-	// Threshold 15 KB/s sits cleanly between shaped 9 and full ~19,
-	// with safety margin for jitter.
+	// Threshold also lowered 15 → 12 KB/s to be slightly more permissive
+	// — empirical full-speed conn rate observed in build 111 was 11-14
+	// KB/s (server-rx logs in vpn.wifi.1.log), not 19 as theoretically
+	// predicted. 12 KB/s threshold sits at the bottom edge of observed
+	// non-shaped rate.
 	//
 	// Backward compat: if the server doesn't echo (pre-PR#168 deploy)
 	// AND serverProbeable hasn't been set true by any other conn,
 	// pongsReceived=0 is treated as "server unreachable for probing,
 	// can't classify, accept the conn" — pre-shape-probe behaviour is
 	// preserved on legacy servers.
-	shapeProbeBurstCount    = 30
-	shapeProbeSpacing       = 50 * time.Millisecond // 30 × 50ms = 1.5s
+	shapeProbeBurstCount    = 100
+	shapeProbeSpacing       = 50 * time.Millisecond // 100 × 50ms = 5s
 	shapeProbePacketSize    = 1280                  // bytes per probe (incl. magic+seq)
 	shapeProbeWindowAfter   = 500 * time.Millisecond
-	shapeProbeRateThreshold = 15 * 1024 // bytes/s — below = shaped
+	shapeProbeRateThreshold = 12 * 1024 // bytes/s — below = shaped (lowered from 15 in build 111)
 )
 
 // errShapedAllocation indicates that the just-established allocation
