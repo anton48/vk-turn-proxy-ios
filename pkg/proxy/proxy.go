@@ -3461,32 +3461,37 @@ const (
 	// by VK; reallocating on the same cred has a fresh ~17% chance of
 	// hitting it again.
 	//
-	// Burst parameters (variant b2, build 112+): 100 probes × 1280 bytes
-	// spread over 5s = ~25.6 KB/s nominal send rate, extended from
-	// build 111's 1.5s burst. Hypothesis: build 111's 1.5s window may
-	// have been too short for full-speed conns to reach steady-state
-	// (TCP slow-start not done yet on iOS NE TCP-control transport
-	// introduced in build 109), causing false SHAPED classification.
-	// Extending to 5s gives slow-start time to settle and provides a
-	// larger statistical sample (100 probes vs 30) to discriminate
-	// shape from full-speed.
+	// Burst parameters (variant b3, build 113+): 30 probes × 1280 bytes
+	// spread over 1.5s — REVERTED back to build 111 baseline after
+	// build 112's 5s burst also produced ~all SHAPED classifications.
 	//
-	// Threshold also lowered 15 → 12 KB/s to be slightly more permissive
-	// — empirical full-speed conn rate observed in build 111 was 11-14
-	// KB/s (server-rx logs in vpn.wifi.1.log), not 19 as theoretically
-	// predicted. 12 KB/s threshold sits at the bottom edge of observed
-	// non-shaped rate.
+	// Cross-correlation with server-side probe-rx logs (build 112 +
+	// vpn.wifi.8 server log 2026-05-19) showed that the server received
+	// 45-57 probes / 100 in the 5s window = ~11-14 KB/s per conn, in a
+	// steady rate-limited stream (NOT bursty drops). Mac bw_test on the
+	// SAME relay+destination same day shows full-speed conns deliver
+	// 257 KB/s sustained, so VK's per-allocation shape cap hasn't moved.
+	//
+	// Conclusion: iOS NE TCP-control has its own per-conn outbound cap
+	// around 10-14 KB/s that we cannot exceed with any burst pattern
+	// shorter than steady-state. This is structurally too close to VK's
+	// 9 KB/s shape cap for the probe to reliably discriminate. Build
+	// 113 keeps the probe as DIAGNOSTIC ONLY — SHAPED classification is
+	// logged but the conn is kept alive (probe returns nil instead of
+	// errShapedAllocation). Actual shape detection will need a different
+	// approach (e.g. passive monitoring of per-conn user-traffic
+	// throughput during real steady-state, or wire-level pattern
+	// changes rather than rate-based).
 	//
 	// Backward compat: if the server doesn't echo (pre-PR#168 deploy)
 	// AND serverProbeable hasn't been set true by any other conn,
 	// pongsReceived=0 is treated as "server unreachable for probing,
-	// can't classify, accept the conn" — pre-shape-probe behaviour is
-	// preserved on legacy servers.
-	shapeProbeBurstCount    = 100
-	shapeProbeSpacing       = 50 * time.Millisecond // 100 × 50ms = 5s
+	// can't classify" — same handling as before.
+	shapeProbeBurstCount    = 30
+	shapeProbeSpacing       = 50 * time.Millisecond // 30 × 50ms = 1.5s
 	shapeProbePacketSize    = 1280                  // bytes per probe (incl. magic+seq)
 	shapeProbeWindowAfter   = 500 * time.Millisecond
-	shapeProbeRateThreshold = 12 * 1024 // bytes/s — below = shaped (lowered from 15 in build 111)
+	shapeProbeRateThreshold = 12 * 1024 // bytes/s — below = shaped (DIAGNOSTIC label only, no kill)
 )
 
 // errShapedAllocation indicates that the just-established allocation
@@ -3647,11 +3652,17 @@ func (p *Proxy) probeForShapingDTLS(
 	}
 
 	if actualRateBps < float64(shapeProbeRateThreshold) {
-		log.Printf("proxy: [conn %d] shape probe: SHAPED (got %d/%d pongs in %s = %.1f KB/s, threshold %d KB/s) — killing for re-allocation",
+		// Build 113: killer DISABLED — log SHAPED for diagnostic only,
+		// keep conn alive. iOS NE TCP-control has its own per-conn
+		// outbound cap (~10-14 KB/s observed via server-rx counts in
+		// build 112 / 2026-05-19) that's structurally too close to VK
+		// shape cap 9 KB/s for the probe to discriminate reliably.
+		// Killing produced 100% false-positive on all live conns.
+		log.Printf("proxy: [conn %d] shape probe: SHAPED (got %d/%d pongs in %s = %.1f KB/s, threshold %d KB/s) — diagnostic only, killer disabled, conn kept",
 			connIdx, pongsReceived, probesSent,
 			burstDuration.Round(100*time.Millisecond),
 			actualRateBps/1024, shapeProbeRateThreshold/1024)
-		return errShapedAllocation
+		return nil
 	}
 
 	log.Printf("proxy: [conn %d] shape probe: OK (got %d/%d pongs in %s = %.1f KB/s)",
