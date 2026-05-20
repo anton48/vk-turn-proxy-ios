@@ -16,9 +16,19 @@
 //       -dst-ip=217.168.246.242 -dst-port=9998 \
 //       -duration=30s
 //
-// Usage (parallel, find per-conn distribution):
+// Usage (parallel across distinct creds):
 //   go run ./tools/turn_srtp_test -creds=backup.json -parallel=10 \
 //       -dst-ip=217.168.246.242 -dst-port=9998 -duration=30s
+//
+// Usage (production-like — many allocations per cred, matching iOS
+// app's connsPerSlot=10 pattern). With -allocs-per-cred=K each cred
+// supports up to K simultaneous TURN allocations (VK per-cred quota
+// is 10); total worker count = parallel * allocs-per-cred.
+// Example: 3 creds × 10 allocs-per-cred = 30 workers, matches
+// NumConns=30 production layout.
+//   go run ./tools/turn_srtp_test -creds=backup.json -parallel=3 \
+//       -allocs-per-cred=10 -spacing=5ms \
+//       -dst-ip=217.168.246.242 -dst-port=9998 -duration=60s
 
 package main
 
@@ -56,7 +66,8 @@ type backupFile struct {
 }
 
 type workerStats struct {
-	slot      int
+	slot      int // backup cred index
+	subIdx    int // 0..allocs-per-cred-1; 0 when allocs-per-cred=1
 	relayAddr string
 	bytesSent atomic.Int64
 	pktsSent  atomic.Int64
@@ -68,22 +79,29 @@ type workerStats struct {
 
 func main() {
 	var (
-		credsPath = flag.String("creds", "", "path to vkturnproxy-backup-*.json")
-		slot      = flag.Int("slot", 0, "slot index to use when -parallel=1")
-		parallel  = flag.Int("parallel", 1, "number of parallel TURN allocations (uses distinct slots)")
-		dstIP     = flag.String("dst-ip", "", "destination IP (server hosting turn_srtp_server)")
-		dstPort   = flag.Int("dst-port", 0, "destination port (turn_srtp_server -port)")
-		relayAddr = flag.String("relay-addr", "", "override TURN relay addr (host:port); default = cred.Address")
-		duration  = flag.Duration("duration", 30*time.Second, "test duration")
-		pktSize   = flag.Int("pkt-size", 1200, "user payload size per RTP packet (before SRTP/RTP overhead)")
-		spacing   = flag.Duration("spacing", 0, "delay between Writes per worker (0 = as fast as possible)")
-		transport = flag.String("transport", "udp", "TURN control transport: udp or tcp (relayed data is always UDP via Allocate())")
-		verbose   = flag.Bool("v", false, "enable pion debug logs")
+		credsPath     = flag.String("creds", "", "path to vkturnproxy-backup-*.json")
+		slot          = flag.Int("slot", 0, "slot index to use when -parallel=1")
+		parallel      = flag.Int("parallel", 1, "number of distinct creds to use (each cred opens -allocs-per-cred allocations)")
+		allocsPerCred = flag.Int("allocs-per-cred", 1, "TURN allocations per cred (VK quota is 10; matches iOS app's connsPerSlot). Total workers = parallel * allocs-per-cred.")
+		dstIP         = flag.String("dst-ip", "", "destination IP (server hosting turn_srtp_server)")
+		dstPort       = flag.Int("dst-port", 0, "destination port (turn_srtp_server -port)")
+		relayAddr     = flag.String("relay-addr", "", "override TURN relay addr (host:port); default = cred.Address")
+		duration      = flag.Duration("duration", 30*time.Second, "test duration")
+		pktSize       = flag.Int("pkt-size", 1200, "user payload size per RTP packet (before SRTP/RTP overhead)")
+		spacing       = flag.Duration("spacing", 0, "delay between Writes per worker (0 = as fast as possible)")
+		transport     = flag.String("transport", "udp", "TURN control transport: udp or tcp (relayed data is always UDP via Allocate())")
+		verbose       = flag.Bool("v", false, "enable pion debug logs")
 	)
 	flag.Parse()
 
 	if *credsPath == "" || *dstIP == "" || *dstPort == 0 {
 		log.Fatal("required flags: -creds, -dst-ip, -dst-port")
+	}
+	if *allocsPerCred < 1 {
+		log.Fatal("-allocs-per-cred must be >= 1")
+	}
+	if *allocsPerCred > 10 {
+		log.Printf("warning: -allocs-per-cred=%d exceeds VK per-cred quota of 10; expect 486 Allocation Quota Reached", *allocsPerCred)
 	}
 
 	creds, err := loadCreds(*credsPath)
@@ -126,23 +144,31 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *duration+30*time.Second)
 	defer cancel()
 
-	stats := make([]*workerStats, len(picked))
+	totalWorkers := len(picked) * *allocsPerCred
+	stats := make([]*workerStats, 0, totalWorkers)
 	var wg sync.WaitGroup
 	startBarrier := make(chan struct{})
 
-	for i, c := range picked {
-		stats[i] = &workerStats{slot: c.Slot}
-		wg.Add(1)
-		go func(idx int, cred backupCred, ws *workerStats) {
-			defer wg.Done()
-			relay := *relayAddr
-			if relay == "" {
-				relay = cred.Address
-			}
-			if err := runWorker(ctx, cred, relay, dstAddr, ws, startBarrier, *duration, *pktSize, *spacing, *transport, *verbose, idx); err != nil {
-				log.Printf("[w%d slot=%d] worker error: %v", idx, cred.Slot, err)
-			}
-		}(i, c, stats[i])
+	log.Printf("config: parallel=%d, allocs-per-cred=%d → %d total workers, transport=%s",
+		len(picked), *allocsPerCred, totalWorkers, *transport)
+
+	for credIdx, c := range picked {
+		for sub := 0; sub < *allocsPerCred; sub++ {
+			workerIdx := credIdx**allocsPerCred + sub
+			ws := &workerStats{slot: c.Slot, subIdx: sub}
+			stats = append(stats, ws)
+			wg.Add(1)
+			go func(wIdx, sub int, cred backupCred, ws *workerStats) {
+				defer wg.Done()
+				relay := *relayAddr
+				if relay == "" {
+					relay = cred.Address
+				}
+				if err := runWorker(ctx, cred, relay, dstAddr, ws, startBarrier, *duration, *pktSize, *spacing, *transport, *verbose, wIdx); err != nil {
+					log.Printf("[w%d slot=%d.%d] worker error: %v", wIdx, cred.Slot, sub, err)
+				}
+			}(workerIdx, sub, c, ws)
+		}
 	}
 
 	// Wait for all workers to reach the barrier (handshakes done)
@@ -254,7 +280,7 @@ func runWorker(ctx context.Context, cred backupCred, relayAddr string, dst *net.
 	defer relayedConn.Close()
 	allocDur := time.Since(allocStart)
 	ws.relayAddr = relayedConn.LocalAddr().String()
-	log.Printf("[w%d slot=%d] allocated relay=%s in %s", idx, cred.Slot, ws.relayAddr, allocDur)
+	log.Printf("[w%d slot=%d.%d] allocated relay=%s in %s", idx, cred.Slot, ws.subIdx, ws.relayAddr, allocDur)
 
 	// CreatePermission for the destination so relay forwards our writes.
 	if err := tc.CreatePermission(dst); err != nil {
@@ -279,7 +305,7 @@ func runWorker(ctx context.Context, cred backupCred, relayAddr string, dst *net.
 	}
 	ws.hsOK.Store(true)
 	defer srtpConn.Close()
-	log.Printf("[w%d slot=%d] DTLS+SRTP handshake done", idx, cred.Slot)
+	log.Printf("[w%d slot=%d.%d] DTLS+SRTP handshake done", idx, cred.Slot, ws.subIdx)
 
 	// Send loop.
 	payload := make([]byte, pktSize)
@@ -323,8 +349,8 @@ func printRate(stats []*workerStats, elapsed time.Duration) {
 			secs = 0.001
 		}
 		bps := float64(ws.bytesSent.Load()) / secs
-		fmt.Printf("  slot=%-2d relay=%-25s %s   %.1f KB/s   pkts=%d  errs=%d\n",
-			ws.slot, ws.relayAddr, hs, bps/1024,
+		fmt.Printf("  slot=%-2d.%-2d relay=%-25s %s   %.1f KB/s   pkts=%d  errs=%d\n",
+			ws.slot, ws.subIdx, ws.relayAddr, hs, bps/1024,
 			ws.pktsSent.Load(), ws.sendErrs.Load())
 	}
 }
