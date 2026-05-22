@@ -40,6 +40,21 @@ Optional fields (omitted from the link if left empty / commented out):
     dnsServers       — e.g. "1.1.1.1"; if absent, importer keeps its current value
     numConnections   — int 1..50; if absent, importer keeps its current value
                        (default 30 in the iOS app)
+    useSrtp          — bool, added 2026-05-20 (iOS build 115+). True means
+                       client uses the DTLS+SRTP transport that bypasses VK's
+                       per-allocation shape policy — server must run with the
+                       -srtp flag (anton48/vk-turn-proxy add-server-srtp-layer
+                       branch), typically on a separate port from the legacy
+                       DTLS listener. If absent, importer keeps current value
+                       (default false). Note: useSrtp=true overrides useDTLS
+                       in the iOS dispatcher (SRTP path wins).
+    useUDP           — bool, added 2026-05-22 (iOS build 128). False (default)
+                       = TCP-control transport from client to TURN relay,
+                       which bypasses VK's per-cred allocation-rate throttle
+                       (introduced 2026-05-18). True = UDP-control, only useful
+                       if your network blocks/throttles TCP to the relay and
+                       you'd rather take VK's allocation-rate hit. If absent,
+                       importer keeps current value (default false / TCP).
 
 What this DOES NOT include and never should:
 
@@ -74,6 +89,12 @@ CONFIG = {
     # ----- optional (delete keys to omit them from the link) -----
     "dnsServers":     "1.1.1.1",
     "numConnections": 30,
+    # useSrtp / useUDP: see docstring at top for semantics. Both default
+    # false (safe for users on the legacy DTLS+WG path). Set useSrtp=true
+    # only if the peerAddress points at a -srtp-enabled server. Set
+    # useUDP=true only if your network requires UDP-control transport.
+    "useSrtp":        False,
+    "useUDP":         False,
 }
 
 REQUIRED = (
