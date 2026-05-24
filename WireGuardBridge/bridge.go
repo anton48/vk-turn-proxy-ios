@@ -1055,6 +1055,39 @@ func init() {
 	debug.SetMemoryLimit(35 << 20)
 	log.Printf("bridge: GOMEMLIMIT set to 35 MB (soft cap for jetsam defence — lowered from 40 MB in build 130)")
 
+	// Periodic debug.FreeOSMemory() — added in build 131 after build 130
+	// soak confirmed Fix A reduced but did not eliminate JETSAM_REASON_
+	// MEMORY_PERPROCESSLIMIT events. Root cause: SetMemoryLimit makes Go
+	// MARK idle pages as returnable (heap-released grows), but Go's default
+	// scavenger is lazy about actually unmapping them from the address
+	// space — pages stay mapped until kernel pressure forces release. iOS
+	// jetsam PERPROCESSLIMIT can count mapped pages (not just resident),
+	// so even with heap-released=22 MB the extension can be killed for
+	// "too much memory mapped" during a sleep cycle.
+	//
+	// Empirical episode (vpn.wifi.0.log 2026-05-24 16:39:54): rss=24.4 MB
+	// sys=45.8 MB heap-released=22.2 MB immediately before sleep → JETSAM
+	// fired during the ~6-minute deep-sleep window with no further
+	// allocations from our side. sys peak from a 16:18-16:19 speedtest
+	// burst stuck at 45.8 MB for 20+ minutes because Go's scavenger hadn't
+	// yet unmapped the released pages. FreeOSMemory() forces the unmap
+	// immediately.
+	//
+	// 60s interval = balance between responsiveness (catches high-water-
+	// mark spikes within a minute of the spike subsiding) and overhead
+	// (FreeOSMemory is heavier than a normal GC — ~10-50ms on phone-class
+	// CPU when there's a lot to scavenge, microseconds when there isn't).
+	// Net cost in idle: negligible. Net cost during traffic burst: small
+	// jitter once per minute, well below user-perceptible threshold.
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			debug.FreeOSMemory()
+		}
+	}()
+	log.Printf("bridge: scheduled periodic debug.FreeOSMemory() every 60s (build 131)")
+
 	// Wire the proxy's memstats logger to read this process's
 	// phys_footprint via Mach task_info (see go_get_phys_footprint
 	// in the cgo preamble). On iOS, jetsam evaluates phys_footprint
