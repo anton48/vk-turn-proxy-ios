@@ -26,14 +26,23 @@ missing or empty):
 
     privateKey       — WG client private key (base64)
     peerPublicKey    — WG server public key  (base64)
-    presharedKey     — WG preshared key      (base64)
     tunnelAddress    — e.g. "192.168.102.3/24"
     allowedIPs       — e.g. "0.0.0.0/0"
     vkLink           — https://vk.me/join/<token>
     peerAddress      — e.g. "1.2.3.4:51820" (the WG server, not the TURN)
 
-Optional fields (omitted from the link if left empty / commented out):
+Optional fields (delete or comment out the CONFIG key to omit them from
+the link — leaving an empty string still gets sent through and overwrites
+the importer's current value with empty):
 
+    presharedKey     — WG preshared key (base64). Made Optional in iOS build
+                       134 — WireGuard PSK is itself optional in the protocol
+                       (deployments without PSK use the all-zeros key). If
+                       absent from the link, the importer keeps its current
+                       PSK setting. If the receiving device has never had a
+                       PSK and the deployment doesn't use one, omit this key
+                       entirely. The script rejects literal "REPLACE_ME" so
+                       you can't accidentally embed the placeholder.
     dnsServers       — e.g. "1.1.1.1"; if absent, importer keeps its current value
     numConnections   — int 1..50; if absent, importer keeps its current value
                        (default 30 in the iOS app)
@@ -67,9 +76,11 @@ Optional fields (omitted from the link if left empty / commented out):
 
 Compat note: links generated against iOS build 128 or earlier MUST include
 useDTLS, useWrap, and wrapKeyHex (iOS Codable rejects the link otherwise).
-Build 129+ accepts their absence. quick_link.py keeps them in CONFIG with
-safe defaults so links work with both eras — only delete them from CONFIG
-if you know all importers are on build 129+.
+Build 129+ accepts their absence. Similarly, builds 133 or earlier require
+presharedKey; build 134+ accepts its absence. quick_link.py keeps these
+fields in CONFIG with safe defaults so links work with both eras — only
+delete them from CONFIG if you know all importers are on the corresponding
+build (129+ for useDTLS/useWrap/wrapKeyHex, 134+ for presharedKey).
 
 What this DOES NOT include and never should:
 
@@ -92,13 +103,20 @@ CONFIG = {
     # ----- required -----
     "privateKey":     "REPLACE_ME",
     "peerPublicKey":  "REPLACE_ME",
-    "presharedKey":   "REPLACE_ME",
     "tunnelAddress":  "192.168.102.3/24",
     "allowedIPs":     "0.0.0.0/0",
     "vkLink":         "REPLACE_ME",         # https://vk.me/join/...
     "peerAddress":    "REPLACE_ME",         # ip:port of the WG server
 
     # ----- optional (delete keys to omit them from the link) -----
+    # presharedKey was required before iOS build 134. Kept in CONFIG with
+    # the REPLACE_ME placeholder so links generated against builds 133 and
+    # earlier still include a non-empty value (those builds reject missing
+    # presharedKey). If the receiving devices are all on 134+ AND the
+    # deployment doesn't use a WG preshared key, delete the line entirely.
+    # validate() rejects literal "REPLACE_ME" so accidental retention of
+    # the placeholder fails loudly.
+    "presharedKey":   "REPLACE_ME",
     "dnsServers":     "1.1.1.1",
     "numConnections": 30,
     # useDTLS / useWrap / wrapKeyHex were required before iOS build 129
@@ -119,7 +137,7 @@ CONFIG = {
 }
 
 REQUIRED = (
-    "privateKey", "peerPublicKey", "presharedKey",
+    "privateKey", "peerPublicKey",
     "tunnelAddress", "allowedIPs",
     "vkLink", "peerAddress",
 )
@@ -149,6 +167,22 @@ def validate(settings):
             f"ERROR: missing or placeholder required fields: {', '.join(missing)}\n"
             f"Edit the CONFIG dict at the top of quick_link.py (or your input "
             f"JSON) and rerun."
+        )
+    # Reject literal "REPLACE_ME" left in any optional field — would
+    # otherwise silently embed the placeholder string into the link and
+    # overwrite the importer's UserDefaults with garbage. The most likely
+    # offender is presharedKey, which moved from required to optional in
+    # build 134 but still defaults to "REPLACE_ME" in CONFIG so links
+    # generated for pre-134 importers (where presharedKey is required)
+    # keep working.
+    placeholders = [k for k, v in settings.items() if v == "REPLACE_ME"]
+    if placeholders:
+        raise SystemExit(
+            f"ERROR: optional field(s) still set to placeholder REPLACE_ME: "
+            f"{', '.join(placeholders)}\n"
+            f"Either set them to real values or delete the line from CONFIG "
+            f"(optional fields can be omitted entirely — the importer will "
+            f"keep its current setting for the corresponding key)."
         )
     # wrapKeyHex sanity-check kept only when useWrap is explicitly true —
     # both fields are now optional, but if the admin set useWrap=true they

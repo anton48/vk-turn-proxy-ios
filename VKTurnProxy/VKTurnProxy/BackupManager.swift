@@ -404,7 +404,12 @@ enum BackupManager {
         let s = link.settings
         d.set(s.privateKey, forKey: "privateKey")
         d.set(s.peerPublicKey, forKey: "peerPublicKey")
-        d.set(s.presharedKey, forKey: "presharedKey")
+        // presharedKey made Optional in build 134 — WG PSK is optional in
+        // the protocol; deployments without one omit the field entirely
+        // (quick_link.py does that automatically). Nil-preserves-default
+        // keeps the device's current PSK alone when absent. Non-nil writes
+        // through, including empty string if explicitly set.
+        if let v = s.presharedKey { d.set(v, forKey: "presharedKey") }
         d.set(s.tunnelAddress, forKey: "tunnelAddress")
         d.set(s.allowedIPs, forKey: "allowedIPs")
         d.set(s.vkLink, forKey: "vkLink")

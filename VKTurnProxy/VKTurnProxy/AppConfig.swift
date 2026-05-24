@@ -139,7 +139,17 @@ struct ConnectionLink: Codable {
 struct ConnectionSettings: Codable {
     let privateKey: String
     let peerPublicKey: String
-    let presharedKey: String
+    /// presharedKey made Optional in build 134 — WireGuard PSK is
+    /// optional in the protocol (RFC 4193 §5.2: "If a PSK is not
+    /// configured, then it is assumed to be all zeros"), so deployments
+    /// that don't use one shouldn't be forced to provide a value in the
+    /// link payload. Nil-preserves-default on import: absent → keep
+    /// whatever the receiving device already had. Older quick_link.py-
+    /// generated links that still carry the field continue to apply it
+    /// through unchanged. AppSettings.presharedKey (full-backup path)
+    /// remains required because currentConfig() always populates it from
+    /// UserDefaults.
+    let presharedKey: String?
     let tunnelAddress: String
     let allowedIPs: String
     let vkLink: String
