@@ -752,8 +752,36 @@ func (p *Proxy) startConnections() error {
 	// answer, retrying immediately just burns budget. Captcha-required
 	// drops out of this loop and surfaces via the captcha-pending path
 	// below.
-	const maxBootstrapAttempts = 4
-	const bootstrapBackoff = 10 * time.Second
+	const maxBootstrapAttempts = 7
+	// Linear-progressive backoff for the non-saturated retry path. The
+	// backoff before retrying into attempt N (N=2..7) is (N-1) * 10s:
+	// 10, 20, 30, 40, 50, 60 seconds. Cumulative timeline of attempt
+	// starts (5s dial timeout per attempt + the backoff before next):
+	//   attempt 1: t=0   (initial)
+	//   attempt 2: t=15  (5s dial + 10s wait)
+	//   attempt 3: t=40  (15 + 5 dial + 20 wait)
+	//   attempt 4: t=75
+	//   attempt 5: t=120
+	//   attempt 6: t=175
+	//   attempt 7: t=240 (4 minutes)
+	// Total bootstrap budget when all 7 fail: ~245s = ~4m5s.
+	//
+	// Rationale: pre-build-137 was maxBootstrapAttempts=4 with fixed
+	// 10s backoff = ~60s total. When network outages last >60s (e.g.
+	// 2026-05-26 02:21-02:35 ~14 min ISP/route flap on user's WiFi
+	// — see progress_summary_may_25_2026 evening notes / open issue),
+	// the 60s budget exhausts and we wait for watchdog Condition 3
+	// to fire after 5 min of zero active conns, giving 5-6 min total
+	// dead-window per cycle. The 4-min budget here covers most
+	// transient network outages (most ISPs recover within 1-2 min),
+	// and if it still fails the watchdog cycle adds another ~1 min
+	// gap, NOT 5 min — bootstrap is doing the waiting work, not
+	// idling. For recoveries that happen mid-bootstrap-budget, the
+	// next attempt catches the recovery within at most 60s instead
+	// of waiting for the next 5-min watchdog tick.
+	bootstrapBackoff := func(failedAttempt int) time.Duration {
+		return time.Duration(failedAttempt) * 10 * time.Second
+	}
 	// Safety window beyond longest cooldown — guards against slot timer
 	// firing slightly after our calculated deadline (re-arms, scheduler
 	// jitter, etc). Empirically a few seconds is plenty.
@@ -767,24 +795,24 @@ func (p *Proxy) startConnections() error {
 
 		// Adaptive backoff: when NO slots are usable (either all in 486
 		// cooldown OR partly saturated + empty slots that grower can't
-		// fill), fixed 10s retries are guaranteed to keep failing — the
-		// only thing that can plausibly help is a saturation cooldown
-		// expiring (broadcasts on slotAvailableCh) or grower successfully
-		// seeding an empty slot (also broadcasts). Wait on the channel
-		// instead, with a deadline equal to the longest remaining
-		// cooldown (+safety).
+		// fill), fixed-duration retries are guaranteed to keep failing
+		// — the only thing that can plausibly help is a saturation
+		// cooldown expiring (broadcasts on slotAvailableCh) or grower
+		// successfully seeding an empty slot (also broadcasts). Wait
+		// on the channel instead, with a deadline equal to the longest
+		// remaining cooldown (+safety).
 		//
 		// Why "available == 0" not "saturated == total": when 7 of 12
 		// slots are saturated and the other 5 are empty with grower
 		// blocked by PoW captcha cascade, available = 0 but saturated
-		// (7) != total (12). The old strict condition picked the 10s
-		// backoff path, exhausted 4×10s budget in 40s, and returned —
-		// then the watchdog needed 5+ min to retry. Empirically
-		// observed in vpn.wifi-lte-wifi.2.log 2026-05-15 17:17:15:
-		// bootstrap exhausted at 17:17:45 even though slots [0,1,3,4,5]
-		// would expire at 17:18:54 (a 1m9s wait would have recovered);
-		// instead recovery came at 17:23:15 via second watchdog tick
-		// — wasted 4m20s. Pre-build-90 also hit this in
+		// (7) != total (12). The old strict condition picked the
+		// fixed-backoff path, exhausted 4×10s budget in 40s, and
+		// returned — then the watchdog needed 5+ min to retry.
+		// Empirically observed in vpn.wifi-lte-wifi.2.log 2026-05-15
+		// 17:17:15: bootstrap exhausted at 17:17:45 even though slots
+		// [0,1,3,4,5] would expire at 17:18:54 (a 1m9s wait would have
+		// recovered); instead recovery came at 17:23:15 via second
+		// watchdog tick — wasted 4m20s. Pre-build-90 also hit this in
 		// vpn.wifi-lte-wifi.3.log 2026-05-08 21:21-21:33: 11m13s
 		// outage, ~4 min of which was waiting for the next watchdog
 		// tick after slots 0/2/4 had already cooled down at 21:29:00
@@ -794,7 +822,7 @@ func (p *Proxy) startConnections() error {
 		// canWaitForCooldown requires longest > 0 — without an active
 		// cooldown there's no guaranteed wake-up source (grower-fill
 		// broadcasts could fire but that's not bounded). Fall back to
-		// the 10s default in the no-cooldown case.
+		// the progressive-backoff default in the no-cooldown case.
 		canWaitForCooldown := total > 0 && available == 0 && longest > 0
 
 		if canWaitForCooldown {
@@ -813,10 +841,11 @@ func (p *Proxy) startConnections() error {
 				return p.ctx.Err()
 			}
 		} else {
+			backoff := bootstrapBackoff(attempt)
 			log.Printf("proxy: bootstrap attempt %d/%d failed (%v), retrying conn 0 after %s",
-				attempt, maxBootstrapAttempts, err, bootstrapBackoff)
+				attempt, maxBootstrapAttempts, err, backoff)
 			select {
-			case <-time.After(bootstrapBackoff):
+			case <-time.After(backoff):
 			case <-p.ctx.Done():
 				return p.ctx.Err()
 			}
