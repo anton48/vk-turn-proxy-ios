@@ -3241,7 +3241,9 @@ var TaskVMInfoFn func() TaskVMInfo
 // the same place — useful when comparing pre-kill state across
 // multiple jetsam incidents.
 func (p *Proxy) logMemStatsLoop(ctx context.Context) {
-	const interval = 10 * time.Second
+	const normalInterval = 10 * time.Second
+	const highFreqInterval = 1 * time.Second
+	const highFreqDuration = 30 * time.Second
 	// Alert threshold for heap-alloc growth between consecutive ticks.
 	// Empirically (2026-05-27 09:45:29→09:45:39) jetsam was preceded by
 	// heap-alloc +6.6 MB then +10.6 MB tick-over-tick. 5 MB is a tight
@@ -3249,13 +3251,25 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 	// fluctuation (typical tick-delta is ±2 MB under steady idle).
 	const allocSpikeThreshold = 5 * 1024 * 1024 // 5 MB
 
-	tick := time.NewTicker(interval)
+	tick := time.NewTicker(normalInterval)
 	defer tick.Stop()
 
 	// Previous-tick state for delta computation. Captured by closure
 	// across dump() calls.
 	var prevTxPkt, prevRxPkt int64
 	var prevHeapAlloc uint64
+
+	// Triggered high-frequency mode (build 141). When an ALLOC-SPIKE is
+	// detected, switch to 1s cadence for the next 30s — captures what
+	// happens in the 10s slice between standard ticks where we've
+	// historically observed jetsam-preceding bursts but had no
+	// instrumentation (e.g. 2026-05-27 16:58:19 last snapshot → 16:58:37
+	// kill = 18s blind window). Each new spike inside the high-freq
+	// window resets the 30s countdown so sustained spike patterns keep
+	// detailed instrumentation. Reverts to 10s cadence after the window
+	// expires with no further spikes.
+	var inHighFreq bool
+	var highFreqUntil time.Time
 
 	dump := func(label string) {
 		var ms runtime.MemStats
@@ -3322,6 +3336,11 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		// goroutine count) so we can post-mortem-attribute the spike
 		// even if the kill happens before next tick. Skip on first call
 		// (prevHeapAlloc=0 would trigger a false positive on startup).
+		//
+		// Build 141: spike detection also triggers high-frequency mode —
+		// ticker switches to 1s for the next 30s so we capture what
+		// happens during the spike's blind window between standard 10s
+		// ticks. Each new spike re-extends the high-freq window.
 		if prevHeapAlloc > 0 && ms.HeapAlloc > prevHeapAlloc+allocSpikeThreshold {
 			gcSinceLastTick := ms.NumGC // can't compute delta without prev — log absolute
 			log.Printf("proxy: ALLOC-SPIKE detected — heap-alloc +%s in this tick. tx-pkt=%d rx-pkt=%d goroutines=%d heap-objects=%d numGC=%d (compare to prev tick)",
@@ -3331,8 +3350,24 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 				runtime.NumGoroutine(),
 				ms.HeapObjects,
 				gcSinceLastTick)
+			highFreqUntil = time.Now().Add(highFreqDuration)
+			if !inHighFreq {
+				inHighFreq = true
+				log.Printf("proxy: memstats switching to high-freq mode (1s cadence for %s)", highFreqDuration)
+				tick.Reset(highFreqInterval)
+			}
 		}
 		prevHeapAlloc = ms.HeapAlloc
+
+		// Revert to normal cadence if high-freq window expired and no
+		// new spike re-extended it. Check after dumping so the final
+		// tick of the high-freq window still emits at 1s cadence
+		// (catches the last sample before reverting).
+		if inHighFreq && time.Now().After(highFreqUntil) {
+			inHighFreq = false
+			tick.Reset(normalInterval)
+			log.Printf("proxy: memstats returning to normal cadence (%s)", normalInterval)
+		}
 	}
 
 	// Emit once at startup so we have a baseline anchor for later
