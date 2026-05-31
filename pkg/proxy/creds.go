@@ -76,14 +76,34 @@ type vkCredentials struct {
 	ClientSecret string
 }
 
-// vkCredentialsList contains all known VK app credentials for rotation.
-// Using multiple client_id reduces per-app rate limiting and captcha frequency.
+// vkCredentialsList contains the VK app credentials for the legacy
+// calls.getAnonymousToken rotation. Two client_id gives failover and spreads
+// per-app rate-limiting / captcha frequency. Each minted anon session is a
+// distinct cred (own ~10-allocation quota), so 2 client_id do NOT cap conns —
+// the credpool mints many distinct creds by re-fetching.
+//
+// 2026-05-31 — full rework after the build-149 force-legacy on-device test
+// minted 0 creds. Two findings, both harness-verified from our own IP (see
+// 29.05.2026/proxy-turn-vk-android-1.2.2/go_client iptest_test.go MINT TEST):
+//
+//   1. Dropped 3 app_ids (52461373 VK_WEB_VKVIDEO, 52649896 VK_MVK_VKVIDEO,
+//      51781872 VK_ID_AUTH): they return error_code 3 "Unknown method passed"
+//      for calls.getAnonymousToken (method not exposed to those apps) — never
+//      produced a cred, and the wasted attempts amplified VK's per-IP captcha
+//      escalation (checkbox→slider→BOT).
+//
+//   2. Replaced our stale secrets. Our old secrets for 6287487
+//      (QbYic1K3lEV5kTGiqlq2) and 7879029 (aR5NKGmm03GYrCiNKsaw) SOLVE the
+//      captcha fine but then VK returns error_code 10 "Internal server error"
+//      on the post-captcha getAnonymousToken MINT — the token1 they yield is
+//      mint-invalid. amurcanov's secret for 6287487 (MuAxFaKDYDOICzGnEOhp) and
+//      their 2nd app 8202606 BOTH mint a call token cleanly from the same
+//      IP/method (verified 2026-05-31: MINT OK 2/2). So the method is NOT
+//      sunset — our secrets were stale. Matched amurcanov's exact pair.
+//      (7879029 dropped: no known-good secret; re-add if one is found.)
 var vkCredentialsList = []vkCredentials{
-	{ClientID: "6287487", ClientSecret: "QbYic1K3lEV5kTGiqlq2"},  // VK_WEB_APP_ID
-	{ClientID: "7879029", ClientSecret: "aR5NKGmm03GYrCiNKsaw"},  // VK_MVK_APP_ID
-	{ClientID: "52461373", ClientSecret: "o557NLIkAErNhakXrQ7A"}, // VK_WEB_VKVIDEO_APP_ID
-	{ClientID: "52649896", ClientSecret: "WStp4ihWG4l3nmXZgIbC"}, // VK_MVK_VKVIDEO_APP_ID
-	{ClientID: "51781872", ClientSecret: "IjjCNl4L4Tf5QZEXIHKK"}, // VK_ID_AUTH_APP
+	{ClientID: "6287487", ClientSecret: "MuAxFaKDYDOICzGnEOhp"}, // VK_WEB — amurcanov's current working secret
+	{ClientID: "8202606", ClientSecret: "lMRsTiMCyPnp5vfoldmn"}, // amurcanov's 2nd stable app_id
 }
 
 // CaptchaSolver is called when VK requires a captcha.
