@@ -1935,16 +1935,23 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 // via fallback).
 //
 // Note: VK's vchat.joinConversationByLink returns multiple TURN endpoints
-// (≥2, confirmed in build 53). We parse them all into creds.Addresses for
-// future use (logging, possible failover) but DO NOT rotate per-conn:
-// only Addresses[0] is exempt from iOS includeAllNetworks=true via
-// Swift TunnelManager.serverAddress. Conns assigned to Addresses[1+]
-// would have their TURN UDP routed back through the tunnel — recursive
-// routing observed empirically (TunnelManager.swift:355) caused
-// throughput collapse to ~0.5 Mbps. Setting serverAddress to a
-// hostname that resolves to multiple IPs is unreliable too: WireGuard
-// iOS' DNSResolver.swift takes only the first IPv4, and Apple has not
-// documented multi-IP exemption behavior in any forum or doc.
+// (≥2, confirmed in build 53). We parse them into creds.Addresses; each
+// conn dials its own cred's Addresses[0], so the pool naturally spreads
+// across whatever relays VK hands out per fetch.
+//
+// CORRECTION 2026-06-08: the previous version of this comment claimed conns
+// on a relay != Swift's serverAddress get "recursive-routed back through the
+// tunnel → ~0.5 Mbps". That is EMPIRICALLY FALSE (08.06.2026/vpn.change.
+// address.log): with serverAddress = relay B, ~10 conns ran on relay A (the
+// NON-serverAddress relay) and carried FULL speed both idle and under a
+// speedtest (~86 KB/s TX/conn, 8.7 MB cum), all on the physical interface
+// (local=192.168.4.21). The extension's own TURN sockets never traverse its
+// own tunnel regardless of destination, so a conn's relay need not match
+// serverAddress — there is no recursion. (The old "155→90 → 0.5 Mbps"
+// anecdote was almost certainly the old relay being DEAD, not recursion.) We
+// still don't actively rotate — no demonstrated throughput win — but a
+// relay/serverAddress mismatch is harmless. See
+// evaluated_alternatives_turn_endpoint_rotation.md.
 func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
 	return p.credPool.get(connIdx, allowCaptchaBlock)
 }

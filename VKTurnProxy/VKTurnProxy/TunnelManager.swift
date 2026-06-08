@@ -354,17 +354,23 @@ class TunnelManager: ObservableObject {
             let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seeded)
 
             // Pick serverAddress. iOS always excludes serverAddress from the
-            // tunnel per Apple's documented rule (essential for Step 4's
-            // includeAllNetworks=true so TURN UDP doesn't loop back through
-            // the tunnel — recursive routing makes the dataplane unusable).
+            // tunnel per Apple's documented rule. We set it to the TURN IP we
+            // allocate against, by historical convention.
+            //
+            // CORRECTION 2026-06-08: this used to claim serverAddress MUST
+            // match the relay or conns "recursive-route → 0.5 Mbps".
+            // EMPIRICALLY FALSE (08.06.2026/vpn.change.address.log): conns on a
+            // relay != serverAddress carry full speed idle + speedtest — the
+            // extension's own TURN sockets never traverse its own tunnel, so
+            // serverAddress's per-IP exemption is NOT load-bearing for the data
+            // path. The "155→90 → 0.5 Mbps" anecdote below was almost certainly
+            // a DEAD old relay, not recursion. We keep the priority order
+            // (harmless) but a mismatch does not break anything. See proxy.go
+            // resolveTURNAddr + evaluated_alternatives_turn_endpoint_rotation.md.
             //
             // Priority order:
-            //   1. The TURN IP we JUST got from pre-bootstrap (seeded.address).
-            //      This is the address conn 0 will actually allocate against,
-            //      so it MUST be the one iOS exempts. Critical when VK rotates
-            //      its TURN infrastructure (observed: VK migrated from
-            //      155.212.197.38 to 90.156.234.242, and using the cached old
-            //      IP caused recursive routing → 0.5 Mbps speeds).
+            //   1. The TURN IP from pre-bootstrap (seeded.address) — what
+            //      conn 0 allocates against.
             //   2. The cached TURN IP from a previous session — used only if
             //      pre-bootstrap somehow didn't run (defensive; normally we
             //      always have seeded.address here).
