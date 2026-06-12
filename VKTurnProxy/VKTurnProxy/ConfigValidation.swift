@@ -170,13 +170,8 @@ enum ConfigValidation {
         return nil
     }
 
-    static func allowedIPs(_ s: String) -> Issue? {
-        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return Issue(.warning, "Empty — no traffic will be routed into the tunnel.") }
-        let parts = t.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-        if parts.contains(where: { !looksLikeCIDR($0) }) {
-            return Issue(.warning, "Each entry should be ip/prefix (e.g. 0.0.0.0/0), comma-separated.")
-        }
-        return nil
-    }
+    // allowedIPs validator removed 2026-06-11 with the UI field — allowedIPs is
+    // pinned to 0.0.0.0/0 (WireGuard cryptokey routing must be full under
+    // includeAllNetworks=true) and is no longer user-editable, so there's
+    // nothing to validate. looksLikeCIDR is still used by tunnelAddress above.
 }

@@ -78,7 +78,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app
         CODE_SIGN_ENTITLEMENTS: VKTurnProxy/VKTurnProxy.entitlements
         MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: 159
+        CURRENT_PROJECT_VERSION: 160
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Pre-bootstrap captcha probe in connect() calls Go-side
         # wgProbeVKCreds directly from main-app process (the only context
@@ -134,7 +134,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vkturnproxy.app.tunnel
         CODE_SIGN_ENTITLEMENTS: PacketTunnel/PacketTunnel.entitlements
         MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: 159
+        CURRENT_PROJECT_VERSION: 160
         SKIP_INSTALL: YES
         SWIFT_OBJC_BRIDGING_HEADER: PacketTunnel/BridgeHeader.h
         OTHER_LDFLAGS:

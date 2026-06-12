@@ -621,9 +621,16 @@ struct SettingsView: View {
                     .autocapitalization(.none)
                 hint(ConfigValidation.dnsServers(dnsServers))
 
-                TextField("Allowed IPs", text: $allowedIPs)
-                    .autocapitalization(.none)
-                hint(ConfigValidation.allowedIPs(allowedIPs))
+                // "Allowed IPs" was removed from the UI 2026-06-11. It maps to
+                // the WireGuard PEER allowed_ip (cryptokey routing, see
+                // TunnelManager.buildUAPIConfig) — NOT iOS routing (that comes
+                // from includeDefaultRoute in PacketTunnelProvider). Under
+                // includeAllNetworks=true the only correct value is 0.0.0.0/0:
+                // a narrower value makes wireguard-go DROP non-matching traffic
+                // (a blackhole, not split tunnel — iOS forces everything to the
+                // TUN regardless), so the field could only mislead or break. The
+                // value stays pinned at the @AppStorage default 0.0.0.0/0 and
+                // still flows into the WG config + backups/links.
             }
             } // end `if != .srtpWrapA` — WireGuard section hidden in WRAP-A mode
 
