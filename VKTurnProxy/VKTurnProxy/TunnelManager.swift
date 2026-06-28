@@ -261,6 +261,19 @@ class TunnelManager: ObservableObject {
             var savedClientID = ""
             var savedTs: Double = 0
             var savedAttempt: Double = 0
+            // Clear the on-disk cred cache when the auth mode (anon vs cookie/
+            // VKAuth) changed since the last connect: anon and burner creds must
+            // NOT bleed across modes — a burner cred carried into anonymous mode
+            // would DEANONYMIZE it (the okcdn user-id IS the burner account). The
+            // extension loads creds-pool.json on bootstrap, so we delete it here
+            // (main app, before startVPNTunnel) on a mode switch.
+            let curAuthMode = config.useCookieAuth ? "cookie" : "anon"
+            if let last = UserDefaults.standard.string(forKey: "lastConnectAuthMode"), last != curAuthMode {
+                SharedLogger.shared.log("[AppDebug] auth mode changed (\(last) → \(curAuthMode)) — clearing cred cache")
+                try? BackupManager.resetTurnCache()
+            }
+            UserDefaults.standard.set(curAuthMode, forKey: "lastConnectAuthMode")
+
             var seededTURN: (address: String, username: String, password: String)? = nil
 
             if config.useCookieAuth {
