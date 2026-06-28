@@ -509,15 +509,20 @@ struct SettingsView: View {
         Form {
             Section("VK TURN Proxy") {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(vkAuthEnabled ? "VK Call Link(s) — one per line" : "VK Call Link")
+                    Text(vkAuthEnabled
+                         ? "VK Call Link(s) — one per line (currently \(vkLinkLines.count))"
+                         : "VK Call Link")
                         .font(.caption).foregroundColor(.secondary)
                     TextEditor(text: $vkLink)
-                        .frame(minHeight: vkAuthEnabled ? 80 : 38)
+                        .frame(minHeight: vkAuthEnabled ? 110 : 38)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                 }
                 if vkAuthEnabled {
-                    Text("VKAuth uses ALL lines: each call link adds 2 TURN relays (~20 connections). The first line is also the call used by anonymous mode.")
+                    let n = vkLinkLines.count
+                    Text(n == 0
+                         ? "Add at least one call link (one per line). Each adds 2 TURN relays (~20 connections); the first line is also anonymous mode."
+                         : "\(n) link\(n == 1 ? "" : "s") → \(n * 2) TURN relays, up to \(cookieConnCap) connections. First line is also the anonymous-mode call.")
                         .font(.caption2).foregroundColor(.secondary)
                 }
                 hint(ConfigValidation.vkLink(vkLinkPrimary))
