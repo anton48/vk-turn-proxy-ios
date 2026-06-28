@@ -1181,7 +1181,7 @@ struct StatsView: View {
                     // dead creds and the grower can't refresh them
                     // (typically PoW rate-limited).
                     title: "Pool",
-                    value: "\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolWithCreds)/\(tunnel.stats.credPoolSize)",
+                    value: "\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolWithCreds)/\(tunnel.stats.credPoolSize)/\(tunnel.stats.credPoolDistinctRelays)",
                     sub: nil
                 )
             }

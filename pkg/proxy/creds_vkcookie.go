@@ -56,14 +56,24 @@ var (
 	cookieAuthFatal   atomic.Value // string — non-empty when the cookie was rejected/expired (re-login required)
 	cookieLinksStore  atomic.Value // []string — call-link IDs for the multi-relay cookie pool
 
-	cookieMu    sync.Mutex
-	cookieCache = map[string]*cookieCachedCred{} // linkID -> last successful mint (multi-relay)
+	cookieMu          sync.Mutex
+	cookieCache       = map[string]*cookieCachedCred{} // linkID -> last successful mint (multi-relay)
+	cookieRelayList   []cookieRelayRef                 // deduped, ordered DISTINCT relay addrs (slot s -> [s])
+	cookieRelaySeen   = map[string]bool{}              // relay-address dedup set
+	cookieDiscoverIdx int                              // # call links already minted for relay discovery
 )
 
 // cookieCachedCred caches one call's minted (multi-relay) cred so both of its
 // relays are served from a single mint until the cred nears expiry.
 type cookieCachedCred struct {
 	creds *TURNCreds
+}
+
+// cookieRelayRef pins a distinct TURN relay address to the call link that
+// provides it (used to mint/refresh that relay's cred).
+type cookieRelayRef struct {
+	address string
+	linkID  string
 }
 
 // ErrCookieRejected signals that the logged-in cookie is no longer accepted by
@@ -91,6 +101,9 @@ func SetVKCookieAuth(enabled bool, cookieHeader string, links []string) {
 	cookieLinksStore.Store(norm)
 	cookieMu.Lock()
 	cookieCache = map[string]*cookieCachedCred{}
+	cookieRelayList = nil
+	cookieRelaySeen = map[string]bool{}
+	cookieDiscoverIdx = 0
 	cookieMu.Unlock()
 }
 
@@ -114,13 +127,15 @@ func cookieLinkID(s string) string {
 	return id
 }
 
-// cookieCredForSlot returns a SINGLE-relay TURN cred for pool slot `slot`,
-// mapping slot -> (call link, relay) deterministically: link = (slot/2) over the
-// configured links, relay = slot%2 (2 relays per call, observed). This makes each
-// slot stably hold one (okcdn_userid, relay) bucket — each its own ~10-allocation
-// quota (2026-06-28 finding) — so the pool spreads conns across relays instead of
-// hammering one. Mints lazily per link and caches the multi-relay result (one mint
-// serves both relays); re-mints when the cached cred nears expiry. NO captcha.
+// cookieCredForSlot returns a SINGLE-relay TURN cred for pool slot `slot`. It
+// discovers the set of DISTINCT relay addresses across the configured call links
+// (minting each call once — its relays are stable across re-mints — and deduping
+// by address), then maps slot s -> the s-th distinct relay. This guarantees no
+// two slots share a (okcdn_userid, relay) bucket (each its own ~10-allocation
+// quota; 2026-06-28 finding), even if okcdn hands overlapping relays across calls
+// or fewer than 2 per call. If there are fewer distinct relays than slot+1, the
+// slot is left unfilled with a clear error (instead of a 486 collision). Mints
+// are cached per link and re-minted near expiry. NO captcha.
 func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
 	ch := vkCookieHeader()
 	if ch == "" {
@@ -133,12 +148,46 @@ func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
 	if slot < 0 {
 		slot = 0
 	}
-	linkIdx := (slot / 2) % len(links)
-	relayIdx := slot % 2
-	linkID := links[linkIdx]
 
 	cookieMu.Lock()
 	defer cookieMu.Unlock()
+
+	// Discover distinct relays lazily until we have more than `slot` of them, or
+	// every call link has been minted (no more relays to find).
+	for len(cookieRelayList) <= slot && cookieDiscoverIdx < len(links) {
+		linkID := links[cookieDiscoverIdx]
+		cookieDiscoverIdx++
+		creds, err := cookieMintCachedLocked(ctx, linkID, ch)
+		if err != nil {
+			return nil, err
+		}
+		for _, addr := range creds.Addresses {
+			if addr != "" && !cookieRelaySeen[addr] {
+				cookieRelaySeen[addr] = true
+				cookieRelayList = append(cookieRelayList, cookieRelayRef{address: addr, linkID: linkID})
+			}
+		}
+	}
+	if slot >= len(cookieRelayList) {
+		return nil, fmt.Errorf("cookie auth: only %d distinct TURN relay(s) from %d call link(s) — slot %d unfilled (add more/different calls, or lower Connections)", len(cookieRelayList), len(links), slot)
+	}
+
+	ref := cookieRelayList[slot]
+	creds, err := cookieMintCachedLocked(ctx, ref.linkID, ch)
+	if err != nil {
+		return nil, err
+	}
+	return &TURNCreds{
+		Username:  creds.Username,
+		Password:  creds.Password,
+		Address:   ref.address,
+		Addresses: []string{ref.address},
+	}, nil
+}
+
+// cookieMintCachedLocked returns the cached (or freshly minted) multi-relay cred
+// for a call link; re-mints when the cached cred nears expiry. Caller holds cookieMu.
+func cookieMintCachedLocked(ctx context.Context, linkID, ch string) (*TURNCreds, error) {
 	cc := cookieCache[linkID]
 	if cc == nil || cc.creds == nil || cookieCredStale(cc.creds) {
 		creds, err := getVKCredsViaCookies(ctx, linkID, ch)
@@ -148,17 +197,7 @@ func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
 		cc = &cookieCachedCred{creds: creds}
 		cookieCache[linkID] = cc
 	}
-	addrs := cc.creds.Addresses
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("cookie auth: minted cred has no relays")
-	}
-	addr := addrs[relayIdx%len(addrs)]
-	return &TURNCreds{
-		Username:  cc.creds.Username,
-		Password:  cc.creds.Password,
-		Address:   addr,
-		Addresses: []string{addr},
-	}, nil
+	return cc.creds, nil
 }
 
 // cookieCredStale reports whether a cached cookie cred is within the pool's

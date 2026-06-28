@@ -132,6 +132,7 @@ type Stats struct {
 	CredPoolFilled    int32 `json:"cred_pool_filled"`     // slots usable for NEW conns (fresh: cred present, not expiring within 30 min, not pending, not saturated)
 	CredPoolWithCreds int32 `json:"cred_pool_with_creds"` // slots physically holding a cred — superset of CredPoolFilled. Diverges when a cred crosses the 30-min expiry buffer: drops out of "fresh", but existing conns on it stay alive until VK-side allocation expires
 	CredPoolSize      int32 `json:"cred_pool_size"`       // total cred pool capacity
+	CredPoolDistinctRelays int32 `json:"cred_pool_distinct_relays"` // distinct TURN relay addresses held across filled slots (4th "Pool" number)
 	TunnelUptimeSec   int64 `json:"tunnel_uptime_sec"`    // seconds since the proxy instance was created — the iOS UI uses this to render Uptime independent of main-app lifecycle (resists jetsam-respawn of the main app while extension keeps running)
 	CaptchaImageURL  string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
 	CaptchaSID       string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
@@ -1564,6 +1565,7 @@ func (p *Proxy) GetStats() Stats {
 		captchaSID = v.(string)
 	}
 	poolFresh, poolWithCreds, poolSize := p.credPool.snapshotSize()
+	distinctRelays := p.credPool.distinctRelays()
 	return Stats{
 		TxBytes:           p.txBytes.Load(),
 		RxBytes:           p.rxBytes.Load(),
@@ -1575,6 +1577,7 @@ func (p *Proxy) GetStats() Stats {
 		CredPoolFilled:    int32(poolFresh),
 		CredPoolWithCreds: int32(poolWithCreds),
 		CredPoolSize:      int32(poolSize),
+		CredPoolDistinctRelays: int32(distinctRelays),
 		TunnelUptimeSec:   int64(time.Since(p.startedAt).Seconds()),
 		CaptchaImageURL:   captchaURL,
 		CaptchaSID:        captchaSID,

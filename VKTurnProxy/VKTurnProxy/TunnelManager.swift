@@ -35,6 +35,10 @@ struct TunnelStats: Codable {
     // misled the user into thinking the pool was healthier than it was.
     var credPoolWithCreds: Int32 = 0
     var credPoolSize: Int32 = 0
+    // Distinct TURN relay addresses held across the pool's filled slots — the 4th
+    // "Pool" number. Each relay is an independent ~10-allocation quota bucket, so
+    // this is the real spread (esp. in cookie/VKAuth mode).
+    var credPoolDistinctRelays: Int32 = 0
     // Seconds since the extension's Proxy was created. Source of truth
     // for the StatsView Uptime box — see fetchStats where it gets
     // converted to a Date origin for the live ticker. Authoritative
@@ -58,6 +62,7 @@ struct TunnelStats: Codable {
         case credPoolFilled = "cred_pool_filled"
         case credPoolWithCreds = "cred_pool_with_creds"
         case credPoolSize = "cred_pool_size"
+        case credPoolDistinctRelays = "cred_pool_distinct_relays"
         case tunnelUptimeSec = "tunnel_uptime_sec"
         case captchaImageURL = "captcha_image_url"
         case captchaSID = "captcha_sid"

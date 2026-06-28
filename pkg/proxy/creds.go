@@ -2586,6 +2586,23 @@ func (cp *credPool) snapshotSize() (available int, withUsableCreds int, size int
 	return
 }
 
+// distinctRelays counts the number of DISTINCT TURN relay addresses currently
+// held across the pool's filled slots — i.e. how many independent
+// (per-(userid,relay)≈10) quota buckets the conns are spread over. Surfaced as
+// the 4th "Pool" stat: the whole point in cookie/VKAuth mode, and harmless/
+// informative in anonymous mode.
+func (cp *credPool) distinctRelays() int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	seen := make(map[string]struct{})
+	for i := range cp.pool {
+		if cp.pool[i].creds != nil && cp.pool[i].addr != "" {
+			seen[cp.pool[i].addr] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
 // isFreshLocked assumes cp.mu is held. A slot is fresh iff it holds creds
 // AND those creds will still be valid on VK's TURN server credExpiryBuffer
 // from now (see parseCredExpiry for the expiry source).
