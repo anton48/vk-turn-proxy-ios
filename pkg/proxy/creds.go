@@ -127,6 +127,27 @@ func (e *CaptchaRequiredError) Error() string {
 	return fmt.Sprintf("captcha required: %s", e.ImageURL)
 }
 
+// CallUnavailableError is a NON-retryable VK error about the call/link itself
+// (ended by the organizer, deleted, or an invalid join link) — as opposed to a
+// captcha / rate-limit / transient network problem. When GetVKCreds sees one it
+// STOPS immediately: no other client_id, no captcha, no free→legacy fallback —
+// and surfaces Message (VK's error_msg) to the user. Contrast error_code 14
+// "Captcha need" (retryable). Recognised by fatalCallError: the 9xxx range on
+// the legacy calls.getAnonymousToken path (9000 "Call not found", 9008 "Join
+// link is not valid", …) and the VK Calls free path's 95x block (951 "Call not
+// found", 954 "Invalid join link").
+type CallUnavailableError struct {
+	Code    int
+	Message string
+}
+
+func (e *CallUnavailableError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("call unavailable: %s (VK error %d)", e.Message, e.Code)
+	}
+	return fmt.Sprintf("call unavailable (VK error %d)", e.Code)
+}
+
 // TURNCreds holds TURN server credentials.
 //
 // Address vs Addresses: VK's vchat.joinConversationByLink response includes
@@ -224,6 +245,13 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 			log.Printf("vk: success via VK Calls captcha-free path")
 			return creds, nil
 		}
+		// A fatal call/link error (ended, deleted, invalid link) hits the legacy
+		// path identically — don't waste a captcha solve on it, stop now and
+		// surface the VK message.
+		if cu, ok := err.(*CallUnavailableError); ok {
+			log.Printf("vk: VK Calls path — call unavailable (VK error %d: %s), not falling back", cu.Code, cu.Message)
+			return nil, err
+		}
 		log.Printf("vk: VK Calls path failed, falling back to legacy: %v", err)
 	}
 
@@ -320,6 +348,11 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 			}
 			// If it's a CaptchaRequiredError (needs WebView), return immediately — don't try other client_ids
 			if _, isCaptcha := err.(*CaptchaRequiredError); isCaptcha {
+				return nil, err
+			}
+			// A fatal call/link error (call ended/deleted, invalid link) won't be
+			// fixed by another client_id — return immediately with the VK message.
+			if _, isCallErr := err.(*CallUnavailableError); isCallErr {
 				return nil, err
 			}
 			log.Printf("vk: failed with client_id=%s: %v", vc.ClientID, err)
@@ -661,6 +694,14 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			log.Printf("vk: WebView captcha solver returned answer (%d chars), retrying", len(answer))
 			step2Data = buildCaptchaRetry(currentSID, answer, currentTs, currentAttempt)
 			continue
+		}
+
+		// Non-retryable call/link error (9xxx "Call not found" / "Join link is
+		// not valid", …) — VK reached us fine, the call itself is gone. Stop and
+		// surface the VK message instead of failing the token parse below.
+		if fatal := fatalCallError(resp); fatal != nil {
+			log.Printf("vk: step2 call unavailable (VK error %d: %s) — not retrying", fatal.Code, fatal.Message)
+			return nil, fatal
 		}
 
 		token2, err = extractStr(resp, "response", "token")
@@ -2838,6 +2879,33 @@ func (cp *credPool) countWithCredsLocked() int {
 		}
 	}
 	return n
+}
+
+// fatalCallError inspects a VK API error object and returns a CallUnavailableError
+// if the error_code denotes a NON-retryable call/link problem, else nil. VK uses
+// different code spaces per API family, so we accept both:
+//   - calls.getAnonymousToken (legacy path): the 9xxx range — 9000 "Call not
+//     found", 9008 "Join link is not valid", … all call-scoped and non-retryable
+//     (as opposed to 14 "Captcha need").
+//   - messages.getCallPreview / getAnonymCallToken (VK Calls free path): the 95x
+//     block — 951 "Call not found", 954 "Invalid join link". Caught here BEFORE
+//     the legacy fallback so we never solve a captcha for a doomed call/link.
+// error_msg is passed through as the user-facing Message.
+func fatalCallError(resp map[string]interface{}) *CallUnavailableError {
+	errObj, ok := resp["error"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	codeF, _ := errObj["error_code"].(float64)
+	code := int(codeF)
+	switch {
+	case code == 951, code == 954: // VK Calls free path: Call not found / Invalid join link
+	case code >= 9000 && code <= 9999: // legacy calls.getAnonymousToken: 9xxx call-domain
+	default:
+		return nil
+	}
+	msg, _ := errObj["error_msg"].(string)
+	return &CallUnavailableError{Code: code, Message: msg}
 }
 
 // extractCaptcha checks if a VK API response contains error code 14 (captcha required).

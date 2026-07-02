@@ -330,6 +330,10 @@ class TunnelManager: ObservableObject {
                     SharedLogger.shared.log("[AppDebug] VKAuth: unexpected captcha in cookie mode — aborting")
                     errorMessage = "Не удалось подключиться (неожиданная капча в режиме VK-аккаунта)."
                     return
+                case .callUnavailable(let code, let msg):
+                    SharedLogger.shared.log("[AppDebug] VKAuth: call unavailable (code=\(code)): \(msg)")
+                    errorMessage = "VK returns error: \(msg)"
+                    return
                 case .error(let msg):
                     SharedLogger.shared.log("[AppDebug] VKAuth: probe error: \(msg)")
                     errorMessage = "Не удалось подключиться: \(msg)"
@@ -432,6 +436,10 @@ class TunnelManager: ObservableObject {
                     // Not expected on the anonymous path; treat as a hard error.
                     SharedLogger.shared.log("[AppDebug] pre-bootstrap: unexpected cookieRejected: \(msg)")
                     errorMessage = "Не удалось подключиться: \(msg)"
+                    return
+                case .callUnavailable(let code, let msg):
+                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: call unavailable (code=\(code)): \(msg)")
+                    errorMessage = "VK returns error: \(msg)"
                     return
                 case .error(let msg):
                     SharedLogger.shared.log("[AppDebug] pre-bootstrap: error: \(msg)")
@@ -1501,6 +1509,7 @@ class TunnelManager: ObservableObject {
         case ok(address: String, username: String, password: String)
         case captcha(url: String, sid: String, ts: Double, attempt: Double, token1: String, clientID: String, isRateLimit: Bool)
         case cookieRejected(message: String)
+        case callUnavailable(code: Int, message: String)
         case error(message: String)
     }
 
@@ -1563,6 +1572,9 @@ class TunnelManager: ObservableObject {
                 let msg = dict["message"] as? String ?? "unknown probe error"
                 if (dict["cookie_rejected"] as? Bool) == true {
                     return .cookieRejected(message: msg)
+                }
+                if (dict["call_unavailable"] as? Bool) == true {
+                    return .callUnavailable(code: dict["code"] as? Int ?? 0, message: msg)
                 }
                 return .error(message: msg)
             }

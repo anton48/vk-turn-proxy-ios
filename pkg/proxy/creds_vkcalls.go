@@ -172,6 +172,10 @@ func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
 			CaptchaTs: captchaTs, CaptchaAttempt: captchaAttempt,
 		}
 	}
+	if fatal := fatalCallError(resp2); fatal != nil {
+		log.Printf("vkcalls: step2 call unavailable (VK error %d: %s) — not falling back to legacy", fatal.Code, fatal.Message)
+		return nil, fatal
+	}
 	userIDFloat, err := extractFloatFromResp(resp2, "response", "user_id")
 	if err != nil {
 		return nil, fmt.Errorf("vkcalls step2 parse user_id: %w (resp: %v)", err, truncResp(resp2))
@@ -201,6 +205,10 @@ func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
 			ImageURL: captchaImg, SID: captchaSID,
 			CaptchaTs: captchaTs, CaptchaAttempt: captchaAttempt,
 		}
+	}
+	if fatal := fatalCallError(resp3); fatal != nil {
+		log.Printf("vkcalls: step3 call unavailable (VK error %d: %s) — not falling back to legacy", fatal.Code, fatal.Message)
+		return nil, fatal
 	}
 	okAnonymToken, err := extractStrFromResp(resp3, "response", "token")
 	if err != nil {

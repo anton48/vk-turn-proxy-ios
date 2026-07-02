@@ -998,6 +998,14 @@ func wgProbeVKCreds(linkID, vkHostIPsJSON, savedSID, savedKey, savedToken1, save
 			resp["token1"] = cerr.Token1
 			resp["client_id"] = cerr.ClientID
 			resp["is_rate_limit"] = cerr.IsRateLimit
+		} else if cuerr, ok := err.(*proxy.CallUnavailableError); ok {
+			// Non-retryable VK call/link error (call ended/deleted, invalid
+			// link). Swift shows a "проблема со звонком" message + stops, instead
+			// of the generic "не удалось подключиться".
+			resp["status"] = "error"
+			resp["message"] = cuerr.Message
+			resp["call_unavailable"] = true
+			resp["code"] = cuerr.Code
 		} else {
 			resp["status"] = "error"
 			resp["message"] = err.Error()
