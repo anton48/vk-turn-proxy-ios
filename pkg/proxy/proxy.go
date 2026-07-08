@@ -117,6 +117,20 @@ type Config struct {
 	// generates+persists one). Empty → NewProxy generates a random UUID for
 	// this session.
 	DeviceID string
+
+	// UseWrapS enables the "SRTP-WRAP-S" mode — the same DTLS-over-TURN wrap
+	// data path as SRTP-WRAP (UseWrap) but the obf codec is chosen by ObfProfile
+	// and a Client-ID record is sent first inside DTLS, for interop with
+	// samosvalishe/free-turn-proxy. Mutually exclusive with UseWrap; the
+	// existing SRTP-WRAP (UseWrap) path is left byte-for-byte unchanged.
+	UseWrapS bool
+	// ObfProfile selects the SRTP-WRAP-S obf codec: "rtpopus" | "rtpopus2" |
+	// "rtpopus3" (see wraps.go). Only consulted when UseWrapS is true.
+	ObfProfile string
+	// ClientID is the free-turn-proxy Client-ID sent as the first DTLS app
+	// record on every SRTP-WRAP-S stream (server allowlist key; read+ignored
+	// unless the server runs -clients-file). Only used when UseWrapS.
+	ClientID string
 }
 
 // Stats holds live tunnel statistics.
@@ -2195,6 +2209,20 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	p.totalConns.Add(1)
 	defer p.activeConns.Add(-1)
 
+	// SRTP-WRAP-S: send the free-turn-proxy Client-ID as the FIRST DTLS app
+	// record, before any WireGuard payload. The server always reads exactly one
+	// such record after the handshake; skipping it desyncs the stream. The wrap
+	// layer (runTURN) is already active here, so this record is obf-wrapped like
+	// any other. No-op for every other mode. See wraps.go / WriteClientID.
+	if p.config.UseWrapS {
+		if cerr := WriteClientID(dtlsConn, p.config.ClientID); cerr != nil {
+			log.Printf("proxy: [conn %d] runDTLSSession: WriteClientID failed: %v", connIdx, cerr)
+			dtlsConn.Close()
+			return fmt.Errorf("write client-id: %w", cerr)
+		}
+		log.Printf("proxy: [conn %d] SRTP-WRAP-S: sent Client-ID (%d bytes, profile=%s)", connIdx, len(p.config.ClientID), p.config.ObfProfile)
+	}
+
 	// Signal ready
 	if readyCh != nil && !*signaled {
 		select {
@@ -3289,6 +3317,21 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		}
 	}
 
+	// SRTP-WRAP-S (samosvalishe/free-turn-proxy): same wrap layer, but the codec
+	// is chosen by obf-profile (rtpopus/rtpopus2/rtpopus3). Parallel to the
+	// useWrap branch above so the existing SRTP-WRAP path is untouched. The
+	// Client-ID record is sent inside DTLS in runDTLSSession, not here.
+	useWrapS := p.config.UseWrapS
+	var wcs WrapCodec
+	if useWrapS {
+		var werr error
+		wcs, werr = NewWrapCodec(p.config.ObfProfile, p.config.WrapKey, false)
+		if werr != nil {
+			log.Printf("proxy: [conn %d] runTURN: wrap-S init failed: %v — disabling WRAP-S for this conn", connIdx, werr)
+			useWrapS = false
+		}
+	}
+
 	// conn2 → relay
 	// No select{default} polling — context cancellation is handled via deadline
 	// set in context.AfterFunc above, which unblocks ReadFrom.
@@ -3302,6 +3345,9 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		var wireBuf []byte
 		if useWrap {
 			wireBuf = make([]byte, wrapMaxWire(1600))
+		}
+		if useWrapS {
+			wireBuf = make([]byte, wcs.Overhead()+1600)
 		}
 		for {
 			n, addr, err := conn2.ReadFrom(buf)
@@ -3317,6 +3363,14 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 				wn, werr := wc.wrapInto(wireBuf, buf[:n])
 				if werr != nil {
 					log.Printf("proxy: [conn %d] runTURN conn2→relay: wrap error: %v", connIdx, werr)
+					return
+				}
+				out = wireBuf[:wn]
+			}
+			if useWrapS {
+				wn, werr := wcs.WrapInto(wireBuf, buf[:n])
+				if werr != nil {
+					log.Printf("proxy: [conn %d] runTURN conn2→relay: wrap-S error: %v", connIdx, werr)
 					return
 				}
 				out = wireBuf[:wn]
@@ -3354,6 +3408,9 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		if useWrap {
 			readBufLen += wrapOverhead
 		}
+		if useWrapS {
+			readBufLen += wcs.Overhead()
+		}
 		buf := make([]byte, readBufLen)
 		// Plaintext destination buffer for unwrap. Sized for the same
 		// 1600-byte upper bound conn2 expects to see.
@@ -3374,6 +3431,14 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 					// Drop and continue rather than tearing down the TURN
 					// session for one bad packet — typically just a stray
 					// from before the WRAP-side server (or wrong key) was up.
+					continue
+				}
+				payload = plain[:m]
+			}
+			if useWrapS {
+				m, werr := wcs.UnwrapPacket(buf[:n], plain)
+				if werr != nil {
+					log.Printf("proxy: [conn %d] runTURN relay→conn2: unwrap-S error: %v (n=%d)", connIdx, werr, n)
 					continue
 				}
 				payload = plain[:m]

@@ -1387,6 +1387,13 @@ class TunnelManager: ObservableObject {
             dict["wrap_a_password"] = config.wrapAPassword
             dict["device_id"] = wrapADeviceID()
         }
+        // SRTP-WRAP-S (samosvalishe/free-turn-proxy): obf profile + Client-ID on
+        // the SRTP+WRAP data path. wrap_key_hex is already set above.
+        if config.useWrapS {
+            dict["use_wrap_s"] = true
+            dict["obf_profile"] = config.obfProfile
+            dict["client_id"] = config.clientID
+        }
         if !vkHostIPs.isEmpty {
             dict["vk_host_ips"] = vkHostIPs
         }
@@ -1703,6 +1710,12 @@ struct TunnelConfig {
     // Shared secret for WRAP-A: HKDF input for the obfuscation key AND GETCONF
     // authentication. One field. Required when useWrapA=true.
     var wrapAPassword: String = ""
+    // SRTP-WRAP-S (samosvalishe/free-turn-proxy interop): obf-profile
+    // (rtpopus/rtpopus2/rtpopus3) + a Client-ID record over the SRTP+WRAP data
+    // path. Reuses wrapKeyHex as the shared key; the user still enters WG keys.
+    var useWrapS: Bool = false
+    var obfProfile: String = "rtpopus"
+    var clientID: String = ""
     // 2026-05-18 empirical: VK's new per-cred TURN allocation-rate
     // throttle (introduced ~16:00 MSK that day) applies ONLY to UDP-
     // transport allocations. 11×10 = 110 TCP-control allocations on a

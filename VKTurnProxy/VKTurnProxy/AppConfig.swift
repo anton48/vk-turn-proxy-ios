@@ -126,6 +126,11 @@ struct AppSettings: Codable {
     /// in the backup — they live in the Keychain (VKCookieStore). Optional +
     /// `var` so Codable decodes it (nil-preserve on import). Default nil.
     var vkAuth: Bool? = nil
+    // SRTP-WRAP-S (samosvalishe/free-turn-proxy). `var ... = nil` like vkAuth so
+    // old backups/links decode and importers don't force the mode when absent.
+    var useWrapS: Bool? = nil
+    var obfProfile: String? = nil
+    var clientID: String? = nil
 }
 
 // MARK: - 1-Click Connection Link
@@ -236,4 +241,9 @@ struct ConnectionSettings: Codable {
     // synthesised memberwise init defaults it (existing construction sites — e.g.
     // parseWdttLink — stay unchanged).
     var vkAuth: Bool? = nil
+    // SRTP-WRAP-S (samosvalishe/free-turn-proxy). `var ... = nil` like vkAuth so
+    // old backups/links decode and importers don't force the mode when absent.
+    var useWrapS: Bool? = nil
+    var obfProfile: String? = nil
+    var clientID: String? = nil
 }

@@ -47,6 +47,12 @@ struct ContentView: View {
     // WireGuard keys/address are server-provisioned (no WG fields needed).
     @AppStorage("useWrapA") private var useWrapA = false
     @AppStorage("wrapAPassword") private var wrapAPassword = ""
+    // useWrapS / obfProfile / clientID: the 5th "SRTP-WRAP-S" mode
+    // (samosvalishe/free-turn-proxy interop). Same DTLS+WG data path as
+    // SRTP+WRAP but with a selectable obf profile + a Client-ID record.
+    @AppStorage("useWrapS") private var useWrapS = false
+    @AppStorage("obfProfile") private var obfProfile = "rtpopus"
+    @AppStorage("clientID") private var clientID = ""
     // useUDP toggles TURN control transport: UDP (true) vs TCP (false,
     // default). Surfaced in Settings build 128. TCP-control bypasses
     // VK's per-cred allocation-rate throttle introduced 2026-05-18 —
@@ -83,7 +89,7 @@ struct ContentView: View {
             issues.append(ConfigValidation.tunnelAddress(tunnelAddress))
             // SRTP+WRAP (mode precedence: not WRAP-A, not SRTP, WRAP on) also
             // needs the hex key.
-            if !useSrtp && useWrap {
+            if (!useSrtp && useWrap) || useWrapS {
                 issues.append(ConfigValidation.wrapKeyHex(wrapKeyHex))
             }
         }
@@ -195,6 +201,9 @@ struct ContentView: View {
                                 useSrtp: useSrtp,
                                 useWrapA: useWrapA,
                                 wrapAPassword: wrapAPassword,
+                                useWrapS: useWrapS,
+                                obfProfile: obfProfile,
+                                clientID: clientID,
                                 useUDP: useUDP,
                                 forceLegacyCaptcha: UserDefaults.standard.bool(forKey: "forceLegacyCaptcha"),
                                 useCookieAuth: UserDefaults.standard.bool(forKey: "VKAuth"),
@@ -345,6 +354,11 @@ enum ServerMode: Int, CaseIterable, Identifiable {
     // pair is already saturated). NOT SRTP despite the grouping — WRAP-A
     // RTP-obfs → plain DTLS → GETCONF auto-provisioning → WireGuard.
     case srtpWrapA = 3
+    // srtpWrapS: interop with samosvalishe/free-turn-proxy. Gated by the
+    // @AppStorage("useWrapS") flag; carries an obf-profile (rtpopus/rtpopus2/
+    // rtpopus3) + a Client-ID record inside DTLS. Same DTLS+WireGuard data path
+    // as SRTP+WRAP (the user still enters WG keys), just a richer obf layer.
+    case srtpWrapS = 4
 
     var id: Int { rawValue }
 
@@ -354,6 +368,7 @@ enum ServerMode: Int, CaseIterable, Identifiable {
         case .srtp: return "SRTP"
         case .srtpWrap: return "SRTP+WRAP"
         case .srtpWrapA: return "SRTP-WRAP-A"
+        case .srtpWrapS: return "SRTP-WRAP-S"
         }
     }
 }
@@ -397,6 +412,12 @@ struct SettingsView: View {
     // WireGuard keys/address are server-provisioned (no WG fields needed).
     @AppStorage("useWrapA") private var useWrapA = false
     @AppStorage("wrapAPassword") private var wrapAPassword = ""
+    // useWrapS / obfProfile / clientID: the 5th "SRTP-WRAP-S" mode
+    // (samosvalishe/free-turn-proxy interop). Same DTLS+WG data path as
+    // SRTP+WRAP but with a selectable obf profile + a Client-ID record.
+    @AppStorage("useWrapS") private var useWrapS = false
+    @AppStorage("obfProfile") private var obfProfile = "rtpopus"
+    @AppStorage("clientID") private var clientID = ""
     // useUDP toggles TURN control transport: UDP (true) vs TCP (false,
     // default). Surfaced in Settings build 128. TCP-control bypasses
     // VK's per-cred allocation-rate throttle introduced 2026-05-18 —
@@ -457,6 +478,7 @@ struct SettingsView: View {
     private var serverModeBinding: Binding<ServerMode> {
         Binding(
             get: {
+                if useWrapS { return .srtpWrapS }
                 if useWrapA { return .srtpWrapA }
                 if useSrtp { return .srtp }
                 if useWrap { return .srtpWrap }
@@ -465,21 +487,32 @@ struct SettingsView: View {
             set: { newMode in
                 switch newMode {
                 case .legacy:
+                    useWrapS = false
                     useWrapA = false
                     useSrtp = false
                     useWrap = false
                 case .srtp:
+                    useWrapS = false
                     useWrapA = false
                     useSrtp = true
                     useWrap = false
                 case .srtpWrap:
+                    useWrapS = false
                     useWrapA = false
                     useSrtp = false
                     useWrap = true
                 case .srtpWrapA:
+                    useWrapS = false
                     useWrapA = true
                     useSrtp = false
                     useWrap = false
+                case .srtpWrapS:
+                    useWrapA = false
+                    useSrtp = false
+                    useWrap = false
+                    useWrapS = true
+                    // Stable Client-ID, generated once on first selection.
+                    if clientID.isEmpty { clientID = UUID().uuidString }
                 }
             }
         )
@@ -634,6 +667,25 @@ struct SettingsView: View {
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                     hint(ConfigValidation.wrapAPassword(wrapAPassword))
+                }
+
+                // SRTP-WRAP-S (samosvalishe/free-turn-proxy): a shared WRAP key
+                // (same as SRTP+WRAP), an obfuscation profile, and a Client-ID
+                // sent as the first DTLS record (server allowlist key; auto-
+                // generated once). WireGuard keys are entered below as usual.
+                if serverModeBinding.wrappedValue == .srtpWrapS {
+                    SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                    hint(ConfigValidation.wrapKeyHex(wrapKeyHex))
+                    Picker("Obfuscation profile", selection: $obfProfile) {
+                        Text("rtpopus").tag("rtpopus")
+                        Text("rtpopus2").tag("rtpopus2")
+                        Text("rtpopus3").tag("rtpopus3")
+                    }
+                    TextField("Client ID", text: $clientID)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
                 }
 
                 // TURN control transport: UDP (true) vs TCP (false /

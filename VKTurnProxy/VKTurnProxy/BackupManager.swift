@@ -73,47 +73,57 @@ enum BackupManager {
     /// fresh install or a Reset TURN Cache.
     static func currentConfig() -> AppConfig {
         let d = UserDefaults.standard
+        // Every value is pre-computed into a local so the AppSettings(...) init
+        // below stays a plain list of identifiers — a large init literal with
+        // inline `??`/`as?` expressions makes Swift's type-checker time out.
+        // Defaults must match SettingsView's @AppStorage defaults (UserDefaults
+        // returns nil for unset keys); `object(forKey:) as? Bool` distinguishes
+        // "explicitly false" from "never set".
+        let privateKey = d.string(forKey: "privateKey") ?? ""
+        let peerPublicKey = d.string(forKey: "peerPublicKey") ?? ""
+        let presharedKey = d.string(forKey: "presharedKey") ?? ""
+        let tunnelAddress = d.string(forKey: "tunnelAddress") ?? "192.168.102.3/24"
+        let dnsServers = d.string(forKey: "dnsServers") ?? "1.1.1.1"
+        let allowedIPs = d.string(forKey: "allowedIPs") ?? "0.0.0.0/0"
+        let vkLink = d.string(forKey: "vkLink") ?? ""
+        let peerAddress = d.string(forKey: "peerAddress") ?? ""
+        let useDTLS = (d.object(forKey: "useDTLS") as? Bool) ?? true
+        let numConnections = (d.object(forKey: "numConnections") as? Int) ?? 30
+        let credPoolCooldownSeconds = (d.object(forKey: "credPoolCooldownSeconds") as? Int) ?? 150
+        let useWrap = (d.object(forKey: "useWrap") as? Bool) ?? false
+        let wrapKeyHex = d.string(forKey: "wrapKeyHex") ?? ""
+        let useSrtp = (d.object(forKey: "useSrtp") as? Bool) ?? false
+        let useUDP = (d.object(forKey: "useUDP") as? Bool) ?? false
+        let useWrapA = (d.object(forKey: "useWrapA") as? Bool) ?? false
+        let wrapAPassword = d.string(forKey: "wrapAPassword") ?? ""
+        let wrapSOn = (d.object(forKey: "useWrapS") as? Bool) ?? false
+        let wrapSProfile = d.string(forKey: "obfProfile") ?? "rtpopus"
+        let wrapSClientID = d.string(forKey: "clientID") ?? ""
+        let turnServerOverride = d.string(forKey: "turnServerOverride")
+        let vkAuth = (d.object(forKey: "VKAuth") as? Bool) ?? false
         let settings = AppSettings(
-            privateKey: d.string(forKey: "privateKey") ?? "",
-            peerPublicKey: d.string(forKey: "peerPublicKey") ?? "",
-            presharedKey: d.string(forKey: "presharedKey") ?? "",
-            // Default values must match SettingsView's AppStorage defaults
-            // — UserDefaults.string(forKey:) returns nil for unset keys
-            // (unlike @AppStorage which returns the default). Using the
-            // same defaults here ensures the export captures the in-app
-            // state even if the user never opened Settings.
-            tunnelAddress: d.string(forKey: "tunnelAddress") ?? "192.168.102.3/24",
-            dnsServers: d.string(forKey: "dnsServers") ?? "1.1.1.1",
-            allowedIPs: d.string(forKey: "allowedIPs") ?? "0.0.0.0/0",
-            vkLink: d.string(forKey: "vkLink") ?? "",
-            peerAddress: d.string(forKey: "peerAddress") ?? "",
-            // Bool defaults: UserDefaults.bool(forKey:) returns false for
-            // unset, but useDTLS defaults to true in @AppStorage. Use
-            // object(forKey:) to distinguish "set to false" from "unset".
-            useDTLS: (d.object(forKey: "useDTLS") as? Bool) ?? true,
-            numConnections: (d.object(forKey: "numConnections") as? Int) ?? 30,
-            credPoolCooldownSeconds: (d.object(forKey: "credPoolCooldownSeconds") as? Int) ?? 150,
-            // WRAP defaults match SettingsView's @AppStorage defaults
-            // (false / empty). Same object(forKey:) trick as useDTLS to
-            // distinguish "explicitly set false" from "never set" — though
-            // for a default of false the difference is invisible, the
-            // pattern stays consistent with surrounding code.
-            useWrap: (d.object(forKey: "useWrap") as? Bool) ?? false,
-            wrapKeyHex: d.string(forKey: "wrapKeyHex") ?? "",
-            useSrtp: (d.object(forKey: "useSrtp") as? Bool) ?? false,
-            // useUDP default false matches SettingsView's @AppStorage
-            // default — TCP-control was made default in build 109 to
-            // bypass VK's per-cred allocation-rate throttle.
-            useUDP: (d.object(forKey: "useUDP") as? Bool) ?? false,
-            // WRAP-A (amurcanov interop, 2026-06-03): export the mode +
-            // password so a full backup round-trips it. deviceID is NOT
-            // exported (per-install identity).
-            useWrapA: (d.object(forKey: "useWrapA") as? Bool) ?? false,
-            wrapAPassword: d.string(forKey: "wrapAPassword") ?? "",
-            turnServerOverride: d.string(forKey: "turnServerOverride"),
-            // VKAuth toggle round-trips in full backups (cookies do NOT — they
-            // live in the Keychain, never in the backup JSON).
-            vkAuth: (d.object(forKey: "VKAuth") as? Bool) ?? false
+            privateKey: privateKey,
+            peerPublicKey: peerPublicKey,
+            presharedKey: presharedKey,
+            tunnelAddress: tunnelAddress,
+            dnsServers: dnsServers,
+            allowedIPs: allowedIPs,
+            vkLink: vkLink,
+            peerAddress: peerAddress,
+            useDTLS: useDTLS,
+            numConnections: numConnections,
+            credPoolCooldownSeconds: credPoolCooldownSeconds,
+            useWrap: useWrap,
+            wrapKeyHex: wrapKeyHex,
+            useSrtp: useSrtp,
+            useUDP: useUDP,
+            useWrapA: useWrapA,
+            wrapAPassword: wrapAPassword,
+            turnServerOverride: turnServerOverride,
+            vkAuth: vkAuth,
+            useWrapS: wrapSOn,
+            obfProfile: wrapSProfile,
+            clientID: wrapSClientID
         )
 
         var turnPool: CredCacheFile? = nil
@@ -245,6 +255,9 @@ enum BackupManager {
         // WRAP-A (amurcanov interop): same nil-preserves-default pattern.
         if let v = s.useWrapA { d.set(v, forKey: "useWrapA") }
         if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
+        if let v = s.useWrapS { d.set(v, forKey: "useWrapS") }
+        if let v = s.obfProfile { d.set(v, forKey: "obfProfile") }
+        if let v = s.clientID { d.set(v, forKey: "clientID") }
         if let v = s.turnServerOverride { d.set(v, forKey: "turnServerOverride") }
         // forceLegacyCaptcha: undocumented on-device captcha-test toggle
         // (build 149) — same nil-preserves-default pattern.
@@ -546,19 +559,25 @@ enum BackupManager {
         // precedence (bug observed 2026-06-10). So if the link specifies ANY of
         // the three, resolve its intended mode and write all three explicitly
         // (mutual exclusion). A link carrying none of them keeps the current mode.
-        if s.useWrapA != nil || s.useSrtp != nil || s.useWrap != nil {
+        if s.useWrapS != nil || s.useWrapA != nil || s.useSrtp != nil || s.useWrap != nil {
+            let wrapS = s.useWrapS ?? false
             let wrapA = s.useWrapA ?? false
             let srtp  = s.useSrtp ?? false
             let wrap  = s.useWrap ?? false
-            d.set(wrapA, forKey: "useWrapA")
-            d.set(!wrapA && srtp, forKey: "useSrtp")
-            d.set(!wrapA && !srtp && wrap, forKey: "useWrap")
+            // Precedence matches serverModeBinding: useWrapS > useWrapA > useSrtp > useWrap.
+            d.set(wrapS, forKey: "useWrapS")
+            d.set(!wrapS && wrapA, forKey: "useWrapA")
+            d.set(!wrapS && !wrapA && srtp, forKey: "useSrtp")
+            d.set(!wrapS && !wrapA && !srtp && wrap, forKey: "useWrap")
         }
         // useUDP optional in ConnectionSettings (added build 128): nil keeps
         // the device's current value (default false / TCP).
         if let v = s.useUDP { d.set(v, forKey: "useUDP") }
         // wrapAPassword: nil-preserve (only meaningful in WRAP-A mode).
         if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
+        // SRTP-WRAP-S: obf profile + Client-ID nil-preserve (wrapKeyHex above).
+        if let v = s.obfProfile { d.set(v, forKey: "obfProfile") }
+        if let v = s.clientID { d.set(v, forKey: "clientID") }
         if let v = s.turnServerOverride { d.set(v, forKey: "turnServerOverride") }
         if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
         if let v = s.numConnections { d.set(v, forKey: "numConnections") }
@@ -568,7 +587,8 @@ enum BackupManager {
         // useful thing to see in triage.
         let nc = s.numConnections.map(String.init) ?? "(kept default)"
         let dn = s.dnsServers ?? "(kept default)"
-        let mode = d.bool(forKey: "useWrapA") ? "SRTP-WRAP-A"
+        let mode = d.bool(forKey: "useWrapS") ? "SRTP-WRAP-S"
+                 : d.bool(forKey: "useWrapA") ? "SRTP-WRAP-A"
                  : d.bool(forKey: "useSrtp")  ? "SRTP"
                  : d.bool(forKey: "useWrap")  ? "SRTP+WRAP" : "legacy"
         SharedLogger.shared.log("[AppDebug] Backup: applied connection link (peer=\(s.peerAddress), mode=\(mode), numConnections=\(nc), dnsServers=\(dn))")

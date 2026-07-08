@@ -159,6 +159,12 @@ type ProxyConfig struct {
 	// ChaCha20 shared key. Required when UseWrap is true and must
 	// match the server's -wrap-key value exactly.
 	WrapKeyHex          string            `json:"wrap_key_hex"`
+	// SRTP-WRAP-S (samosvalishe/free-turn-proxy interop): UseWrapS turns on the
+	// mode; ObfProfile picks the codec ("rtpopus"|"rtpopus2"|"rtpopus3");
+	// ClientID is the first-DTLS-record allowlist id. Shared key = WrapKeyHex.
+	UseWrapS            bool              `json:"use_wrap_s,omitempty"`
+	ObfProfile          string            `json:"obf_profile,omitempty"`
+	ClientID            string            `json:"client_id,omitempty"`
 	// UseSrtp enables the DTLS+SRTP transport (see pkg/proxy/srtpwrap
 	// and proxy.Config.UseSrtp). Requires the peer server to be running
 	// anton48/vk-turn-proxy add-server-srtp-layer with the -srtp flag.
@@ -251,10 +257,14 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	}
 
 	// Create proxy
-	wrapKey, wrapErr := decodeWrapKey(pcfg.UseWrap, pcfg.WrapKeyHex)
+	if pcfg.UseWrapS {
+		pcfg.UseWrap = false // SRTP-WRAP-S and SRTP-WRAP are mutually exclusive
+	}
+	wrapKey, wrapErr := decodeWrapKey(pcfg.UseWrap || pcfg.UseWrapS, pcfg.WrapKeyHex)
 	if wrapErr != nil {
 		log.Printf("wgTurnOnWithTURN: WRAP key invalid: %s — disabling WRAP", wrapErr)
 		pcfg.UseWrap = false
+		pcfg.UseWrapS = false
 	}
 	p := proxy.NewProxy(proxy.Config{
 		PeerAddr:         pcfg.PeerAddr,
@@ -265,6 +275,9 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		UseUDP:           pcfg.UseUDP,
 		UseWrap:          pcfg.UseWrap,
 		WrapKey:          wrapKey,
+		UseWrapS:         pcfg.UseWrapS,
+		ObfProfile:       pcfg.ObfProfile,
+		ClientID:         pcfg.ClientID,
 		UseSrtp:          pcfg.UseSrtp,
 		UseWrapA:         pcfg.UseWrapA,
 		WrapAPassword:    pcfg.WrapAPassword,
@@ -397,10 +410,14 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		credCachePath = filepath.Join(filepath.Dir(logFilePath), "creds-pool.json")
 	}
 
-	wrapKey, wrapErr := decodeWrapKey(pcfg.UseWrap, pcfg.WrapKeyHex)
+	if pcfg.UseWrapS {
+		pcfg.UseWrap = false // SRTP-WRAP-S and SRTP-WRAP are mutually exclusive
+	}
+	wrapKey, wrapErr := decodeWrapKey(pcfg.UseWrap || pcfg.UseWrapS, pcfg.WrapKeyHex)
 	if wrapErr != nil {
 		log.Printf("wgStartVKBootstrap: WRAP key invalid: %s — disabling WRAP", wrapErr)
 		pcfg.UseWrap = false
+		pcfg.UseWrapS = false
 	}
 	p := proxy.NewProxy(proxy.Config{
 		PeerAddr:         pcfg.PeerAddr,
@@ -411,6 +428,9 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		UseUDP:           pcfg.UseUDP,
 		UseWrap:          pcfg.UseWrap,
 		WrapKey:          wrapKey,
+		UseWrapS:         pcfg.UseWrapS,
+		ObfProfile:       pcfg.ObfProfile,
+		ClientID:         pcfg.ClientID,
 		UseSrtp:          pcfg.UseSrtp,
 		UseWrapA:         pcfg.UseWrapA,
 		WrapAPassword:    pcfg.WrapAPassword,

@@ -189,6 +189,16 @@ CONFIG = {
     # keys. peerAddress must be the amurcanov server's host:port. Only vkLink +
     # peerAddress + wrapAPassword are required in this mode.
     # "wrapAPassword":  "REPLACE_ME",
+    # ----- SRTP-WRAP-S (samosvalishe/free-turn-proxy interop) -----
+    # To target a free-turn-proxy server: set useWrapS=True, KEEP the WireGuard
+    # fields above (unlike WRAP-A the user's own WG keys are used), set wrapKeyHex
+    # to the server's -obf-key (64 hex), pick obfProfile to match the server's
+    # -obf-profile, and set clientID (the server's -clients-file allowlist id; any
+    # value if the server runs no allowlist). Emitted explicitly like useWrapA so
+    # the link fully defines the mode.
+    "useWrapS":       False,
+    "obfProfile":     "rtpopus",            # rtpopus | rtpopus2 | rtpopus3
+    "clientID":       "",                   # free-turn-proxy Client-ID
     # ----- TURN server override (optional) -----
     # Force fresh conns onto a specific TURN relay instead of whatever VK
     # returns (disk-cached creds keep their stored address). Uncomment + set
@@ -262,6 +272,17 @@ def validate(settings):
             "ERROR: useWrap=True but wrapKeyHex is not 64 hex chars (32 bytes). "
             "Generate one with: openssl rand -hex 32"
         )
+    if settings.get("useWrapS"):
+        if len(settings.get("wrapKeyHex", "") or "") != 64:
+            raise SystemExit(
+                "ERROR: useWrapS=True but wrapKeyHex is not 64 hex chars (32 bytes). "
+                "It must match the free-turn-proxy server's -obf-key."
+            )
+        if settings.get("obfProfile") not in ("rtpopus", "rtpopus2", "rtpopus3"):
+            raise SystemExit(
+                "ERROR: useWrapS=True requires obfProfile in "
+                "rtpopus|rtpopus2|rtpopus3 (match the server's -obf-profile)."
+            )
 
 
 def build_link(settings):
