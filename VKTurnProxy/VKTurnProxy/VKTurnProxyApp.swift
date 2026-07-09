@@ -32,15 +32,16 @@ struct VKTurnProxyApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                // Capture vkturnproxy:// AND wdtt:// URLs at the WindowGroup
-                // level so cold-launch via URL-tap works regardless of which
-                // page SettingsView is currently on. wdtt:// is amurcanov's
-                // proxy-turn-vk-android link scheme (SRTP-WRAP-A interop) — his
-                // own app doesn't register it, so we're the sole handler. Any
-                // other scheme is ignored here.
+                // Capture vkturnproxy://, wdtt:// AND freeturn:// URLs at the
+                // WindowGroup level so cold-launch via URL-tap works regardless
+                // of which page SettingsView is currently on. wdtt:// is
+                // amurcanov's proxy-turn-vk-android scheme (SRTP-WRAP-A interop);
+                // freeturn:// is samosvalishe's free-turn-proxy scheme
+                // (SRTP-WRAP-S interop). Neither of those apps registers its own
+                // scheme, so we're the sole handler. Any other scheme is ignored.
                 .onOpenURL { url in
                     let scheme = url.scheme?.lowercased()
-                    if scheme == "vkturnproxy" || scheme == "wdtt" {
+                    if scheme == "vkturnproxy" || scheme == "wdtt" || scheme == "freeturn" {
                         ConnectionLinkInbox.shared.pendingURL = url
                     }
                 }

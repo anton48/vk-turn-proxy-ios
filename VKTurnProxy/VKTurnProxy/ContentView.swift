@@ -899,6 +899,15 @@ struct SettingsView: View {
                 s.dnsServers.map { "DNS \($0)" }
             ].compactMap { $0 }.joined(separator: ", ")
             let extrasText = extras.isEmpty ? "" : " (\(extras))"
+            // A freeturn:// link (SRTP-WRAP-S) carries neither WG keys nor a VK
+            // call link — the parser leaves both untouched (privateKey stays
+            // nil). Tell the user those must be entered manually, so they don't
+            // expect the import to have filled them. A quick_link.py WRAP-S link
+            // DOES include WG keys (privateKey non-nil) → keeps the generic text.
+            if s.useWrapS == true, s.privateKey == nil {
+                let prof = s.obfProfile ?? "rtpopus"
+                return Text("Switch to SRTP-WRAP-S for \(s.peerAddress)\(extrasText)? Sets the server, WRAP key, obf profile (\(prof)) and Client-ID. Your WireGuard keys and VK call link are NOT included — enter them manually.")
+            }
             return Text("Apply settings for \(s.peerAddress)\(extrasText)? This overwrites your WireGuard keys, server, vkLink and WRAP key.")
         }
         // Reset confirm — destructive button on the alert removes the
@@ -1031,7 +1040,7 @@ struct SettingsView: View {
         let raw = UIPasteboard.general.string ?? ""
         if raw.isEmpty {
             alertTitle = "Clipboard Empty"
-            alertMessage = "Copy a vkturnproxy:// or wdtt:// link to the clipboard first, then tap this again."
+            alertMessage = "Copy a vkturnproxy://, wdtt:// or freeturn:// link to the clipboard first, then tap this again."
             return
         }
         do {

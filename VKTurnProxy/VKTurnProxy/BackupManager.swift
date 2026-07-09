@@ -371,6 +371,10 @@ enum BackupManager {
         if url.scheme?.lowercased() == "wdtt" {
             return try parseWdttLink(url.absoluteString)
         }
+        // samosvalishe free-turn-proxy compat: freeturn://<base64url(json)>.
+        if url.scheme?.lowercased() == "freeturn" {
+            return try parseFreeturnLink(url.absoluteString)
+        }
         guard url.scheme?.lowercased() == "vkturnproxy" else {
             throw BackupError.decodeFailed("URL scheme is not vkturnproxy://")
         }
@@ -396,6 +400,10 @@ enum BackupManager {
         // amurcanov compat: a pasted wdtt:// link (his android server's format).
         if trimmed.lowercased().hasPrefix("wdtt://") {
             return try parseWdttLink(trimmed)
+        }
+        // samosvalishe free-turn-proxy compat: a pasted freeturn:// link.
+        if trimmed.lowercased().hasPrefix("freeturn://") {
+            return try parseFreeturnLink(trimmed)
         }
         if let url = URL(string: trimmed), url.scheme?.lowercased() == "vkturnproxy" {
             return try parseConnectionLink(from: url)
@@ -516,6 +524,115 @@ enum BackupManager {
         if let q = s.firstIndex(of: "?") { s = String(s[..<q]) }
         if let h = s.firstIndex(of: "#") { s = String(s[..<h]) }
         return s.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+    }
+
+    // MARK: - samosvalishe free-turn-proxy freeturn:// compat link
+
+    /// Parses a samosvalishe `freeturn://<base64url(json)>` link into our
+    /// ConnectionLink (SRTP-WRAP-S mode). Verified against free-turn-proxy
+    /// internal/uri/uri.go: the body after `freeturn://` is a base64url
+    /// (RawURLEncoding — url-safe, NO padding) JSON object.
+    ///
+    /// We map ONLY the fields that have an equivalent in our app:
+    ///   peer→peerAddress, transport(tcp|udp)→useUDP, obf→obfProfile,
+    ///   key→wrapKeyHex, n→numConnections, cid→clientID, dnss→dnsServers.
+    /// Every other field (provider, mode, bond, spc, listen, dns, mcap, name)
+    /// is intentionally ignored. Importing always switches to SRTP-WRAP-S.
+    ///
+    /// The link carries NEITHER a VK call link NOR WireGuard keys (free-turn
+    /// passes the VK -link + WG config as separate CLI flags, not in the URI),
+    /// so those stay untouched: WG keys via nil-preserve, and vkLink by passing
+    /// the device's current value straight back through (applyConnectionLink
+    /// writes vkLink unconditionally). The user still fills WG keys + the VK
+    /// call link in by hand after import.
+    static func parseFreeturnLink(_ raw: String) throws -> ConnectionLink {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("freeturn://") else {
+            throw BackupError.decodeFailed("URL scheme is not freeturn://")
+        }
+        var body = String(trimmed.dropFirst("freeturn://".count))
+        // .onOpenURL can hand back an authority-only URL with a trailing slash.
+        while body.hasSuffix("/") { body = String(body.dropLast()) }
+        guard !body.isEmpty else {
+            throw BackupError.decodeFailed("freeturn:// link has an empty payload")
+        }
+        // base64url (RawURLEncoding) → standard base64 with padding, then decode.
+        var b64 = body.replacingOccurrences(of: "-", with: "+")
+                      .replacingOccurrences(of: "_", with: "/")
+        let padNeeded = (4 - b64.count % 4) % 4
+        b64 += String(repeating: "=", count: padNeeded)
+        guard let data = Data(base64Encoded: b64),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw BackupError.decodeFailed("freeturn:// link payload is not valid base64url JSON")
+        }
+
+        // Version gate — free-turn's currentVersion == 1.
+        if let v = obj["v"] as? Int, v != 1 {
+            throw BackupError.decodeFailed("Unsupported freeturn:// version \(v) (expected 1)")
+        }
+
+        // peer (host:port) → peerAddress. free-turn marks -peer mandatory.
+        let peer = (obj["peer"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+        guard !peer.isEmpty else {
+            throw BackupError.decodeFailed("freeturn:// link is missing the peer (server) address")
+        }
+
+        // transport (tcp|udp to the TURN relay) → useUDP. Absent = nil-preserve.
+        var useUDP: Bool? = nil
+        switch (obj["transport"] as? String)?.lowercased() {
+        case "udp": useUDP = true
+        case "tcp": useUDP = false
+        default: break
+        }
+
+        // obf → obfProfile. Only our three known profiles map; "none"/absent/
+        // anything else leaves the device's current profile in place.
+        var obfProfile: String? = nil
+        if let o = (obj["obf"] as? String)?.lowercased(),
+           o == "rtpopus" || o == "rtpopus2" || o == "rtpopus3" {
+            obfProfile = o
+        }
+
+        // key (hex obf key) → wrapKeyHex. Absent = nil-preserve.
+        var wrapKeyHex: String? = nil
+        if let k = (obj["key"] as? String)?.trimmingCharacters(in: .whitespaces), !k.isEmpty {
+            wrapKeyHex = k
+        }
+
+        // n (parallel TURN streams) → numConnections. Absent/≤0 = nil-preserve.
+        var numConnections: Int? = nil
+        if let n = obj["n"] as? Int, n > 0 { numConnections = n }
+
+        // cid (client id) → clientID. Absent = nil-preserve.
+        var clientID: String? = nil
+        if let c = (obj["cid"] as? String)?.trimmingCharacters(in: .whitespaces), !c.isEmpty {
+            clientID = c
+        }
+
+        // dnss (comma-separated DNS servers) → dnsServers. Absent = nil-preserve.
+        var dnsServers: String? = nil
+        if let dns = (obj["dnss"] as? String)?.trimmingCharacters(in: .whitespaces), !dns.isEmpty {
+            dnsServers = dns
+        }
+
+        // vkLink is non-Optional and written unconditionally by
+        // applyConnectionLink; the link has none, so pass the device's current
+        // value straight back through → the apply is a no-op for it (preserve).
+        let currentVkLink = UserDefaults.standard.string(forKey: "vkLink") ?? ""
+
+        let settings = ConnectionSettings(
+            privateKey: nil, peerPublicKey: nil, presharedKey: nil,
+            tunnelAddress: nil, allowedIPs: nil,
+            vkLink: currentVkLink,
+            peerAddress: peer,
+            useDTLS: nil, useWrap: nil, wrapKeyHex: wrapKeyHex,
+            useSrtp: nil, useUDP: useUDP,
+            useWrapA: nil, wrapAPassword: nil,
+            turnServerOverride: nil,
+            dnsServers: dnsServers, numConnections: numConnections,
+            useWrapS: true, obfProfile: obfProfile, clientID: clientID
+        )
+        return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }
 
     /// Applies the ConnectionLink to UserDefaults. Does NOT touch
