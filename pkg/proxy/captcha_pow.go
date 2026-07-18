@@ -660,6 +660,16 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	if sessionToken == "" {
 		return "", "", fmt.Errorf("no session_token in redirect_uri")
 	}
+	// Captcha domain: VK carries it in the redirect_uri itself
+	// (id.vk.ru/not_robot_captcha?domain=vk.com&session_token=...). Mirror it so
+	// we track VK's vk.com->vk.ru migration AUTOMATICALLY instead of hardcoding:
+	// hardcoding vk.com breaks whenever VK flips, and hardcoding vk.ru now would
+	// break TODAY because VK's captcha session is still domain=vk.com. Fall back
+	// to vk.com (VK's current value) only if the param is ever absent.
+	captchaDomain := parsed.Query().Get("domain")
+	if captchaDomain == "" {
+		captchaDomain = "vk.com"
+	}
 
 	// The HTTP client (with its cookie jar) is passed in by the caller so the
 	// captcha session shares cookies with the getAnonymousToken request that
@@ -732,7 +742,7 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	time.Sleep(time.Duration(200+mathrand.Intn(300)) * time.Millisecond)
 
 	// Step 3: Call captchaNotRobot API sequence (using same client = same cookies)
-	successToken, showType, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, hash, adFp, debugInfo, htmlSettings)
+	successToken, showType, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, captchaDomain, hash, adFp, debugInfo, htmlSettings)
 	if err != nil {
 		return "", showType, fmt.Errorf("captchaNotRobot API: %w", err)
 	}
@@ -1265,7 +1275,7 @@ func randomUUIDish() string {
 //
 // Returns (successToken, lastShowCaptchaType, err). See solveCaptchaPoW for
 // the meaning of lastShowCaptchaType.
-func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, sessionToken, hash, adFp, debugInfo string, htmlSettings map[string]interface{}) (string, string, error) {
+func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, sessionToken, domain, hash, adFp, debugInfo string, htmlSettings map[string]interface{}) (string, string, error) {
 	vkReq := func(method, postData string) (map[string]interface{}, error) {
 		reqURL := "https://" + vkAPIHost() + "/method/" + method + "?v=5.131"
 		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
@@ -1354,7 +1364,8 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 		return resp, nil
 	}
 
-	domain := "vk.com"
+	// `domain` is passed in from solveCaptchaPoW, mirrored from VK's own captcha
+	// redirect_uri (vk.com today, vk.ru after VK's migration) — NOT hardcoded.
 	// Phase 11 (build 106): adFp LIFECYCLE matches captured WebView 2026-05-17.
 	// Real WebView sends adFp=EMPTY on captchaNotRobot.settings (because
 	// sync-loader.js hasn't generated it yet at that point in the page
