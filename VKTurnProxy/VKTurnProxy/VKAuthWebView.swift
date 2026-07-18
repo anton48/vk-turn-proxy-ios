@@ -126,8 +126,10 @@ struct VKAuthWKWebView: UIViewRepresentable {
                 var p: HTTPCookie?
                 for c in cookies {
                     let domain = c.domain.hasPrefix(".") ? c.domain : "." + c.domain
-                    if c.name == "remixsid", domain.hasSuffix(".vk.com") { remixsid = c }
-                    if c.name == "p", domain.hasSuffix(".login.vk.com") { p = c }
+                    // VK domain migration (vk.com -> vk.ru): accept the session/
+                    // auth cookies on EITHER domain — vk.com still issues them today.
+                    if c.name == "remixsid", (domain.hasSuffix(".vk.com") || domain.hasSuffix(".vk.ru")) { remixsid = c }
+                    if c.name == "p", (domain.hasSuffix(".login.vk.com") || domain.hasSuffix(".login.vk.ru")) { p = c }
                 }
                 guard let r = remixsid, let pp = p else {
                     self.onStatus("Ожидаю завершения входа…")

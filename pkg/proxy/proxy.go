@@ -1691,7 +1691,7 @@ func (p *Proxy) RefreshCaptchaURL() string {
 
 	// Step 2: trigger captcha
 	step2URL := fmt.Sprintf("https://%s/method/calls.getAnonymousToken?v=5.275&client_id=%s", vkAPIHost(), vc.ClientID)
-	step2Data := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s",
+	step2Data := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s",
 		linkID, neturl.QueryEscape(name), token1)
 	step2Resp, err := doSimplePost(client, step2Data, step2URL, ua)
 	if err != nil {

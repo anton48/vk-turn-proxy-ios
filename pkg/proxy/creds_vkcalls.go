@@ -99,7 +99,7 @@ func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
 	deviceID := uuid.New().String()
 	name := generateName()
 	ua := GetSessionUserAgent()
-	linkURL := neturl.QueryEscape("https://vk.com/call/join/" + linkID)
+	linkURL := neturl.QueryEscape(vkCallJoinBase + linkID)
 	nameEnc := neturl.QueryEscape(name)
 
 	log.Printf("vkcalls: identity — name: %s, device_id: %s, UA: %s", name, deviceID, ua)

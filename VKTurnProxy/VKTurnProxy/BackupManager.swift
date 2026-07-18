@@ -514,6 +514,12 @@ enum BackupManager {
             "https://vk.com/call/join/", "http://vk.com/call/join/",
             "https://m.vk.com/call/join/", "http://m.vk.com/call/join/",
             "m.vk.com/call/join/", "vk.com/call/join/",
+            // VK domain migration (vk.com -> vk.ru): accept BOTH so a link the
+            // user already has (vk.com) AND a new vk.ru link both strip to the
+            // bare hash. Do NOT drop the vk.com forms — VK still emits them today.
+            "https://vk.ru/call/join/", "http://vk.ru/call/join/",
+            "https://m.vk.ru/call/join/", "http://m.vk.ru/call/join/",
+            "m.vk.ru/call/join/", "vk.ru/call/join/",
             "https://vk.me/join/", "http://vk.me/join/", "vk.me/join/"
         ]
         let lower = s.lowercased()
