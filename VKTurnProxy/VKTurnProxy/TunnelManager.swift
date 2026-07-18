@@ -217,6 +217,12 @@ class TunnelManager: ObservableObject {
             // setTunnelNetworkSettings (and we defer that until after
             // bootstrap). Run on a background queue so the UI thread isn't
             // blocked by CFHost (~30-100 ms per host on a healthy network).
+            //
+            // DIAGNOSTIC (build 167): dump interfaces + address families FIRST,
+            // unconditionally, so a "can't assign requested address"
+            // (EADDRNOTAVAIL) on the VK resolve/dial below can be correlated
+            // with whether the device actually has a usable IPv4 source address.
+            logNetworkInterfaces()
             let vkHostIPs = await Task.detached(priority: .userInitiated) { [self] in
                 self.resolveVKHosts()
             }.value
@@ -225,6 +231,10 @@ class TunnelManager: ObservableObject {
             } else {
                 SharedLogger.shared.log("[AppDebug] TunnelManager.connect: WARNING — pre-resolved VK hosts list is empty")
             }
+            // DIAGNOSTIC (build 168): which local SOURCE does the kernel pick
+            // for a VK IPv4 destination (or EADDRNOTAVAIL if none) — the true
+            // "requested/assigned source" behind "can't assign requested address".
+            logSourceSelection(vkHostIPs)
 
             // ----------------------------------------------------------------
             // Pre-bootstrap captcha probe.
@@ -1630,6 +1640,137 @@ class TunnelManager: ObservableObject {
         }
 
         return resolved
+    }
+
+    /// DIAGNOSTIC (build 167): logs every network interface and the address
+    /// family (IPv4 / IPv6) of each of its addresses, plus up/running/loopback
+    /// flags, and a summary of whether any NON-loopback IPv4/IPv6 address
+    /// exists. Called unconditionally right before the pre-bootstrap VK
+    /// resolve+dial so a "can't assign requested address" (EADDRNOTAVAIL)
+    /// failure can be tied to whether the device actually has a usable IPv4
+    /// source address at that moment. getifaddrs is a sub-millisecond syscall.
+    nonisolated private func logNetworkInterfaces() {
+        var ifap: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifap) == 0, let first = ifap else {
+            SharedLogger.shared.log("[AppDebug] netif: getifaddrs failed (errno \(errno))")
+            return
+        }
+        defer { freeifaddrs(ifap) }
+
+        var entries: [String] = []
+        var hasGlobalIPv4 = false
+        var hasGlobalIPv6 = false
+        var ptr: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = ptr {
+            ptr = cur.pointee.ifa_next
+            let ifa = cur.pointee
+            guard let sa = ifa.ifa_addr else { continue }
+            let family = sa.pointee.sa_family
+            let name = String(cString: ifa.ifa_name)
+            let flags = ifa.ifa_flags
+            let up = (flags & UInt32(IFF_UP)) != 0
+            let running = (flags & UInt32(IFF_RUNNING)) != 0
+            let loopback = (flags & UInt32(IFF_LOOPBACK)) != 0
+
+            var famLabel = ""
+            var addrStr = ""
+            if family == sa_family_t(AF_INET) {
+                famLabel = "IPv4"
+                var a = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, &a, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    addrStr = String(cString: buf)
+                }
+                if !loopback { hasGlobalIPv4 = true }
+            } else if family == sa_family_t(AF_INET6) {
+                famLabel = "IPv6"
+                var a = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
+                var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                if inet_ntop(AF_INET6, &a, &buf, socklen_t(INET6_ADDRSTRLEN)) != nil {
+                    addrStr = String(cString: buf)
+                }
+                if !loopback { hasGlobalIPv6 = true }
+            } else {
+                continue  // skip AF_LINK and other non-IP families
+            }
+            let fl = "\(up ? "U" : "-")\(running ? "R" : "-")\(loopback ? "L" : "-")"
+            entries.append("\(name)/\(famLabel)/\(fl) \(addrStr)")
+        }
+        SharedLogger.shared.log("[AppDebug] netif (non-loopback IPv4=\(hasGlobalIPv4) IPv6=\(hasGlobalIPv6)): \(entries.joined(separator: " | "))")
+    }
+
+    /// DIAGNOSTIC (build 168): source-selection probe. Does a UDP "connect"
+    /// (route+source selection only — NO packets are sent) to a public IPv4 VK
+    /// destination and logs which LOCAL source address the kernel would pick for
+    /// it — or the errno if it can't (EADDRNOTAVAIL = "can't assign requested
+    /// address" = no usable IPv4 source, the exact failure we're chasing). Also
+    /// probes a reference IPv6 destination for contrast. Runs in the main-app
+    /// pre-bootstrap window where the VK cred fetch actually dials.
+    nonisolated private func logSourceSelection(_ vkHostIPs: [String: [String]]) {
+        let v4Dest = vkHostIPs["api.vk.ru"]?.first
+            ?? vkHostIPs["login.vk.ru"]?.first
+            ?? vkHostIPs.values.first(where: { !$0.isEmpty })?.first
+            ?? "1.1.1.1"
+        let v4 = probeSourceV4(dest: v4Dest, port: 443)
+        let v6 = probeSourceV6(dest: "2606:4700:4700::1111", port: 443)
+        SharedLogger.shared.log("[AppDebug] src-probe: IPv4→\(v4Dest):443 source=\(v4) | IPv6→[2606:4700:4700::1111]:443 source=\(v6)")
+    }
+
+    /// UDP4 connect (no packets) → the local IPv4 source the kernel selects for
+    /// `dest`, or "connect-errno=N(...)" (49 = EADDRNOTAVAIL = no IPv4 source).
+    nonisolated private func probeSourceV4(dest: String, port: UInt16) -> String {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        if fd < 0 { return "socket-errno=\(errno)" }
+        defer { close(fd) }
+        var sa = sockaddr_in()
+        sa.sin_family = sa_family_t(AF_INET)
+        sa.sin_port = port.bigEndian
+        let pton = dest.withCString { inet_pton(AF_INET, $0, &sa.sin_addr) }
+        if pton != 1 { return "bad-dest(\(dest))" }
+        let c = withUnsafePointer(to: &sa) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if c != 0 { let e = errno; return "connect-errno=\(e)(\(String(cString: strerror(e))))" }
+        var local = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let g = withUnsafeMutablePointer(to: &local) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }
+        if g != 0 { return "getsockname-errno=\(errno)" }
+        var addr = local.sin_addr
+        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        _ = inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN))
+        return "\(String(cString: buf)):\(UInt16(bigEndian: local.sin_port))"
+    }
+
+    /// UDP6 counterpart of probeSourceV4.
+    nonisolated private func probeSourceV6(dest: String, port: UInt16) -> String {
+        let fd = socket(AF_INET6, SOCK_DGRAM, 0)
+        if fd < 0 { return "socket-errno=\(errno)" }
+        defer { close(fd) }
+        var sa = sockaddr_in6()
+        sa.sin6_family = sa_family_t(AF_INET6)
+        sa.sin6_port = port.bigEndian
+        let pton = dest.withCString { inet_pton(AF_INET6, $0, &sa.sin6_addr) }
+        if pton != 1 { return "bad-dest(\(dest))" }
+        let c = withUnsafePointer(to: &sa) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        if c != 0 { let e = errno; return "connect-errno=\(e)(\(String(cString: strerror(e))))" }
+        var local = sockaddr_in6()
+        var len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        let g = withUnsafeMutablePointer(to: &local) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }
+        if g != 0 { return "getsockname-errno=\(errno)" }
+        var addr = local.sin6_addr
+        var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        _ = inet_ntop(AF_INET6, &addr, &buf, socklen_t(INET6_ADDRSTRLEN))
+        return "[\(String(cString: buf))]:\(UInt16(bigEndian: local.sin6_port))"
     }
 
     /// Diagnostic: try a TCP+TLS handshake from the main-app process to

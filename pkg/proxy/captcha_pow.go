@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	mathrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -495,6 +497,23 @@ var (
 	sessionClient     tls_client.HttpClient
 )
 
+// vkDiagDialer returns a net.Dialer whose Control hook logs the exact remote
+// address the bogdanfinn session client is about to connect to, with the
+// address family exposed via network ("tcp4" vs "tcp6"). DIAGNOSTIC (build
+// 167): pairs with the main app's pre-call interface dump so a
+// "connect: can't assign requested address" (EADDRNOTAVAIL) failure can be tied
+// to the address that was actually requested — i.e. confirm whether we dialed
+// an IPv4 literal while the device had no usable IPv4 source. Only Control is
+// set; newDirectDialer overwrites Timeout with the client's WithTimeoutSeconds.
+func vkDiagDialer() net.Dialer {
+	return net.Dialer{
+		Control: func(network, address string, _ syscall.RawConn) error {
+			log.Printf("vk-dial: requesting %s %s", network, address)
+			return nil
+		},
+	}
+}
+
 // GetSessionClient returns the singleton bogdanfinn HttpClient configured with
 // Phase 9 Safari iOS 26 TLS profile + persistent cookie jar. Same instance
 // returned across the whole process lifetime — cookies and connection state
@@ -525,6 +544,7 @@ func GetSessionClient() tls_client.HttpClient {
 			tls_client.WithTimeoutSeconds(20),
 			tls_client.WithClientProfile(clientProfile),
 			tls_client.WithCookieJar(jar),
+			tls_client.WithDialer(vkDiagDialer()), // DIAGNOSTIC (build 167): log requested dial addr+family
 		}
 		client, cerr := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 		if cerr != nil {
@@ -587,6 +607,7 @@ func newFreshSessionClient() tls_client.HttpClient {
 		tls_client.WithTimeoutSeconds(20),
 		tls_client.WithClientProfile(clientProfile),
 		tls_client.WithCookieJar(tls_client.NewCookieJar()),
+		tls_client.WithDialer(vkDiagDialer()), // DIAGNOSTIC (build 167): log requested dial addr+family
 	)
 	if cerr != nil {
 		log.Printf("pow: ERROR creating fresh session client: %v — falling back to singleton", cerr)
