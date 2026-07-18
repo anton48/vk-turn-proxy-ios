@@ -41,11 +41,12 @@ func vkAPIHost() string {
 // vkCallJoinBase is the VK call-join link prefix the app rebuilds from the
 // extracted call hash and hands to VK as the vk_join_link / link parameter
 // (proxy.go, creds.go, creds_vkcalls.go). VK is migrating vk.com -> vk.ru;
-// vk.com still works today. Centralised so the domain can flip in ONE place
-// once vk.ru acceptance is confirmed by a live test. NOTE: this is the link we
-// SEND to VK — NOT the user-link parser (Swift BackupManager.stripVkUrl), which
-// must accept BOTH domains.
-const vkCallJoinBase = "https://vk.com/call/join/"
+// FLIPPED to vk.ru in build 170; vk.com still worked but VK is migrating.
+// Centralised so this is a one-line change — revert to vk.com here if a live-VK
+// test shows the anon path (api.vk.me link= and api.vk.ru vk_join_link=) rejects
+// the vk.ru join link. NOTE: this is the link we SEND to VK — NOT the user-link
+// parser (Swift BackupManager.stripVkUrl), which must accept BOTH domains.
+const vkCallJoinBase = "https://vk.ru/call/join/"
 
 // credExpiryBuffer is the safety margin before a TURN cred's expiry timestamp
 // at which we consider the cred no longer fresh and start refreshing. The
