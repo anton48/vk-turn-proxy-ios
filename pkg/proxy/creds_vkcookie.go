@@ -46,6 +46,14 @@ const (
 	vkCookieAPIVersion = "5.280"
 	vkCookieAppVersion = "1.1"
 	okAppKeyDefault    = "CGMMEJLGDIHBABABA"
+	// vkCookieHost is the VK web domain for the cookie-auth endpoints + Origin/
+	// Referer (login.<host>/?act=web_token, api.<host>/method/{calls.getSettings,
+	// messages.getCallToken}). FLIPPED to vk.ru for VK's vk.com->vk.ru migration
+	// (the anon path already uses api.vk.ru — same backend). One revert point:
+	// set back to "vk.com" if a live VKAuth burner-login test shows vk.ru rejects
+	// a session cookie issued on .vk.com. The cookie harvest already accepts both
+	// .vk.com and .vk.ru domains, so whichever family VK lands the session on works.
+	vkCookieHost = "vk.ru"
 )
 
 // Package-level cookie-auth state, set from the bridge (mirrors the
@@ -265,8 +273,8 @@ func getVKCredsViaCookies(ctx context.Context, linkID, cookieHeader string) (*TU
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("User-Agent", ua)
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Origin", "https://vk.com")
-		req.Header.Set("Referer", "https://vk.com/")
+		req.Header.Set("Origin", "https://"+vkCookieHost)
+		req.Header.Set("Referer", "https://"+vkCookieHost+"/")
 		req.Header.Set("Cookie", cookieHeader)
 		if bearer != "" {
 			req.Header.Set("Authorization", "Bearer "+bearer)
@@ -292,7 +300,7 @@ func getVKCredsViaCookies(ctx context.Context, linkID, cookieHeader string) (*TU
 
 	// Step 1: web_token — exchange the session cookie for a web access token.
 	log.Printf("vk-cookie: web_token...")
-	webResp, err := doForm("https://login.vk.com/?act=web_token",
+	webResp, err := doForm("https://login."+vkCookieHost+"/?act=web_token",
 		neturl.Values{"version": {"1"}, "app_id": {vkCookieAppID}}, "")
 	if err != nil {
 		return nil, fmt.Errorf("web_token: %w", err)
@@ -307,7 +315,7 @@ func getVKCredsViaCookies(ctx context.Context, linkID, cookieHeader string) (*TU
 	}
 
 	// Step 2: calls.getSettings — OK.ru application public_key.
-	settingsResp, err := doForm("https://api.vk.com/method/calls.getSettings",
+	settingsResp, err := doForm("https://api."+vkCookieHost+"/method/calls.getSettings",
 		neturl.Values{"v": {vkCookieAPIVersion}}, vkToken)
 	if err != nil {
 		return nil, fmt.Errorf("calls.getSettings: %w", err)
@@ -324,7 +332,7 @@ func getVKCredsViaCookies(ctx context.Context, linkID, cookieHeader string) (*TU
 	}
 
 	// Step 3: messages.getCallToken — authed call token + okcdn base url.
-	callTokResp, err := doForm("https://api.vk.com/method/messages.getCallToken",
+	callTokResp, err := doForm("https://api."+vkCookieHost+"/method/messages.getCallToken",
 		neturl.Values{"v": {vkCookieAPIVersion}, "env": {"production"}}, vkToken)
 	if err != nil {
 		return nil, fmt.Errorf("messages.getCallToken: %w", err)

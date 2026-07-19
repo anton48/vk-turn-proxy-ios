@@ -72,9 +72,11 @@ struct VKAuthWKWebView: UIViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
-        // vk.com redirects an unauthenticated session through the VK ID flow
-        // (login.vk.com / id.vk.com), which is what sets `p` on .login.vk.com.
-        if let url = URL(string: "https://vk.com/") {
+        // vk.ru (VK is migrating vk.com->vk.ru) redirects an unauthenticated
+        // session through the VK ID flow (login.vk.ru / id.vk.ru), which sets
+        // `p`. The cookie harvest above accepts BOTH .vk.com and .vk.ru domains,
+        // so whichever family VK lands the session on is caught.
+        if let url = URL(string: "https://vk.ru/") {
             webView.load(URLRequest(url: url))
         }
         context.coordinator.startPolling()
