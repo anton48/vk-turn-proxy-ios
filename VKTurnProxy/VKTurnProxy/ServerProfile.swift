@@ -57,6 +57,53 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     }
 }
 
+extension ServerProfile {
+    /// Build a NEW server from an imported connection link (vkturnproxy:// /
+    /// wdtt:// / freeturn://).
+    ///
+    /// A link now CREATES a server instead of overwriting the current one, so an
+    /// absent field takes the ServerProfile default rather than the previously
+    /// active server's value — e.g. a freeturn:// link carries no WireGuard keys,
+    /// and the new server starts with empty ones for the user to fill in.
+    /// `vkLink` and `vkAuth` are GLOBAL and handled by the caller, not here.
+    /// An empty `serverName` tells ServerStore to assign the next free "ServerN".
+    init(link s: ConnectionSettings) {
+        self.init()
+        serverName = s.serverName?.trimmingCharacters(in: .whitespaces) ?? ""
+        if let v = s.privateKey { privateKey = v }
+        if let v = s.peerPublicKey { peerPublicKey = v }
+        if let v = s.presharedKey { presharedKey = v }
+        if let v = s.tunnelAddress { tunnelAddress = v }
+        peerAddress = s.peerAddress
+        if let v = s.dnsServers { dnsServers = v }
+        if let v = s.numConnections { numConnections = v }
+        if let v = s.turnServerOverride { turnServerOverride = v }
+        if let v = s.useUDP { useUDP = v }
+        if let v = s.useDTLS { useDTLS = v }
+        if let v = s.wrapKeyHex { wrapKeyHex = v }
+        if let v = s.obfProfile { obfProfile = v }
+        if let v = s.clientID { clientID = v }
+        if let v = s.wrapAPassword { wrapAPassword = v }
+        // Transport mode is ONE enum spread over four flags: resolve it as a
+        // coupled set with the serverModeBinding precedence
+        // (useWrapS > useWrapA > useSrtp > useWrap). A link that specifies none
+        // of them keeps the ServerProfile default (SRTP).
+        if s.useWrapS != nil || s.useWrapA != nil || s.useSrtp != nil || s.useWrap != nil {
+            let wrapS = s.useWrapS ?? false
+            let wrapA = s.useWrapA ?? false
+            let srtp = s.useSrtp ?? false
+            let wrap = s.useWrap ?? false
+            useWrapS = wrapS
+            useWrapA = !wrapS && wrapA
+            useSrtp = !wrapS && !wrapA && srtp
+            useWrap = !wrapS && !wrapA && !srtp && wrap
+        }
+        // SRTP-WRAP-S needs a stable per-stream Client-ID; mint one when the
+        // link didn't carry it (mirrors the mode picker).
+        if useWrapS && clientID.isEmpty { clientID = UUID().uuidString }
+    }
+}
+
 /// Backup form of a ServerProfile (the elements of `AppSettings.servers`).
 ///
 /// Every field except the name is Optional so a backup written by a different

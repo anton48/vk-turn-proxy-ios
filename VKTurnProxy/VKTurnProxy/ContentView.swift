@@ -784,21 +784,25 @@ struct SettingsView: View {
             }
         } message: { link in
             let s = link.settings
+            // Build 179+: the link ADDS a named server (and makes it active)
+            // instead of overwriting the current configuration, so the message
+            // names what will be created rather than what gets overwritten.
+            let created = ServerProfile(link: s)
+            let name = created.serverName.isEmpty ? "a new server" : "\"\(created.serverName)\""
             let extras = [
                 s.numConnections.map { "\($0) conns" },
                 s.dnsServers.map { "DNS \($0)" }
             ].compactMap { $0 }.joined(separator: ", ")
             let extrasText = extras.isEmpty ? "" : " (\(extras))"
             // A freeturn:// link (SRTP-WRAP-S) carries neither WG keys nor a VK
-            // call link — the parser leaves both untouched (privateKey stays
-            // nil). Tell the user those must be entered manually, so they don't
-            // expect the import to have filled them. A quick_link.py WRAP-S link
-            // DOES include WG keys (privateKey non-nil) → keeps the generic text.
+            // call link, so the new server starts without them — say so, or the
+            // user will expect the import to have filled them in. A quick_link.py
+            // WRAP-S link DOES include WG keys (privateKey non-nil).
             if s.useWrapS == true, s.privateKey == nil {
                 let prof = s.obfProfile ?? "rtpopus"
-                return Text("Switch to SRTP-WRAP-S for \(s.peerAddress)\(extrasText)? Sets the server, WRAP key, obf profile (\(prof)) and Client-ID. Your WireGuard keys and VK call link are NOT included — enter them manually.")
+                return Text("Add \(name) as SRTP-WRAP-S for \(s.peerAddress)\(extrasText)? Sets the server, WRAP key, obf profile (\(prof)) and Client-ID, and makes it active. WireGuard keys and the VK call link are NOT included — enter them manually.")
             }
-            return Text("Apply settings for \(s.peerAddress)\(extrasText)? This overwrites your WireGuard keys, server, vkLink and WRAP key.")
+            return Text("Add \(name) [\(created.modeLabel)] for \(s.peerAddress)\(extrasText) and make it active? Your existing servers are kept; the VK call link is global and will be updated.")
         }
         // Reset confirm — destructive button on the alert removes the
         // creds-pool.json. UserDefaults are untouched.

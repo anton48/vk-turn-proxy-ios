@@ -265,4 +265,9 @@ struct ConnectionSettings: Codable {
     var useWrapS: Bool? = nil
     var obfProfile: String? = nil
     var clientID: String? = nil
+    /// Name for the server this link creates (build 179+). Importing a link now
+    /// ADDS a named server instead of overwriting the current configuration.
+    /// Absent (older vkturnproxy:// links, and wdtt:// which has no name field)
+    /// → ServerStore assigns the next free "ServerN".
+    var serverName: String? = nil
 }
