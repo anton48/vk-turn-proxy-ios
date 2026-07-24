@@ -437,6 +437,12 @@ struct SettingsView: View {
     // the cookies.
     @AppStorage("VKAuth") private var vkAuthEnabled = false
 
+    // Named-server store (M2). The active server's fields are projected into the
+    // flat @AppStorage keys above by ServerStore, so ContentView's connect path
+    // stays unchanged. This view now edits only the GLOBAL vkLink/VKAuth here;
+    // per-server fields live in ServerEditView.
+    @ObservedObject private var store = ServerStore.shared
+
     // Backup & Restore state. exportURL drives the share sheet; the
     // sheet only appears when this is non-nil so the URL is guaranteed
     // valid by the time UIActivityViewController is constructed. Each
@@ -560,7 +566,7 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Section("VK TURN Proxy") {
+            Section("VK Call Link") {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(vkAuthEnabled
                          ? "VK Call Link(s) — one per line (currently \(vkLinkLines.count))"
@@ -579,181 +585,27 @@ struct SettingsView: View {
                         .font(.caption2).foregroundColor(.secondary)
                 }
                 hint(ConfigValidation.vkLink(vkLinkPrimary))
-
-                TextField("Proxy Server (host:port)", text: $peerAddress)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                hint(ConfigValidation.peerAddress(peerAddress))
-
-                // Optional TURN-relay override. When set to IP:port, the app
-                // ignores VK's TURN address and forces fresh conns onto this
-                // relay (disk-cached creds keep their stored address). Empty =
-                // use whatever VK returns. Malformed input is ignored.
-                TextField("TURN server (IP:port, optional)", text: $turnServerOverride)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .keyboardType(.numbersAndPunctuation)
-                hint(ConfigValidation.turnOverride(turnServerOverride))
-
-                // "DTLS Obfuscation" toggle removed from UI 2026-05-22
-                // (build 127). The toggle was misleading: on the SRTP
-                // path it is ignored entirely (dispatcher prefers UseSrtp
-                // in runConnection), and on the legacy path turning it
-                // OFF lands in runDirectSession where conns "establish"
-                // but no real traffic flows (VK TURN drops raw WG
-                // payload without the DTLS envelope). Empirically
-                // verified 2026-05-22 (vpn.wifi.nodtls.log): 30 conns
-                // allocated, conn-stats final showed 30 idle with 0 RX —
-                // tunnel up by NEVPNStatus but no actual internet.
-                //
-                // Default @AppStorage value stays true so existing users
-                // keep working on the DTLS+WG fallback path. The
-                // useDTLS field still round-trips through BackupManager
-                // for backups + Connection Links, so power users can
-                // flip it via export-edit-import if they really want
-                // the direct-mode for debugging.
-
-                // Server transport mode — tri-state, mutually exclusive.
-                //
-                //   Legacy (DTLS+WG)   peer runs server with no flags.
-                //                       Heavily shaped by VK to ~9 KB/s.
-                //                       Kept for back-compat only.
-                //
-                //   SRTP               peer runs server with -srtp.
-                //                       Full DTLS-SRTP transport (pion,
-                //                       PayloadType 100 mimics VP8). VK
-                //                       sees legitimate media → no shape.
-                //                       Production default since build 115.
-                //
-                //   SRTP+WRAP          peer runs server with -wrap-srtp +
-                //                       -wrap-key (matches wrap_key_hex
-                //                       below). DTLS+WG inside a static-
-                //                       key ChaCha20-Poly1305 SRTP-shaped
-                //                       envelope. Same VK-bypass intent
-                //                       as pure SRTP, different inner
-                //                       transport — used as A/B baseline
-                //                       for the memory-pressure
-                //                       investigation (see open_problem
-                //                       memory file).
-                //
-                // Pointing this at a server in the wrong mode produces a
-                // clean DTLS handshake failure (no traffic flows; conns
-                // appear "establishing" then time out).
-                Picker("Server mode", selection: serverModeBinding) {
-                    ForEach(ServerMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-
-                // WRAP key field — visible only when SRTP+WRAP is the
-                // active mode. Empty / wrong-length keys are caught by
-                // decodeWrapKey on the Go bridge side and disable the
-                // mode for that session with a clear log entry. Generate
-                // the matching key on the server with `-gen-wrap-key`.
-                if serverModeBinding.wrappedValue == .srtpWrap {
-                    SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                    hint(ConfigValidation.wrapKeyHex(wrapKeyHex))
-                }
-
-                // SRTP-WRAP-A (amurcanov interop): the server provisions
-                // WireGuard via GETCONF, so the user enters ONE secret — no WG
-                // keys (the WireGuard section below is hidden in this mode).
-                // A wrong/empty password surfaces as a clean GETCONF
-                // DENIED / DTLS handshake failure in the logs.
-                if serverModeBinding.wrappedValue == .srtpWrapA {
-                    SecureField("Server password", text: $wrapAPassword)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                    hint(ConfigValidation.wrapAPassword(wrapAPassword))
-                }
-
-                // SRTP-WRAP-S (samosvalishe/free-turn-proxy): a shared WRAP key
-                // (same as SRTP+WRAP), an obfuscation profile, and a Client-ID
-                // sent as the first DTLS record (server allowlist key; auto-
-                // generated once). WireGuard keys are entered below as usual.
-                if serverModeBinding.wrappedValue == .srtpWrapS {
-                    SecureField("WRAP key (64 hex chars)", text: $wrapKeyHex)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                    hint(ConfigValidation.wrapKeyHex(wrapKeyHex))
-                    Picker("Obfuscation profile", selection: $obfProfile) {
-                        Text("rtpopus").tag("rtpopus")
-                        Text("rtpopus2").tag("rtpopus2")
-                        Text("rtpopus3").tag("rtpopus3")
-                    }
-                    TextField("Client ID", text: $clientID)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                }
-
-                // TURN control transport: UDP (true) vs TCP (false /
-                // default). TCP-control bypasses VK's per-cred allocation-
-                // rate throttle introduced 2026-05-18 — empirically ~0%
-                // quota errors on TCP vs 36-58% on UDP for the same cred
-                // (see TunnelManager.swift TunnelConfig.useUDP doc block
-                // for the test numbers). Default off; only toggle on if
-                // your network blocks/throttles TCP-to-relay and you'd
-                // rather take VK's allocation-rate hit than fail to
-                // connect. Independent of the DTLS/SRTP transport choice
-                // above — controls the leg between client and TURN relay
-                // (the iOS↔relay control channel).
-                Toggle("Use UDP transport to TURN", isOn: $useUDP)
-
-                // UI cap at 50 — pool size formula (ceil(N*4/10), creds.go
-                // build 73) means N=50 → 20 slots, N=64 → 26 slots, both
-                // pull more VK API traffic than is practical for typical
-                // single-user setups. Existing values above 50 (legacy
-                // installs, or values applied via Full Backup / Connection
-                // Link import — both bypass this Stepper) are preserved
-                // by widening the upper bound to max(50, current). Stepper
-                // can only decrease them; once back ≤ 50 the cap holds.
-                Stepper(connectionsLabel, value: $numConnections, in: 1...connectionsUpperBound)
-
-                Stepper("Cred pool cooldown: \(credPoolCooldownSeconds) s", value: $credPoolCooldownSeconds, in: 30...600, step: 30)
             }
 
-            // WireGuard keys/address are user-entered for Legacy / SRTP /
-            // SRTP+WRAP. In SRTP-WRAP-A they're minted by the server via
-            // GETCONF, so hide the whole section in that mode.
-            if serverModeBinding.wrappedValue != .srtpWrapA {
-            Section("WireGuard") {
-                SecureField("Private Key (base64)", text: $privateKey)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                hint(ConfigValidation.wgKey(privateKey, label: "Private key", required: true))
-
-                TextField("Peer Public Key (base64)", text: $peerPublicKey)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                hint(ConfigValidation.wgKey(peerPublicKey, label: "Peer public key", required: true))
-
-                SecureField("Preshared Key (base64)", text: $presharedKey)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                hint(ConfigValidation.wgKey(presharedKey, label: "Preshared key", required: false))
-
-                TextField("Tunnel Address", text: $tunnelAddress)
-                    .autocapitalization(.none)
-                hint(ConfigValidation.tunnelAddress(tunnelAddress))
-
-                TextField("DNS Servers", text: $dnsServers)
-                    .autocapitalization(.none)
-                hint(ConfigValidation.dnsServers(dnsServers))
-
-                // "Allowed IPs" was removed from the UI 2026-06-11. It maps to
-                // the WireGuard PEER allowed_ip (cryptokey routing, see
-                // TunnelManager.buildUAPIConfig) — NOT iOS routing (that comes
-                // from includeDefaultRoute in PacketTunnelProvider). Under
-                // includeAllNetworks=true the only correct value is 0.0.0.0/0:
-                // a narrower value makes wireguard-go DROP non-matching traffic
-                // (a blackhole, not split tunnel — iOS forces everything to the
-                // TUN regardless), so the field could only mislead or break. The
-                // value stays pinned at the @AppStorage default 0.0.0.0/0 and
-                // still flows into the WG config + backups/links.
+            Section("Server") {
+                Picker("Active server", selection: Binding(
+                    get: { store.activeServerId },
+                    set: { store.activate($0) }
+                )) {
+                    ForEach(store.servers) { s in
+                        Text(s.serverName).tag(s.id)
+                    }
+                }
+                NavigationLink {
+                    ServerEditView(serverId: store.activeServerId)
+                } label: {
+                    HStack {
+                        Text("Edit server settings")
+                        Spacer()
+                        Text(store.activeServer.serverName).foregroundColor(.secondary)
+                    }
+                }
             }
-            } // end `if != .srtpWrapA` — WireGuard section hidden in WRAP-A mode
 
             // VK Account Auth (non-anonymous cookie path). Default OFF. When ON,
             // GetVKCreds uses ONLY the logged-in cookie (no anonymous fallback).

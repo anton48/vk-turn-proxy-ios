@@ -8,10 +8,9 @@
 // ServerStore is the ONLY writer of the per-server flat keys. The GLOBAL keys
 // (vkLink, VKAuth, forceLegacyCaptcha) are NEVER touched by projection.
 //
-// M1 note: the store is instantiated at launch (so first-launch migration runs
-// and captures the existing single config as "Server1"), but nothing projects
-// on launch yet — the flat keys stay authoritative until M2 wires the
-// store-driven UI. So an M1-only build is behaviorally a no-op.
+// The store is instantiated at launch: first-launch migration captures the
+// existing single config as "Server1", then load() projects the active server
+// onto the flat @AppStorage keys that ContentView / TunnelManager read.
 
 import Foundation
 
@@ -72,6 +71,10 @@ final class ServerStore: ObservableObject {
             activeServerId = s.id
             persist()
         }
+        // Project the active server onto the flat @AppStorage keys so ContentView
+        // / TunnelManager always read the active server's config. On first launch
+        // this is a no-op (Server1 was built from those very keys).
+        projectToFlatKeys(activeServer)
     }
 
     private func persist() {
