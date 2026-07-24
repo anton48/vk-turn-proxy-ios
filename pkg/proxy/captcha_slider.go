@@ -21,6 +21,12 @@ import (
 const (
 	sliderCaptchaType     = "slider"
 	defaultSliderAttempts = 4
+	// maxSliderGridSize bounds the grid dimension parsed from the untrusted VK
+	// captcha response (steps[0]) — real VK sliders are ~3-6 tiles per side.
+	// Without an upper bound a hostile response (e.g. steps[0]=50000) drives
+	// make([]int, size*size) into a multi-GB allocation that jetsam-kills the
+	// memory-constrained iOS Network Extension.
+	maxSliderGridSize = 16
 )
 
 // vkReqFunc is the type for the VK API request helper from callCaptchaNotRobotAPI.
@@ -365,6 +371,9 @@ func parseSliderSteps(steps []int) (int, []int, int, error) {
 	if size <= 0 {
 		return 0, nil, 0, fmt.Errorf("invalid grid size: %d", size)
 	}
+	if size > maxSliderGridSize {
+		return 0, nil, 0, fmt.Errorf("grid size too large: %d", size)
+	}
 
 	remaining := append([]int(nil), steps[1:]...)
 	attempts := defaultSliderAttempts
@@ -563,6 +572,9 @@ func buildSliderTileMapping(gridSize int, activeSteps []int) ([]int, error) {
 	tileCount := gridSize * gridSize
 	if tileCount <= 0 {
 		return nil, fmt.Errorf("invalid tile count")
+	}
+	if gridSize > maxSliderGridSize {
+		return nil, fmt.Errorf("grid size too large: %d", gridSize)
 	}
 	if len(activeSteps)%2 != 0 {
 		return nil, fmt.Errorf("invalid steps length: %d", len(activeSteps))

@@ -139,8 +139,16 @@ enum CredCache {
                 continue
             }
             let expiryStr = String(entry.username[..<colonIdx])
-            guard let expiry = Double(expiryStr) else {
-                skipReasons.append("slot \(entry.slot) unparseable expiry")
+            // The username comes from an imported backup (BackupManager writes
+            // config.turnPool to creds-pool.json verbatim), so the expiry is
+            // untrusted. Reject non-finite (NaN / ±Inf) and out-of-range values
+            // before ANY `Int(expiry - now)` conversion below — Int(Double)
+            // traps on NaN/Inf/overflow, which would crash the app on every
+            // connect until the cache is manually reset. Upper bound
+            // 4_102_444_800 = 2100-01-01 UTC (a real TURN expiry is now + ~8h).
+            guard let expiry = Double(expiryStr), expiry.isFinite,
+                  expiry > 0, expiry < 4_102_444_800 else {
+                skipReasons.append("slot \(entry.slot) unparseable/implausible expiry")
                 continue
             }
             if expiry - now <= expiryGuard {

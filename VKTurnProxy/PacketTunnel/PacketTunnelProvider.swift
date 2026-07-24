@@ -309,6 +309,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     completionHandler(VPNError.invalidConfiguration)
                     return
                 }
+                guard self.isValidTunnelAddress(addr) else {
+                    self.logMsg("ERROR: WRAP-A provision address is not a valid ip/prefix — aborting")
+                    wgTurnOff(handle)
+                    self.tunnelHandle = -1
+                    completionHandler(VPNError.invalidConfiguration)
+                    return
+                }
                 effWGConfig = uapi
                 effAddress = addr
                 if let d = prov["dns"] as? String, !d.isEmpty { effDNS = d }
@@ -623,7 +630,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // path event logging never blocks on the SSID lookup.
             if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) {
                 NEHotspotNetwork.fetchCurrent { [weak self] network in
-                    self?.currentWiFiSSID = network?.ssid
+                    // Sanitize the network-controlled SSID before it reaches any
+                    // log sink (describePath → vpn.log, and describePath →
+                    // wgLogPathSnapshot → Go pathstats): an AP named with
+                    // embedded CR/LF could otherwise forge log lines.
+                    if let rawSSID = network?.ssid {
+                        self?.currentWiFiSSID = SharedLogger.sanitizeField(rawSSID, maxLength: 64)
+                    } else {
+                        self?.currentWiFiSSID = nil
+                    }
                     process()
                 }
             } else {
@@ -736,6 +751,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - Network Settings
 
+    /// True iff `address` is a well-formed `ip` or `ip/prefix` whose host part
+    /// is a valid IPv4/IPv6 literal. Guards the WRAP-A GETCONF provision path
+    /// against a malicious/compromised server returning "/" or "//" (non-empty,
+    /// so it passes the isEmpty check) which would otherwise crash the
+    /// extension in createTunnelSettings.
+    private func isValidTunnelAddress(_ address: String) -> Bool {
+        let parts = address.split(separator: "/", omittingEmptySubsequences: false)
+        guard let host = parts.first, !host.isEmpty else { return false }
+        let h = String(host)
+        return IPv4Address(h) != nil || IPv6Address(h) != nil
+    }
+
     private func createTunnelSettings(
         address: String,
         dns: String,
@@ -743,8 +770,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         tunnelRemoteAddress: String,
         includeDefaultRoute: Bool = true
     ) -> NEPacketTunnelNetworkSettings {
+        // Defensive: `address` can originate from an untrusted source (the
+        // WRAP-A GETCONF provision, or an imported backup's tunnelAddress). A
+        // value like "/" splits to an empty array, so index [0] would trap and
+        // crash the extension. Fall back to the raw string instead of crashing
+        // (the WRAP-A provision path also rejects malformed addresses up front
+        // via isValidTunnelAddress).
         let parts = address.split(separator: "/")
-        let ip = String(parts[0])
+        let ip = parts.first.map(String.init) ?? address
         let prefix = parts.count > 1 ? Int(parts[1]) ?? 24 : 24
 
         // tunnelRemoteAddress is a cosmetic label per NEPacketTunnelNetworkSettings

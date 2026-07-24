@@ -41,6 +41,10 @@ enum ConfigValidation {
     /// the TURN/proxy endpoints here are IPv4/hostname in practice).
     static func isHostPort(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Reject interior control characters / whitespace: a value like
+        // "host\nendpoint=evil:1" would otherwise pass (split on the LAST colon)
+        // yet inject extra wireguard-go UAPI directives in buildUAPIConfig.
+        guard !t.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7f }) else { return false }
         guard let colon = t.lastIndex(of: ":") else { return false }
         let host = String(t[..<colon])
         let port = String(t[t.index(after: colon)...])

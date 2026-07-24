@@ -46,6 +46,20 @@ class SharedLogger {
         }
     }
 
+    /// Neutralize an untrusted value before it is interpolated into a log line:
+    /// strip ASCII control characters (CR/LF/etc. that could forge additional
+    /// log lines) plus DEL, and cap the length. Used for network-supplied
+    /// fields such as the WiFi SSID that end up in the exportable vpn.log.
+    static func sanitizeField(_ s: String, maxLength: Int = 128) -> String {
+        var out = s.filter { ch in
+            !ch.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f }
+        }
+        if out.count > maxLength {
+            out = String(out.prefix(maxLength)) + "…"
+        }
+        return out
+    }
+
     /// Append raw data (used by Go bridge for already-timestamped log lines).
     func logRaw(_ data: Data) {
         guard let url = fileURL else { return }

@@ -1279,6 +1279,7 @@ class TunnelManager: ObservableObject {
         case empty(field: String)
         case invalidBase64(field: String)
         case wrongLength(field: String, got: Int)
+        case controlChars(field: String)
 
         var errorDescription: String? {
             switch self {
@@ -1288,6 +1289,8 @@ class TunnelManager: ObservableObject {
                 return "\(f) is not valid Base64. Expected 44 characters ending with '=' (output of `wg genkey`)."
             case .wrongLength(let f, let got):
                 return "\(f) decoded to \(got) bytes, expected 32. Did you paste the wrong key?"
+            case .controlChars(let f):
+                return "\(f) contains control characters and was rejected."
             }
         }
     }
@@ -1317,6 +1320,17 @@ class TunnelManager: ObservableObject {
         return data.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Reject a value containing ASCII control characters (CR/LF/etc.).
+    /// Free-form fields (peerAddress, allowedIPs) are interpolated verbatim into
+    /// the newline-delimited wireguard-go UAPI config, so an embedded newline
+    /// from an imported link/backup would inject arbitrary UAPI directives
+    /// (e.g. a hidden second peer). Fail closed rather than strip.
+    private func assertNoControlChars(_ v: String, field: String) throws {
+        if v.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f }) {
+            throw KeyError.controlChars(field: field)
+        }
+    }
+
     private func buildUAPIConfig(config: TunnelConfig) throws -> String {
         // WRAP-A: the user enters no WireGuard keys — amurcanov's server mints
         // them via GETCONF and the extension applies the result
@@ -1334,6 +1348,7 @@ class TunnelManager: ObservableObject {
         // Endpoint -- this is the "fake" endpoint that WireGuard will use.
         // TURNBind intercepts it, so the actual value doesn't matter much,
         // but we set it to the peer server address for correctness.
+        try assertNoControlChars(config.peerAddress, field: "Peer Address")
         lines.append("endpoint=\(config.peerAddress)")
 
         if config.persistentKeepalive > 0 {
@@ -1341,7 +1356,9 @@ class TunnelManager: ObservableObject {
         }
 
         for allowedIP in config.allowedIPs.split(separator: ",") {
-            lines.append("allowed_ip=\(allowedIP.trimmingCharacters(in: .whitespaces))")
+            let trimmed = allowedIP.trimmingCharacters(in: .whitespaces)
+            try assertNoControlChars(trimmed, field: "Allowed IP")
+            lines.append("allowed_ip=\(trimmed)")
         }
 
         if let psk = config.presharedKey, !psk.isEmpty {
