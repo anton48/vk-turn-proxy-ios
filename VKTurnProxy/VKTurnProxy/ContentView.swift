@@ -75,22 +75,26 @@ struct ContentView: View {
     /// non-blocking hints in Settings, not here. Mirrors serverModeBinding's
     /// precedence (useWrapA > useSrtp > useWrap).
     private var configValidationError: String? {
+        // Per-server fields come from the ACTIVE server (read directly from the
+        // store, NOT from the flat @AppStorage keys — those are no longer
+        // projected during Settings, which is what caused the NavigationView pop
+        // on iOS 26). vkLink is global.
+        let s = ServerStore.shared.activeServer
         var issues: [ConfigValidation.Issue?] = [
             ConfigValidation.vkLink(vkLink),
-            ConfigValidation.peerAddress(peerAddress),
-            ConfigValidation.turnOverride(turnServerOverride),
+            ConfigValidation.peerAddress(s.peerAddress),
+            ConfigValidation.turnOverride(s.turnServerOverride),
         ]
-        if useWrapA {
-            issues.append(ConfigValidation.wrapAPassword(wrapAPassword))
+        if s.useWrapA {
+            issues.append(ConfigValidation.wrapAPassword(s.wrapAPassword))
         } else {
-            issues.append(ConfigValidation.wgKey(privateKey, label: "Private key", required: true))
-            issues.append(ConfigValidation.wgKey(peerPublicKey, label: "Peer public key", required: true))
-            issues.append(ConfigValidation.wgKey(presharedKey, label: "Preshared key", required: false))
-            issues.append(ConfigValidation.tunnelAddress(tunnelAddress))
-            // SRTP+WRAP (mode precedence: not WRAP-A, not SRTP, WRAP on) also
-            // needs the hex key.
-            if (!useSrtp && useWrap) || useWrapS {
-                issues.append(ConfigValidation.wrapKeyHex(wrapKeyHex))
+            issues.append(ConfigValidation.wgKey(s.privateKey, label: "Private key", required: true))
+            issues.append(ConfigValidation.wgKey(s.peerPublicKey, label: "Peer public key", required: true))
+            issues.append(ConfigValidation.wgKey(s.presharedKey, label: "Preshared key", required: false))
+            issues.append(ConfigValidation.tunnelAddress(s.tunnelAddress))
+            // SRTP+WRAP / SRTP-WRAP-S also need the hex key.
+            if (!s.useSrtp && s.useWrap) || s.useWrapS {
+                issues.append(ConfigValidation.wrapKeyHex(s.wrapKeyHex))
             }
         }
         return issues.compactMap { $0 }.first { $0.severity == .error }?.message
@@ -174,7 +178,11 @@ struct ContentView: View {
                         } else {
                             NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
                             SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
-                            let turnOv = parseTurnOverride(turnServerOverride)
+                            // Per-server fields come from the ACTIVE server (read
+                            // directly from the store); vkLink / VKAuth /
+                            // forceLegacyCaptcha are global.
+                            let active = ServerStore.shared.activeServer
+                            let turnOv = parseTurnOverride(active.turnServerOverride)
                             let vkLines = vkLink.split(whereSeparator: { $0.isNewline })
                                 .map { $0.trimmingCharacters(in: .whitespaces) }
                                 .filter { !$0.isEmpty }
@@ -183,32 +191,32 @@ struct ContentView: View {
                             // Applied here (non-destructive) so the stored Connections
                             // setting is preserved across mode/line changes.
                             let effectiveConns = vkAuthOn
-                                ? min(numConnections, min(50, max(2, vkLines.count * 20)))
-                                : numConnections
+                                ? min(active.numConnections, min(50, max(2, vkLines.count * 20)))
+                                : active.numConnections
                             let config = TunnelConfig(
-                                privateKey: privateKey,
-                                peerPublicKey: peerPublicKey,
-                                presharedKey: presharedKey.isEmpty ? nil : presharedKey,
-                                tunnelAddress: tunnelAddress,
-                                dnsServers: dnsServers,
-                                allowedIPs: allowedIPs,
+                                privateKey: active.privateKey,
+                                peerPublicKey: active.peerPublicKey,
+                                presharedKey: active.presharedKey.isEmpty ? nil : active.presharedKey,
+                                tunnelAddress: active.tunnelAddress,
+                                dnsServers: active.dnsServers,
+                                allowedIPs: "0.0.0.0/0",
                                 vkLink: vkLines.first ?? vkLink,
                                 cookieLinks: vkLines,
-                                peerAddress: peerAddress,
-                                useDTLS: useDTLS,
-                                useWrap: useWrap,
-                                wrapKeyHex: wrapKeyHex,
-                                useSrtp: useSrtp,
-                                useWrapA: useWrapA,
-                                wrapAPassword: wrapAPassword,
-                                useWrapS: useWrapS,
-                                obfProfile: obfProfile,
-                                clientID: clientID,
-                                useUDP: useUDP,
+                                peerAddress: active.peerAddress,
+                                useDTLS: active.useDTLS,
+                                useWrap: active.useWrap,
+                                wrapKeyHex: active.wrapKeyHex,
+                                useSrtp: active.useSrtp,
+                                useWrapA: active.useWrapA,
+                                wrapAPassword: active.wrapAPassword,
+                                useWrapS: active.useWrapS,
+                                obfProfile: active.obfProfile,
+                                clientID: active.clientID,
+                                useUDP: active.useUDP,
                                 forceLegacyCaptcha: UserDefaults.standard.bool(forKey: "forceLegacyCaptcha"),
                                 useCookieAuth: UserDefaults.standard.bool(forKey: "VKAuth"),
-                                numConnections: numConnections,
-                                credPoolCooldownSeconds: credPoolCooldownSeconds,
+                                numConnections: active.numConnections,
+                                credPoolCooldownSeconds: active.credPoolCooldownSeconds,
                                 turnServerOverride: turnOv?.host,
                                 turnPortOverride: turnOv?.port
                             )
@@ -587,24 +595,35 @@ struct SettingsView: View {
                 hint(ConfigValidation.vkLink(vkLinkPrimary))
             }
 
-            Section("Server") {
-                Picker("Active server", selection: Binding(
-                    get: { store.activeServerId },
-                    set: { store.activate($0) }
-                )) {
-                    ForEach(store.servers) { s in
-                        Text(s.serverName).tag(s.id)
-                    }
-                }
-                NavigationLink {
-                    ServerEditView(serverId: store.activeServerId)
-                } label: {
+            // One NavigationLink per server (stable identity) — avoids the
+            // iOS-15 NavigationView "first tap after a state change is dropped"
+            // flakiness that a single link tied to the changing activeServerId
+            // had. The leading circle (a .borderless Button, so its tap is
+            // isolated from the row's navigation) sets the active server; the
+            // name navigates into the editor.
+            Section {
+                ForEach(store.servers) { server in
                     HStack {
-                        Text("Edit server settings")
-                        Spacer()
-                        Text(store.activeServer.serverName).foregroundColor(.secondary)
+                        Button {
+                            store.activate(server.id)
+                        } label: {
+                            Image(systemName: server.id == store.activeServerId
+                                  ? "checkmark.circle.fill" : "circle")
+                                .foregroundColor(server.id == store.activeServerId ? .accentColor : .secondary)
+                                .imageScale(.large)
+                        }
+                        .buttonStyle(.borderless)
+                        NavigationLink {
+                            ServerEditView(serverId: server.id)
+                        } label: {
+                            Text(server.serverName)
+                        }
                     }
                 }
+            } header: {
+                Text("Servers")
+            } footer: {
+                Text("Tap the circle to make a server active; tap the name to edit it. The active server's settings are used when you connect.")
             }
 
             // VK Account Auth (non-anonymous cookie path). Default OFF. When ON,

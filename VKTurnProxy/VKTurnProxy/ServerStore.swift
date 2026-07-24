@@ -118,14 +118,24 @@ final class ServerStore: ObservableObject {
         guard servers.contains(where: { $0.id == id }) else { return }
         activeServerId = id
         persist()
-        projectToFlatKeys(activeServer)
     }
 
     func update(_ profile: ServerProfile) {
         guard let i = servers.firstIndex(where: { $0.id == profile.id }) else { return }
         servers[i] = profile
         persist()
-        if profile.id == activeServerId { projectToFlatKeys(profile) }
+    }
+
+    /// Project the ACTIVE server onto the flat @AppStorage keys. Called at
+    /// launch and when the Settings flow closes (SettingsView.onDisappear) —
+    /// NOT during editing / active-server switching. Reason: writing these keys
+    /// re-renders ContentView (it observes them via @AppStorage), and in a
+    /// NavigationView that pops any pushed child (ServerEditView / SettingsView).
+    /// Deferring projection to "leaving Settings" keeps editing stable; the flat
+    /// keys are only consumed on ContentView's main screen (validation + connect),
+    /// which is exactly where the user lands after Settings closes.
+    func projectActive() {
+        projectToFlatKeys(activeServer)
     }
 
     @discardableResult

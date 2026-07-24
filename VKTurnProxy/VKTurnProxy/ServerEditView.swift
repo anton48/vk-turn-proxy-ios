@@ -82,12 +82,14 @@ struct ServerEditView: View {
             }
 
             Section("Transport") {
-                if mode.wrappedValue != .srtpWrapA {
-                    TextField("Proxy Server (host:port)", text: $draft.peerAddress)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                    hint(ConfigValidation.peerAddress(draft.peerAddress))
-                }
+                // Proxy Server (peerAddress) applies to ALL modes — incl.
+                // SRTP-WRAP-A, where it is the amurcanov DTLS server address
+                // (only the WireGuard-keys section below is hidden in WRAP-A,
+                // since those are minted server-side via GETCONF).
+                TextField("Proxy Server (host:port)", text: $draft.peerAddress)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                hint(ConfigValidation.peerAddress(draft.peerAddress))
 
                 TextField("TURN server (IP:port, optional)", text: $draft.turnServerOverride)
                     .autocapitalization(.none)
@@ -99,27 +101,31 @@ struct ServerEditView: View {
                     ForEach(ServerMode.allCases) { m in Text(m.label).tag(m) }
                 }
 
-                if mode.wrappedValue == .srtpWrap {
-                    SecureField("WRAP key (64 hex chars)", text: $draft.wrapKeyHex)
-                        .autocapitalization(.none).disableAutocorrection(true)
-                    hint(ConfigValidation.wrapKeyHex(draft.wrapKeyHex))
-                }
-                if mode.wrappedValue == .srtpWrapA {
-                    SecureField("Server password", text: $draft.wrapAPassword)
-                        .autocapitalization(.none).disableAutocorrection(true)
-                    hint(ConfigValidation.wrapAPassword(draft.wrapAPassword))
-                }
-                if mode.wrappedValue == .srtpWrapS {
-                    SecureField("WRAP key (64 hex chars)", text: $draft.wrapKeyHex)
-                        .autocapitalization(.none).disableAutocorrection(true)
-                    hint(ConfigValidation.wrapKeyHex(draft.wrapKeyHex))
-                    Picker("Obfuscation profile", selection: $draft.obfProfile) {
-                        Text("rtpopus").tag("rtpopus")
-                        Text("rtpopus2").tag("rtpopus2")
-                        Text("rtpopus3").tag("rtpopus3")
+                // Mode-specific fields, grouped so the section stays under the
+                // ViewBuilder 10-child limit.
+                Group {
+                    if mode.wrappedValue == .srtpWrap {
+                        SecureField("WRAP key (64 hex chars)", text: $draft.wrapKeyHex)
+                            .autocapitalization(.none).disableAutocorrection(true)
+                        hint(ConfigValidation.wrapKeyHex(draft.wrapKeyHex))
                     }
-                    TextField("Client ID", text: $draft.clientID)
-                        .autocapitalization(.none).disableAutocorrection(true)
+                    if mode.wrappedValue == .srtpWrapA {
+                        SecureField("Server password", text: $draft.wrapAPassword)
+                            .autocapitalization(.none).disableAutocorrection(true)
+                        hint(ConfigValidation.wrapAPassword(draft.wrapAPassword))
+                    }
+                    if mode.wrappedValue == .srtpWrapS {
+                        SecureField("WRAP key (64 hex chars)", text: $draft.wrapKeyHex)
+                            .autocapitalization(.none).disableAutocorrection(true)
+                        hint(ConfigValidation.wrapKeyHex(draft.wrapKeyHex))
+                        Picker("Obfuscation profile", selection: $draft.obfProfile) {
+                            Text("rtpopus").tag("rtpopus")
+                            Text("rtpopus2").tag("rtpopus2")
+                            Text("rtpopus3").tag("rtpopus3")
+                        }
+                        TextField("Client ID", text: $draft.clientID)
+                            .autocapitalization(.none).disableAutocorrection(true)
+                    }
                 }
 
                 Toggle("Use UDP transport to TURN", isOn: $draft.useUDP)
