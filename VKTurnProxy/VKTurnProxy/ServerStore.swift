@@ -168,6 +168,34 @@ final class ServerStore: ObservableObject {
         if wasActive { activate(servers[0].id) } else { persist() }
     }
 
+    // MARK: - Full-backup import (M3)
+
+    /// Replace the whole set from a backup that carries `servers`. The active
+    /// server is picked by name (falling back to the first entry) and projected
+    /// onto the flat keys, since an import lands the user back on the main
+    /// screen where those keys are read.
+    func replaceAll(_ profiles: [ServerProfile], activeName: String?) {
+        guard !profiles.isEmpty else { return }
+        servers = profiles
+        let active = activeName.flatMap { name in profiles.first { $0.serverName == name } }
+                     ?? profiles[0]
+        activeServerId = active.id
+        persist()
+        projectToFlatKeys(active)
+        SharedLogger.shared.log("[AppDebug] Backup: restored \(profiles.count) server(s), active = \"\(active.serverName)\" [\(active.modeLabel)]")
+    }
+
+    /// Rebuild the set as a single server from the flat @AppStorage keys. Used
+    /// when importing a pre-179 backup, whose settings were just written to
+    /// those keys — no projection needed, they already hold these values.
+    func resetFromFlatKeys(name: String = "Server1") {
+        let p = Self.serverFromFlatKeys(name: name)
+        servers = [p]
+        activeServerId = p.id
+        persist()
+        SharedLogger.shared.log("[AppDebug] Backup: legacy single-server backup imported as \"\(p.serverName)\" [\(p.modeLabel)]")
+    }
+
     /// M4: import a connection link as a NEW server and make it active.
     @discardableResult
     func addAndActivate(_ profile: ServerProfile) -> ServerProfile {

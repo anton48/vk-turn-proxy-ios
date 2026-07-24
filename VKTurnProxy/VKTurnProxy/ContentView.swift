@@ -767,7 +767,9 @@ struct SettingsView: View {
             formatter.timeStyle = .short
             let credCount = config.turnPool?.creds.count ?? 0
             let profileMark = (config.vkProfile != nil) ? " + browser profile" : ""
-            return Text("Backup from \(formatter.string(from: date)) with \(credCount) cached TURN cred(s)\(profileMark). This will overwrite all current settings.")
+            // Pre-179 backups carry no `servers` array — they restore as one server.
+            let serverCount = config.settings.servers?.count ?? 1
+            return Text("Backup from \(formatter.string(from: date)) with \(serverCount) server(s) and \(credCount) cached TURN cred(s)\(profileMark). This will overwrite all current settings.")
         }
         // Connection link confirm — same shape as the full-backup import
         // alert but applies only the deployment definition (WG keys,

@@ -79,51 +79,27 @@ enum BackupManager {
         // Defaults must match SettingsView's @AppStorage defaults (UserDefaults
         // returns nil for unset keys); `object(forKey:) as? Bool` distinguishes
         // "explicitly false" from "never set".
-        let privateKey = d.string(forKey: "privateKey") ?? ""
-        let peerPublicKey = d.string(forKey: "peerPublicKey") ?? ""
-        let presharedKey = d.string(forKey: "presharedKey") ?? ""
-        let tunnelAddress = d.string(forKey: "tunnelAddress") ?? "192.168.102.3/24"
-        let dnsServers = d.string(forKey: "dnsServers") ?? "1.1.1.1"
-        let allowedIPs = d.string(forKey: "allowedIPs") ?? "0.0.0.0/0"
+        // Globals (not per-server). Everything else now lives in `servers`.
         let vkLink = d.string(forKey: "vkLink") ?? ""
-        let peerAddress = d.string(forKey: "peerAddress") ?? ""
-        let useDTLS = (d.object(forKey: "useDTLS") as? Bool) ?? true
-        let numConnections = (d.object(forKey: "numConnections") as? Int) ?? 30
-        let credPoolCooldownSeconds = (d.object(forKey: "credPoolCooldownSeconds") as? Int) ?? 150
-        let useWrap = (d.object(forKey: "useWrap") as? Bool) ?? false
-        let wrapKeyHex = d.string(forKey: "wrapKeyHex") ?? ""
-        let useSrtp = (d.object(forKey: "useSrtp") as? Bool) ?? false
-        let useUDP = (d.object(forKey: "useUDP") as? Bool) ?? false
-        let useWrapA = (d.object(forKey: "useWrapA") as? Bool) ?? false
-        let wrapAPassword = d.string(forKey: "wrapAPassword") ?? ""
-        let wrapSOn = (d.object(forKey: "useWrapS") as? Bool) ?? false
-        let wrapSProfile = d.string(forKey: "obfProfile") ?? "rtpopus"
-        let wrapSClientID = d.string(forKey: "clientID") ?? ""
-        let turnServerOverride = d.string(forKey: "turnServerOverride")
         let vkAuth = (d.object(forKey: "VKAuth") as? Bool) ?? false
+        // Named servers (build 179+). The legacy flat per-server fields are
+        // deliberately NOT written alongside them — a backup from this build is
+        // not meant to be readable by 178 and earlier.
+        let store = ServerStore.shared
+        let servers = store.servers.map { ServerSettings($0) }
+        let activeServer = store.activeServer.serverName
         let settings = AppSettings(
-            privateKey: privateKey,
-            peerPublicKey: peerPublicKey,
-            presharedKey: presharedKey,
-            tunnelAddress: tunnelAddress,
-            dnsServers: dnsServers,
-            allowedIPs: allowedIPs,
             vkLink: vkLink,
-            peerAddress: peerAddress,
-            useDTLS: useDTLS,
-            numConnections: numConnections,
-            credPoolCooldownSeconds: credPoolCooldownSeconds,
-            useWrap: useWrap,
-            wrapKeyHex: wrapKeyHex,
-            useSrtp: useSrtp,
-            useUDP: useUDP,
-            useWrapA: useWrapA,
-            wrapAPassword: wrapAPassword,
-            turnServerOverride: turnServerOverride,
-            vkAuth: vkAuth,
-            useWrapS: wrapSOn,
-            obfProfile: wrapSProfile,
-            clientID: wrapSClientID
+            servers: servers,
+            activeServer: activeServer,
+            useWrap: nil,
+            wrapKeyHex: nil,
+            useSrtp: nil,
+            useUDP: nil,
+            useWrapA: nil,
+            wrapAPassword: nil,
+            turnServerOverride: nil,
+            vkAuth: vkAuth
         )
 
         var turnPool: CredCacheFile? = nil
@@ -230,41 +206,48 @@ enum BackupManager {
     static func applyConfig(_ config: AppConfig) throws {
         let d = UserDefaults.standard
         let s = config.settings
-        d.set(s.privateKey, forKey: "privateKey")
-        d.set(s.peerPublicKey, forKey: "peerPublicKey")
-        d.set(s.presharedKey, forKey: "presharedKey")
-        d.set(stripControlChars(s.tunnelAddress), forKey: "tunnelAddress")
-        d.set(s.dnsServers, forKey: "dnsServers")
-        d.set(stripControlChars(s.allowedIPs), forKey: "allowedIPs")
+
+        // GLOBAL settings first — they apply to both backup shapes.
         d.set(s.vkLink, forKey: "vkLink")
-        d.set(stripControlChars(s.peerAddress), forKey: "peerAddress")
-        d.set(s.useDTLS, forKey: "useDTLS")
-        d.set(s.numConnections, forKey: "numConnections")
-        d.set(s.credPoolCooldownSeconds, forKey: "credPoolCooldownSeconds")
-        // WRAP fields: nil → leave UserDefaults alone so the AppStorage
-        // default kicks in, matching the behaviour for an older backup
-        // that never had these keys. Non-nil → write through, including
-        // false / empty if the user explicitly set them that way.
-        if let v = s.useWrap { d.set(v, forKey: "useWrap") }
-        if let v = s.wrapKeyHex { d.set(v, forKey: "wrapKeyHex") }
-        // useSrtp: same pattern as WRAP fields — nil leaves the
-        // AppStorage default in place, non-nil writes through.
-        if let v = s.useSrtp { d.set(v, forKey: "useSrtp") }
-        // useUDP: same nil-preserves-default pattern.
-        if let v = s.useUDP { d.set(v, forKey: "useUDP") }
-        // WRAP-A (amurcanov interop): same nil-preserves-default pattern.
-        if let v = s.useWrapA { d.set(v, forKey: "useWrapA") }
-        if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
-        if let v = s.useWrapS { d.set(v, forKey: "useWrapS") }
-        if let v = s.obfProfile { d.set(v, forKey: "obfProfile") }
-        if let v = s.clientID { d.set(v, forKey: "clientID") }
-        if let v = s.turnServerOverride { d.set(v, forKey: "turnServerOverride") }
         // forceLegacyCaptcha: undocumented on-device captcha-test toggle
-        // (build 149) — same nil-preserves-default pattern.
+        // (build 149) — nil-preserves-default pattern.
         if let v = s.forceLegacyCaptcha { d.set(v, forKey: "forceLegacyCaptcha") }
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
 
-        SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false), useSrtp=\(s.useSrtp ?? false), useUDP=\(s.useUDP ?? false))")
+        if let backedUpServers = s.servers, !backedUpServers.isEmpty {
+            // Build 179+ backup: the named server sets ARE the configuration.
+            // replaceAll projects the active one onto the flat keys.
+            ServerStore.shared.replaceAll(backedUpServers.map { $0.profile },
+                                          activeName: s.activeServer)
+        } else {
+            // Pre-179 backup: one flat configuration. Write it to the flat keys
+            // exactly as before, then capture it as the single "Server1".
+            // nil → leave the key alone so the @AppStorage default applies,
+            // matching how older builds tolerated absent fields.
+            if let v = s.privateKey { d.set(v, forKey: "privateKey") }
+            if let v = s.peerPublicKey { d.set(v, forKey: "peerPublicKey") }
+            if let v = s.presharedKey { d.set(v, forKey: "presharedKey") }
+            if let v = s.tunnelAddress { d.set(stripControlChars(v), forKey: "tunnelAddress") }
+            if let v = s.dnsServers { d.set(v, forKey: "dnsServers") }
+            if let v = s.allowedIPs { d.set(stripControlChars(v), forKey: "allowedIPs") }
+            if let v = s.peerAddress { d.set(stripControlChars(v), forKey: "peerAddress") }
+            if let v = s.useDTLS { d.set(v, forKey: "useDTLS") }
+            if let v = s.numConnections { d.set(v, forKey: "numConnections") }
+            if let v = s.credPoolCooldownSeconds { d.set(v, forKey: "credPoolCooldownSeconds") }
+            if let v = s.useWrap { d.set(v, forKey: "useWrap") }
+            if let v = s.wrapKeyHex { d.set(v, forKey: "wrapKeyHex") }
+            if let v = s.useSrtp { d.set(v, forKey: "useSrtp") }
+            if let v = s.useUDP { d.set(v, forKey: "useUDP") }
+            if let v = s.useWrapA { d.set(v, forKey: "useWrapA") }
+            if let v = s.wrapAPassword { d.set(v, forKey: "wrapAPassword") }
+            if let v = s.useWrapS { d.set(v, forKey: "useWrapS") }
+            if let v = s.obfProfile { d.set(v, forKey: "obfProfile") }
+            if let v = s.clientID { d.set(v, forKey: "clientID") }
+            if let v = s.turnServerOverride { d.set(v, forKey: "turnServerOverride") }
+            ServerStore.shared.resetFromFlatKeys()
+        }
+
+        SharedLogger.shared.log("[AppDebug] Backup: applied settings (servers=\(s.servers?.count ?? 0), vkAuth=\(s.vkAuth ?? false))")
 
         // creds-pool.json: write only if backup contained one. If the
         // backup has nil turnPool (e.g. user exported on a fresh install

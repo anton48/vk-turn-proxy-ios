@@ -65,17 +65,36 @@ struct AppConfig: Codable {
 /// the AppStorage default when nil. Each addition documents which
 /// build introduced it for traceability.
 struct AppSettings: Codable {
-    let privateKey: String
-    let peerPublicKey: String
-    let presharedKey: String
-    let tunnelAddress: String
-    let dnsServers: String
-    let allowedIPs: String
+    /// VK call link(s), one per line. GLOBAL — shared by every named server,
+    /// so it stays at the top level of `settings`.
     let vkLink: String
-    let peerAddress: String
-    let useDTLS: Bool
-    let numConnections: Int
-    let credPoolCooldownSeconds: Int
+
+    // MARK: Named servers (exported by build 179+)
+    //
+    /// The named server sets. Present in backups from build 179 onward; absent
+    /// in older ones, where the legacy single-server fields below carry the one
+    /// configuration instead (imported as "Server1"). Not dual-written: a build
+    /// 179+ backup is NOT readable by build 178 and earlier.
+    var servers: [ServerSettings]? = nil
+    /// `serverName` of the active server inside `servers`; nil → first entry.
+    var activeServer: String? = nil
+
+    // MARK: Legacy single-server fields (backups from build 178 and earlier)
+    //
+    // These mirrored the flat @AppStorage keys back when the app had exactly one
+    // configuration. Builds 179+ leave them absent and export `servers` instead;
+    // the importer synthesises a single "Server1" from them when `servers` is
+    // missing. All Optional so both shapes decode.
+    var privateKey: String? = nil
+    var peerPublicKey: String? = nil
+    var presharedKey: String? = nil
+    var tunnelAddress: String? = nil
+    var dnsServers: String? = nil
+    var allowedIPs: String? = nil
+    var peerAddress: String? = nil
+    var useDTLS: Bool? = nil
+    var numConnections: Int? = nil
+    var credPoolCooldownSeconds: Int? = nil
     /// WRAP layer (ChaCha20-XOR ChannelData payload obfuscation, see
     /// vk-turn-proxy-ios commit 1c1edc1 / branch add-client-wrap-layer).
     /// Optional for back-compat with backups exported before WRAP shipped.
