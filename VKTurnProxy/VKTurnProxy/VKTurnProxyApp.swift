@@ -27,6 +27,12 @@ struct VKTurnProxyApp: App {
         // while the source had moved on.
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         SharedLogger.shared.log("[App] VKTurnProxy launched (build \(build))")
+
+        // Instantiate the named-server store so first-launch migration runs and
+        // captures the user's existing single config as "Server1". M1 is inert:
+        // the store does not project onto the flat @AppStorage keys yet (the
+        // flat keys stay authoritative until M2 wires the store-driven UI).
+        _ = ServerStore.shared
     }
 
     var body: some Scene {

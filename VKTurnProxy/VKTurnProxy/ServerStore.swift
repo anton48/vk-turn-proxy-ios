@@ -1,0 +1,180 @@
+// ServerStore.swift
+//
+// Canonical store of named server profiles (Option A architecture). The ACTIVE
+// profile is PROJECTED into the flat @AppStorage/UserDefaults keys that
+// ContentView's TunnelConfig build + TunnelManager already read — so connect(),
+// buildProxyConfig and buildUAPIConfig need no changes.
+//
+// ServerStore is the ONLY writer of the per-server flat keys. The GLOBAL keys
+// (vkLink, VKAuth, forceLegacyCaptcha) are NEVER touched by projection.
+//
+// M1 note: the store is instantiated at launch (so first-launch migration runs
+// and captures the existing single config as "Server1"), but nothing projects
+// on launch yet — the flat keys stay authoritative until M2 wires the
+// store-driven UI. So an M1-only build is behaviorally a no-op.
+
+import Foundation
+
+final class ServerStore: ObservableObject {
+    static let shared = ServerStore()
+
+    @Published private(set) var servers: [ServerProfile] = []
+    @Published private(set) var activeServerId: UUID = UUID()
+
+    private let d = UserDefaults.standard
+    private let serversKey = "servers_v1"
+    private let activeKey = "activeServerId"
+
+    // The flat per-server keys projected/migrated. GLOBAL keys (vkLink, VKAuth,
+    // forceLegacyCaptcha) are deliberately absent from these tables.
+    private static let stringKeyPaths: [(String, WritableKeyPath<ServerProfile, String>)] = [
+        ("privateKey", \.privateKey), ("peerPublicKey", \.peerPublicKey),
+        ("presharedKey", \.presharedKey), ("tunnelAddress", \.tunnelAddress),
+        ("peerAddress", \.peerAddress), ("dnsServers", \.dnsServers),
+        ("turnServerOverride", \.turnServerOverride), ("wrapKeyHex", \.wrapKeyHex),
+        ("obfProfile", \.obfProfile), ("clientID", \.clientID),
+        ("wrapAPassword", \.wrapAPassword),
+    ]
+    private static let boolKeyPaths: [(String, WritableKeyPath<ServerProfile, Bool>, Bool)] = [
+        ("useUDP", \.useUDP, false), ("useDTLS", \.useDTLS, true),
+        ("useSrtp", \.useSrtp, true), ("useWrap", \.useWrap, false),
+        ("useWrapA", \.useWrapA, false), ("useWrapS", \.useWrapS, false),
+    ]
+    private static let intKeyPaths: [(String, WritableKeyPath<ServerProfile, Int>, Int)] = [
+        ("numConnections", \.numConnections, 30),
+        ("credPoolCooldownSeconds", \.credPoolCooldownSeconds, 150),
+    ]
+
+    private init() { load() }
+
+    var activeServer: ServerProfile {
+        servers.first(where: { $0.id == activeServerId }) ?? servers[0]
+    }
+
+    // MARK: - Persistence + first-launch migration
+
+    private func load() {
+        if let data = d.data(forKey: serversKey),
+           let decoded = try? JSONDecoder().decode([ServerProfile].self, from: data),
+           !decoded.isEmpty {
+            servers = decoded
+            if let s = d.string(forKey: activeKey), let id = UUID(uuidString: s),
+               decoded.contains(where: { $0.id == id }) {
+                activeServerId = id
+            } else {
+                activeServerId = decoded[0].id
+            }
+        } else {
+            // First launch (or an unreadable store): capture the user's existing
+            // single config from the flat keys as "Server1".
+            let s = Self.serverFromFlatKeys(name: "Server1")
+            servers = [s]
+            activeServerId = s.id
+            persist()
+        }
+    }
+
+    private func persist() {
+        if let data = try? JSONEncoder().encode(servers) {
+            d.set(data, forKey: serversKey)
+        }
+        d.set(activeServerId.uuidString, forKey: activeKey)
+    }
+
+    /// Build a ServerProfile from the current flat @AppStorage keys, matching
+    /// each key's @AppStorage default when the key was never written.
+    static func serverFromFlatKeys(name: String) -> ServerProfile {
+        let d = UserDefaults.standard
+        var p = ServerProfile()
+        p.serverName = name
+        for (key, kp) in stringKeyPaths {
+            if let v = d.string(forKey: key) { p[keyPath: kp] = v }
+        }
+        for (key, kp, def) in boolKeyPaths {
+            p[keyPath: kp] = d.object(forKey: key) == nil ? def : d.bool(forKey: key)
+        }
+        for (key, kp, def) in intKeyPaths {
+            p[keyPath: kp] = d.object(forKey: key) == nil ? def : d.integer(forKey: key)
+        }
+        return p
+    }
+
+    // MARK: - Projection (active profile -> flat keys). ONLY writer of these keys.
+
+    func projectToFlatKeys(_ p: ServerProfile) {
+        for (key, kp) in Self.stringKeyPaths { d.set(p[keyPath: kp], forKey: key) }
+        for (key, kp, _) in Self.boolKeyPaths { d.set(p[keyPath: kp], forKey: key) }
+        for (key, kp, _) in Self.intKeyPaths { d.set(p[keyPath: kp], forKey: key) }
+        d.set("0.0.0.0/0", forKey: "allowedIPs")   // always pinned
+        // GLOBAL keys (vkLink, VKAuth, forceLegacyCaptcha) intentionally untouched.
+    }
+
+    // MARK: - Mutations (wired to the UI in M2 / link import in M4)
+
+    func activate(_ id: UUID) {
+        guard servers.contains(where: { $0.id == id }) else { return }
+        activeServerId = id
+        persist()
+        projectToFlatKeys(activeServer)
+    }
+
+    func update(_ profile: ServerProfile) {
+        guard let i = servers.firstIndex(where: { $0.id == profile.id }) else { return }
+        servers[i] = profile
+        persist()
+        if profile.id == activeServerId { projectToFlatKeys(profile) }
+    }
+
+    @discardableResult
+    func addNew() -> ServerProfile {
+        var p = ServerProfile()
+        p.serverName = nextDefaultName()
+        servers.append(p)
+        persist()
+        return p
+    }
+
+    @discardableResult
+    func copy(_ id: UUID) -> ServerProfile? {
+        guard var p = servers.first(where: { $0.id == id }) else { return nil }
+        p.id = UUID()
+        p.serverName = uniqueName(p.serverName + " copy")
+        servers.append(p)
+        persist()
+        return p
+    }
+
+    func delete(_ id: UUID) {
+        guard servers.count > 1 else { return }   // can't delete the last server
+        let wasActive = (id == activeServerId)
+        servers.removeAll { $0.id == id }
+        if wasActive { activate(servers[0].id) } else { persist() }
+    }
+
+    /// M4: import a connection link as a NEW server and make it active.
+    @discardableResult
+    func addAndActivate(_ profile: ServerProfile) -> ServerProfile {
+        var p = profile
+        p.serverName = p.serverName.isEmpty ? nextDefaultName() : uniqueName(p.serverName)
+        servers.append(p)
+        activate(p.id)
+        return p
+    }
+
+    // MARK: - Naming helpers
+
+    private func nextDefaultName() -> String {
+        let names = Set(servers.map { $0.serverName })
+        var n = 1
+        while names.contains("Server\(n)") { n += 1 }
+        return "Server\(n)"
+    }
+
+    private func uniqueName(_ base: String) -> String {
+        let names = Set(servers.map { $0.serverName })
+        if !names.contains(base) { return base }
+        var n = 2
+        while names.contains("\(base) \(n)") { n += 1 }
+        return "\(base) \(n)"
+    }
+}
