@@ -45,4 +45,14 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     var clientID: String = ""        // SRTP-WRAP-S per-stream id (auto-UUID)
     // SRTP-WRAP-A.
     var wrapAPassword: String = ""
+
+    /// Human-readable transport mode, matching the ServerMode picker labels.
+    /// Used in log lines and import confirmations.
+    var modeLabel: String {
+        if useWrapS { return "SRTP-WRAP-S" }
+        if useWrapA { return "SRTP-WRAP-A" }
+        if useSrtp { return "SRTP" }
+        if useWrap { return "SRTP+WRAP" }
+        return "Legacy (DTLS+WG)"
+    }
 }

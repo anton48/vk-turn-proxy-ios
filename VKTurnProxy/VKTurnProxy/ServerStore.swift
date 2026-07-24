@@ -75,6 +75,8 @@ final class ServerStore: ObservableObject {
         // / TunnelManager always read the active server's config. On first launch
         // this is a no-op (Server1 was built from those very keys).
         projectToFlatKeys(activeServer)
+        let s = activeServer
+        SharedLogger.shared.log("[AppDebug] servers: \(servers.count) configured, active = \"\(s.serverName)\" [\(s.modeLabel)]")
     }
 
     private func persist() {
@@ -118,6 +120,8 @@ final class ServerStore: ObservableObject {
         guard servers.contains(where: { $0.id == id }) else { return }
         activeServerId = id
         persist()
+        let s = activeServer
+        SharedLogger.shared.log("[AppDebug] active server → \"\(s.serverName)\" [\(s.modeLabel)]")
     }
 
     func update(_ profile: ServerProfile) {

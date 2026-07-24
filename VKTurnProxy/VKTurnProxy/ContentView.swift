@@ -10,6 +10,13 @@ private let captchaLog = OSLog(subsystem: "com.vkturnproxy.app", category: "Capt
 struct ContentView: View {
     @StateObject private var tunnel = TunnelManager()
 
+    // Name of the ACTIVE server, shown under the status text. Deliberately a
+    // @State snapshot refreshed in .onAppear (which fires when Settings is
+    // popped) rather than an @ObservedObject on ServerStore: observing the store
+    // would re-render this root view on every edit keystroke, which is exactly
+    // what popped the pushed editor before (see ServerStore.projectActive).
+    @State private var activeServerName = ServerStore.shared.activeServer.serverName
+
     // All config stored in AppStorage, edited on SettingsView
     @AppStorage("privateKey") private var privateKey = ""
     @AppStorage("peerPublicKey") private var peerPublicKey = ""
@@ -134,6 +141,13 @@ struct ContentView: View {
                     Text(statusText)
                         .font(.headline)
 
+                    // Which named server this status refers to.
+                    Text(tunnel.status == .connected
+                         ? "Connected to \(activeServerName)"
+                         : "Server: \(activeServerName)")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+
                     if let error = tunnel.errorMessage {
                         Text(error)
                             .font(.caption)
@@ -176,12 +190,12 @@ struct ContentView: View {
                             SharedLogger.shared.log("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
                             tunnel.disconnect()
                         } else {
-                            NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
-                            SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue))")
                             // Per-server fields come from the ACTIVE server (read
                             // directly from the store); vkLink / VKAuth /
                             // forceLegacyCaptcha are global.
                             let active = ServerStore.shared.activeServer
+                            NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue), server=\"\(active.serverName)\" [\(active.modeLabel)])")
+                            SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue), server=\"\(active.serverName)\" [\(active.modeLabel)])")
                             let turnOv = parseTurnOverride(active.turnServerOverride)
                             let vkLines = vkLink.split(whereSeparator: { $0.isNewline })
                                 .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -257,6 +271,9 @@ struct ContentView: View {
             }
             .navigationTitle("VK Turn Proxy")
             .navigationBarTitleDisplayMode(.inline)
+            // Fires on first show AND when Settings is popped, so the displayed
+            // server name follows a rename / active-server switch.
+            .onAppear { activeServerName = ServerStore.shared.activeServer.serverName }
             .sheet(isPresented: $tunnel.captchaPending) {
                 if let urlStr = tunnel.captchaImageURL, let url = URL(string: urlStr) {
                     CaptchaWebView(
