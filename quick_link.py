@@ -15,11 +15,20 @@ Three ways to feed it:
 
            python3 quick_link.py
 
-    2. Pass a JSON file (same shape as CONFIG) as argv[1] — useful when
-       managing multiple deployments via files in a private repo or
-       password manager:
+    2. Pass a JSON file as argv[1] — useful when managing multiple
+       deployments via files in a private repo or password manager. Two
+       shapes are accepted:
+
+         - the CONFIG shape (bare, or wrapped in {"settings": {...}}),
+         - a Full Backup exported by app build 179+, whose settings carry
+           a named-server array. The ACTIVE server is used by default:
 
            python3 quick_link.py my-deployment.json
+           python3 quick_link.py vkturnproxy-backup.json
+           python3 quick_link.py vkturnproxy-backup.json --server Server2
+
+       In a 179+ backup vkLink is global (shared by all servers), so it is
+       merged into the chosen server automatically.
 
     3. Provision a NEW client: generate a fresh WireGuard keypair, override
        CONFIG["privateKey"] with it, and print BOTH the link (carrying the new
@@ -156,6 +165,12 @@ CONFIG = {
     "presharedKey":   "REPLACE_ME",
     "dnsServers":     "1.1.1.1",
     "numConnections": 30,
+    # Name of the server this link creates on the importing device (app build
+    # 179+, which stores a set of named servers instead of one configuration).
+    # Importing ADDS a server under this name and makes it active; existing
+    # servers are kept. Delete the line to let the app assign "ServerN".
+    # Older builds ignore the field.
+    "serverName":     "Server1",
     # useDTLS / useWrap / wrapKeyHex were required before iOS build 129
     # (they corresponded to UI toggles that have since been removed —
     # useDTLS in build 127, useWrap in build 115). Kept in CONFIG with
@@ -225,12 +240,70 @@ SCHEMA_VERSION = 1
 
 
 def load_config(argv):
-    if len(argv) > 1:
-        path = argv[1]
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("settings", data)
-    return CONFIG
+    """Resolve the settings dict a link is built from.
+
+    Accepts three input shapes:
+      * no file argument                  → the CONFIG dict above;
+      * CONFIG-shaped JSON                → used as-is (also unwraps
+                                            {"settings": {...}});
+      * Full Backup from app build 179+   → settings.servers[] holds the named
+                                            servers; pick the active one (or
+                                            --server <name>) and merge in the
+                                            GLOBAL vkLink, which no longer lives
+                                            inside a server.
+    """
+    path = None
+    want_server = None
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] in ("--server", "-server"):
+            if i + 1 >= len(args):
+                raise SystemExit("ERROR: --server needs a server name")
+            want_server = args[i + 1]
+            i += 2
+            continue
+        if path is None:
+            path = args[i]
+        i += 1
+
+    if path is None:
+        if want_server:
+            raise SystemExit("ERROR: --server only applies to a backup file argument")
+        return CONFIG
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    settings = data.get("settings", data)
+
+    servers = settings.get("servers")
+    if isinstance(servers, list) and servers:
+        names = [s.get("serverName", "") for s in servers]
+        if want_server:
+            chosen = next((s for s in servers if s.get("serverName") == want_server), None)
+            if chosen is None:
+                raise SystemExit(
+                    f"ERROR: no server named {want_server!r} in {path}\n"
+                    f"Available: {', '.join(n for n in names if n)}"
+                )
+        else:
+            active = settings.get("activeServer")
+            chosen = next((s for s in servers if s.get("serverName") == active), None)
+            if chosen is None:
+                chosen = servers[0]
+        merged = dict(chosen)
+        # vkLink is GLOBAL in the 179+ backup (shared by every server) but is a
+        # required field of a connection link, so fold it back in here.
+        if "vkLink" in settings:
+            merged["vkLink"] = settings["vkLink"]
+        return merged
+
+    if want_server:
+        raise SystemExit(
+            f"ERROR: --server given but {path} has no servers[] "
+            f"(it is a pre-179 backup or a plain CONFIG file)"
+        )
+    return settings
 
 
 def validate(settings):
