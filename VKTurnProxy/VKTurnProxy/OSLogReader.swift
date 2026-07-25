@@ -57,24 +57,31 @@ enum OSLogReader {
             formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
             formatter.locale = Locale(identifier: "en_US_POSIX")
 
+            // Tag by PROCESS, not by subsystem. The store we just opened is
+            // scoped to .currentProcessIdentifier, so every entry in it belongs
+            // to whoever called this — the main app when LogsView reads its own
+            // logs, the extension when it answers get_logs.
+            //
+            // Tagging by subsystem was actively misleading: the Go bridge
+            // hardcodes the `com.vkturnproxy.tunnel` subsystem in WHICHEVER
+            // process loads it, and the main app links the same xcframework for
+            // the pre-bootstrap VK probe. So the app's own `wgProbeVKCreds` /
+            // `vkcalls:` lines were being labelled "[Tunnel]", and a reader
+            // (twice, including us, 2026-07-25) concluded the extension was
+            // alive and talking when it was not — which matters most on exactly
+            // the builds where the extension is unreachable and every line in
+            // the export is in fact the app's.
+            let processTag = Bundle.main.bundlePath.hasSuffix(".appex") ? "[Tunnel] " : "[App] "
             var out = ""
             out.reserveCapacity(64 * 1024)
             for entry in entries {
                 guard let logEntry = entry as? OSLogEntryLog else { continue }
                 let ts = formatter.string(from: logEntry.date)
-                // Go-side entries already start with "[Go] HH:mm:ss.SSSSSS";
-                // we tag the rest with "[Tunnel]" or "[App]" by source so
-                // the UI looks consistent with the regular file format.
-                let tag: String
-                switch logEntry.subsystem {
-                case "com.vkturnproxy.tunnel":
-                    tag = logEntry.composedMessage.hasPrefix("[Go] ") ? "" : "[Tunnel] "
-                case "com.vkturnproxy.app":
-                    tag = "[App] "
-                default:
-                    tag = ""
-                }
-                out += "[\(ts)] \(tag)\(logEntry.composedMessage)\n"
+                // Go-side entries keep their own "[Go] HH:mm:ss.SSSSSS" prefix
+                // AFTER the process tag rather than instead of it: the Go
+                // library runs in both processes, so "[Go]" alone never said
+                // which one produced the line.
+                out += "[\(ts)] \(processTag)\(logEntry.composedMessage)\n"
             }
             return out
         } catch {

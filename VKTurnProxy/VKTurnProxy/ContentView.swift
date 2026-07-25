@@ -2054,6 +2054,22 @@ struct LogsView: View {
                 reason = "Log file present but readLogs returned empty (current=\(status.currentBytes)B, archived=\(status.archivedBytes)B at \(status.containerPath))"
             }
 
+            // The extension's os_log entries can only reach us over the SAME
+            // providerMessage channel the stats use. On a re-signed build the OS
+            // refuses it ("process N is not entitled to establish IPC with
+            // plugins of type com.vkturnproxy.app"), so this fallback then shows
+            // main-app lines ONLY. Say so — otherwise the export looks like the
+            // extension is silent, and the reader concludes the tunnel is dead
+            // when it is running fine. (Verified 2026-07-25: the extension does
+            // emit its own App-Group diagnosis; it is visible in a device-wide
+            // idevicesyslog capture and absent from this screen.)
+            let extensionNote = extensionLogs.isEmpty
+                ? "\nNOTE: no lines from the tunnel extension below — the app "
+                + "could not reach it (same channel as the statistics). Everything "
+                + "shown is from the app process. The extension may well be "
+                + "running; a device-wide log capture would show its lines.\n"
+                : ""
+
             var combined = mainAppLogs + extensionLogs
             if combined.isEmpty {
                 combined = "No logs available.\n\nReason: \(reason)\n\n" +
@@ -2062,7 +2078,7 @@ struct LogsView: View {
             } else {
                 combined = "⚠️ Showing os_log fallback (recent ~30 min only, " +
                     "may be incomplete and out of order).\n" +
-                    "Reason: \(reason)\n\n" +
+                    "Reason: \(reason)\n" + extensionNote + "\n" +
                     combined
             }
 
