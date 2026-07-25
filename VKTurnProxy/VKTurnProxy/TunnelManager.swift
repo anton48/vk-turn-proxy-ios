@@ -1368,12 +1368,17 @@ class TunnelManager: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
-    /// Stable per-install device identifier for WRAP-A GETCONF, persisted in
-    /// the App Group so it survives relaunch (the server keys the minted
-    /// WireGuard device + IP on it, so it must be constant across reconnects).
-    /// NOT included in backups/links — it is device identity, not deployment
-    /// config; a fresh install mints a new one so two devices never collide on
-    /// amurcanov's server WG-peer pool. Generated lazily on first WRAP-A use.
+    /// LEGACY per-install device identifier for WRAP-A GETCONF, persisted in
+    /// the App Group. Until build 180 this single hidden value was THE device ID
+    /// for every configuration; since 181 it lives per-server in
+    /// `ServerProfile.deviceID` (editable in Settings, carried in full backups),
+    /// and ServerStore seeds this value into existing WRAP-A servers on first
+    /// launch. Kept as the fallback for the one case that remains: a WRAP-A
+    /// server whose field is empty — the server keys the WireGuard peer + IP it
+    /// mints on this value, so sending an empty one (Go would generate a
+    /// throwaway per session) would re-provision the tunnel on every connect.
+    /// Still NOT included in connection links: device identity, not deployment
+    /// config, so two devices never collide on the server's WG-peer pool.
     private func wrapADeviceID() -> String {
         let suite = UserDefaults(suiteName: "group.com.vkturnproxy.app")
         if let existing = suite?.string(forKey: "wrapADeviceID"), !existing.isEmpty {
@@ -1412,7 +1417,12 @@ class TunnelManager: ObservableObject {
         if config.useWrapA {
             dict["use_wrap_a"] = true
             dict["wrap_a_password"] = config.wrapAPassword
-            dict["device_id"] = wrapADeviceID()
+            // Trimmed because the field is hand-editable and pasting an ID
+            // easily brings a trailing newline; a whitespace-only value must
+            // count as "unset" and take the legacy fallback rather than reach
+            // GETCONF as a blank identity.
+            let devID = config.deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+            dict["device_id"] = devID.isEmpty ? wrapADeviceID() : devID
         }
         // SRTP-WRAP-S (samosvalishe/free-turn-proxy): obf profile + Client-ID on
         // the SRTP+WRAP data path. wrap_key_hex is already set above.
@@ -1868,6 +1878,11 @@ struct TunnelConfig {
     // Shared secret for WRAP-A: HKDF input for the obfuscation key AND GETCONF
     // authentication. One field. Required when useWrapA=true.
     var wrapAPassword: String = ""
+    // Device identity sent with GETCONF; the server keys the WireGuard peer +
+    // tunnel IP it mints on it, so it must be stable across reconnects. A
+    // per-server, user-editable field since build 181 (ServerProfile.deviceID);
+    // empty falls back to the legacy App-Group value — see wrapADeviceID().
+    var deviceID: String = ""
     // SRTP-WRAP-S (samosvalishe/free-turn-proxy interop): obf-profile
     // (rtpopus/rtpopus2/rtpopus3) + a Client-ID record over the SRTP+WRAP data
     // path. Reuses wrapKeyHex as the shared key; the user still enters WG keys.

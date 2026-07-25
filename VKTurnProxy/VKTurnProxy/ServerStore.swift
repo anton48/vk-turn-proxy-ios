@@ -32,7 +32,7 @@ final class ServerStore: ObservableObject {
         ("peerAddress", \.peerAddress), ("dnsServers", \.dnsServers),
         ("turnServerOverride", \.turnServerOverride), ("wrapKeyHex", \.wrapKeyHex),
         ("obfProfile", \.obfProfile), ("clientID", \.clientID),
-        ("wrapAPassword", \.wrapAPassword),
+        ("wrapAPassword", \.wrapAPassword), ("deviceID", \.deviceID),
     ]
     private static let boolKeyPaths: [(String, WritableKeyPath<ServerProfile, Bool>, Bool)] = [
         ("useUDP", \.useUDP, false), ("useDTLS", \.useDTLS, true),
@@ -71,6 +71,7 @@ final class ServerStore: ObservableObject {
             activeServerId = s.id
             persist()
         }
+        seedLegacyWrapADeviceID()
         // Project the active server onto the flat @AppStorage keys so ContentView
         // / TunnelManager always read the active server's config. On first launch
         // this is a no-op (Server1 was built from those very keys).
@@ -84,6 +85,47 @@ final class ServerStore: ObservableObject {
             d.set(data, forKey: serversKey)
         }
         d.set(activeServerId.uuidString, forKey: activeKey)
+    }
+
+    /// Build 181 migration: the SRTP-WRAP-A device identifier used to be ONE
+    /// hidden App-Group value (`wrapADeviceID`) that every configuration shared;
+    /// it is now a per-server, user-editable field. Seed that legacy value into
+    /// every WRAP-A server that has no device ID yet, so an existing install
+    /// keeps the WireGuard peer + tunnel IP the server already minted for it.
+    ///
+    /// Seeding all of them reproduces the old behaviour exactly (they really did
+    /// all send the same ID); the user can now give them distinct ones. Keyed on
+    /// "field is empty" rather than a one-shot migration flag, so a server whose
+    /// ID was cleared by hand is repaired too — an empty device ID is never
+    /// valid for GETCONF.
+    private static var legacyWrapADeviceID: String? {
+        let v = UserDefaults(suiteName: "group.com.vkturnproxy.app")?.string(forKey: "wrapADeviceID")
+        return (v?.isEmpty == false) ? v : nil
+    }
+
+    /// The legacy WRAP-A device ID, but only while NO server holds it yet.
+    ///
+    /// Used when a server is switched INTO SRTP-WRAP-A: on build ≤180 that
+    /// server would have connected with the legacy ID, so handing it over keeps
+    /// the WireGuard peer the server already minted. Returning nil once some
+    /// server owns it is what makes this safe — the ID can be adopted at most
+    /// once, so two profiles can never end up sharing one server-side peer.
+    /// The caller mints a fresh UUID when this is nil.
+    func unclaimedLegacyWrapADeviceID() -> String? {
+        guard let legacy = Self.legacyWrapADeviceID else { return nil }
+        return servers.contains { $0.deviceID == legacy } ? nil : legacy
+    }
+
+    private func seedLegacyWrapADeviceID() {
+        guard let legacy = Self.legacyWrapADeviceID else { return }
+        var seeded = 0
+        for i in servers.indices where servers[i].useWrapA && servers[i].deviceID.isEmpty {
+            servers[i].deviceID = legacy
+            seeded += 1
+        }
+        guard seeded > 0 else { return }
+        persist()
+        SharedLogger.shared.log("[AppDebug] servers: seeded the legacy WRAP-A device ID into \(seeded) server(s)")
     }
 
     /// Build a ServerProfile from the current flat @AppStorage keys, matching
@@ -180,8 +222,14 @@ final class ServerStore: ObservableObject {
         let active = activeName.flatMap { name in profiles.first { $0.serverName == name } }
                      ?? profiles[0]
         activeServerId = active.id
+        // A backup from build ≤180 carries no per-server device ID, so give the
+        // restored WRAP-A servers this device's legacy one — otherwise the
+        // Settings field would read empty while the tunnel quietly connected
+        // with the hidden App-Group value, and the NEXT export would persist
+        // that emptiness onto a device that has no legacy value to fall back to.
+        seedLegacyWrapADeviceID()
         persist()
-        projectToFlatKeys(active)
+        projectToFlatKeys(activeServer)   // re-read: seeding may have changed it
         SharedLogger.shared.log("[AppDebug] Backup: restored \(profiles.count) server(s), active = \"\(active.serverName)\" [\(active.modeLabel)]")
     }
 
@@ -192,6 +240,7 @@ final class ServerStore: ObservableObject {
         let p = Self.serverFromFlatKeys(name: name)
         servers = [p]
         activeServerId = p.id
+        seedLegacyWrapADeviceID()   // same reasoning as replaceAll
         persist()
         SharedLogger.shared.log("[AppDebug] Backup: legacy single-server backup imported as \"\(p.serverName)\" [\(p.modeLabel)]")
     }

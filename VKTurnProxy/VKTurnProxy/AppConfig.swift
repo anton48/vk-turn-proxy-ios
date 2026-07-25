@@ -120,9 +120,11 @@ struct AppSettings: Codable {
     let useUDP: Bool?
     /// WRAP-A (amurcanov-compatible 4th transport mode, added 2026-06-03).
     /// Optional for back-compat with backups exported before WRAP-A shipped —
-    /// nil leaves the AppStorage default (false). The per-install deviceID is
-    /// deliberately NOT backed up (device identity, regenerated on fresh
-    /// install so two devices never collide on the server's WG-peer pool).
+    /// nil leaves the AppStorage default (false). The WRAP-A device ID has NO
+    /// legacy field here: until build 180 it was a hidden App-Group value that
+    /// backups never carried, and since 181 it is a per-server field inside
+    /// `servers` (ServerSettings.deviceID). Connection links still omit it —
+    /// device identity, not deployment config.
     let useWrapA: Bool?
     /// WRAP-A shared secret (obfuscation key + GETCONF auth). Optional for
     /// back-compat. Plaintext like the WG private key above.

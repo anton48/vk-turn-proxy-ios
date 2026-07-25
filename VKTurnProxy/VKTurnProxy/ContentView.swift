@@ -223,6 +223,7 @@ struct ContentView: View {
                                 useSrtp: active.useSrtp,
                                 useWrapA: active.useWrapA,
                                 wrapAPassword: active.wrapAPassword,
+                                deviceID: active.deviceID,
                                 useWrapS: active.useWrapS,
                                 obfProfile: active.obfProfile,
                                 clientID: active.clientID,

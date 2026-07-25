@@ -43,6 +43,14 @@ struct ServerEditView: View {
                 if m == .srtpWrapS && draft.clientID.isEmpty {
                     draft.clientID = UUID().uuidString
                 }
+                // Same idea for SRTP-WRAP-A's device ID, except a server
+                // switched into WRAP-A on build ≤180 would have connected with
+                // this install's single hidden App-Group ID — so adopt that one
+                // while it is still unclaimed (keeps the WireGuard peer the
+                // server already minted) and mint a fresh one otherwise.
+                if m == .srtpWrapA && draft.deviceID.isEmpty {
+                    draft.deviceID = store.unclaimedLegacyWrapADeviceID() ?? UUID().uuidString
+                }
             }
         )
     }
@@ -113,6 +121,10 @@ struct ServerEditView: View {
                         SecureField("Server password", text: $draft.wrapAPassword)
                             .autocapitalization(.none).disableAutocorrection(true)
                         hint(ConfigValidation.wrapAPassword(draft.wrapAPassword))
+                        // The server keys the WireGuard peer it mints on this
+                        // value, so changing it gets you a NEW tunnel IP.
+                        TextField("Device ID", text: $draft.deviceID)
+                            .autocapitalization(.none).disableAutocorrection(true)
                     }
                     if mode.wrappedValue == .srtpWrapS {
                         SecureField("WRAP key (64 hex chars)", text: $draft.wrapKeyHex)

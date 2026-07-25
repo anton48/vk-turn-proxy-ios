@@ -358,7 +358,17 @@ def validate(settings):
             )
 
 
+# Never put these in a link, whichever input shape they came from. deviceID
+# (the SRTP-WRAP-A GETCONF identity, a per-server backup field since app build
+# 181) is DEVICE identity, not deployment config: amurcanov's server keys the
+# WireGuard peer + IP it mints on it, so two people importing a link that
+# carried one would collide on the same peer. The app mints a fresh device ID
+# whenever it imports a WRAP-A link, so dropping it here is all that's needed.
+LINK_EXCLUDED = ("deviceID",)
+
+
 def build_link(settings):
+    settings = {k: v for k, v in settings.items() if k not in LINK_EXCLUDED}
     payload = {
         "version": SCHEMA_VERSION,
         "type": "connection",

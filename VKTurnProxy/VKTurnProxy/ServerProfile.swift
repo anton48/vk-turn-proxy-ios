@@ -45,6 +45,20 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     var clientID: String = ""        // SRTP-WRAP-S per-stream id (auto-UUID)
     // SRTP-WRAP-A.
     var wrapAPassword: String = ""
+    /// SRTP-WRAP-A device identifier sent in the GETCONF request. amurcanov's
+    /// server keys the WireGuard peer + tunnel IP it mints on this value, so it
+    /// must stay constant across reconnects — and two devices must never share
+    /// one, or they collide on his WG-peer pool.
+    ///
+    /// Build 181 made it a per-server, user-editable field that round-trips
+    /// through full backups, mirroring SRTP-WRAP-S's Client ID (which it is the
+    /// exact analogue of). Before that it was a single hidden App-Group value
+    /// (`wrapADeviceID`) shared by every configuration; ServerStore seeds that
+    /// legacy value into existing WRAP-A servers on first launch, and
+    /// TunnelManager still falls back to it if this field is somehow empty.
+    /// Deliberately NOT carried in connection links — a link is deployment
+    /// config, this is device identity, so an imported link mints a fresh one.
+    var deviceID: String = ""
 
     /// Human-readable transport mode, matching the ServerMode picker labels.
     /// Used in log lines and import confirmations.
@@ -54,6 +68,59 @@ struct ServerProfile: Codable, Identifiable, Equatable {
         if useSrtp { return "SRTP" }
         if useWrap { return "SRTP+WRAP" }
         return "Legacy (DTLS+WG)"
+    }
+
+    /// Declared explicitly (rather than synthesised) because `init(from:)`
+    /// below is hand-written. **When you add a property, add it in BOTH
+    /// places** — a key missing here is silently not persisted, and one missing
+    /// from `init(from:)` silently decodes as its default.
+    enum CodingKeys: String, CodingKey {
+        case id, serverName
+        case privateKey, peerPublicKey, presharedKey, tunnelAddress, peerAddress
+        case dnsServers, numConnections, credPoolCooldownSeconds, turnServerOverride
+        case useUDP, useDTLS
+        case useSrtp, useWrap, useWrapA, useWrapS
+        case wrapKeyHex, obfProfile, clientID
+        case wrapAPassword, deviceID
+    }
+}
+
+extension ServerProfile {
+    /// Tolerant decoding: every key is optional at the JSON level, so a
+    /// `servers_v1` blob written by an OLDER build — which lacks any property
+    /// added later, e.g. `deviceID` in build 181 — still decodes, taking the
+    /// property's default for whatever it doesn't carry.
+    ///
+    /// This is load-bearing, not defensive style. Swift's synthesised decoder
+    /// ignores property defaults and throws `.keyNotFound` for an absent
+    /// non-Optional key; `ServerStore.load()` decodes with `try?` and treats
+    /// nil as "no store yet", so a single added property would have silently
+    /// thrown away the user's entire server set and rebuilt one "Server1".
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(UUID.self, forKey: .id) { id = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .serverName) { serverName = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .privateKey) { privateKey = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .peerPublicKey) { peerPublicKey = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .presharedKey) { presharedKey = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .tunnelAddress) { tunnelAddress = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .peerAddress) { peerAddress = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .dnsServers) { dnsServers = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .numConnections) { numConnections = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .credPoolCooldownSeconds) { credPoolCooldownSeconds = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .turnServerOverride) { turnServerOverride = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useUDP) { useUDP = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useDTLS) { useDTLS = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useSrtp) { useSrtp = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useWrap) { useWrap = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useWrapA) { useWrapA = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useWrapS) { useWrapS = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .wrapKeyHex) { wrapKeyHex = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .obfProfile) { obfProfile = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clientID) { clientID = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .wrapAPassword) { wrapAPassword = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .deviceID) { deviceID = v }
     }
 }
 
@@ -101,6 +168,10 @@ extension ServerProfile {
         // SRTP-WRAP-S needs a stable per-stream Client-ID; mint one when the
         // link didn't carry it (mirrors the mode picker).
         if useWrapS && clientID.isEmpty { clientID = UUID().uuidString }
+        // SRTP-WRAP-A needs a stable device ID for GETCONF. Links never carry
+        // one — it is device identity, and two people importing the same link
+        // must not collide on the server's WG-peer pool — so always mint.
+        if useWrapA && deviceID.isEmpty { deviceID = UUID().uuidString }
     }
 }
 
@@ -132,6 +203,10 @@ struct ServerSettings: Codable {
     var obfProfile: String? = nil
     var clientID: String? = nil
     var wrapAPassword: String? = nil
+    /// SRTP-WRAP-A GETCONF device identity (build 181+). Backed up like every
+    /// other per-server field so restoring onto the same (or a replacement)
+    /// device keeps the WireGuard peer the server already minted for it.
+    var deviceID: String? = nil
 
     init(_ p: ServerProfile) {
         serverName = p.serverName
@@ -154,6 +229,7 @@ struct ServerSettings: Codable {
         obfProfile = p.obfProfile
         clientID = p.clientID
         wrapAPassword = p.wrapAPassword
+        deviceID = p.deviceID
     }
 
     /// Rebuild a profile, filling every absent field with the ServerProfile
@@ -180,6 +256,7 @@ struct ServerSettings: Codable {
         if let v = obfProfile { p.obfProfile = v }
         if let v = clientID { p.clientID = v }
         if let v = wrapAPassword { p.wrapAPassword = v }
+        if let v = deviceID { p.deviceID = v }
         return p
     }
 }
