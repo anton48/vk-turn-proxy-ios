@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 
 /// Shared file logger for VPN logs.
 /// Both the main app and the Network Extension write to the same file
@@ -33,7 +34,31 @@ class SharedLogger {
             fileURL = container.appendingPathComponent("vpn.log")
         } else {
             fileURL = nil
+            // Every file-backed log line from here on is a no-op, so say WHY
+            // exactly once, through the one channel that still works: os_log.
+            // That is what the Logs screen falls back to reading, and what
+            // idevicesyslog shows. Entitlements are parsed only on this path —
+            // a correctly signed build never pays for it.
+            Self.logAppGroupFailure()
         }
+    }
+
+    /// Emit the App-Group diagnosis to this process's os_log subsystem. Split
+    /// per process so the Logs view tags it correctly: the extension's Go
+    /// bridge hardcodes the `.tunnel` subsystem in whatever process loads it,
+    /// which is why main-app lines have historically shown up labelled
+    /// "[Tunnel]" and misled us into thinking the extension was talking.
+    private static func logAppGroupFailure() {
+        let isExtension = Bundle.main.bundlePath.hasSuffix(".appex")
+        let log = OSLog(subsystem: isExtension ? "com.vkturnproxy.tunnel" : "com.vkturnproxy.app",
+                        category: "AppGroup")
+        let who = isExtension ? "extension" : "main app"
+        let text = "App Group unavailable to \(who). "
+                 + AppEntitlements.appGroupDiagnosis(required: "group.com.vkturnproxy.app")
+        for line in text.split(separator: "\n") {
+            os_log("%{public}s", log: log, type: .error, String(line))
+        }
+        NSLog("[AppGroup] %@", text)
     }
 
     /// Append a timestamped log line to the shared log file.

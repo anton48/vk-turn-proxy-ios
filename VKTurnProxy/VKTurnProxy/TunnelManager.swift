@@ -78,6 +78,23 @@ class TunnelManager: ObservableObject {
     // Set when tunnel transitions into .connected, cleared on any other
     // status. StatsView reads this via TimelineView to show live uptime.
     @Published var connectedAt: Date?
+    /// True while the extension's stats replies aren't reaching us, so
+    /// `stats` holds nothing meaningful. StatsView renders "—" instead of the
+    /// stale zeros that made a perfectly healthy tunnel look dead.
+    @Published var statsChannelDown = false
+    private var lastStatsSuccess = Date.distantPast
+    private var statsChannelLoggedReason: String?
+
+    /// Flip the stats channel to "down" and say why — once per reason, since
+    /// the poll runs every 2s and would otherwise flood the log.
+    private func noteStatsChannelDown(_ reason: String) {
+        if statsChannelLoggedReason != reason {
+            statsChannelLoggedReason = reason
+            SharedLogger.shared.log("[AppDebug] stats channel unavailable — \(reason)")
+            NSLog("[TunnelManager] stats channel unavailable — %@", reason)
+        }
+        if !statsChannelDown { statsChannelDown = true }
+    }
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
@@ -1027,6 +1044,12 @@ class TunnelManager: ObservableObject {
         prevTx = 0
         prevRx = 0
         prevTime = Date()
+        // Grace-start the stats-channel watchdog: the first reply legitimately
+        // takes a moment, and a false "channel down" on every connect would be
+        // worse than the silence it replaces.
+        lastStatsSuccess = Date()
+        statsChannelDown = false
+        statsChannelLoggedReason = nil
         // Fetch immediately, then every 2 seconds.
         // Add to .common RunLoop mode so the timer fires even during
         // UI animations (e.g., SwiftUI sheet dismiss transitions).
@@ -1089,11 +1112,27 @@ class TunnelManager: ObservableObject {
     private func fetchStats() {
         guard let session = manager?.connection as? NETunnelProviderSession else { return }
         guard let msg = "get_stats".data(using: .utf8) else { return }
+        // Watchdog: sendProviderMessage can fail two ways — it throws (caught
+        // below), or it is accepted and the reply never arrives. On a
+        // third-party re-signed build the OS refuses the channel outright
+        // ("process N is not entitled to establish IPC with plugins of type
+        // com.vkturnproxy.app"), and every counter then sits at 0 while the
+        // tunnel is genuinely up — which reads as "the VPN is broken" and is
+        // what GitHub #7/#8 actually were. Time-based so both modes are caught.
+        if status == .connected, Date().timeIntervalSince(lastStatsSuccess) > 10 {
+            noteStatsChannelDown("no reply from the extension for >10s")
+        }
         do {
             try session.sendProviderMessage(msg) { [weak self] response in
                 Task { @MainActor in
                     guard let self = self, let data = response else { return }
                     if let newStats = try? JSONDecoder().decode(TunnelStats.self, from: data) {
+                        self.lastStatsSuccess = Date()
+                        if self.statsChannelDown {
+                            self.statsChannelDown = false
+                            self.debugLog("stats channel recovered")
+                        }
+                        self.statsChannelLoggedReason = nil
                         let now = Date()
                         let dt = now.timeIntervalSince(self.prevTime)
                         if dt > 0 && self.prevTx > 0 {
@@ -1223,7 +1262,11 @@ class TunnelManager: ObservableObject {
                 }
             }
         } catch {
-            // Extension might not be running
+            // Before, this was swallowed with "Extension might not be running"
+            // — true during startup, but it also hid a permanent IPC denial for
+            // the entire session. Record it; the UI shows "—" rather than a
+            // fabricated 0.
+            noteStatsChannelDown("sendProviderMessage failed: \(error.localizedDescription)")
         }
 
         // Measure internet RTT every 5th poll (~10 sec) to avoid flooding

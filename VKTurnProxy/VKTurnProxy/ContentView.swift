@@ -1085,22 +1085,41 @@ struct DocumentPicker: UIViewControllerRepresentable {
 struct StatsView: View {
     @ObservedObject var tunnel: TunnelManager
 
+    /// Every counter below comes from the extension over NE IPC. When that
+    /// channel is refused — which is what a third-party re-signed build gets —
+    /// `tunnel.stats` stays at its zero value, and rendering those zeros claims
+    /// "0 connections, 0 bytes" about a tunnel that is actually carrying
+    /// traffic. Show nothing instead of something false.
+    private func dashed(_ value: @autoclosure () -> String) -> String {
+        tunnel.statsChannelDown ? "—" : value()
+    }
+
     var body: some View {
         VStack(spacing: 6) {
+            if tunnel.statsChannelDown {
+                Text("Statistics unavailable — the app can't reach the tunnel extension. The VPN itself is unaffected; see Logs for the reason.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
             HStack {
-                StatBox(title: "↑ TX", value: formatBytes(tunnel.stats.txBytes), sub: formatRate(tunnel.txRate))
-                StatBox(title: "↓ RX", value: formatBytes(tunnel.stats.rxBytes), sub: formatRate(tunnel.rxRate))
+                StatBox(title: "↑ TX", value: dashed(formatBytes(tunnel.stats.txBytes)), sub: tunnel.statsChannelDown ? nil : formatRate(tunnel.txRate))
+                StatBox(title: "↓ RX", value: dashed(formatBytes(tunnel.stats.rxBytes)), sub: tunnel.statsChannelDown ? nil : formatRate(tunnel.rxRate))
             }
 
             HStack {
-                StatBox(title: "TURN RTT", value: String(format: "%.0f ms", tunnel.stats.turnRTTms), sub: nil)
-                StatBox(title: "DTLS HS", value: String(format: "%.0f ms", tunnel.stats.dtlsHandshakeMs), sub: nil)
+                StatBox(title: "TURN RTT", value: dashed(String(format: "%.0f ms", tunnel.stats.turnRTTms)), sub: nil)
+                StatBox(title: "DTLS HS", value: dashed(String(format: "%.0f ms", tunnel.stats.dtlsHandshakeMs)), sub: nil)
+                // Internet RTT is measured by the main app itself, so it stays
+                // real even when the extension is unreachable — that contrast
+                // is a useful signal, not an inconsistency.
                 StatBox(title: "Internet", value: tunnel.internetRTTms > 0 ? String(format: "%.0f ms", tunnel.internetRTTms) : "—", sub: nil)
             }
 
             HStack {
-                StatBox(title: "Conns", value: "\(tunnel.stats.activeConns)/\(tunnel.stats.totalConns)", sub: nil)
-                StatBox(title: "Reconnects", value: "\(tunnel.stats.reconnects)", sub: nil)
+                StatBox(title: "Conns", value: dashed("\(tunnel.stats.activeConns)/\(tunnel.stats.totalConns)"), sub: nil)
+                StatBox(title: "Reconnects", value: dashed("\(tunnel.stats.reconnects)"), sub: nil)
             }
 
             HStack {
@@ -2009,7 +2028,14 @@ struct LogsView: View {
             let status = SharedLogger.shared.inspectStorage()
             let reason: String
             if !status.hasContainer {
-                reason = "App Group container unavailable to main app (entitlement missing or provisioning issue)"
+                // Name the actual cause instead of "entitlement missing or
+                // provisioning issue", which told nobody anything. Reading our
+                // own code signature turns this into a self-diagnosing report:
+                // it states which team signed the build and which App Groups it
+                // really has. See AppEntitlements.swift for why this is the
+                // common case (GitHub #7, #8, #59).
+                reason = "App Group container unavailable to main app.\n"
+                       + AppEntitlements.appGroupDiagnosis(required: "group.com.vkturnproxy.app")
             } else if !status.currentExists && !status.archivedExists {
                 reason = "Log file doesn't exist yet at \(status.containerPath)/vpn.log (fresh install or container reset)"
             } else if status.currentBytes == 0 && status.archivedBytes <= 0 {
