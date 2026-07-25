@@ -432,7 +432,7 @@ enum BackupManager {
     ///   wdtt://<IP>:<dtlsPort>:<wgPort>:<localPeerPort>:<password>:<hash[,hash…]>
     ///
     /// We use only IP+dtlsPort (→ peerAddress), password (→ wrapAPassword) and
-    /// the FIRST VK hash (→ vkLink = https://vk.com/call/join/<hash>, which our
+    /// the FIRST VK hash (→ vkLink = vkCallJoinBase + <hash>, which our
     /// Go side reduces to the lastPathComponent token). wgPort/localPeerPort are
     /// his server-internal / android-loopback values — irrelevant to us (we
     /// provision WireGuard via GETCONF and route via our own conn.Bind). His
@@ -476,7 +476,7 @@ enum BackupManager {
         let settings = ConnectionSettings(
             privateKey: nil, peerPublicKey: nil, presharedKey: nil,
             tunnelAddress: nil, allowedIPs: nil,
-            vkLink: "https://vk.com/call/join/" + firstHash,
+            vkLink: vkCallJoinBase + firstHash,
             peerAddress: "\(ip):\(dtlsPort)",
             useDTLS: nil, useWrap: nil, wrapKeyHex: nil,
             useSrtp: nil, useUDP: nil,
@@ -486,6 +486,23 @@ enum BackupManager {
         )
         return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }
+
+    /// Base URL used when we CONSTRUCT a VK call link — amurcanov's wdtt:// links
+    /// carry a bare hash, so we have to build the URL ourselves. Mirrors Go's
+    /// `vkCallJoinBase` (creds.go), flipped to vk.ru in build 170 for VK's
+    /// vk.com→vk.ru migration; VK accepts the vk.ru form on both the free-anon
+    /// and the legacy join path (tested 18.07.2026, vpn.7 + vpn.8).
+    ///
+    /// This is the *construct* side and therefore a single value, unlike
+    /// `stripVkUrl` below which must keep accepting BOTH domains — VK still
+    /// hands users vk.com links today. Revert point: flip this one line back to
+    /// vk.com if VK ever rejects vk.ru (and flip creds.go's const with it).
+    ///
+    /// Note the stored domain never actually reaches VK: Go splits the link on
+    /// "join/" and keeps only the token, then rebuilds the URL from its own
+    /// const. What this fixes is the link the USER sees in Settings and may
+    /// copy out of the app after importing a wdtt:// link.
+    private static let vkCallJoinBase = "https://vk.ru/call/join/"
 
     /// Strips a VK call/join URL prefix (+ any query/fragment) from a hash,
     /// canonicalising to the bare token. Mirrors amurcanov's stripVkUrlStatic;
