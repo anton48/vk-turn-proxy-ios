@@ -1085,13 +1085,21 @@ struct DocumentPicker: UIViewControllerRepresentable {
 struct StatsView: View {
     @ObservedObject var tunnel: TunnelManager
 
-    /// Every counter below comes from the extension over NE IPC. When that
-    /// channel is refused — which is what a third-party re-signed build gets —
-    /// `tunnel.stats` stays at its zero value, and rendering those zeros claims
-    /// "0 connections, 0 bytes" about a tunnel that is actually carrying
-    /// traffic. Show nothing instead of something false.
+    /// Every counter below comes from the extension over NE IPC. Until a reply
+    /// has actually arrived, `tunnel.stats` is the all-zero initial value, and
+    /// rendering it claims "0 connections, 0 bytes" about a tunnel that may
+    /// well be carrying traffic — which is what a third-party re-signed build
+    /// shows forever, since the OS refuses that channel outright.
+    ///
+    /// Gated on "have we ever received", not on "has the watchdog tripped", so
+    /// the blanks appear on the first frame rather than seconds later. On a
+    /// healthy build the immediate first poll answers in milliseconds, so this
+    /// is imperceptible there.
+    private var statsAreReal: Bool {
+        tunnel.statsReceivedOnce && !tunnel.statsChannelDown
+    }
     private func dashed(_ value: @autoclosure () -> String) -> String {
-        tunnel.statsChannelDown ? "—" : value()
+        statsAreReal ? value() : "—"
     }
 
     var body: some View {
@@ -1104,8 +1112,8 @@ struct StatsView: View {
                     .padding(.horizontal)
             }
             HStack {
-                StatBox(title: "↑ TX", value: dashed(formatBytes(tunnel.stats.txBytes)), sub: tunnel.statsChannelDown ? nil : formatRate(tunnel.txRate))
-                StatBox(title: "↓ RX", value: dashed(formatBytes(tunnel.stats.rxBytes)), sub: tunnel.statsChannelDown ? nil : formatRate(tunnel.rxRate))
+                StatBox(title: "↑ TX", value: dashed(formatBytes(tunnel.stats.txBytes)), sub: statsAreReal ? formatRate(tunnel.txRate) : nil)
+                StatBox(title: "↓ RX", value: dashed(formatBytes(tunnel.stats.rxBytes)), sub: statsAreReal ? formatRate(tunnel.rxRate) : nil)
             }
 
             HStack {
@@ -1156,7 +1164,7 @@ struct StatsView: View {
                     // dead creds and the grower can't refresh them
                     // (typically PoW rate-limited).
                     title: "Pool",
-                    value: "\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolWithCreds)/\(tunnel.stats.credPoolSize)/\(tunnel.stats.credPoolDistinctRelays)",
+                    value: dashed("\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolWithCreds)/\(tunnel.stats.credPoolSize)/\(tunnel.stats.credPoolDistinctRelays)"),
                     sub: nil
                 )
             }

@@ -78,9 +78,15 @@ class TunnelManager: ObservableObject {
     // Set when tunnel transitions into .connected, cleared on any other
     // status. StatsView reads this via TimelineView to show live uptime.
     @Published var connectedAt: Date?
+    /// True once a stats reply has arrived in the current polling session.
+    /// Until then `stats` is still the all-zero initial value and must not be
+    /// rendered as if it were measured — that zero is the absence of an answer,
+    /// not an answer of zero.
+    @Published var statsReceivedOnce = false
     /// True while the extension's stats replies aren't reaching us, so
-    /// `stats` holds nothing meaningful. StatsView renders "—" instead of the
-    /// stale zeros that made a perfectly healthy tunnel look dead.
+    /// `stats` holds nothing meaningful. Drives the visible warning; the
+    /// counters themselves are gated on `statsReceivedOnce` and go blank
+    /// immediately, without waiting for this to trip.
     @Published var statsChannelDown = false
     private var lastStatsSuccess = Date.distantPast
     private var statsChannelLoggedReason: String?
@@ -1044,9 +1050,15 @@ class TunnelManager: ObservableObject {
         prevTx = 0
         prevRx = 0
         prevTime = Date()
-        // Grace-start the stats-channel watchdog: the first reply legitimately
-        // takes a moment, and a false "channel down" on every connect would be
-        // worse than the silence it replaces.
+        // Start each polling session as "nothing received yet", so the UI shows
+        // "—" from the first frame and only switches to numbers once a reply has
+        // actually arrived. A healthy extension answers the immediate fetch
+        // below within milliseconds, so this is invisible there; on a build
+        // where the channel is refused it never flips, which is the point.
+        statsReceivedOnce = false
+        // Grace-start the watchdog that raises the visible warning: the first
+        // reply legitimately takes a moment, and flashing "unavailable" on every
+        // connect would be its own kind of lie.
         lastStatsSuccess = Date()
         statsChannelDown = false
         statsChannelLoggedReason = nil
@@ -1119,8 +1131,13 @@ class TunnelManager: ObservableObject {
         // com.vkturnproxy.app"), and every counter then sits at 0 while the
         // tunnel is genuinely up — which reads as "the VPN is broken" and is
         // what GitHub #7/#8 actually were. Time-based so both modes are caught.
-        if status == .connected, Date().timeIntervalSince(lastStatsSuccess) > 10 {
-            noteStatsChannelDown("no reply from the extension for >10s")
+        //
+        // 4s = two missed 2s polls. Short enough that the user isn't left
+        // wondering (the first on-device test at 10s felt like an eternity),
+        // long enough not to fire on a single slow reply — and if it does, the
+        // next successful poll clears it again.
+        if status == .connected, Date().timeIntervalSince(lastStatsSuccess) > 4 {
+            noteStatsChannelDown("no reply from the extension for >4s")
         }
         do {
             try session.sendProviderMessage(msg) { [weak self] response in
@@ -1128,6 +1145,7 @@ class TunnelManager: ObservableObject {
                     guard let self = self, let data = response else { return }
                     if let newStats = try? JSONDecoder().decode(TunnelStats.self, from: data) {
                         self.lastStatsSuccess = Date()
+                        self.statsReceivedOnce = true
                         if self.statsChannelDown {
                             self.statsChannelDown = false
                             self.debugLog("stats channel recovered")
