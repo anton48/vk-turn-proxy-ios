@@ -467,6 +467,9 @@ class TunnelManager: ObservableObject {
 
             // Build proxy config JSON, seeding credPool slot 0 with the
             // pre-fetched TURN creds.
+            if config.effectiveNumConnections != config.numConnections {
+                SharedLogger.shared.log("[AppDebug] cookie mode: Connections \(config.numConnections) → \(config.effectiveNumConnections) (\(config.cookieLinks.count) call link(s) × 20)")
+            }
             let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seeded)
 
             // Pick serverAddress. iOS always excludes serverAddress from the
@@ -1404,7 +1407,7 @@ class TunnelManager: ObservableObject {
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
             "use_srtp": config.useSrtp,
-            "num_conns": config.numConnections,
+            "num_conns": config.effectiveNumConnections,
             "cred_pool_cooldown_seconds": config.credPoolCooldownSeconds,
             "turn_server": config.turnServerOverride ?? "",
             "turn_port": config.turnPortOverride ?? "",
@@ -1920,4 +1923,38 @@ struct TunnelConfig {
     var credPoolCooldownSeconds: Int = 150
     var turnServerOverride: String?
     var turnPortOverride: String?
+}
+
+extension TunnelConfig {
+    /// Ceiling on simultaneous conns in cookie (VKAuth) mode, for `callLinks`
+    /// VK call links.
+    ///
+    /// The okcdn TURN quota is per (burner account, relay) and sits at ~10
+    /// allocations, and each call link yields 2 distinct relays — so one link
+    /// supports ~20 conns on a single burner, two links ~40, and so on, up to a
+    /// global ceiling of 50. Verified on device 2026-06-28: 30 conns from one
+    /// burner across 3 call links.
+    ///
+    /// The floor of 2 keeps a configuration with no usable link from collapsing
+    /// to zero conns; connect is gated on a non-empty vkLink anyway.
+    static func cookieConnCap(callLinks: Int) -> Int {
+        min(50, max(2, callLinks * 20))
+    }
+
+    /// The conn count actually handed to Go — the stored Connections setting,
+    /// clamped by `cookieConnCap` when the cookie path is in use.
+    ///
+    /// Non-destructive by design: the user's stored setting is never rewritten,
+    /// so raising it while a call link is temporarily missing (or switching
+    /// between anonymous and cookie mode) doesn't lose it. It lives here rather
+    /// than at the connect call site because it was written there first and the
+    /// result was computed and then dropped — every conn above the cap reached
+    /// Go, found the cookie cred pool (sized 2×links) saturated, and churned
+    /// forever on "cold-start cap — parking to share instead of over-fetching"
+    /// (observed 2026-07-25, 1 link + 30 conns: conns 20-29 retrying every few
+    /// seconds indefinitely). As a property of the config it cannot be skipped.
+    var effectiveNumConnections: Int {
+        guard useCookieAuth else { return numConnections }
+        return min(numConnections, Self.cookieConnCap(callLinks: cookieLinks.count))
+    }
 }

@@ -200,13 +200,11 @@ struct ContentView: View {
                             let vkLines = vkLink.split(whereSeparator: { $0.isNewline })
                                 .map { $0.trimmingCharacters(in: .whitespaces) }
                                 .filter { !$0.isEmpty }
-                            let vkAuthOn = UserDefaults.standard.bool(forKey: "VKAuth")
-                            // Effective conns: cookie mode caps at min(50, 20×lines).
-                            // Applied here (non-destructive) so the stored Connections
-                            // setting is preserved across mode/line changes.
-                            let effectiveConns = vkAuthOn
-                                ? min(active.numConnections, min(50, max(2, vkLines.count * 20)))
-                                : active.numConnections
+                            // The cookie-mode conn cap is applied downstream, by
+                            // TunnelConfig.effectiveNumConnections — the stored
+                            // setting is passed through untouched here. It used
+                            // to be clamped into a local at this call site,
+                            // which was then never passed to TunnelConfig.
                             let config = TunnelConfig(
                                 privateKey: active.privateKey,
                                 peerPublicKey: active.peerPublicKey,
@@ -571,8 +569,10 @@ struct SettingsView: View {
             .filter { !$0.isEmpty }
     }
     private var vkLinkPrimary: String { vkLinkLines.first ?? "" }
-    // Cookie-mode connection cap: 2 relays per call × 10 conns/relay, global max 50.
-    private var cookieConnCap: Int { min(50, max(2, vkLinkLines.count * 20)) }
+    // Cookie-mode connection cap. Shared with the value connect() actually
+    // applies (TunnelConfig.effectiveNumConnections) so the label can't drift
+    // from what the tunnel does — it did exactly that from build 163 to 181.
+    private var cookieConnCap: Int { TunnelConfig.cookieConnCap(callLinks: vkLinkLines.count) }
     private var connectionsUpperBound: Int {
         // Non-destructive: preserve a stored value above the cookie cap (e.g. set
         // when more call links existed, or carried over from anon mode). The cap

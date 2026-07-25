@@ -64,13 +64,14 @@ struct ServerEditView: View {
         }
     }
 
-    // Cookie-mode connection cap (mirrors SettingsView): 2 relays/call × 10, max 50.
+    // Cookie-mode connection cap (mirrors SettingsView), from the same helper
+    // connect() clamps with, so the label always states what really happens.
     private var vkLinkLines: [String] {
         vkLink.split(whereSeparator: { $0.isNewline })
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
     }
-    private var cookieConnCap: Int { min(50, max(2, vkLinkLines.count * 20)) }
+    private var cookieConnCap: Int { TunnelConfig.cookieConnCap(callLinks: vkLinkLines.count) }
     private var connectionsUpperBound: Int {
         vkAuthEnabled ? max(cookieConnCap, draft.numConnections) : max(50, draft.numConnections)
     }
