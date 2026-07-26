@@ -96,6 +96,11 @@ struct AppEntitlements: Sendable {
         the team that registered it, so a re-signer cannot carry ours over. Shared \
         logging, the TURN credential cache and the captured captcha profile are \
         disabled in this build. Install via TestFlight for a fully working build.
+        DELETE THIS APP FIRST: iOS refuses to install an official build over a \
+        re-signed one, because the signing identity differs — TestFlight only \
+        reports "An error occurred while installing". Deleting the app erases its \
+        settings, so export a Full Backup from Settings beforehand and import it \
+        into the fresh install.
         """
     }
 
