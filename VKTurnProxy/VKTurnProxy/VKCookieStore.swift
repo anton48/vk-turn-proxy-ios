@@ -23,7 +23,37 @@ enum VKCookieStore {
     /// `$(AppIdentifierPrefix)` expands at build time to the team id + "." —
     /// i.e. "CDMQ33VFQC." (DEVELOPMENT_TEAM in project.yml) — so the
     /// fully-qualified group below must stay in sync if the team ever changes.
-    private static let accessGroup = "CDMQ33VFQC.com.vkturnproxy.shared"
+    private static let canonicalAccessGroup = "CDMQ33VFQC.com.vkturnproxy.shared"
+
+    /// The group to scope the item to, or **nil to use this process's default
+    /// group** — resolved once, from the entitlements the build was actually
+    /// signed with.
+    ///
+    /// Naming a group we are not entitled to makes every SecItem call fail with
+    /// `errSecMissingEntitlement` (-34018), and that is precisely what happens
+    /// on a third-party re-signed IPA: the signer replaces our
+    /// `keychain-access-groups` with its own (`4FN8R4RQZT.*`, …), so VKAuth
+    /// could never store or read the cookie there. Omitting the attribute puts
+    /// the item in the process default instead — and because such a re-signer
+    /// stamps BYTE-IDENTICAL entitlements onto the app and the appex (verified
+    /// 2026-07-25), both processes resolve the same default and can still share
+    /// it, which is all VKAuth needs.
+    ///
+    /// A correctly signed build is unaffected: it IS entitled, so it keeps
+    /// naming the group explicitly, exactly as before. If the entitlements
+    /// cannot be read at all we also keep today's behaviour rather than guess.
+    private static let accessGroup: String? = {
+        let e = AppEntitlements.current
+        if e.error != nil { return canonicalAccessGroup }
+        if e.keychainAccessGroups.contains(canonicalAccessGroup) { return canonicalAccessGroup }
+        SharedLogger.logDiagnostic(
+            "keychain group \(canonicalAccessGroup) is not entitled to this build "
+          + "(entitled: \(e.keychainAccessGroups.joined(separator: ", "))) — "
+          + "storing the VK cookie in the process default group instead.",
+            category: "Keychain")
+        return nil
+    }()
+
     private static let service = "com.vkturnproxy.vkauth"
     private static let account = "cookie"
 
@@ -86,11 +116,17 @@ enum VKCookieStore {
     }
 
     private static func baseQuery() -> [String: Any] {
-        return [
+        var q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecAttrAccessGroup as String: accessGroup,
         ]
+        // Absent (not empty) when we aren't entitled to the group — see
+        // `accessGroup`. An empty string here would NOT mean "default", it
+        // would name a group nobody has.
+        if let group = accessGroup {
+            q[kSecAttrAccessGroup as String] = group
+        }
+        return q
     }
 }

@@ -43,22 +43,34 @@ class SharedLogger {
         }
     }
 
-    /// Emit the App-Group diagnosis to this process's os_log subsystem. Split
-    /// per process so the Logs view tags it correctly: the extension's Go
-    /// bridge hardcodes the `.tunnel` subsystem in whatever process loads it,
-    /// which is why main-app lines have historically shown up labelled
-    /// "[Tunnel]" and misled us into thinking the extension was talking.
+    /// Emit the App-Group diagnosis to this process's os_log subsystem.
     private static func logAppGroupFailure() {
+        let who = Bundle.main.bundlePath.hasSuffix(".appex") ? "extension" : "main app"
+        logDiagnostic("App Group unavailable to \(who). "
+                    + AppEntitlements.appGroupDiagnosis(required: "group.com.vkturnproxy.app"),
+                      category: "AppGroup")
+    }
+
+    /// Write a diagnostic that must survive an unusable App Group: straight to
+    /// this process's os_log (which the Logs screen falls back to reading, and
+    /// which `idevicesyslog` shows) plus the shared file when there is one.
+    ///
+    /// The subsystem is picked per process so the Logs view tags it correctly:
+    /// the Go bridge hardcodes the `.tunnel` subsystem in whatever process
+    /// loads it, which is why main-app lines historically showed up labelled
+    /// "[Tunnel]" and misled us into thinking the extension was talking.
+    static func logDiagnostic(_ text: String, category: String) {
         let isExtension = Bundle.main.bundlePath.hasSuffix(".appex")
         let log = OSLog(subsystem: isExtension ? "com.vkturnproxy.tunnel" : "com.vkturnproxy.app",
-                        category: "AppGroup")
-        let who = isExtension ? "extension" : "main app"
-        let text = "App Group unavailable to \(who). "
-                 + AppEntitlements.appGroupDiagnosis(required: "group.com.vkturnproxy.app")
+                        category: category)
         for line in text.split(separator: "\n") {
             os_log("%{public}s", log: log, type: .error, String(line))
         }
-        NSLog("[AppGroup] %@", text)
+        NSLog("[%@] %@", category, text)
+        // Deliberately does NOT touch `shared`: logAppGroupFailure() calls this
+        // from inside init(), and re-entering a `static let` initializer while
+        // it is running is undefined behaviour. Everything routed here is a
+        // failure the shared file cannot record anyway.
     }
 
     /// Append a timestamped log line to the shared log file.
