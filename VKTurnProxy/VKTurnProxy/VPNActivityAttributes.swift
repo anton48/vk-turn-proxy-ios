@@ -6,8 +6,10 @@
 // only renders them.
 //
 // Scope note (GitHub issue #64, stage 1): this stage is DISPLAY ONLY —
-// connection state + active server name. No buttons, so it needs iOS 16.1
-// rather than the 17.0 that interactive Live Activities require; stage 2 adds
+// connection state + active server name. No buttons, so its floor is iOS 16.2
+// (ActivityContent, and with it staleDate, arrived in 16.2 — 16.1 only has the
+// deprecated contentState API) rather than the 17.0 that interactive Live
+// Activities require; stage 2 adds
 // connect/disconnect and profile switching via App Intents and raises that
 // floor for the interactive parts only.
 //
@@ -31,7 +33,7 @@ enum VPNActivityStatus: String, Codable, Hashable {
     case disconnected
 }
 
-@available(iOS 16.1, *)
+@available(iOS 16.2, *)
 struct VPNActivityAttributes: ActivityAttributes {
     /// The mutable part. Keep it small: ActivityKit caps a ContentState at
     /// roughly 4 KB, and every field here is a field someone has to keep true.

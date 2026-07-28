@@ -958,6 +958,10 @@ class TunnelManager: ObservableObject {
         if status == .connected && connectedAt == nil {
             connectedAt = Date()
         }
+        // Launching with the tunnel already up: adopt/refresh the Live Activity
+        // now, otherwise it would only appear after the next status change —
+        // which for a stable tunnel may be hours away.
+        syncLiveActivity()
 
         statusObserver = NotificationCenter.default.addObserver(
             forName: .NEVPNStatusDidChange,
@@ -1034,8 +1038,23 @@ class TunnelManager: ObservableObject {
                     // may recover momentarily (e.g., sleep/wake cycle).
                     break
                 }
+                // Mirror the new state onto the Live Activity. After the switch
+                // so it sees the connectedAt this transition just set/cleared.
+                self.syncLiveActivity()
             }
         }
+    }
+
+    /// Push the current tunnel state to the Live Activity (GitHub issue #64).
+    /// No-op below iOS 16.1 and whenever no activity is warranted; see
+    /// LiveActivityController for the lifecycle. The server name is read fresh
+    /// each time, so switching the active server shows up on the next status
+    /// transition — which is exactly when a switch takes effect anyway, since
+    /// it requires a reconnect.
+    private func syncLiveActivity() {
+        LiveActivityBridge.sync(status: status,
+                                connectedAt: connectedAt,
+                                serverName: ServerStore.shared.activeServer.serverName)
     }
 
     private func startStatsPolling(reset: Bool = true) {
