@@ -963,6 +963,24 @@ class TunnelManager: ObservableObject {
         if status == .connected && connectedAt == nil {
             connectedAt = Date()
         }
+        // ...and for the same reason the stats poll has to be started here.
+        // Both of its other entry points miss a cold launch onto a running
+        // tunnel: the switch below only runs on FUTURE transitions, and
+        // willEnterForeground is not posted when an app launches — it needs a
+        // background→foreground round trip. Without this the timer never
+        // started, no get_stats was ever sent, and every counter sat at "—"
+        // for the whole session (build 187 screenshot) while Uptime, computed
+        // locally, ticked away next to it. Force-quitting and reopening the app
+        // reproduced it every time; backgrounding and returning "fixed" it,
+        // because that finally posted willEnterForeground.
+        //
+        // Pre-existing — the same three call sites are there in build 163 —
+        // but invisible until build 184 stopped rendering the untouched
+        // TunnelStats() as real zeros: "0/0 conns, 0 B" reads as a connected
+        // but idle tunnel, "—" reads as the bug it always was.
+        if status == .connected {
+            startStatsPolling(reset: false)
+        }
         // Launching with the tunnel already up: adopt/refresh the Live Activity
         // now, otherwise it would only appear after the next status change —
         // which for a stable tunnel may be hours away.
