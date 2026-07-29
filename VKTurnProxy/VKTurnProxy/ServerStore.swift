@@ -148,6 +148,23 @@ final class ServerStore: ObservableObject {
 
     // MARK: - Projection (active profile -> flat keys). ONLY writer of these keys.
 
+    /// Write the active profile into the legacy flat keys.
+    ///
+    /// ⚠️ Nothing in the running app READS these keys any more. Connect,
+    /// validation, the backup export and the extension all take their values
+    /// from this store; `serverFromFlatKeys` is the single remaining reader and
+    /// runs only on the two legacy INPUT paths — a first launch migrating a
+    /// pre-173 single config, and a pre-179 backup whose fields `applyConfig`
+    /// has just written here. So this projection now exists solely to leave a
+    /// coherent configuration behind for a DOWNGRADE to build ≤180.
+    ///
+    /// It follows that projecting more often is not "safer" — it is pure risk.
+    /// A `projectActive()` used to sit here for SettingsView to call on
+    /// dismissal; it was never wired up, and by the time anyone noticed,
+    /// calling it would have written 20 keys that views were still subscribed
+    /// to and popped the pushed screen for no benefit at all (the exact
+    /// build-177 trap). Removed in build 196 along with those subscriptions —
+    /// do not reintroduce either.
     func projectToFlatKeys(_ p: ServerProfile) {
         for (key, kp) in Self.stringKeyPaths { d.set(p[keyPath: kp], forKey: key) }
         for (key, kp, _) in Self.boolKeyPaths { d.set(p[keyPath: kp], forKey: key) }
@@ -170,18 +187,6 @@ final class ServerStore: ObservableObject {
         guard let i = servers.firstIndex(where: { $0.id == profile.id }) else { return }
         servers[i] = profile
         persist()
-    }
-
-    /// Project the ACTIVE server onto the flat @AppStorage keys. Called at
-    /// launch and when the Settings flow closes (SettingsView.onDisappear) —
-    /// NOT during editing / active-server switching. Reason: writing these keys
-    /// re-renders ContentView (it observes them via @AppStorage), and in a
-    /// NavigationView that pops any pushed child (ServerEditView / SettingsView).
-    /// Deferring projection to "leaving Settings" keeps editing stable; the flat
-    /// keys are only consumed on ContentView's main screen (validation + connect),
-    /// which is exactly where the user lands after Settings closes.
-    func projectActive() {
-        projectToFlatKeys(activeServer)
     }
 
     @discardableResult

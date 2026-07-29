@@ -14,64 +14,19 @@ struct ContentView: View {
     // @State snapshot refreshed in .onAppear (which fires when Settings is
     // popped) rather than an @ObservedObject on ServerStore: observing the store
     // would re-render this root view on every edit keystroke, which is exactly
-    // what popped the pushed editor before (see ServerStore.projectActive).
+    // what popped the pushed editor before (see MainNavigationLinks below).
     @State private var activeServerName = ServerStore.shared.activeServer.serverName
 
-    // All config stored in AppStorage, edited on SettingsView
-    @AppStorage("privateKey") private var privateKey = ""
-    @AppStorage("peerPublicKey") private var peerPublicKey = ""
-    @AppStorage("presharedKey") private var presharedKey = ""
-    @AppStorage("tunnelAddress") private var tunnelAddress = "192.168.102.3/24"
-    @AppStorage("dnsServers") private var dnsServers = "1.1.1.1"
-    @AppStorage("allowedIPs") private var allowedIPs = "0.0.0.0/0"
+    // vkLink is the one GLOBAL setting this screen reads (it is not per-server).
+    // The 20 per-server keys that used to be mirrored here are gone: every
+    // per-server value is read straight from ServerStore.activeServer below.
+    // Keeping them as @AppStorage was not merely redundant — an unused
+    // @AppStorage still subscribes, so ANY write to those keys (a backup
+    // import, a link import, the old projection) re-rendered this view, which
+    // hosts the NavigationView and therefore tears down whatever is pushed.
+    // That is the build-177 pop trap, left armed. See MainNavigationLinks and
+    // TunnelLiveStats for the same lesson learned the hard way in build 195.
     @AppStorage("vkLink") private var vkLink = ""
-    @AppStorage("peerAddress") private var peerAddress = ""
-    // turnServerOverride: optional "IP:port". When non-empty + valid, the app
-    // ignores the TURN IP:port VK returns and forces FRESH conns onto this
-    // relay instead. Disk-cached creds keep their stored address (this setting
-    // does not affect their use). Empty = use whatever VK returns.
-    @AppStorage("turnServerOverride") private var turnServerOverride = ""
-    @AppStorage("useDTLS") private var useDTLS = true
-    // useWrap / wrapKeyHex are the persisted form of the SRTP+WRAP
-    // server-mode selection. Surfaced in Settings as a third Picker
-    // option ("SRTP+WRAP") alongside Legacy and SRTP — see ServerMode
-    // enum + serverModeBinding in SettingsView. UI re-added build 142
-    // for A/B comparison with the SRTP path during memory investigation;
-    // the underlying JSON contract carried through to Go (use_wrap +
-    // wrap_key_hex) is unchanged from earlier builds.
-    @AppStorage("useWrap") private var useWrap = false
-    @AppStorage("wrapKeyHex") private var wrapKeyHex = ""
-    // useSrtp / useWrap form a tri-state server-mode selection (see
-    // ServerMode enum + serverModeBinding in SettingsView). Default
-    // useSrtp=true on fresh installs so the Picker lands on .srtp —
-    // the production path since build 115+. Existing installs keep
-    // whatever they had set explicitly.
-    @AppStorage("useSrtp") private var useSrtp = true
-    // useWrapA / wrapAPassword: the 4th "SRTP-WRAP-A" server mode (amurcanov
-    // interop, added 2026-06-03). useWrapA takes priority over the
-    // (useSrtp, useWrap) pair. wrapAPassword is the single secret the user
-    // enters — it derives the obfuscation key AND authenticates GETCONF; the
-    // WireGuard keys/address are server-provisioned (no WG fields needed).
-    @AppStorage("useWrapA") private var useWrapA = false
-    @AppStorage("wrapAPassword") private var wrapAPassword = ""
-    // useWrapS / obfProfile / clientID: the 5th "SRTP-WRAP-S" mode
-    // (samosvalishe/free-turn-proxy interop). Same DTLS+WG data path as
-    // SRTP+WRAP but with a selectable obf profile + a Client-ID record.
-    @AppStorage("useWrapS") private var useWrapS = false
-    @AppStorage("obfProfile") private var obfProfile = "rtpopus"
-    @AppStorage("clientID") private var clientID = ""
-    // useUDP toggles TURN control transport: UDP (true) vs TCP (false,
-    // default). Surfaced in Settings build 128. TCP-control bypasses
-    // VK's per-cred allocation-rate throttle introduced 2026-05-18 —
-    // see TunnelManager.swift TunnelConfig.useUDP for the empirical
-    // numbers (0% quota errors on TCP vs ~36-58% on UDP for the same
-    // cred). Default off so users stay on the post-2026-05-18 working
-    // transport. Toggle on only if your network blocks/throttles TCP
-    // to the TURN relay and you'd rather take VK's allocation-rate
-    // hit than not connect at all.
-    @AppStorage("useUDP") private var useUDP = false
-    @AppStorage("numConnections") private var numConnections = 30
-    @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
 
     /// First BLOCKING (.error) validation issue for the ACTIVE server mode, or
     /// nil if the config is good enough to attempt a connection. Gates the
@@ -418,60 +373,11 @@ enum ServerMode: Int, CaseIterable, Identifiable {
 // MARK: - Settings Screen
 
 struct SettingsView: View {
-    @AppStorage("privateKey") private var privateKey = ""
-    @AppStorage("peerPublicKey") private var peerPublicKey = ""
-    @AppStorage("presharedKey") private var presharedKey = ""
-    @AppStorage("tunnelAddress") private var tunnelAddress = "192.168.102.3/24"
-    @AppStorage("dnsServers") private var dnsServers = "1.1.1.1"
-    @AppStorage("allowedIPs") private var allowedIPs = "0.0.0.0/0"
+    // Only the two GLOBAL settings live here. Every per-server field moved to
+    // ServerEditView (build 173-180) and is edited through ServerStore; the 20
+    // per-server @AppStorage keys this view still declared were dead weight
+    // that also kept it subscribed to writes it has no interest in.
     @AppStorage("vkLink") private var vkLink = ""
-    @AppStorage("peerAddress") private var peerAddress = ""
-    // turnServerOverride: optional "IP:port". When non-empty + valid, the app
-    // ignores the TURN IP:port VK returns and forces FRESH conns onto this
-    // relay instead. Disk-cached creds keep their stored address (this setting
-    // does not affect their use). Empty = use whatever VK returns.
-    @AppStorage("turnServerOverride") private var turnServerOverride = ""
-    @AppStorage("useDTLS") private var useDTLS = true
-    // useWrap / wrapKeyHex are the persisted form of the SRTP+WRAP
-    // server-mode selection. Surfaced in Settings as a third Picker
-    // option ("SRTP+WRAP") alongside Legacy and SRTP — see ServerMode
-    // enum + serverModeBinding in SettingsView. UI re-added build 142
-    // for A/B comparison with the SRTP path during memory investigation;
-    // the underlying JSON contract carried through to Go (use_wrap +
-    // wrap_key_hex) is unchanged from earlier builds.
-    @AppStorage("useWrap") private var useWrap = false
-    @AppStorage("wrapKeyHex") private var wrapKeyHex = ""
-    // useSrtp / useWrap form a tri-state server-mode selection (see
-    // ServerMode enum + serverModeBinding in SettingsView). Default
-    // useSrtp=true on fresh installs so the Picker lands on .srtp —
-    // the production path since build 115+. Existing installs keep
-    // whatever they had set explicitly.
-    @AppStorage("useSrtp") private var useSrtp = true
-    // useWrapA / wrapAPassword: the 4th "SRTP-WRAP-A" server mode (amurcanov
-    // interop, added 2026-06-03). useWrapA takes priority over the
-    // (useSrtp, useWrap) pair. wrapAPassword is the single secret the user
-    // enters — it derives the obfuscation key AND authenticates GETCONF; the
-    // WireGuard keys/address are server-provisioned (no WG fields needed).
-    @AppStorage("useWrapA") private var useWrapA = false
-    @AppStorage("wrapAPassword") private var wrapAPassword = ""
-    // useWrapS / obfProfile / clientID: the 5th "SRTP-WRAP-S" mode
-    // (samosvalishe/free-turn-proxy interop). Same DTLS+WG data path as
-    // SRTP+WRAP but with a selectable obf profile + a Client-ID record.
-    @AppStorage("useWrapS") private var useWrapS = false
-    @AppStorage("obfProfile") private var obfProfile = "rtpopus"
-    @AppStorage("clientID") private var clientID = ""
-    // useUDP toggles TURN control transport: UDP (true) vs TCP (false,
-    // default). Surfaced in Settings build 128. TCP-control bypasses
-    // VK's per-cred allocation-rate throttle introduced 2026-05-18 —
-    // see TunnelManager.swift TunnelConfig.useUDP for the empirical
-    // numbers (0% quota errors on TCP vs ~36-58% on UDP for the same
-    // cred). Default off so users stay on the post-2026-05-18 working
-    // transport. Toggle on only if your network blocks/throttles TCP
-    // to the TURN relay and you'd rather take VK's allocation-rate
-    // hit than not connect at all.
-    @AppStorage("useUDP") private var useUDP = false
-    @AppStorage("numConnections") private var numConnections = 30
-    @AppStorage("credPoolCooldownSeconds") private var credPoolCooldownSeconds = 150
     // VKAuth: the non-anonymous "VK account (cookie)" cred-path toggle. When ON,
     // the app uses ONLY the cookie path (no anonymous fallback). The cookies
     // themselves live in the Keychain (VKCookieStore), NOT here and NOT in
@@ -518,53 +424,10 @@ struct SettingsView: View {
     @State private var showConnectionLinkConfirm = false
     @StateObject private var connectionLinkInbox = ConnectionLinkInbox.shared
 
-    /// Bridges the (useSrtp, useWrap) pair of @AppStorage booleans to a
-    /// single Picker selection. Reads collapse the four logical states
-    /// of (Bool, Bool) into three ServerMode cases (see ServerMode docs
-    /// for the mapping); writes enforce mutual exclusion by clearing the
-    /// other flag whenever a non-default mode is chosen.
-    private var serverModeBinding: Binding<ServerMode> {
-        Binding(
-            get: {
-                if useWrapS { return .srtpWrapS }
-                if useWrapA { return .srtpWrapA }
-                if useSrtp { return .srtp }
-                if useWrap { return .srtpWrap }
-                return .legacy
-            },
-            set: { newMode in
-                switch newMode {
-                case .legacy:
-                    useWrapS = false
-                    useWrapA = false
-                    useSrtp = false
-                    useWrap = false
-                case .srtp:
-                    useWrapS = false
-                    useWrapA = false
-                    useSrtp = true
-                    useWrap = false
-                case .srtpWrap:
-                    useWrapS = false
-                    useWrapA = false
-                    useSrtp = false
-                    useWrap = true
-                case .srtpWrapA:
-                    useWrapS = false
-                    useWrapA = true
-                    useSrtp = false
-                    useWrap = false
-                case .srtpWrapS:
-                    useWrapA = false
-                    useSrtp = false
-                    useWrap = false
-                    useWrapS = true
-                    // Stable Client-ID, generated once on first selection.
-                    if clientID.isEmpty { clientID = UUID().uuidString }
-                }
-            }
-        )
-    }
+    // serverModeBinding lived here until the server-mode Picker moved into
+    // ServerEditView, which has its own draft-backed equivalent. It survived as
+    // dead code that still WROTE the flat mode keys — the one thing this screen
+    // must never do while a child is pushed. Removed in build 196.
 
     /// Inline validation caption shown under a field. Red for blocking
     /// (.error) issues, orange for non-blocking (.warning) ones; renders
@@ -591,23 +454,6 @@ struct SettingsView: View {
     // applies (TunnelConfig.effectiveNumConnections) so the label can't drift
     // from what the tunnel does — it did exactly that from build 163 to 181.
     private var cookieConnCap: Int { TunnelConfig.cookieConnCap(callLinks: vkLinkLines.count) }
-    private var connectionsUpperBound: Int {
-        // Non-destructive: preserve a stored value above the cookie cap (e.g. set
-        // when more call links existed, or carried over from anon mode). The cap
-        // is enforced on the EFFECTIVE conn count at connect (ContentView), not by
-        // mutating this stored setting.
-        vkAuthEnabled ? max(cookieConnCap, numConnections) : max(50, numConnections)
-    }
-    private var connectionsLabel: String {
-        if vkAuthEnabled && numConnections > cookieConnCap {
-            return "Connections: \(numConnections) → \(cookieConnCap) (add call links)"
-        }
-        if vkAuthEnabled {
-            return "Connections: \(numConnections) (max \(cookieConnCap))"
-        }
-        return "Connections: \(numConnections)"
-    }
-
     var body: some View {
         Form {
             Section("VK Call Link") {
