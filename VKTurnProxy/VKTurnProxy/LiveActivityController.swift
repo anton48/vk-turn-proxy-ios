@@ -41,6 +41,10 @@ final class LiveActivityController {
     /// Logged once per reason so a permanently-disabled setting can't spam the
     /// log on every status change.
     private var loggedFailure: String?
+    /// Last content we published, and when. Lets `sync` be called from the 2s
+    /// stats poll without hammering ActivityKit: an unchanged state is only
+    /// re-pushed when its staleDate is approaching.
+    private var lastPushed: (state: VPNActivityAttributes.ContentState, at: Date)?
 
     private init() {
         // Adopt an activity that outlived the app (relaunch while the tunnel
@@ -73,9 +77,16 @@ final class LiveActivityController {
         )
         if activity == nil {
             start(state)
-        } else {
-            update(state)
+            return
         }
+        // Re-publishing an identical state is only worth doing to push the
+        // staleDate out; do it well before that date so the island never
+        // flickers into "last known" while the app is watching.
+        if let last = lastPushed, last.state == state,
+           Date().timeIntervalSince(last.at) < Self.refreshInterval {
+            return
+        }
+        update(state)
     }
 
     // MARK: - Lifecycle
@@ -95,6 +106,7 @@ final class LiveActivityController {
                 pushType: nil   // no push: see the note on push updates below
             )
             loggedFailure = nil
+            lastPushed = (state, Date())
             SharedLogger.shared.log("[AppDebug] live-activity: started (\(state.status.rawValue), server=\"\(state.serverName)\")")
         } catch {
             note("Activity.request failed: \(error.localizedDescription)")
@@ -103,6 +115,7 @@ final class LiveActivityController {
 
     private func update(_ state: VPNActivityAttributes.ContentState) {
         guard let activity else { return }
+        lastPushed = (state, Date())
         Task {
             await activity.update(ActivityContent(state: state, staleDate: Self.staleDate()))
         }
@@ -111,6 +124,7 @@ final class LiveActivityController {
     private func end() {
         guard let activity else { return }
         self.activity = nil
+        lastPushed = nil
         SharedLogger.shared.log("[AppDebug] live-activity: ended")
         Task {
             await activity.end(nil, dismissalPolicy: .immediate)
@@ -128,7 +142,14 @@ final class LiveActivityController {
     /// "Connected" over a tunnel that dropped. 15 minutes keeps it accurate for
     /// the common case while bounding how long a wrong state can stand.
     /// `context.isStale` is what the view should render differently (M2).
-    private static func staleDate() -> Date { Date().addingTimeInterval(15 * 60) }
+    private static let staleAfter: TimeInterval = 15 * 60
+    private static func staleDate() -> Date { Date().addingTimeInterval(staleAfter) }
+
+    /// How often an UNCHANGED state is re-published while the app is running.
+    /// Comfortably inside `staleAfter`, so a foreground session never shows
+    /// "last known" — that wording is reserved for when we genuinely are not
+    /// watching. Also the reason `sync` is cheap enough for the 2s stats poll.
+    private static let refreshInterval: TimeInterval = 5 * 60
 
     private static func map(_ s: NEVPNStatus) -> VPNActivityStatus? {
         switch s {

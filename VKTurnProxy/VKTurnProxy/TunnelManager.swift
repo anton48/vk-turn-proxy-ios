@@ -172,6 +172,11 @@ class TunnelManager: ObservableObject {
                 if self.status == .connected {
                     self.startStatsPolling(reset: false)
                 }
+                // Coming back to the foreground is not a status change, so the
+                // observer below never fires — without this the Live Activity
+                // would stay marked stale forever once its staleDate passed,
+                // even with the app open and the truth in hand.
+                self.syncLiveActivity()
                 // If the auto-refresh overlay was up when the app went to
                 // background, the scheduled Timer stopped firing (iOS
                 // suspends timers in background apps). When we come back
@@ -1165,6 +1170,12 @@ class TunnelManager: ObservableObject {
                     if let newStats = try? JSONDecoder().decode(TunnelStats.self, from: data) {
                         self.lastStatsSuccess = Date()
                         self.statsReceivedOnce = true
+                        // Keep the Live Activity's staleDate rolling forward
+                        // while the app is alive: a session left open longer
+                        // than the stale window would otherwise start claiming
+                        // it doesn't know a state we are actively watching.
+                        // Throttled inside the controller — this fires every 2s.
+                        self.syncLiveActivity()
                         if self.statsChannelDown {
                             self.statsChannelDown = false
                             self.debugLog("stats channel recovered")
