@@ -1904,7 +1904,35 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// grower's existing cold-start target (growCredPool) — the grower still
 	// fills reserve slots beyond the target, but slowly + staggered.
 	{
-		usable := cp.countWithUsableCredsLocked()
+		// Count with the SAME predicate Phase 1 hands slots out by.
+		//
+		// This used to call countWithUnexpiredCredsLocked (then misleadingly
+		// named countWithUnexpiredCredsLocked) and assign it to a local called
+		// `usable`. That counts a cred as provisioned when it merely has not
+		// EXPIRED — it ignores the per-relay cooldown that Phase 1 checks via
+		// entryIsFresh. So a pool whose slots are all cooling down looked fully
+		// provisioned, the target was satisfied, nothing fetched, and Phase 1
+		// still refused every slot. The conn parked for a cooldown instead of
+		// spending three seconds on a fresh cred, and bootstrap retried until
+		// it gave up:
+		//
+		//   credpool: load: slot 0 pending (… usable in 9m57s once VK allocations expire)
+		//   credpool: cold-start cap (3 usable+inflight >= 3 target) — parking to share
+		//   credpool-grow: bootstrap did not succeed within 2m, grower exiting
+		//
+		// Fetching here does NOT burn the quota this cap protects: that quota is
+		// per (okcdn user-id, relay), and a fresh fetch mints a NEW VK session —
+		// a different user-id, unrelated to the relays currently cooling down.
+		//
+		// No "but the cooldown might be about to end" threshold, deliberately.
+		// Across every log where the cap fired (29.07 vpn.10/13/16, 75 parked
+		// slots) the SHORTEST remaining cooldown was 105s and the median ~8min;
+		// there was no near-expiry case to protect. A threshold would be a
+		// guess dressed as caution.
+		//
+		// The original burst case is untouched: there the slots are empty, so
+		// availableAt is zero and both predicates agree.
+		ready := cp.countFreshLocked()
 		inFlight := 0
 		for i := range cp.pool {
 			if cp.pool[i].fetching {
@@ -1915,9 +1943,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		if coldStartTarget < 1 {
 			coldStartTarget = 1
 		}
-		if usable+inFlight >= coldStartTarget {
+		if ready+inFlight >= coldStartTarget {
 			cp.mu.Unlock()
-			return "", nil, -1, fmt.Errorf("credpool: cold-start cap (%d usable+inflight >= %d target) — parking to share instead of over-fetching", usable+inFlight, coldStartTarget)
+			return "", nil, -1, fmt.Errorf("credpool: cold-start cap (%d ready+inflight >= %d target) — parking to share instead of over-fetching", ready+inFlight, coldStartTarget)
 		}
 	}
 
@@ -2631,7 +2659,7 @@ func (cp *credPool) snapshotSize() (available int, withUsableCreds int, size int
 	// had expired creds the grower had been failing to refresh for
 	// 26+ minutes). The middle number now matches the user's mental
 	// model of "viable creds the pool can fall back on".
-	withUsableCreds = cp.countWithUsableCredsLocked()
+	withUsableCreds = cp.countWithUnexpiredCredsLocked()
 	size = cp.size
 	cp.mu.Unlock()
 	return
@@ -2758,7 +2786,15 @@ func (cp *credPool) countAvailableLocked() int {
 	return n
 }
 
-// countWithUsableCredsLocked assumes cp.mu is held. Counts slots whose
+// countWithUnexpiredCredsLocked assumes cp.mu is held. Counts slots whose
+//
+// ⚠️ NOT "usable" — this is the Stats UI's MIDDLE number, deliberately the
+// weakest predicate of the three: it ignores both the per-relay cooldown and
+// saturation. Do not use it to decide whether a cred can be handed out; that is
+// entryIsFresh (countFreshLocked) or entryIsAvailable (countAvailableLocked).
+// It was called countWithUsableCreds until 2026-07-29, and the cold-start cap
+// above had been reading it as "usable" ever since build 150.
+//
 // cred has NOT crossed the credExpiryBuffer threshold — i.e. slots that
 // will (or could) hand out new allocations once any current saturation
 // or load-pending state passes. Excludes:
@@ -2776,7 +2812,7 @@ func (cp *credPool) countAvailableLocked() int {
 // — the prior "any cred" semantic was misleading when background
 // grower is stuck (e.g. PoW rate-limited) and slots hold stale creds
 // that can't be refreshed.
-func (cp *credPool) countWithUsableCredsLocked() int {
+func (cp *credPool) countWithUnexpiredCredsLocked() int {
 	n := 0
 	now := time.Now()
 	for _, e := range cp.pool {
