@@ -88,7 +88,11 @@ class TunnelManager: ObservableObject {
     /// counters themselves are gated on `statsReceivedOnce` and go blank
     /// immediately, without waiting for this to trip.
     @Published var statsChannelDown = false
-    private var lastStatsSuccess = Date.distantPast
+    /// Polls sent since the last reply. Counting POLLS rather than elapsed
+    /// time matters: wall-clock since the last success also grows while the
+    /// timer isn't firing at all (backgrounded, suspended), which trips a
+    /// time-based check for a channel that was never actually asked.
+    private var missedStatsPolls = 0
     private var statsChannelLoggedReason: String?
 
     /// Flip the stats channel to "down" and say why — once per reason, since
@@ -1101,7 +1105,7 @@ class TunnelManager: ObservableObject {
         // Grace-start the watchdog that raises the visible warning: the first
         // reply legitimately takes a moment, and flashing "unavailable" on every
         // connect would be its own kind of lie.
-        lastStatsSuccess = Date()
+        missedStatsPolls = 0
         statsChannelDown = false
         statsChannelLoggedReason = nil
         // Fetch immediately, then every 2 seconds.
@@ -1174,19 +1178,27 @@ class TunnelManager: ObservableObject {
         // tunnel is genuinely up — which reads as "the VPN is broken" and is
         // what GitHub #7/#8 actually were. Time-based so both modes are caught.
         //
-        // 4s = two missed 2s polls. Short enough that the user isn't left
-        // wondering (the first on-device test at 10s felt like an eternity),
-        // long enough not to fire on a single slow reply — and if it does, the
-        // next successful poll clears it again.
-        if status == .connected, Date().timeIntervalSince(lastStatsSuccess) > 4 {
-            noteStatsChannelDown("no reply from the extension for >4s")
+        // Five unanswered polls (~10s). The 4s of build 185 was far too eager:
+        // a healthy 30-conn session on device tripped it SEVENTEEN times in one
+        // run (28.07.2026/vpn.0.log) because a busy extension legitimately
+        // answers late. This watchdog exists to report a channel that is
+        // permanently refused, not to editorialise about latency — and each
+        // spurious trip toggled a banner in ContentView, i.e. changed the view
+        // tree inside a NavigationView, which in this app has a history of
+        // popping whatever screen is pushed. The user-visible blanks do not
+        // wait for this: they are gated on statsReceivedOnce and appear at once.
+        if status == .connected {
+            missedStatsPolls += 1
+            if missedStatsPolls >= 5 {
+                noteStatsChannelDown("no reply to \(missedStatsPolls) consecutive polls")
+            }
         }
         do {
             try session.sendProviderMessage(msg) { [weak self] response in
                 Task { @MainActor in
                     guard let self = self, let data = response else { return }
                     if let newStats = try? JSONDecoder().decode(TunnelStats.self, from: data) {
-                        self.lastStatsSuccess = Date()
+                        self.missedStatsPolls = 0
                         self.statsReceivedOnce = true
                         // Keep the Live Activity's staleDate rolling forward
                         // while the app is alive: a session left open longer

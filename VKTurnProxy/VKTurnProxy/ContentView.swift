@@ -1104,13 +1104,24 @@ struct StatsView: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            if tunnel.statsChannelDown {
-                Text("Statistics unavailable — the app can't reach the tunnel extension. The VPN itself is unaffected; see Logs for the reason.")
-                    .font(.caption)
-                    .foregroundColor(.orange)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
-            }
+            // Deliberately NOT an `if`. Inserting and removing a view here
+            // changes the shape of the tree inside the NavigationView, and in
+            // this app that is the trap that popped whatever screen was pushed
+            // and cost four rebuild rounds in build 177. The banner is always
+            // in the hierarchy and collapses to nothing instead, so a flapping
+            // flag can never restructure anything while the user is deep in
+            // Settings. Reported 2026-07-28: entering a server from Settings
+            // bounced back to Settings at random intervals, but only while
+            // connected — i.e. only while this flag could move at all.
+            Text("Statistics unavailable — the app can't reach the tunnel extension. The VPN itself is unaffected; see Logs for the reason.")
+                .font(.caption)
+                .foregroundColor(.orange)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+                .opacity(tunnel.statsChannelDown ? 1 : 0)
+                .frame(height: tunnel.statsChannelDown ? nil : 0)
+                .clipped()
+                .accessibilityHidden(!tunnel.statsChannelDown)
             HStack {
                 StatBox(title: "↑ TX", value: dashed(formatBytes(tunnel.stats.txBytes)), sub: statsAreReal ? formatRate(tunnel.txRate) : nil)
                 StatBox(title: "↓ RX", value: dashed(formatBytes(tunnel.stats.rxBytes)), sub: statsAreReal ? formatRate(tunnel.rxRate) : nil)
