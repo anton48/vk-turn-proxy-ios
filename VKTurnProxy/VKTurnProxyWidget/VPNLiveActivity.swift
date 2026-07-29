@@ -58,9 +58,18 @@ struct VPNLiveActivity: Widget {
                         // "Last kno…" — which said less than nothing. The
                         // staleness wording lives in .bottom, which is full
                         // width; here it shows as the grey glyph and colour.
+                        //
+                        // Even the short form does not always fit: "Connecting…"
+                        // came back as "Connecti..." on an iPhone Air (29.07).
+                        // Latent since build 192 — the island had only ever been
+                        // looked at while Connected, which does fit — and stage 2
+                        // surfaced it by making a long stay in Connecting easy.
+                        // Shrink the word rather than cut it; a scaled label is
+                        // still a word, a truncated one is a puzzle.
                         Text(shortStatus(context.state.status))
                             .font(.subheadline.weight(.medium))
                             .lineLimit(1)
+                            .minimumScaleFactor(0.7)
                     } icon: {
                         shield(context)
                     }
