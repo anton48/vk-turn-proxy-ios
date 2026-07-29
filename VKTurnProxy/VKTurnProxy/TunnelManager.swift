@@ -1354,6 +1354,13 @@ class TunnelManager: ObservableObject {
     /// each time, so switching the active server shows up on the next status
     /// transition — which is exactly when a switch takes effect anyway, since
     /// it requires a reconnect.
+    /// Re-publish the Live Activity now. Used by Settings › Advanced when the
+    /// master switch flips, so the card appears or disappears on the tap rather
+    /// than at the next status change.
+    func refreshLiveActivity() {
+        syncLiveActivity()
+    }
+
     private func syncLiveActivity() {
         LiveActivityBridge.sync(status: status,
                                 connectedAt: live.connectedAt,

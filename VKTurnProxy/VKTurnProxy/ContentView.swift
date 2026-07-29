@@ -504,6 +504,12 @@ struct SettingsView: View {
             }
 
             Section {
+                NavigationLink(destination: AdvancedView()) {
+                    Label("Advanced", systemImage: "slider.horizontal.3")
+                }
+            }
+
+            Section {
                 Button(action: handleExport) {
                     Label("Export Full Backup…", systemImage: "square.and.arrow.up")
                 }

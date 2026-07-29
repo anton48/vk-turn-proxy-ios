@@ -147,6 +147,12 @@ struct AppSettings: Codable {
     /// in the backup — they live in the Keychain (VKCookieStore). Optional +
     /// `var` so Codable decodes it (nil-preserve on import). Default nil.
     var vkAuth: Bool? = nil
+    /// Live Activity master switch (Settings › Advanced, issue #64). A GLOBAL
+    /// preference like vkAuth, so it round-trips in full backups — a setting
+    /// silently lost on restore is its own debugging session. Optional + `var`
+    /// so Codable decodes it and an older backup that lacks the key leaves the
+    /// current value alone (nil-preserve) rather than forcing the feature off.
+    var liveActivityEnabled: Bool? = nil
     // SRTP-WRAP-S (samosvalishe/free-turn-proxy). `var ... = nil` like vkAuth so
     // old backups/links decode and importers don't force the mode when absent.
     var useWrapS: Bool? = nil

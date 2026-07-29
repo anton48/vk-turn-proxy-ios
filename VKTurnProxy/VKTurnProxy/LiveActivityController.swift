@@ -93,7 +93,22 @@ final class LiveActivityController {
 
     // MARK: - Entry point
 
+    /// Master switch, Settings › Advanced. Read from UserDefaults rather than
+    /// declared as @AppStorage anywhere near ContentView — see AdvancedView's
+    /// header for why that distinction matters in this app.
+    private var featureEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "liveActivityEnabled")
+    }
+
     func sync(status: NEVPNStatus, connectedAt: Date?, serverName: String, force: Bool = false) {
+        // Turned off: make sure nothing of ours is left on the Lock Screen. This
+        // runs before every other branch, so flipping the switch while connected
+        // takes the card down on the next sync (≤2s, the stats poll) and the
+        // explicit refresh from AdvancedView makes it immediate.
+        guard featureEnabled else {
+            if activity != nil { end() }
+            return
+        }
         // ── Mid-switch, NOTHING may end the activity. ────────────────────
         //
         // Not a nicety: ending it forces a re-`request`, and iOS REFUSES to
