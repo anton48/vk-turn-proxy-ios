@@ -33,6 +33,18 @@ struct VKTurnProxyApp: App {
         // active server onto the flat @AppStorage keys that ContentView /
         // TunnelManager read.
         _ = ServerStore.shared
+
+        // Live Activity buttons (issue #64 stage 2). The intents live in a file
+        // compiled into the widget too, so they cannot reference TunnelManager
+        // directly; the app installs the sink they forward to. Gated because
+        // ActivityKit — and the controller — start at iOS 16.2.
+        if #available(iOS 16.2, *) {
+            Task { @MainActor in
+                LiveActivityActionRouter.shared.handler = { action in
+                    await LiveActivityController.shared.handle(action)
+                }
+            }
+        }
     }
 
     var body: some Scene {

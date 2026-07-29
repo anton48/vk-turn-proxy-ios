@@ -19,6 +19,17 @@
 //
 // Everything is laid out for a name of arbitrary length: server names are user
 // input, so every label truncates rather than pushing the timer off-screen.
+//
+// STAGE 2 adds the controls. Two rules learned on the prototype:
+//
+//  a. The island's expanded .bottom region fits THREE buttons and silently CLIPS
+//     anything after them — a cancel/paging row stacked under the server list
+//     simply vanished, leaving no way out of the picker. Chrome therefore lives
+//     in .leading/.trailing, which are separate regions.
+//  b. An expired picker renders as the NORMAL layout. staleDate is the picker's
+//     deadline (see LiveActivityController): the app is asleep and cannot close
+//     the menu itself, so this is the only thing that gets the user out without
+//     a tap.
 
 import ActivityKit
 import SwiftUI
@@ -27,12 +38,20 @@ import WidgetKit
 struct VPNLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: VPNActivityAttributes.self) { context in
-            lockScreen(context)
+            Group {
+                if picking(context) { lockScreenPicker(context) } else { lockScreen(context) }
+            }
                 .activityBackgroundTint(Color.black.opacity(0.45))
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
+                    if picking(context), #available(iOS 17.0, *) {
+                        Button(intent: ExitPickerIntent()) {
+                            Image(systemName: "xmark").font(.caption2)
+                        }
+                        .buttonStyle(.bordered)
+                    } else {
                     Label {
                         // SHORT form only: this region is ~1/3 of the island's
                         // width, and "Last known: Connected" truncated to
@@ -46,26 +65,53 @@ struct VPNLiveActivity: Widget {
                         shield(context)
                     }
                     .foregroundStyle(context.isStale ? .secondary : .primary)
+                    }
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    clock(context)
-                        .font(.subheadline.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    if picking(context) {
+                        if context.state.pageCount > 1, #available(iOS 17.0, *) {
+                            Button(intent: NextPageIntent()) {
+                                Text("\(context.state.page + 1)/\(context.state.pageCount) ›")
+                                    .font(.caption2)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    } else {
+                        clock(context)
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 DynamicIslandExpandedRegion(.bottom) {
-                    HStack(spacing: 4) {
-                        Text(context.state.serverName)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        if context.isStale {
-                            Text("· last known")
-                                .lineLimit(1)
-                                .layoutPriority(1)   // drop the NAME first, not this
+                    if picking(context) {
+                        if #available(iOS 17.0, *) {
+                            // Nothing else may go in here — see rule (a) above.
+                            VStack(spacing: 4) {
+                                ForEach(context.state.choices) { c in
+                                    serverButton(c, busy: context.state.busyServerId == c.id)
+                                }
+                            }
+                        }
+                    } else {
+                        VStack(spacing: 6) {
+                            HStack(spacing: 4) {
+                                Text(context.state.serverName)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                if context.isStale {
+                                    Text("· last known")
+                                        .lineLimit(1)
+                                        .layoutPriority(1)   // drop the NAME first, not this
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            if #available(iOS 17.0, *) {
+                                controls(context)
+                            }
                         }
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } compactLeading: {
                 shield(context)
@@ -82,10 +128,91 @@ struct VPNLiveActivity: Widget {
         }
     }
 
+    // MARK: - Controls (iOS 17+)
+
+    /// Is the picker open AND still live? See rule (b) in the file header.
+    private func picking(_ context: ActivityViewContext<VPNActivityAttributes>) -> Bool {
+        context.state.mode == .picking && !context.isStale
+    }
+
+    @available(iOS 17.0, *)
+    @ViewBuilder
+    private func controls(_ context: ActivityViewContext<VPNActivityAttributes>) -> some View {
+        HStack(spacing: 8) {
+            Button(intent: DisconnectIntent()) {
+                Label(context.state.status == .disconnecting ? "Disconnecting…" : "Disconnect",
+                      systemImage: "power")
+                    .font(.caption)
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+            // Already on its way down — a second tap has nothing to add.
+            .disabled(context.state.status == .disconnecting)
+
+            Button(intent: EnterPickerIntent()) {
+                Label("Switch", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    @available(iOS 17.0, *)
+    private func serverButton(_ choice: ServerChoice, busy: Bool) -> some View {
+        Button(intent: SelectServerIntent(serverId: choice.id)) {
+            HStack(spacing: 4) {
+                if busy { Image(systemName: "circle.dotted").font(.caption2) }
+                Text(choice.name)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(busy ? .green : nil)
+    }
+
+    /// The picker, Lock Screen edition. Roomier than the island, so the chrome
+    /// can sit on the title row instead of borrowing other regions.
+    @ViewBuilder
+    private func lockScreenPicker(_ context: ActivityViewContext<VPNActivityAttributes>) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Switch server").font(.subheadline.weight(.semibold))
+                Spacer()
+                if #available(iOS 17.0, *) {
+                    HStack(spacing: 6) {
+                        Button(intent: ExitPickerIntent()) {
+                            Image(systemName: "xmark").font(.caption2)
+                        }
+                        .buttonStyle(.bordered)
+                        if context.state.pageCount > 1 {
+                            Button(intent: NextPageIntent()) {
+                                Label("More (\(context.state.page + 1)/\(context.state.pageCount))",
+                                      systemImage: "chevron.right")
+                                    .font(.caption2)
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                }
+            }
+            if #available(iOS 17.0, *) {
+                ForEach(context.state.choices) { c in
+                    serverButton(c, busy: context.state.busyServerId == c.id)
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
     // MARK: - Lock Screen
 
     @ViewBuilder
     private func lockScreen(_ context: ActivityViewContext<VPNActivityAttributes>) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
         HStack(spacing: 12) {
             shield(context)
                 .font(.title3)
@@ -107,6 +234,11 @@ struct VPNLiveActivity: Widget {
                 // Never let a long uptime squeeze the name below legibility.
                 .lineLimit(1)
                 .fixedSize()
+        }
+        if #available(iOS 17.0, *) {
+            controls(context)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)

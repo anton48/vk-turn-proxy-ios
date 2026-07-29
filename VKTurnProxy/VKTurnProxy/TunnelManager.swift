@@ -109,8 +109,71 @@ final class TunnelLiveStats: ObservableObject {
     @Published var internetRTTms: Double = 0  // ms, TCP connect to 1.1.1.1
 }
 
+extension TunnelConfig {
+    /// Build the tunnel configuration for a server profile.
+    ///
+    /// ONE builder, used by both the Connect button and the Live Activity's
+    /// switch intent. They must not each assemble this by hand: the last time a
+    /// value was computed in one place and not passed on, the connection cap sat
+    /// dead in a local for nineteen builds (163 → 182).
+    ///
+    /// vkLink / VKAuth / forceLegacyCaptcha are GLOBAL, not per-server.
+    static func make(for s: ServerProfile) -> TunnelConfig {
+        let d = UserDefaults.standard
+        let vkLink = d.string(forKey: "vkLink") ?? ""
+        let lines = vkLink.split(whereSeparator: { $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let turnOv = parseTurnOverride(s.turnServerOverride)
+        return TunnelConfig(
+            privateKey: s.privateKey,
+            peerPublicKey: s.peerPublicKey,
+            presharedKey: s.presharedKey.isEmpty ? nil : s.presharedKey,
+            tunnelAddress: s.tunnelAddress,
+            dnsServers: s.dnsServers,
+            allowedIPs: "0.0.0.0/0",
+            vkLink: lines.first ?? vkLink,
+            cookieLinks: lines,
+            peerAddress: s.peerAddress,
+            useDTLS: s.useDTLS,
+            useWrap: s.useWrap,
+            wrapKeyHex: s.wrapKeyHex,
+            useSrtp: s.useSrtp,
+            useWrapA: s.useWrapA,
+            wrapAPassword: s.wrapAPassword,
+            deviceID: s.deviceID,
+            useWrapS: s.useWrapS,
+            obfProfile: s.obfProfile,
+            clientID: s.clientID,
+            useUDP: s.useUDP,
+            forceLegacyCaptcha: d.bool(forKey: "forceLegacyCaptcha"),
+            useCookieAuth: d.bool(forKey: "VKAuth"),
+            numConnections: s.numConnections,
+            credPoolCooldownSeconds: s.credPoolCooldownSeconds,
+            turnServerOverride: turnOv?.host,
+            turnPortOverride: turnOv?.port
+        )
+    }
+
+    /// "IP:port" -> (host, port), or nil when empty/malformed (= no override).
+    /// Splits on the LAST colon so IPv4:port parses cleanly.
+    static func parseTurnOverride(_ raw: String) -> (host: String, port: String)? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, let colon = t.lastIndex(of: ":") else { return nil }
+        let host = String(t[..<colon]), port = String(t[t.index(after: colon)...])
+        guard !host.isEmpty, !port.isEmpty, port.allSatisfy(\.isNumber), Int(port) != nil else { return nil }
+        return (host, port)
+    }
+}
+
 @MainActor
 class TunnelManager: ObservableObject {
+    /// One instance for the whole process. The Live Activity intents run in the
+    /// app but outside any view, and they must drive the very manager the UI is
+    /// showing — two instances would mean two NEVPNStatus observers and a UI
+    /// that disagrees with what the island just did.
+    static let shared = TunnelManager()
+
     @Published var status: NEVPNStatus = .disconnected
     @Published var errorMessage: String?
 
@@ -342,12 +405,7 @@ class TunnelManager: ObservableObject {
             // would DEANONYMIZE it (the okcdn user-id IS the burner account). The
             // extension loads creds-pool.json on bootstrap, so we delete it here
             // (main app, before startVPNTunnel) on a mode switch.
-            let curAuthMode = config.useCookieAuth ? "cookie" : "anon"
-            if let last = UserDefaults.standard.string(forKey: "lastConnectAuthMode"), last != curAuthMode {
-                SharedLogger.shared.log("[AppDebug] auth mode changed (\(last) → \(curAuthMode)) — clearing cred cache")
-                try? BackupManager.resetTurnCache()
-            }
-            UserDefaults.standard.set(curAuthMode, forKey: "lastConnectAuthMode")
+            clearCredCacheIfAuthModeChanged(config: config)
 
             var seededTURN: (address: String, username: String, password: String)? = nil
 
@@ -525,12 +583,204 @@ class TunnelManager: ObservableObject {
                 return
             }
 
+            try await applyConfigurationAndStart(config: config,
+                                                 vkHostIPs: vkHostIPs,
+                                                 seededTURN: seeded)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Drop the on-disk cred cache when the VK auth mode changed since the last
+    /// connect, and record the mode this connect runs in.
+    ///
+    /// Must run BEFORE anything reads `CredCache` — that is the whole point, and
+    /// the reason it is a separate method rather than part of
+    /// `applyConfigurationAndStart`. Both entry points read the cache: connect()
+    /// seeds slot 0 from it before the probe, and the Live Activity switch seeds
+    /// from it too.
+    ///
+    /// The trigger is NOT "this action changed the mode" — a server switch never
+    /// can, VKAuth being global. It is "the mode of THIS connect differs from the
+    /// last one", which a switch absolutely can hit: toggle VKAuth in Settings
+    /// while the tunnel is up, then switch profiles from the island, and that
+    /// switch is the first connect under the new mode. Skipping it would reuse a
+    /// burner cred in anonymous mode, which DEANONYMISES the burner (the okcdn
+    /// user-id is the account).
+    func clearCredCacheIfAuthModeChanged(config: TunnelConfig) {
+        let curAuthMode = config.useCookieAuth ? "cookie" : "anon"
+        if let last = UserDefaults.standard.string(forKey: "lastConnectAuthMode"), last != curAuthMode {
+            SharedLogger.shared.log("[AppDebug] auth mode changed (\(last) → \(curAuthMode)) — clearing cred cache")
+            try? BackupManager.resetTurnCache()
+        }
+        UserDefaults.standard.set(curAuthMode, forKey: "lastConnectAuthMode")
+    }
+
+    /// Block until the tunnel has settled into a terminal state.
+    ///
+    /// Called from INSIDE a Live Activity intent's perform(): once perform()
+    /// returns the app is suspended and would never observe the transition, so a
+    /// stop that was merely *requested* leaves the card frozen on
+    /// "Disconnecting". A disconnect takes ~1.75s (build 59) against a measured
+    /// ~28s perform() budget.
+    func awaitTerminal(timeout: TimeInterval = 15) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while status != .disconnected && status != .invalid && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+    }
+
+    /// Fetch ONE fresh TURN cred for the Live Activity switch, without any UI.
+    ///
+    /// This restores the half of `connect()` the split had dropped, and it has
+    /// to be here: the switch path used to pass `seededTURN: nil` whenever the
+    /// on-disk cache had nothing usable, on the assumption that the extension
+    /// would fetch its own. It will not. The credpool's cold-start cap counts
+    /// slots that merely sit in their VK per-relay cooldown as "usable", so a
+    /// pool of three cooling creds satisfies a cold-start target of three and it
+    /// parks instead of fetching — bootstrap then retries until a cooldown
+    /// expires, minutes later. Device log 29.07 vpn.13:
+    ///   `cold-start cap (3 usable+inflight >= 3 target) — parking to share`
+    /// The app's Connect button never hits this because it always probes first;
+    /// this makes the switch behave the same way.
+    ///
+    /// NON-INTERACTIVE by construction: one attempt, and anything that would
+    /// need a human (captcha) returns nil rather than trying to show a WebView
+    /// that a background intent cannot present anyway. Nil simply means we start
+    /// unseeded, exactly as before — no worse, and usually the free path answers
+    /// in ~3s (vpn.11: 16:44:34.9 → 16:44:37.4).
+    private func probeFreshCredWithoutUI(config: TunnelConfig)
+        async -> (address: String, username: String, password: String)? {
+        let linkID = URL(string: config.vkLink)?.lastPathComponent ?? ""
+
+        if config.useCookieAuth {
+            guard let cookieHeader = VKCookieStore.validCookieHeader() else {
+                SharedLogger.shared.log("[AppDebug] live-activity: no valid VK cookie — starting unseeded")
+                return nil
+            }
+            let linksJSON = (try? String(data: JSONSerialization.data(withJSONObject: config.cookieLinks),
+                                         encoding: .utf8)) ?? "[]"
+            cookieHeader.withCString { cptr in
+                linksJSON.withCString { lptr in wgSetVKCookieAuth(1, cptr, lptr) }
+            }
+        } else {
+            // Same guard connect() uses: make sure a stale cookie-mode setting
+            // can't gate the anonymous probe.
+            wgSetVKCookieAuth(0, "", "[]")
+        }
+
+        switch await probeVKCreds(linkID: linkID, vkHostIPsJSON: "") {
+        case .ok(let addr, let user, let pass):
+            if let h = config.turnServerOverride, !h.isEmpty,
+               let pt = config.turnPortOverride, !pt.isEmpty {
+                SharedLogger.shared.log("[AppDebug] live-activity: fresh cred, TURN override \(h):\(pt) (VK gave \(addr))")
+                return ("\(h):\(pt)", user, pass)
+            }
+            SharedLogger.shared.log("[AppDebug] live-activity: fresh TURN cred acquired (addr=\(addr))")
+            return (addr, user, pass)
+        case .captcha:
+            SharedLogger.shared.log("[AppDebug] live-activity: captcha required — cannot solve from a background intent, starting unseeded")
+            return nil
+        default:
+            SharedLogger.shared.log("[AppDebug] live-activity: cred probe failed — starting unseeded")
+            return nil
+        }
+    }
+
+    /// Wait, bounded, for the tunnel to actually come up.
+    ///
+    /// Without this the card is left saying "Connecting…" indefinitely: the app
+    /// is suspended the moment perform() returns, NEVPNStatusDidChange only
+    /// reaches a RUNNING app, and nothing else may update a Live Activity. The
+    /// device log (29.07 vpn.9) showed exactly that — tunnel up at 15:44:10,
+    /// card still "Connecting" minutes later.
+    ///
+    /// It fits comfortably: that switch took 5.6s end to end against a measured
+    /// ~28s perform() budget. 15s is the cap, leaving margin for the intent to
+    /// publish the final state afterwards; a connect slower than that keeps the
+    /// honest "Connecting…", which staleDate will eventually qualify.
+    func awaitConnected(timeout: TimeInterval = 12) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while status != .connected && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+    }
+
+    /// Switch the active server and reconnect — the action behind the Live
+    /// Activity's server picker (GitHub #64 stage 2). The app has no equivalent
+    /// single action: in Settings you change the active profile and the running
+    /// tunnel keeps going on the old one until you Disconnect/Connect by hand.
+    ///
+    /// Order matters, and it is the opposite of the obvious one:
+    ///  1. STOP first. Writing providerConfiguration while a session is live is
+    ///     undefined territory, and activating the profile first would make
+    ///     syncLiveActivity publish the NEW name while the OLD tunnel still
+    ///     carries traffic — the card would assert something untrue.
+    ///  2. Only then activate + reconfigure, with nothing running to disturb.
+    ///  3. Start and return WITHOUT waiting: bootstrap can take up to 120s, far
+    ///     past the intent budget, and the extension does it under the system's
+    ///     watch anyway.
+    func switchAndReconnect(to serverId: UUID) async {
+        guard let server = ServerStore.shared.servers.first(where: { $0.id == serverId }) else { return }
+        SharedLogger.shared.log("[AppDebug] live-activity: switch → \"\(server.serverName)\" [\(server.modeLabel)]")
+
+        if status != .disconnected && status != .invalid {
+            disconnect()
+            await awaitTerminal()
+        }
+
+        ServerStore.shared.activate(serverId)
+        let config = TunnelConfig.make(for: server)
+        clearCredCacheIfAuthModeChanged(config: config)
+        // A cached cred is free; otherwise go and get one, exactly as the
+        // Connect button does — see probeFreshCredWithoutUI for why the
+        // extension cannot be left to do it.
+        var seed = CredCache.loadValidCred()
+        if seed == nil {
+            seed = await probeFreshCredWithoutUI(config: config)
+        }
+        do {
+            try await applyConfigurationAndStart(config: config, seededTURN: seed)
+            // Stay alive long enough to SEE it come up, so the card can be told.
+            await awaitConnected()
+        } catch {
+            errorMessage = error.localizedDescription
+            SharedLogger.shared.log("[AppDebug] live-activity: switch failed — \(error.localizedDescription)")
+        }
+    }
+
+    /// Everything from "we already know what to connect with" onward: build the
+    /// WireGuard + proxy configuration, write it into the VPN profile, and start
+    /// the tunnel. No network of its own, no captcha, no cred fetch — it
+    /// completes in well under a second.
+    ///
+    /// Split out of `connect()` for the Live Activity's switch-server intent
+    /// (GitHub #64 stage 2), which must NOT run the pre-bootstrap probe:
+    ///  - the probe runs in THIS process, and an intent's process is suspended
+    ///    the moment perform() returns. Measured on iOS 26.3: a detached task
+    ///    gets ZERO further execution, so an in-flight cred fetch would just die;
+    ///  - its captcha half needs a WebView, which a background intent can show no
+    ///    more than the extension can.
+    /// The extension fetches creds itself during bootstrap, and that is run by
+    /// the system, so it survives our suspension.
+    ///
+    /// `seededTURN` is optional here: pass a cached cred when one is at hand (it
+    /// seeds credPool slot 0 and saves a VK round-trip) or nil to let the
+    /// extension fetch. `vkHostIPs` is only a DNS latency optimisation.
+    func applyConfigurationAndStart(
+        config: TunnelConfig,
+        vkHostIPs: [String: [String]] = [:],
+        seededTURN: (address: String, username: String, password: String)? = nil
+    ) async throws {
+        let manager = try await getOrCreateManager()
+        let wgConfig = try buildUAPIConfig(config: config)
+
             // Build proxy config JSON, seeding credPool slot 0 with the
             // pre-fetched TURN creds.
             if config.effectiveNumConnections != config.numConnections {
                 SharedLogger.shared.log("[AppDebug] cookie mode: Connections \(config.numConnections) → \(config.effectiveNumConnections) (\(config.cookieLinks.count) call link(s) × 20)")
             }
-            let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seeded)
+            let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seededTURN)
 
             // Pick serverAddress. iOS always excludes serverAddress from the
             // tunnel per Apple's documented rule. We set it to the TURN IP we
@@ -558,7 +808,8 @@ class TunnelManager: ObservableObject {
             let savedTurnIP = shared?.string(forKey: "lastTurnServerIP") ?? ""
             // Parse host from seeded.address ("host:port" format).
             let seededHost: String = {
-                let parts = seeded.address.split(separator: ":", maxSplits: 1).map(String.init)
+                guard let s = seededTURN else { return "" }
+                let parts = s.address.split(separator: ":", maxSplits: 1).map(String.init)
                 return parts.first ?? ""
             }()
             let serverAddress: String
@@ -661,9 +912,6 @@ class TunnelManager: ObservableObject {
             try await Task.sleep(nanoseconds: 700_000_000)
 
             try manager.connection.startVPNTunnel()
-        } catch {
-            errorMessage = error.localizedDescription
-        }
     }
 
     func disconnect() {

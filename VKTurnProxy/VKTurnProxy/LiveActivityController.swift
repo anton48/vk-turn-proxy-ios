@@ -13,6 +13,7 @@
 import Foundation
 import NetworkExtension
 import ActivityKit
+import UIKit
 
 /// Availability shim. TunnelManager talks to this; it forwards to the real
 /// controller only where ActivityKit exists.
@@ -46,6 +47,40 @@ final class LiveActivityController {
     /// re-pushed when its staleDate is approaching.
     private var lastPushed: (state: VPNActivityAttributes.ContentState, at: Date)?
 
+    /// Picker state lives HERE, not in the tunnel: it is UI state owned by the
+    /// activity, so every sync() has to MERGE it back in rather than rebuild
+    /// ContentState from tunnel state alone. Without that, the 2s stats poll
+    /// would close the menu under the user's finger — verified on the prototype,
+    /// where tunnel-driven updates during a reconnect kept arriving with
+    /// mode=picking exactly as intended.
+    private struct Picker {
+        var page: Int
+        var busyServerId: String?
+    }
+    private var picker: Picker?
+
+    /// When the in-flight server switch stops excusing terminal states.
+    ///
+    /// A boolean cleared "when the switch call returns" is NOT enough, and the
+    /// device proved it (29.07 vpn.8): `switchAndReconnect` ends at
+    /// `startVPNTunnel()`, which returns immediately, while the status changes it
+    /// caused are still queued — LiveActivityBridge hops each one through a
+    /// Task. They then drained AFTER the flag was cleared, the first `.invalid`
+    /// ended the activity, and the re-`request` died on "Target is not
+    /// foreground". So the excuse has to last until the tunnel actually SETTLES,
+    /// which is a deadline, not a call boundary. Cleared early the moment
+    /// `.connected` arrives.
+    private var switchDeadline: Date?
+    private var isSwitching: Bool {
+        guard let d = switchDeadline else { return false }
+        if Date() >= d { switchDeadline = nil; return false }
+        return true
+    }
+    /// Generous on purpose: a cold reconnect can spend up to the extension's
+    /// 120s bootstrap before the first conn is up. Overshooting only means the
+    /// card says "Connecting" a while longer; undershooting loses the card.
+    private static let switchWindow: TimeInterval = 150
+
     private init() {
         // Adopt an activity that outlived the app (relaunch while the tunnel
         // stayed up). Without this we would orphan the old one and request a
@@ -58,7 +93,36 @@ final class LiveActivityController {
 
     // MARK: - Entry point
 
-    func sync(status: NEVPNStatus, connectedAt: Date?, serverName: String) {
+    func sync(status: NEVPNStatus, connectedAt: Date?, serverName: String, force: Bool = false) {
+        // ── Mid-switch, NOTHING may end the activity. ────────────────────
+        //
+        // Not a nicety: ending it forces a re-`request`, and iOS REFUSES to
+        // start a Live Activity while the app is in the background —
+        // "Activity.request failed: Target is not foreground" (device log
+        // 29.07, 14:42:26). The card then vanishes for good, because every
+        // button that could bring it back lives on the card. `update` from the
+        // background is allowed; `request` is not. So the only safe move is to
+        // keep the same activity alive across the whole switch.
+        //
+        // Both terminal-looking states occur during a normal switch:
+        //   .disconnected — the stop we asked for;
+        //   .invalid      — saveToPreferences() invalidating the session while
+        //                   we rewrite the profile. This one was missed first
+        //                   time round and cost exactly the failure above.
+        // A settled tunnel ends the switch window early — from here the normal
+        // rules apply again.
+        if isSwitching {
+            if Self.map(status) == .connected {
+                switchDeadline = nil
+            } else {
+                let waypoint = pickerApplied(.connecting, connectedAt: nil, serverName: serverName)
+                // Same anti-chatter rule as the normal path: the 2s stats poll
+                // calls in here too, and re-pushing an identical state would
+                // burn ActivityKit updates for nothing.
+                if lastPushed?.state != waypoint { update(waypoint) }
+                return
+            }
+        }
         guard let mapped = Self.map(status) else {
             // .invalid and anything Apple adds later: treat as "no session".
             end()
@@ -68,13 +132,14 @@ final class LiveActivityController {
             end()
             return
         }
-        let state = VPNActivityAttributes.ContentState(
+        var state = VPNActivityAttributes.ContentState(
             status: mapped,
             serverName: serverName,
             // Only a real .connected has a session clock; while connecting the
             // view shows a dash rather than a timer counting from nothing.
             connectedSince: mapped == .connected ? connectedAt : nil
         )
+        applyPicker(to: &state)
         if activity == nil {
             start(state)
             return
@@ -82,11 +147,89 @@ final class LiveActivityController {
         // Re-publishing an identical state is only worth doing to push the
         // staleDate out; do it well before that date so the island never
         // flickers into "last known" while the app is watching.
-        if let last = lastPushed, last.state == state,
+        if !force, let last = lastPushed, last.state == state,
            Date().timeIntervalSince(last.at) < Self.refreshInterval {
             return
         }
         update(state)
+    }
+
+    /// Merge the open picker into a freshly-built state.
+    private func applyPicker(to state: inout VPNActivityAttributes.ContentState) {
+        guard let p = picker else { return }
+        let all = ServerStore.shared.servers
+        let pages = max(1, Int(ceil(Double(all.count) / Double(serversPerPage))))
+        let page = min(p.page, pages - 1)
+        let start = page * serversPerPage
+        state.mode = .picking
+        state.choices = all[start..<min(start + serversPerPage, all.count)]
+            .map { ServerChoice(id: $0.id.uuidString, name: $0.serverName) }
+        state.page = page
+        state.pageCount = pages
+        state.busyServerId = p.busyServerId
+    }
+
+    /// Publish immediately — no throttle, no "unchanged" check. A button tap has
+    /// to land now; `sync` is for the tunnel's own chatter.
+    private func pushNow() {
+        let tunnel = TunnelManager.shared
+        sync(status: tunnel.status,
+             connectedAt: tunnel.live.connectedAt,
+             serverName: ServerStore.shared.activeServer.serverName,
+             force: true)
+    }
+
+    /// Build a state with the picker merged in — used where sync()'s normal
+    /// mapping doesn't apply (the mid-switch waypoint above).
+    private func pickerApplied(_ status: VPNActivityStatus,
+                               connectedAt: Date?,
+                               serverName: String) -> VPNActivityAttributes.ContentState {
+        var state = VPNActivityAttributes.ContentState(status: status,
+                                                       serverName: serverName,
+                                                       connectedSince: connectedAt)
+        applyPicker(to: &state)
+        return state
+    }
+
+    // MARK: - Button taps
+
+    func handle(_ action: LiveActivityAction) async {
+        let tunnel = TunnelManager.shared
+        switch action {
+        case .disconnect:
+            picker = nil
+            tunnel.disconnect()
+            // AWAITED: after perform() returns the app is suspended and would
+            // never see .disconnected, leaving the card stuck on "Disconnecting"
+            // instead of disappearing. The end() happens in the sync that the
+            // terminal status triggers, so it must land before we return.
+            await tunnel.awaitTerminal()
+
+        case .enterPicker:
+            picker = Picker(page: 0, busyServerId: nil)
+            pushNow()
+
+        case .exitPicker:
+            picker = nil
+            pushNow()
+
+        case .nextPage:
+            guard var p = picker else { return }
+            let pages = max(1, Int(ceil(Double(ServerStore.shared.servers.count) / Double(serversPerPage))))
+            p.page = (p.page + 1) % pages
+            picker = p
+            pushNow()
+
+        case .selectServer(let idString):
+            guard let id = UUID(uuidString: idString) else { return }
+            picker?.busyServerId = idString
+            pushNow()
+            switchDeadline = Date().addingTimeInterval(Self.switchWindow)
+            await tunnel.switchAndReconnect(to: id)
+            // switchDeadline is deliberately NOT cleared here — see its doc.
+            picker = nil
+            pushNow()
+        }
     }
 
     // MARK: - Lifecycle
@@ -95,6 +238,14 @@ final class LiveActivityController {
         // Fails silently otherwise — the user can switch Live Activities off
         // per app in Settings, and we spent enough of this project chasing
         // features that quietly did nothing.
+        // iOS refuses Activity.request outside the foreground, and a failed
+        // request is unrecoverable here: every control that could bring the card
+        // back lives ON the card. Say so plainly instead of logging an opaque
+        // "Target is not foreground".
+        guard UIApplication.shared.applicationState != .background else {
+            note("cannot start a Live Activity from the background — iOS only allows request() in the foreground")
+            return
+        }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
             note("Live Activities are disabled for this app in Settings — no island")
             return
@@ -102,7 +253,7 @@ final class LiveActivityController {
         do {
             activity = try Activity.request(
                 attributes: VPNActivityAttributes(startedAt: Date()),
-                content: ActivityContent(state: state, staleDate: Self.staleDate()),
+                content: ActivityContent(state: state, staleDate: staleDate(for: state.status)),
                 pushType: nil   // no push: see the note on push updates below
             )
             loggedFailure = nil
@@ -117,7 +268,7 @@ final class LiveActivityController {
         guard let activity else { return }
         lastPushed = (state, Date())
         Task {
-            await activity.update(ActivityContent(state: state, staleDate: Self.staleDate()))
+            await activity.update(ActivityContent(state: state, staleDate: staleDate(for: state.status)))
         }
     }
 
@@ -143,7 +294,35 @@ final class LiveActivityController {
     /// the common case while bounding how long a wrong state can stand.
     /// `context.isStale` is what the view should render differently (M2).
     private static let staleAfter: TimeInterval = 15 * 60
-    private static func staleDate() -> Date { Date().addingTimeInterval(staleAfter) }
+
+    /// An open picker must not stay open forever — the user taps "switch", gets
+    /// distracted, and the island sits on a menu instead of reporting the tunnel.
+    ///
+    /// ⚠️ This CANNOT be a timer in the app. Measured on the prototype: once the
+    /// app is backgrounded its Timers stop, so any app-side deadline never fires
+    /// — precisely in the case that needs it. The expiry is therefore handed to
+    /// the SYSTEM as the activity's staleDate, and the views render an expired
+    /// picker as the normal layout.
+    private static let pickerTimeout: TimeInterval = 45
+
+    /// A `.connecting` we cannot confirm must not stand as long as a confirmed
+    /// `.connected`. Only the app may refresh the card and it is suspended right
+    /// after the switch, so an unconfirmed "Connecting…" would otherwise sit
+    /// there for the full 15 minutes looking authoritative.
+    ///
+    /// Seen on device 29.07 (vpn.10): a fifth rapid switch found every cred slot
+    /// in its VK per-relay cooldown (1m45s-9m57s), so the extension's credpool
+    /// parked rather than over-fetch and bootstrap kept retrying. The tunnel was
+    /// genuinely coming up — just far slower than the intent can wait. Three
+    /// minutes is long enough for an ordinary connect and short enough that a
+    /// stuck one visibly becomes "last known" instead of a confident claim.
+    private static let connectingStaleAfter: TimeInterval = 3 * 60
+
+    private func staleDate(for status: VPNActivityStatus) -> Date {
+        if picker != nil { return Date().addingTimeInterval(Self.pickerTimeout) }
+        let window = (status == .connected) ? Self.staleAfter : Self.connectingStaleAfter
+        return Date().addingTimeInterval(window)
+    }
 
     /// How often an UNCHANGED state is re-published while the app is running.
     /// Comfortably inside `staleAfter`, so a foreground session never shows

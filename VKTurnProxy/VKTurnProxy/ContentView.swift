@@ -8,7 +8,7 @@ import os.log
 private let captchaLog = OSLog(subsystem: "com.vkturnproxy.app", category: "Captcha")
 
 struct ContentView: View {
-    @StateObject private var tunnel = TunnelManager()
+    @StateObject private var tunnel = TunnelManager.shared
 
     // Name of the ACTIVE server, shown under the status text. Deliberately a
     // @State snapshot refreshed in .onAppear (which fires when Settings is
@@ -60,20 +60,6 @@ struct ContentView: View {
             }
         }
         return issues.compactMap { $0 }.first { $0.severity == .error }?.message
-    }
-
-    /// Parse the optional "TURN server" override ("IP:port") into (host, port),
-    /// or nil if empty/malformed (treated as no override). Splits on the LAST
-    /// colon so IPv4:port parses cleanly; the port must be all digits.
-    private func parseTurnOverride(_ s: String) -> (host: String, port: String)? {
-        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty, let colon = t.lastIndex(of: ":") else { return nil }
-        let host = String(t[..<colon])
-        let port = String(t[t.index(after: colon)...])
-        guard !host.isEmpty, !port.isEmpty, port.allSatisfy(\.isNumber), Int(port) != nil else {
-            return nil
-        }
-        return (host, port)
     }
 
     var body: some View {
@@ -151,43 +137,7 @@ struct ContentView: View {
                             let active = ServerStore.shared.activeServer
                             NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue), server=\"\(active.serverName)\" [\(active.modeLabel)])")
                             SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue), server=\"\(active.serverName)\" [\(active.modeLabel)])")
-                            let turnOv = parseTurnOverride(active.turnServerOverride)
-                            let vkLines = vkLink.split(whereSeparator: { $0.isNewline })
-                                .map { $0.trimmingCharacters(in: .whitespaces) }
-                                .filter { !$0.isEmpty }
-                            // The cookie-mode conn cap is applied downstream, by
-                            // TunnelConfig.effectiveNumConnections — the stored
-                            // setting is passed through untouched here. It used
-                            // to be clamped into a local at this call site,
-                            // which was then never passed to TunnelConfig.
-                            let config = TunnelConfig(
-                                privateKey: active.privateKey,
-                                peerPublicKey: active.peerPublicKey,
-                                presharedKey: active.presharedKey.isEmpty ? nil : active.presharedKey,
-                                tunnelAddress: active.tunnelAddress,
-                                dnsServers: active.dnsServers,
-                                allowedIPs: "0.0.0.0/0",
-                                vkLink: vkLines.first ?? vkLink,
-                                cookieLinks: vkLines,
-                                peerAddress: active.peerAddress,
-                                useDTLS: active.useDTLS,
-                                useWrap: active.useWrap,
-                                wrapKeyHex: active.wrapKeyHex,
-                                useSrtp: active.useSrtp,
-                                useWrapA: active.useWrapA,
-                                wrapAPassword: active.wrapAPassword,
-                                deviceID: active.deviceID,
-                                useWrapS: active.useWrapS,
-                                obfProfile: active.obfProfile,
-                                clientID: active.clientID,
-                                useUDP: active.useUDP,
-                                forceLegacyCaptcha: UserDefaults.standard.bool(forKey: "forceLegacyCaptcha"),
-                                useCookieAuth: UserDefaults.standard.bool(forKey: "VKAuth"),
-                                numConnections: active.numConnections,
-                                credPoolCooldownSeconds: active.credPoolCooldownSeconds,
-                                turnServerOverride: turnOv?.host,
-                                turnPortOverride: turnOv?.port
-                            )
+                            let config = TunnelConfig.make(for: active)
                             Task {
                                 await tunnel.connect(config: config)
                             }
@@ -221,6 +171,18 @@ struct ContentView: View {
             // Fires on first show AND when Settings is popped, so the displayed
             // server name follows a rename / active-server switch.
             .onAppear { activeServerName = ServerStore.shared.activeServer.serverName }
+            // ...but NOT on a return from background, which is how the Live
+            // Activity's server picker changes it (issue #64 stage 2): the view
+            // never disappeared, so onAppear never fires and the header kept
+            // naming the server from launch while Settings showed the real one
+            // (device log 29.07). Guarded on a real change — an unconditional
+            // @State write here would re-render the view that hosts the
+            // NavigationView on every foregrounding.
+            .onReceive(NotificationCenter.default.publisher(
+                for: UIApplication.willEnterForegroundNotification)) { _ in
+                let name = ServerStore.shared.activeServer.serverName
+                if name != activeServerName { activeServerName = name }
+            }
             .sheet(isPresented: $tunnel.captchaPending) {
                 if let urlStr = tunnel.captchaImageURL, let url = URL(string: urlStr) {
                     CaptchaWebView(

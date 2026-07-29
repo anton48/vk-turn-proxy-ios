@@ -33,6 +33,22 @@ enum VPNActivityStatus: String, Codable, Hashable {
     case disconnected
 }
 
+/// Which of the two presentations the activity is currently showing.
+enum ActivityMode: String, Codable, Hashable {
+    case normal, picking
+}
+
+/// One selectable server. Deliberately tiny — id + name is all the picker needs.
+struct ServerChoice: Codable, Hashable, Identifiable {
+    var id: String      // ServerProfile.id.uuidString
+    var name: String
+}
+
+/// Server buttons per page. The Dynamic Island's expanded region is the tighter
+/// of the two surfaces and fits three; a fourth is silently clipped, which is
+/// how the cancel/paging row disappeared during prototyping.
+let serversPerPage = 3
+
 @available(iOS 16.2, *)
 struct VPNActivityAttributes: ActivityAttributes {
     /// The mutable part. Keep it small: ActivityKit caps a ContentState at
@@ -45,6 +61,22 @@ struct VPNActivityAttributes: ActivityAttributes {
         /// view renders a live timer from this, so the clock keeps running even
         /// while the app is suspended and cannot update anything.
         var connectedSince: Date?
+
+        // ── stage 2 (GitHub #64): the two-mode server picker ──────────────
+        // A Live Activity has no Menu, Picker, List, scrolling or gestures —
+        // Button and Toggle are the entire palette. "Choose one of N servers"
+        // is therefore done by re-rendering the SAME activity as a page of
+        // buttons and back again.
+        var mode: ActivityMode = .normal
+        /// Populated ONLY while `mode == .picking`, so the normal-mode payload
+        /// stays exactly as small as it was in stage 1 (ContentState is capped
+        /// around 4 KB, and this is the only part that grows with the config).
+        var choices: [ServerChoice] = []
+        var page: Int = 0
+        var pageCount: Int = 1
+        /// The row whose switch is in flight, so a tap visibly does something
+        /// during the seconds before the status catches up.
+        var busyServerId: String?
     }
 
     /// When the activity itself was started. Informational — the session clock
