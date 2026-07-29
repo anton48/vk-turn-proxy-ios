@@ -70,10 +70,26 @@ struct TunnelStats: Codable {
     }
 }
 
+/// Everything that changes on the 2-second stats poll, split out of
+/// `TunnelManager` into an observable of its own.
+///
+/// This split is load-bearing, not tidiness: `ContentView` owns the
+/// `NavigationView` and holds `TunnelManager` as a `@StateObject`, so ANY
+/// `@Published` change on the manager re-renders the view that hosts the
+/// navigation stack — and on iOS 26 that tears down whatever screen is pushed.
+/// With these counters on the manager, a connected tunnel popped the user out
+/// of a server's settings back to Settings every 2 seconds (GitHub #65; the
+/// reporter pinned it exactly: "выкидывает с той же частотой, с которой
+/// обновляется стата"). Reproduced in isolation on an iOS 26.3 simulator with
+/// nothing but a 2s `@Published` tick, and fixed by this split.
+///
+/// Rule of thumb for anything added here later: if it changes while the tunnel
+/// is merely running, it belongs on this object; if it changes when the user
+/// does something (status, errors, captcha), it belongs on `TunnelManager`.
+/// Only views BELOW the navigation links may observe this — re-rendering a
+/// pushed screen is harmless, re-rendering their host is not.
 @MainActor
-class TunnelManager: ObservableObject {
-    @Published var status: NEVPNStatus = .disconnected
-    @Published var errorMessage: String?
+final class TunnelLiveStats: ObservableObject {
     @Published var stats = TunnelStats()
     // Set when tunnel transitions into .connected, cleared on any other
     // status. StatsView reads this via TimelineView to show live uptime.
@@ -88,6 +104,21 @@ class TunnelManager: ObservableObject {
     /// counters themselves are gated on `statsReceivedOnce` and go blank
     /// immediately, without waiting for this to trip.
     @Published var statsChannelDown = false
+    @Published var txRate: Double = 0  // bytes/sec
+    @Published var rxRate: Double = 0  // bytes/sec
+    @Published var internetRTTms: Double = 0  // ms, TCP connect to 1.1.1.1
+}
+
+@MainActor
+class TunnelManager: ObservableObject {
+    @Published var status: NEVPNStatus = .disconnected
+    @Published var errorMessage: String?
+
+    /// The poll-driven counters. A plain `let`, deliberately NOT `@Published`:
+    /// observing it from here would re-couple every 2-second update to
+    /// `ContentView` and bring back the pop this split exists to fix.
+    let live = TunnelLiveStats()
+
     /// Polls sent since the last reply. Counting POLLS rather than elapsed
     /// time matters: wall-clock since the last success also grows while the
     /// timer isn't firing at all (backgrounded, suspended), which trips a
@@ -103,7 +134,7 @@ class TunnelManager: ObservableObject {
             SharedLogger.shared.log("[AppDebug] stats channel unavailable — \(reason)")
             NSLog("[TunnelManager] stats channel unavailable — %@", reason)
         }
-        if !statsChannelDown { statsChannelDown = true }
+        if !live.statsChannelDown { live.statsChannelDown = true }
     }
 
     private var manager: NETunnelProviderManager?
@@ -115,9 +146,6 @@ class TunnelManager: ObservableObject {
     private var prevTx: Int64 = 0
     private var prevRx: Int64 = 0
     private var prevTime: Date = Date()
-    @Published var txRate: Double = 0  // bytes/sec
-    @Published var rxRate: Double = 0  // bytes/sec
-    @Published var internetRTTms: Double = 0  // ms, TCP connect to 1.1.1.1
     @Published var captchaPending = false
     @Published var captchaImageURL: String?
     @Published var captchaSID: String?
@@ -964,8 +992,8 @@ class TunnelManager: ObservableObject {
         // it via stats), but for a status box that's fine: the user
         // mainly cares about the "is it ticking" visual cue, not the
         // absolute number.
-        if status == .connected && connectedAt == nil {
-            connectedAt = Date()
+        if status == .connected && live.connectedAt == nil {
+            live.connectedAt = Date()
         }
         // ...and for the same reason the stats poll has to be started here.
         // Both of its other entry points miss a cold launch onto a running
@@ -1006,8 +1034,8 @@ class TunnelManager: ObservableObject {
                     // can render a live uptime via TimelineView. Don't reset
                     // on .connecting/.reasserting cycles inside an existing
                     // session — those count as part of the same uptime.
-                    if self.connectedAt == nil {
-                        self.connectedAt = Date()
+                    if self.live.connectedAt == nil {
+                        self.live.connectedAt = Date()
                     }
                     // (Re)start polling, preserving captcha state across reconnects
                     self.startStatsPolling(reset: false)
@@ -1051,7 +1079,7 @@ class TunnelManager: ObservableObject {
                     // Terminal states — full cleanup
                     self.stopStatsPolling()
                     self.resetCaptchaState()
-                    self.connectedAt = nil
+                    self.live.connectedAt = nil
                     // If the extension self-stopped due to a rejected VKAuth
                     // cookie, it wrote the reason to the App Group before
                     // cancelling — surface it (and clear it so it shows once).
@@ -1080,7 +1108,7 @@ class TunnelManager: ObservableObject {
     /// it requires a reconnect.
     private func syncLiveActivity() {
         LiveActivityBridge.sync(status: status,
-                                connectedAt: connectedAt,
+                                connectedAt: live.connectedAt,
                                 serverName: ServerStore.shared.activeServer.serverName)
     }
 
@@ -1088,10 +1116,10 @@ class TunnelManager: ObservableObject {
         statsTimer?.invalidate()
         statsTimer = nil
         if reset {
-            stats = TunnelStats()
-            txRate = 0
-            rxRate = 0
-            internetRTTms = 0
+            live.stats = TunnelStats()
+            live.txRate = 0
+            live.rxRate = 0
+            live.internetRTTms = 0
         }
         prevTx = 0
         prevRx = 0
@@ -1101,12 +1129,12 @@ class TunnelManager: ObservableObject {
         // actually arrived. A healthy extension answers the immediate fetch
         // below within milliseconds, so this is invisible there; on a build
         // where the channel is refused it never flips, which is the point.
-        statsReceivedOnce = false
+        live.statsReceivedOnce = false
         // Grace-start the watchdog that raises the visible warning: the first
         // reply legitimately takes a moment, and flashing "unavailable" on every
         // connect would be its own kind of lie.
         missedStatsPolls = 0
-        statsChannelDown = false
+        live.statsChannelDown = false
         statsChannelLoggedReason = nil
         // Fetch immediately, then every 2 seconds.
         // Add to .common RunLoop mode so the timer fires even during
@@ -1127,10 +1155,10 @@ class TunnelManager: ObservableObject {
         // Do NOT clear captcha state here — it must survive across
         // transient status changes (sleep/wake, reasserting).
         // Captcha state is cleared in resetCaptchaState() on terminal disconnect.
-        stats = TunnelStats()
-        txRate = 0
-        rxRate = 0
-        internetRTTms = 0
+        live.stats = TunnelStats()
+        live.txRate = 0
+        live.rxRate = 0
+        live.internetRTTms = 0
     }
 
     /// Clear all captcha-related state. Only called on terminal disconnect.
@@ -1199,28 +1227,28 @@ class TunnelManager: ObservableObject {
                     guard let self = self, let data = response else { return }
                     if let newStats = try? JSONDecoder().decode(TunnelStats.self, from: data) {
                         self.missedStatsPolls = 0
-                        self.statsReceivedOnce = true
+                        self.live.statsReceivedOnce = true
                         // Keep the Live Activity's staleDate rolling forward
                         // while the app is alive: a session left open longer
                         // than the stale window would otherwise start claiming
                         // it doesn't know a state we are actively watching.
                         // Throttled inside the controller — this fires every 2s.
                         self.syncLiveActivity()
-                        if self.statsChannelDown {
-                            self.statsChannelDown = false
+                        if self.live.statsChannelDown {
+                            self.live.statsChannelDown = false
                             self.debugLog("stats channel recovered")
                         }
                         self.statsChannelLoggedReason = nil
                         let now = Date()
                         let dt = now.timeIntervalSince(self.prevTime)
                         if dt > 0 && self.prevTx > 0 {
-                            self.txRate = Double(newStats.txBytes - self.prevTx) / dt
-                            self.rxRate = Double(newStats.rxBytes - self.prevRx) / dt
+                            self.live.txRate = Double(newStats.txBytes - self.prevTx) / dt
+                            self.live.rxRate = Double(newStats.rxBytes - self.prevRx) / dt
                         }
                         self.prevTx = newStats.txBytes
                         self.prevRx = newStats.rxBytes
                         self.prevTime = now
-                        self.stats = newStats
+                        self.live.stats = newStats
 
                         // VKAuth: the extension reports a fatal cookie rejection
                         // via auth_error. Surface it and stop the tunnel (we
@@ -1257,11 +1285,11 @@ class TunnelManager: ObservableObject {
                             // milliseconds per poll due to RPC latency, so
                             // anything <1s is just noise that would force
                             // SwiftUI to re-render TimelineView dependents.
-                            if let existing = self.connectedAt,
+                            if let existing = self.live.connectedAt,
                                abs(existing.timeIntervalSince(originFromExtension)) < 1 {
                                 // close enough, keep current
                             } else {
-                                self.connectedAt = originFromExtension
+                                self.live.connectedAt = originFromExtension
                             }
                         }
 
@@ -1371,7 +1399,7 @@ class TunnelManager: ObservableObject {
                 let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
                 connection.cancel()
                 Task { @MainActor in
-                    self?.internetRTTms = elapsed
+                    self?.live.internetRTTms = elapsed
                 }
             case .failed(_):
                 done = true

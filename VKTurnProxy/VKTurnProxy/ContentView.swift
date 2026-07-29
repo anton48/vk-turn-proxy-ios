@@ -171,7 +171,7 @@ struct ContentView: View {
 
                     // Stats (shown when connected)
                     if tunnel.status == .connected {
-                        StatsView(tunnel: tunnel)
+                        StatsView(live: tunnel.live)
                             .padding(.horizontal)
                     }
 
@@ -255,15 +255,8 @@ struct ContentView: View {
                     .disabled(tunnel.status != .connected && tunnel.status != .connecting && configValidationError != nil)
 
                     // Logs & Settings links
-                    HStack(spacing: 24) {
-                        NavigationLink(destination: LogsView(tunnel: tunnel)) {
-                            Label("Logs", systemImage: "doc.text")
-                        }
-                        NavigationLink(destination: SettingsView()) {
-                            Label("Settings", systemImage: "gear")
-                        }
-                    }
-                    .padding(.bottom, 8)
+                    MainNavigationLinks(tunnel: tunnel)
+                        .padding(.bottom, 8)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, 8)
@@ -348,6 +341,31 @@ struct ContentView: View {
         switch tunnel.status {
         case .connected, .connecting: return .red
         default: return .blue
+        }
+    }
+}
+
+/// The two links out of the main screen, deliberately in a view of their own.
+///
+/// `tunnel` is held but NOT observed (plain `let`, no `@ObservedObject`), so
+/// this subtree's value never changes and SwiftUI leaves it — and the screens
+/// pushed from it — untouched when ContentView re-renders. Belt and braces
+/// alongside the TunnelLiveStats split: build 177 already popped this app's
+/// pushed screens once via a different publisher (@AppStorage writes), and
+/// keeping the links out of the churning body makes that class of regression
+/// harmless rather than a repeat bug. LogsView observes the manager itself, so
+/// it still updates live once pushed.
+private struct MainNavigationLinks: View {
+    let tunnel: TunnelManager
+
+    var body: some View {
+        HStack(spacing: 24) {
+            NavigationLink(destination: LogsView(tunnel: tunnel)) {
+                Label("Logs", systemImage: "doc.text")
+            }
+            NavigationLink(destination: SettingsView()) {
+                Label("Settings", systemImage: "gear")
+            }
         }
     }
 }
@@ -1083,10 +1101,14 @@ struct DocumentPicker: UIViewControllerRepresentable {
 // MARK: - Stats View
 
 struct StatsView: View {
-    @ObservedObject var tunnel: TunnelManager
+    /// Observes ONLY the poll-driven counters, never the TunnelManager itself.
+    /// This view sits under ContentView's NavigationView, so re-rendering it is
+    /// harmless — but observing the manager from anywhere in ContentView's own
+    /// body is not. See TunnelLiveStats for why (GitHub #65).
+    @ObservedObject var live: TunnelLiveStats
 
     /// Every counter below comes from the extension over NE IPC. Until a reply
-    /// has actually arrived, `tunnel.stats` is the all-zero initial value, and
+    /// has actually arrived, `live.stats` is the all-zero initial value, and
     /// rendering it claims "0 connections, 0 bytes" about a tunnel that may
     /// well be carrying traffic — which is what a third-party re-signed build
     /// shows forever, since the OS refuses that channel outright.
@@ -1096,7 +1118,7 @@ struct StatsView: View {
     /// healthy build the immediate first poll answers in milliseconds, so this
     /// is imperceptible there.
     private var statsAreReal: Bool {
-        tunnel.statsReceivedOnce && !tunnel.statsChannelDown
+        live.statsReceivedOnce && !live.statsChannelDown
     }
     private func dashed(_ value: @autoclosure () -> String) -> String {
         statsAreReal ? value() : "—"
@@ -1118,27 +1140,27 @@ struct StatsView: View {
                 .foregroundColor(.orange)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
-                .opacity(tunnel.statsChannelDown ? 1 : 0)
-                .frame(height: tunnel.statsChannelDown ? nil : 0)
+                .opacity(live.statsChannelDown ? 1 : 0)
+                .frame(height: live.statsChannelDown ? nil : 0)
                 .clipped()
-                .accessibilityHidden(!tunnel.statsChannelDown)
+                .accessibilityHidden(!live.statsChannelDown)
             HStack {
-                StatBox(title: "↑ TX", value: dashed(formatBytes(tunnel.stats.txBytes)), sub: statsAreReal ? formatRate(tunnel.txRate) : nil)
-                StatBox(title: "↓ RX", value: dashed(formatBytes(tunnel.stats.rxBytes)), sub: statsAreReal ? formatRate(tunnel.rxRate) : nil)
+                StatBox(title: "↑ TX", value: dashed(formatBytes(live.stats.txBytes)), sub: statsAreReal ? formatRate(live.txRate) : nil)
+                StatBox(title: "↓ RX", value: dashed(formatBytes(live.stats.rxBytes)), sub: statsAreReal ? formatRate(live.rxRate) : nil)
             }
 
             HStack {
-                StatBox(title: "TURN RTT", value: dashed(String(format: "%.0f ms", tunnel.stats.turnRTTms)), sub: nil)
-                StatBox(title: "DTLS HS", value: dashed(String(format: "%.0f ms", tunnel.stats.dtlsHandshakeMs)), sub: nil)
+                StatBox(title: "TURN RTT", value: dashed(String(format: "%.0f ms", live.stats.turnRTTms)), sub: nil)
+                StatBox(title: "DTLS HS", value: dashed(String(format: "%.0f ms", live.stats.dtlsHandshakeMs)), sub: nil)
                 // Internet RTT is measured by the main app itself, so it stays
                 // real even when the extension is unreachable — that contrast
                 // is a useful signal, not an inconsistency.
-                StatBox(title: "Internet", value: tunnel.internetRTTms > 0 ? String(format: "%.0f ms", tunnel.internetRTTms) : "—", sub: nil)
+                StatBox(title: "Internet", value: live.internetRTTms > 0 ? String(format: "%.0f ms", live.internetRTTms) : "—", sub: nil)
             }
 
             HStack {
-                StatBox(title: "Conns", value: dashed("\(tunnel.stats.activeConns)/\(tunnel.stats.totalConns)"), sub: nil)
-                StatBox(title: "Reconnects", value: dashed("\(tunnel.stats.reconnects)"), sub: nil)
+                StatBox(title: "Conns", value: dashed("\(live.stats.activeConns)/\(live.stats.totalConns)"), sub: nil)
+                StatBox(title: "Reconnects", value: dashed("\(live.stats.reconnects)"), sub: nil)
             }
 
             HStack {
@@ -1149,7 +1171,7 @@ struct StatsView: View {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     StatBox(
                         title: "Uptime",
-                        value: formatUptime(tunnel.connectedAt.map { context.date.timeIntervalSince($0) }),
+                        value: formatUptime(live.connectedAt.map { context.date.timeIntervalSince($0) }),
                         sub: nil
                     )
                 }
@@ -1175,7 +1197,7 @@ struct StatsView: View {
                     // dead creds and the grower can't refresh them
                     // (typically PoW rate-limited).
                     title: "Pool",
-                    value: dashed("\(tunnel.stats.credPoolFilled)/\(tunnel.stats.credPoolWithCreds)/\(tunnel.stats.credPoolSize)/\(tunnel.stats.credPoolDistinctRelays)"),
+                    value: dashed("\(live.stats.credPoolFilled)/\(live.stats.credPoolWithCreds)/\(live.stats.credPoolSize)/\(live.stats.credPoolDistinctRelays)"),
                     sub: nil
                 )
             }
