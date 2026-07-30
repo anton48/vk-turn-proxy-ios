@@ -950,6 +950,24 @@ func wgSetVKCookieAuth(enabled C.int32_t, cookie *C.char, linksJSON *C.char) {
 	proxy.SetVKCookieAuth(enabled != 0, C.GoString(cookie), links)
 }
 
+//export wgSetForceLegacyCaptcha
+//
+// Sets the force-legacy-captcha diagnostic flag for THIS process. Call it in the
+// main app before wgProbeVKCreds; the extension gets the same value through
+// ProxyConfig.ForceLegacyCaptcha and needs no separate call.
+//
+// It has to be a separate entry point because the flag is process-global (a Go
+// atomic), and the main app and the tunnel extension are different processes
+// with their own copies of this library. Until build 213 only the extension's
+// two ProxyConfig entry points set it, so the pre-bootstrap probe — which runs
+// FIRST, in the app, and often supplies the only credential needed — always took
+// the captcha-free path regardless of the setting. Device log 30.07: the probe
+// logged "success via VK Calls captcha-free path" at 21:14:36 while the
+// extension logged "vkcalls skipped (force legacy captcha)" five seconds later.
+func wgSetForceLegacyCaptcha(enabled C.int32_t) {
+	proxy.SetForceLegacyCaptcha(enabled != 0)
+}
+
 //export wgGetAuthError
 //
 // Returns the current cookie ("VKAuth") fatal-auth message, or "" if none. The

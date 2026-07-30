@@ -1986,6 +1986,17 @@ class TunnelManager: ObservableObject {
         savedAttempt: Double = 0
     ) async -> ProbeResult {
         return await Task.detached(priority: .userInitiated) {
+            // Set here rather than at the call sites: this is the only funnel to
+            // wgProbeVKCreds, so no present or future caller can forget it.
+            //
+            // It has to be set at all because the flag is process-global in Go
+            // and the app and the extension are separate processes — the
+            // extension gets it from ProxyConfig, the app has to say so itself.
+            // Without this the probe, which runs FIRST and often supplies the
+            // only credential needed, always took the captcha-free path and the
+            // setting looked as if it worked only sometimes (device log 30.07).
+            wgSetForceLegacyCaptcha(
+                UserDefaults.standard.bool(forKey: "forceLegacyCaptcha") ? 1 : 0)
             let cResult: UnsafePointer<CChar>? = linkID.withCString { l in
                 vkHostIPsJSON.withCString { h in
                     savedSID.withCString { s in

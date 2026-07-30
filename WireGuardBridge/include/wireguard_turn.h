@@ -146,6 +146,18 @@ void wgSetTimezoneOffset(int offsetSeconds);
 ///        across each call's relays (~10 per relay). "" / "[]" = none.
 void wgSetVKCookieAuth(int32_t enabled, const char *cookie, const char *links_json);
 
+/// Set the force-legacy-captcha diagnostic flag (Settings › Advanced ›
+/// Diagnostics) for THIS process. Call BEFORE wgProbeVKCreds in the main app.
+/// The extension does not need it — it gets the same value through
+/// ProxyConfig.force_legacy_captcha.
+///
+/// Separate entry point because the flag is process-global and the app and the
+/// extension are different processes: before build 213 only the extension
+/// honoured it, so the pre-bootstrap probe still used the captcha-free path and
+/// the setting looked like it worked only sometimes.
+/// @param enabled 1 = skip the captcha-free VK Calls path; 0 = normal
+void wgSetForceLegacyCaptcha(int32_t enabled);
+
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
 /// The extension polls this after bootstrap (cookie mode only) — a non-empty
 /// value means the saved cookie was rejected/expired in the background, so the
