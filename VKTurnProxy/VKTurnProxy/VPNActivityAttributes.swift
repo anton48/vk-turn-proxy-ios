@@ -77,6 +77,23 @@ struct VPNActivityAttributes: ActivityAttributes {
         /// The row whose switch is in flight, so a tap visibly does something
         /// during the seconds before the status catches up.
         var busyServerId: String?
+
+        // ── build 208: the compact island's clock is opt-in ────────────────
+        /// Show the session clock in the COLLAPSED Dynamic Island (Settings ›
+        /// Advanced). It has to travel here rather than be read by the widget
+        /// itself: the widget is a separate process and, by design, shares no
+        /// App Group with the app (that is what keeps the Live Activity working
+        /// on third-party re-signed builds), so `UserDefaults.standard` in the
+        /// widget is NOT the app's.
+        ///
+        /// **Optional on purpose.** An activity started by build ≤207 was
+        /// encoded without this key, and after an app update the NEW widget
+        /// decodes that OLD payload; a non-Optional `Bool` would throw
+        /// `.keyNotFound` there and break a card nobody can refresh until the
+        /// app next runs. `nil` therefore means "published before the setting
+        /// existed" and reads as off — same reasoning as the Optional fields in
+        /// AppSettings, and the same trap that once wiped ServerProfile.
+        var compactClock: Bool?
     }
 
     /// When the activity itself was started. Informational — the session clock

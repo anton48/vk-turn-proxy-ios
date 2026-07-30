@@ -153,16 +153,31 @@ struct VPNLiveActivity: Widget {
                 // — past 99 h the label shrinks instead of truncating, because a
                 // scaled number is still a number (same reasoning as build 203).
                 //
-                // What 53% costs: iOS sheds status-bar items right-to-left as the
-                // island grows. On cellular — this app's normal habitat — it drops
-                // only the "LTE"/"5G" label and keeps the signal bars, the battery
-                // and the clock. On Wi-Fi the cellular dots go instead.
-                clock(context)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.6)
-                    .frame(maxWidth: 44)
+                // What it costs is why the clock here is OPT-IN (Settings ›
+                // Advanced, default off): iOS sheds status-bar items right-to-left
+                // as the island grows, so 53% drops the "LTE"/"5G" label on
+                // cellular — this app's normal habitat, where the signal bars,
+                // battery and clock all survive — or the cellular dots on Wi-Fi.
+                // Off, the pill is 40% wide and the status bar stays intact.
+                //
+                // `compactClock == true`, not `?? false`: nil means the state was
+                // published before the setting existed, which reads as off.
+                if context.state.compactClock == true {
+                    clock(context)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .frame(maxWidth: 44)
+                } else if context.isStale {
+                    // Staleness still has to be sayable with the clock off: the
+                    // greyed shield alone reads as a colour choice, not as "we
+                    // stopped being able to vouch for this" (stage 1). One
+                    // character, and only while stale.
+                    Text("?")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             } minimal: {
                 // Several activities collapse to this single glyph, so it has to
                 // identify the app on its own — a bare dot could be anyone's.

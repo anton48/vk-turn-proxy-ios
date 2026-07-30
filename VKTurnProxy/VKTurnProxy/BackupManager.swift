@@ -83,6 +83,7 @@ enum BackupManager {
         let vkLink = d.string(forKey: "vkLink") ?? ""
         let vkAuth = (d.object(forKey: "VKAuth") as? Bool) ?? false
         let liveActivity = (d.object(forKey: "liveActivityEnabled") as? Bool) ?? false
+        let liveActivityClock = (d.object(forKey: "liveActivityCompactClock") as? Bool) ?? false
         // Named servers (build 179+). The legacy flat per-server fields are
         // deliberately NOT written alongside them — a backup from this build is
         // not meant to be readable by 178 and earlier.
@@ -101,7 +102,8 @@ enum BackupManager {
             wrapAPassword: nil,
             turnServerOverride: nil,
             vkAuth: vkAuth,
-            liveActivityEnabled: liveActivity
+            liveActivityEnabled: liveActivity,
+            liveActivityCompactClock: liveActivityClock
         )
 
         var turnPool: CredCacheFile? = nil
@@ -216,6 +218,7 @@ enum BackupManager {
         if let v = s.forceLegacyCaptcha { d.set(v, forKey: "forceLegacyCaptcha") }
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
         if let v = s.liveActivityEnabled { d.set(v, forKey: "liveActivityEnabled") }
+        if let v = s.liveActivityCompactClock { d.set(v, forKey: "liveActivityCompactClock") }
 
         if let backedUpServers = s.servers, !backedUpServers.isEmpty {
             // Build 179+ backup: the named server sets ARE the configuration.

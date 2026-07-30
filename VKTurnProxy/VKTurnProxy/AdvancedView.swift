@@ -26,6 +26,12 @@ struct AdvancedView: View {
     /// Deliberately NOT declared in ContentView (see the file header).
     @AppStorage("liveActivityEnabled") private var liveActivityEnabled = false
 
+    /// Session clock in the COLLAPSED Dynamic Island. Default OFF because it is
+    /// not free: the collapsed island is sized by its content and shares the top
+    /// of the screen with the status bar, so a clock there costs one status-bar
+    /// item. Same rule as above — declared HERE, never in ContentView.
+    @AppStorage("liveActivityCompactClock") private var liveActivityCompactClock = false
+
     var body: some View {
         Form {
             Section {
@@ -38,12 +44,23 @@ struct AdvancedView: View {
                     .onChange(of: liveActivityEnabled) { _ in
                         TunnelManager.shared.refreshLiveActivity()
                     }
+
+                Toggle("Session time in collapsed island", isOn: $liveActivityCompactClock)
+                    // Nothing to configure while the feature itself is off, and a
+                    // live switch that changes nothing invites a bug report.
+                    .disabled(!liveActivityEnabled)
+                    // The widget cannot read this key (separate process, no App
+                    // Group), so it travels in ContentState — which means the
+                    // card only changes on the next push. Force one now.
+                    .onChange(of: liveActivityCompactClock) { _ in
+                        TunnelManager.shared.refreshLiveActivity()
+                    }
             } header: {
                 // Per-feature section, so the header names the feature and the
                 // row says what the switch does. More sections are expected here.
                 Text("Live Activity")
             } footer: {
-                Text("Shows the connection state and the active server on the Lock Screen, and in the Dynamic Island on iPhone 14 Pro and later. On iOS 17+ it also gets buttons to disconnect and to switch server without opening the app. Requires iOS 16.2 or later. Off by default.")
+                Text("Shows the connection state and the active server on the Lock Screen, and in the Dynamic Island on iPhone 14 Pro and later. On iOS 17+ it also gets buttons to disconnect and to switch server without opening the app. Requires iOS 16.2 or later. Off by default.\n\nSession time in the collapsed island widens it, so iOS hides part of the status bar — on cellular the network-type label, on Wi-Fi the signal indicator. The clock is always shown on the Lock Screen card and in the expanded island, where there is room for it.")
             }
         }
         .navigationTitle("Advanced")

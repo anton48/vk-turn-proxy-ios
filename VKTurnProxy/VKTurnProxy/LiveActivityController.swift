@@ -100,6 +100,13 @@ final class LiveActivityController {
         UserDefaults.standard.bool(forKey: "liveActivityEnabled")
     }
 
+    /// Session clock in the COLLAPSED island, Settings › Advanced, default off.
+    /// Read here and carried in ContentState because the widget process cannot
+    /// see these defaults — see VPNActivityAttributes.compactClock.
+    private var compactClockEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "liveActivityCompactClock")
+    }
+
     func sync(status: NEVPNStatus, connectedAt: Date?, serverName: String, force: Bool = false) {
         // Turned off: make sure nothing of ours is left on the Lock Screen. This
         // runs before every other branch, so flipping the switch while connected
@@ -154,6 +161,7 @@ final class LiveActivityController {
             // view shows a dash rather than a timer counting from nothing.
             connectedSince: mapped == .connected ? connectedAt : nil
         )
+        state.compactClock = compactClockEnabled
         applyPicker(to: &state)
         if activity == nil {
             start(state)
@@ -202,6 +210,7 @@ final class LiveActivityController {
         var state = VPNActivityAttributes.ContentState(status: status,
                                                        serverName: serverName,
                                                        connectedSince: connectedAt)
+        state.compactClock = compactClockEnabled
         applyPicker(to: &state)
         return state
     }

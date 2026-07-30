@@ -153,6 +153,11 @@ struct AppSettings: Codable {
     /// so Codable decodes it and an older backup that lacks the key leaves the
     /// current value alone (nil-preserve) rather than forcing the feature off.
     var liveActivityEnabled: Bool? = nil
+    /// Session clock in the collapsed Dynamic Island (Settings › Advanced,
+    /// build 208). Same Optional + `var` nil-preserve contract as the switch
+    /// above, for the same reason: a preference lost on restore is its own
+    /// debugging session.
+    var liveActivityCompactClock: Bool? = nil
     // SRTP-WRAP-S (samosvalishe/free-turn-proxy). `var ... = nil` like vkAuth so
     // old backups/links decode and importers don't force the mode when absent.
     var useWrapS: Bool? = nil
