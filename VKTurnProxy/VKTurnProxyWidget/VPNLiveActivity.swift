@@ -20,13 +20,19 @@
 // Everything is laid out for a name of arbitrary length: server names are user
 // input, so every label truncates rather than pushing the timer off-screen.
 //
-// STAGE 2 adds the controls. Two rules learned on the prototype:
+// Three layout rules, each learned the hard way — (a) on device, (b) and (c) on
+// the prototype:
 //
-//  a. The island's expanded .bottom region fits THREE buttons and silently CLIPS
+//  a. The COMPACT island is sized by its content, and it shares the status bar
+//     with the clock, signal and battery. A live text there (`style: .timer`)
+//     asks for a width unrelated to the string it shows, so it MUST be given an
+//     explicit `.frame` — unbounded it took ~82% of the screen and hid the status
+//     bar entirely (build 205; fixed in 207). See compactTrailing for the numbers.
+//  b. The island's expanded .bottom region fits THREE buttons and silently CLIPS
 //     anything after them — a cancel/paging row stacked under the server list
 //     simply vanished, leaving no way out of the picker. Chrome therefore lives
 //     in .leading/.trailing, which are separate regions.
-//  b. An expired picker renders as the NORMAL layout. staleDate is the picker's
+//  c. An expired picker renders as the NORMAL layout. staleDate is the picker's
 //     deadline (see LiveActivityController): the app is asleep and cannot close
 //     the menu itself, so this is the only thing that gets the user out without
 //     a tap.
@@ -94,7 +100,7 @@ struct VPNLiveActivity: Widget {
                 DynamicIslandExpandedRegion(.bottom) {
                     if picking(context) {
                         if #available(iOS 17.0, *) {
-                            // Nothing else may go in here — see rule (a) above.
+                            // Nothing else may go in here — see rule (b) above.
                             VStack(spacing: 4) {
                                 ForEach(context.state.choices) { c in
                                     serverButton(c, busy: context.state.busyServerId == c.id)
@@ -125,9 +131,38 @@ struct VPNLiveActivity: Widget {
             } compactLeading: {
                 shield(context)
             } compactTrailing: {
+                // 🚨 The `.frame` is load-bearing — never drop it. A live text
+                // (`style: .timer`, and `Text(timerInterval:)` too) asks for a
+                // width that has NOTHING to do with the string on screen, and the
+                // compact island sizes itself to its content. Unbounded, the pill
+                // grew to ~82% of the screen and swallowed the whole status bar:
+                // no clock, no signal, no battery. That is what build 205 shipped.
+                //
+                // A/B-measured on an iPhone Air simulator, 12 h 35 m session:
+                //   unbounded ................ 82% wide, status bar gone
+                //   Text(timerInterval:) ..... 92% wide — worse, and no better
+                //                              bounded: a 1 h range showing "0:15"
+                //                              reserves as much as a 99 h one
+                //   frame 44 + scale 0.6 ..... 53% wide, "12:35:18" in full ✅
+                //   no clock at all .......... 40% wide
+                //
+                // 44pt is chosen for the longest string the format really produces
+                // ("12:34:56" = 8 glyphs), which is why the prototype's 42pt was
+                // wrong twice over: it was picked for "0:12" and truncated a
+                // 12-hour session to "12:3…". minimumScaleFactor is the insurance
+                // — past 99 h the label shrinks instead of truncating, because a
+                // scaled number is still a number (same reasoning as build 203).
+                //
+                // What 53% costs: iOS sheds status-bar items right-to-left as the
+                // island grows. On cellular — this app's normal habitat — it drops
+                // only the "LTE"/"5G" label and keeps the signal bars, the battery
+                // and the clock. On Wi-Fi the cellular dots go instead.
                 clock(context)
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+                    .frame(maxWidth: 44)
             } minimal: {
                 // Several activities collapse to this single glyph, so it has to
                 // identify the app on its own — a bare dot could be anyone's.
@@ -139,7 +174,7 @@ struct VPNLiveActivity: Widget {
 
     // MARK: - Controls (iOS 17+)
 
-    /// Is the picker open AND still live? See rule (b) in the file header.
+    /// Is the picker open AND still live? See rule (c) in the file header.
     private func picking(_ context: ActivityViewContext<VPNActivityAttributes>) -> Bool {
         context.state.mode == .picking && !context.isStale
     }
@@ -240,9 +275,28 @@ struct VPNLiveActivity: Widget {
             clock(context)
                 .font(.title3.monospacedDigit())
                 .foregroundStyle(.secondary)
-                // Never let a long uptime squeeze the name below legibility.
+                // Never let a long uptime squeeze the name below legibility —
+                // but bound it, do NOT use .fixedSize().
+                //
+                // 🚨 `.fixedSize()` here made the whole card fail to render:
+                // shield, status and server name appeared, the clock and BOTH
+                // buttons did not. Proven by bisection in ~/work/la-widget-harness
+                // on 2026-07-30 — removing this one modifier brought them back.
+                // Mechanism: a live text asks for a width unrelated to its string
+                // (the same property that blew up the compact island), and
+                // .fixedSize() promotes that absurd width to a requirement the
+                // layout cannot satisfy, so WidgetKit abandons the subtree.
+                // Simulator-only so far — the device has always rendered this
+                // card — but there is no version of this modifier that is worth
+                // that risk.
+                // 170pt because the Lock Screen does NOT render this as a clock:
+                // `.timer` becomes a PHRASE there ("<1 minute", "12 hours, 35
+                // minutes") while the island renders the same view as digits
+                // ("2:16"). 20 characters at .title3 is ~175pt, so anything
+                // tighter truncates a real session to "12 hours, 35 min…".
                 .lineLimit(1)
-                .fixedSize()
+                .minimumScaleFactor(0.7)
+                .frame(maxWidth: 170, alignment: .trailing)
         }
         if #available(iOS 17.0, *) {
             controls(context)
@@ -265,12 +319,17 @@ struct VPNLiveActivity: Widget {
 
     /// The session clock, or a dash. Withheld while connecting (there is no
     /// session yet) and while stale (we can't vouch for it still running).
+    ///
+    /// Anywhere this goes it needs a width the layout controls: in the expanded
+    /// island and on the Lock Screen the region itself provides one, but in the
+    /// compact island it must be given an explicit `.frame` — see the note at
+    /// `compactTrailing` for what an unbounded live text does to the island.
     @ViewBuilder
     private func clock(_ context: ActivityViewContext<VPNActivityAttributes>) -> some View {
         if context.isStale {
-            // A question mark, not a dash: in the compact island this glyph and
-            // the greyed shield are the ONLY room there is to say "we are not
-            // watching any more", and a dash reads as "no session".
+            // A question mark, not a dash: a dash reads as "no session", and the
+            // point is that we no longer know. The compact island says the same
+            // thing with its own "?" for the same reason.
             Text("?")
         } else if let since = context.state.connectedSince {
             Text(since, style: .timer)
