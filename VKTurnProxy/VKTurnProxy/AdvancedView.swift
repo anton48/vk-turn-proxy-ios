@@ -45,6 +45,12 @@ struct AdvancedView: View {
                 set: { tunnelMTU = $0 ? TunnelMTU.standard : TunnelMTU.automatic })
     }
 
+    /// Diagnostic: skip the captcha-free VK Calls path so credential fetching
+    /// falls through to the legacy solver. Existed since build 149 but only
+    /// reachable by hand-editing a backup; surfaced here in build 212 because a
+    /// switch nobody can find is a switch nobody tests.
+    @AppStorage("forceLegacyCaptcha") private var forceLegacyCaptcha = false
+
     var body: some View {
         Form {
             Section {
@@ -99,6 +105,18 @@ struct AdvancedView: View {
                 // this setting while diagnosing, and "what should I try?" is the
                 // next question. Range and reasoning live in TunnelMTU.swift.
                 Text("Size of the largest packet the tunnel carries. Automatic uses \(TunnelMTU.standard); on SRTP-WRAP-A servers automatic means the server's own value, and setting it here overrides that.\n\nLower it (try \(TunnelMTU.standard - 64)) if the tunnel connects but large transfers stall — that is the usual sign that packets are too big for the network's path.\n\nThis setting is for making a difficult network work, not for going faster.\n\nAllowed range \(TunnelMTU.minimum)–\(TunnelMTU.maximum). Applied on the next connect.")
+            }
+
+            Section {
+                Toggle("Force legacy captcha path", isOn: $forceLegacyCaptcha)
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                // Deliberately blunt about the cost. This is the one switch here
+                // that makes the app slower and more fragile on purpose, and the
+                // person who finds it should be able to tell whether they want it
+                // without reading the source.
+                Text("Skips the captcha-free path VK Calls uses, so getting credentials falls through to the older flow that has to solve a captcha. That solver never runs otherwise, which is exactly why it is hard to test.\n\nLeave this off. On, connecting is slower, can fail where it would have succeeded, and repeated attempts may get the captcha refused for a while. Applied on the next connect.")
             }
         }
         .navigationTitle("Advanced")

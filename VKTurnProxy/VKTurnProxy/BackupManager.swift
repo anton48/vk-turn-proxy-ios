@@ -85,6 +85,11 @@ enum BackupManager {
         let liveActivity = (d.object(forKey: "liveActivityEnabled") as? Bool) ?? false
         let liveActivityClock = (d.object(forKey: "liveActivityCompactClock") as? Bool) ?? false
         let mtu = TunnelMTU.stored(in: d)
+        // Exported since build 212, when this stopped being backup-only and got
+        // a switch in Settings › Advanced. Before that it could be imported but
+        // never came back out, so a round-trip through Export → Import silently
+        // turned it off.
+        let forceLegacy = (d.object(forKey: "forceLegacyCaptcha") as? Bool) ?? false
         // Named servers (build 179+). The legacy flat per-server fields are
         // deliberately NOT written alongside them — a backup from this build is
         // not meant to be readable by 178 and earlier.
@@ -102,6 +107,7 @@ enum BackupManager {
             useWrapA: nil,
             wrapAPassword: nil,
             turnServerOverride: nil,
+            forceLegacyCaptcha: forceLegacy,
             vkAuth: vkAuth,
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,

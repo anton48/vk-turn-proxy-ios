@@ -2321,10 +2321,11 @@ struct TunnelConfig {
     // Bonus: some ISP whitelists drop UDP entirely but pass TCP, so this
     // also helps for that class of restricted networks.
     var useUDP: Bool = false
-    // forceLegacyCaptcha: undocumented on-device captcha-test toggle (build
-    // 149) — skip the captcha-free VK Calls path so the legacy
-    // captchaNotRobot.* solver runs. Set via a `forceLegacyCaptcha` field in
-    // the backup JSON (no Settings UI). Default false → no production effect.
+    // forceLegacyCaptcha: on-device captcha-test toggle (build 149) — skip the
+    // captcha-free VK Calls path so the legacy captchaNotRobot.* solver runs.
+    // Settings › Advanced › Diagnostics since build 212; before that it was
+    // reachable only by hand-editing a backup. Default false → no production
+    // effect.
     var forceLegacyCaptcha: Bool = false
     // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
     // anonymous fallback). The cookie itself lives in the Keychain

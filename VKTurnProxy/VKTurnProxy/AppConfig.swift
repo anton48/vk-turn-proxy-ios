@@ -137,10 +137,12 @@ struct AppSettings: Codable {
     /// extension skips the captcha-free VK Calls path so the legacy
     /// captchaNotRobot.* solver runs — lets a tester exercise the captcha fix
     /// (the free path is captcha-free, so the solver never runs otherwise).
-    /// Optional + default nil so normal backups omit it; a tester adds
-    /// `"forceLegacyCaptcha": true` to the backup JSON by hand. No Settings UI.
-    /// `var` (not `let`) so the synthesised Decodable actually decodes it — an
-    /// immutable property with an initial value is never decoded by Codable.
+    /// On-device captcha test (build 149). Since build 212 it has a switch in
+    /// Settings › Advanced › Diagnostics and is EXPORTED as well as imported —
+    /// before that a backup could set it but never carried it back out, so an
+    /// export/import round-trip quietly cleared it. `var` (not `let`) so the
+    /// synthesised Decodable actually decodes it, and Optional so an older
+    /// backup without the key leaves the device's own value alone.
     var forceLegacyCaptcha: Bool? = nil
     /// VKAuth (non-anonymous cookie cred path) toggle. Round-trips in full
     /// backups so the preference is preserved. The cookies themselves are NEVER
