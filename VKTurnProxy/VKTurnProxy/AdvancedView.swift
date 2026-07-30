@@ -98,7 +98,7 @@ struct AdvancedView: View {
                 // The numbers are deliberately in the UI: someone reaches for
                 // this setting while diagnosing, and "what should I try?" is the
                 // next question. Range and reasoning live in TunnelMTU.swift.
-                Text("Size of the largest packet the tunnel carries. Automatic uses \(TunnelMTU.standard); on SRTP-WRAP-A servers automatic means the server's own value, and setting it here overrides that.\n\nLower it (try \(TunnelMTU.standard - 64)) if the tunnel connects but large transfers stall — that is the usual sign that packets are too big for the network's path. Above \(TunnelMTU.frameThreshold) every full-size packet stops fitting one network frame and starts costing two, so raising it that far takes throughput away rather than adding it.\n\nThis setting is for making a difficult network work, not for going faster: measured end to end, throughput barely moves with it.\n\nAllowed range \(TunnelMTU.minimum)–\(TunnelMTU.maximum). Applied on the next connect.")
+                Text("Size of the largest packet the tunnel carries. Automatic uses \(TunnelMTU.standard); on SRTP-WRAP-A servers automatic means the server's own value, and setting it here overrides that.\n\nLower it (try \(TunnelMTU.standard - 64)) if the tunnel connects but large transfers stall — that is the usual sign that packets are too big for the network's path.\n\nThis setting is for making a difficult network work, not for going faster.\n\nAllowed range \(TunnelMTU.minimum)–\(TunnelMTU.maximum). Applied on the next connect.")
             }
         }
         .navigationTitle("Advanced")

@@ -14,19 +14,26 @@
 // and 1400. What those captures actually showed is in
 // reference_mtu_and_relay_downstream_loss; the short version:
 //
-// Ceiling — NOT about fragmentation. There was none anywhere, at any MTU: the
-// client↔relay leg is TURN over TCP (which cannot fragment), and on the
-// relay↔server UDP leg a 1400-byte MTU produced 1490-byte datagrams — inside the
-// 1500 limit, with 10 bytes to spare, and 0 fragments out of 85k packets. What
-// DOES bite is `frameThreshold` below: past it a full-size packet no longer fits
-// one Ethernet frame and costs two, one of them a 78-byte runt. 1400 is kept as
-// the maximum for someone whose path really is larger, and it stays under our OWN
-// limit — the 1600-byte relay read buffers in pkg/proxy/proxy.go cap the inner
-// MTU near 1530 whatever the network does.
+// Ceiling — NOT about fragmentation. There was none in ANY of the four runs, at
+// either MTU, on either transport. What 1400 does buy is a very thin margin: with
+// the client on UDP its frames reach 1508 bytes, i.e. **6 bytes** short of the
+// 1514 an Ethernet path allows, so it works here and would start fragmenting one
+// small hop away. That margin, not an observed failure, is why the ceiling stays
+// where it is; 1400 also stays under our OWN limit, the 1600-byte relay read
+// buffers in pkg/proxy/proxy.go, which cap the inner MTU near 1530 whatever the
+// network does.
 //
-// And do not reach for this expecting speed: measured, throughput barely moves
-// with MTU, because the ~10-12% downstream loss across the VK relay under load is
-// the same at 1000 as at 1400.
+// (With the client on TCP there is a second, transport-specific cost above 1376:
+// the ChannelData record stops fitting one segment and every full-size packet
+// goes out as a 1514-byte frame plus a 78-byte runt carrying 12 bytes. It does
+// not happen on UDP, which is why it is not a bound here.)
+//
+// Do not reach for this expecting speed. Across TCP runs the MTU differences sat
+// inside run-to-run variation; the single best download measured came from UDP at
+// 1400, but the transport — `useUDP`, per-server — is what actually moved the
+// numbers, not this. The loss that sets the ceiling is congestion in whichever
+// direction is saturated (10-22%, while the idle direction stays packet-exact),
+// and it is not something an MTU can fix.
 //
 // Floor — nothing protocol-level forces 1280 here (the tunnel interface is
 // IPv4-only; the 1280 that everyone quotes is the IPv6 minimum and does not
@@ -58,15 +65,6 @@ enum TunnelMTU {
     static let minimum = 1000
     static let maximum = 1400
     static let step = 8
-
-    /// Largest MTU whose full-size packet still fits ONE Ethernet frame.
-    ///
-    /// Derived from the wire, not from theory: at MTU 1400 the TURN ChannelData
-    /// record is 1460 bytes on the TCP stream while the usable segment is 1448
-    /// (MSS 1460 minus the 12-byte timestamp option), so every packet went out as
-    /// a 1514-byte frame plus a 78-byte runt carrying 12 bytes. 1400 − 24 = 1376,
-    /// and it happens to sit on the `step` grid.
-    static let frameThreshold = 1376
 
     static var range: ClosedRange<Int> { minimum...maximum }
 
