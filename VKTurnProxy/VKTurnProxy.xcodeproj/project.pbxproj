@@ -23,8 +23,10 @@
 		5474956678AC676C6E7AE2E6 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 50685ED014984982ABF8CF0C /* Assets.xcassets */; };
 		548E254EF4C178FACD9DCAF6 /* VKAuthWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15C079F499D57B27E1635DE /* VKAuthWebView.swift */; };
 		5BFFE56605C7A3D0A4672924 /* VKTurnProxyApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE10D4B4A2BE32E0DD5E3D4 /* VKTurnProxyApp.swift */; };
+		6481DAB30DAF3572C55089E0 /* TunnelMTU.swift in Sources */ = {isa = PBXBuildFile; fileRef = C80CE8603F45C625FABAC090 /* TunnelMTU.swift */; };
 		6795B707AE033110D01EB135 /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 41F2E4485000AF848A0CFE03 /* AppIntents.framework */; };
 		6C715D35A7DE938BCED16E7A /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC7905B75584E8ECB5B29CDF /* ServerStore.swift */; };
+		74676C96495AC72E7D7C7EB5 /* TunnelMTU.swift in Sources */ = {isa = PBXBuildFile; fileRef = C80CE8603F45C625FABAC090 /* TunnelMTU.swift */; };
 		7D5BE8912D686FBFB3143EA1 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 605ED1D89D0F1886A8414767 /* NetworkExtension.framework */; };
 		7EB391317C3311B5283FC9AD /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = DDB21244CBAB1A5B17A5CF06 /* WidgetKit.framework */; };
 		8B3730E4522EA4838D0D2F77 /* VPNLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58612E89BCBF7234C05D3831 /* VPNLiveActivity.swift */; };
@@ -113,6 +115,7 @@
 		B72BF34DDA41B9171843CDA5 /* CredCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CredCache.swift; sourceTree = "<group>"; };
 		B9126F72D30AE6D3503CC167 /* VKTurnProxyWidgetBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VKTurnProxyWidgetBundle.swift; sourceTree = "<group>"; };
 		C3A5B4FA5218B9A32CDB5F78 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
+		C80CE8603F45C625FABAC090 /* TunnelMTU.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelMTU.swift; sourceTree = "<group>"; };
 		CFF216A96C8B2716DA861C50 /* LiveActivityIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityIntents.swift; sourceTree = "<group>"; };
 		D5927A5725339CB3E0F08E4B /* VKCookieStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VKCookieStore.swift; sourceTree = "<group>"; };
 		DDB21244CBAB1A5B17A5CF06 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
@@ -209,6 +212,7 @@
 				FC7905B75584E8ECB5B29CDF /* ServerStore.swift */,
 				A648919F90B0D8CBE826BC6E /* SharedLogger.swift */,
 				E74B178DC212A229BC8565F4 /* TunnelManager.swift */,
+				C80CE8603F45C625FABAC090 /* TunnelMTU.swift */,
 				B15C079F499D57B27E1635DE /* VKAuthWebView.swift */,
 				D5927A5725339CB3E0F08E4B /* VKCookieStore.swift */,
 				48CEB6CB28E1CC064B6D8C79 /* VKProfileCache.swift */,
@@ -366,6 +370,7 @@
 				90CBABBC0C21BE682CF22ACF /* OSLogReader.swift in Sources */,
 				B1B5B221672B08CCCC35BE51 /* PacketTunnelProvider.swift in Sources */,
 				3F33AE79B74735B536FE1D31 /* SharedLogger.swift in Sources */,
+				6481DAB30DAF3572C55089E0 /* TunnelMTU.swift in Sources */,
 				4CED034D8AD400C0702E369A /* VKCookieStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -399,6 +404,7 @@
 				C414EAD88CD3819206A6E93F /* ServerProfile.swift in Sources */,
 				6C715D35A7DE938BCED16E7A /* ServerStore.swift in Sources */,
 				F5781EB3D4D7E0467DC2A5F5 /* SharedLogger.swift in Sources */,
+				74676C96495AC72E7D7C7EB5 /* TunnelMTU.swift in Sources */,
 				118478458E595AEBEEA20266 /* TunnelManager.swift in Sources */,
 				548E254EF4C178FACD9DCAF6 /* VKAuthWebView.swift in Sources */,
 				AE025DA7D5CF543AFACF6F20 /* VKCookieStore.swift in Sources */,
@@ -427,7 +433,7 @@
 		1551285F9714F8A1EA2F3F46 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 208;
+				CURRENT_PROJECT_VERSION = 210;
 				INFOPLIST_FILE = VKTurnProxyWidget/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -447,7 +453,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 208;
+				CURRENT_PROJECT_VERSION = 210;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -477,7 +483,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 208;
+				CURRENT_PROJECT_VERSION = 210;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -503,7 +509,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 208;
+				CURRENT_PROJECT_VERSION = 210;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -598,7 +604,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 208;
+				CURRENT_PROJECT_VERSION = 210;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -623,7 +629,7 @@
 		C9EC52049256F969AB0E71C8 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 208;
+				CURRENT_PROJECT_VERSION = 210;
 				INFOPLIST_FILE = VKTurnProxyWidget/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (

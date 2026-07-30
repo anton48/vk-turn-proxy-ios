@@ -84,6 +84,7 @@ enum BackupManager {
         let vkAuth = (d.object(forKey: "VKAuth") as? Bool) ?? false
         let liveActivity = (d.object(forKey: "liveActivityEnabled") as? Bool) ?? false
         let liveActivityClock = (d.object(forKey: "liveActivityCompactClock") as? Bool) ?? false
+        let mtu = TunnelMTU.stored(in: d)
         // Named servers (build 179+). The legacy flat per-server fields are
         // deliberately NOT written alongside them — a backup from this build is
         // not meant to be readable by 178 and earlier.
@@ -103,7 +104,8 @@ enum BackupManager {
             turnServerOverride: nil,
             vkAuth: vkAuth,
             liveActivityEnabled: liveActivity,
-            liveActivityCompactClock: liveActivityClock
+            liveActivityCompactClock: liveActivityClock,
+            tunnelMTU: mtu
         )
 
         var turnPool: CredCacheFile? = nil
@@ -219,6 +221,9 @@ enum BackupManager {
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
         if let v = s.liveActivityEnabled { d.set(v, forKey: "liveActivityEnabled") }
         if let v = s.liveActivityCompactClock { d.set(v, forKey: "liveActivityCompactClock") }
+        // Clamped on the way in: a hand-edited backup is an untrusted source,
+        // and an out-of-range MTU would otherwise reach the network settings.
+        if let v = s.tunnelMTU { d.set(TunnelMTU.clamp(v), forKey: "tunnelMTU") }
 
         if let backedUpServers = s.servers, !backedUpServers.isEmpty {
             // Build 179+ backup: the named server sets ARE the configuration.

@@ -158,6 +158,10 @@ struct AppSettings: Codable {
     /// above, for the same reason: a preference lost on restore is its own
     /// debugging session.
     var liveActivityCompactClock: Bool? = nil
+    /// Tunnel MTU override (Settings › Advanced, build 209). `0` = automatic,
+    /// which is also what an older backup means by omitting the key entirely —
+    /// so nil-preserve on import leaves whatever the device already had.
+    var tunnelMTU: Int? = nil
     // SRTP-WRAP-S (samosvalishe/free-turn-proxy). `var ... = nil` like vkAuth so
     // old backups/links decode and importers don't force the mode when absent.
     var useWrapS: Bool? = nil

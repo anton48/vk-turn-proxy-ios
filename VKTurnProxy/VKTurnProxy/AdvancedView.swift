@@ -32,6 +32,19 @@ struct AdvancedView: View {
     /// item. Same rule as above — declared HERE, never in ContentView.
     @AppStorage("liveActivityCompactClock") private var liveActivityCompactClock = false
 
+    /// Tunnel MTU. `TunnelMTU.automatic` (0) means "don't override", which is
+    /// both the default and what every pre-209 install has — see TunnelMTU.swift
+    /// for where the bounds come from. One key, not two: a separate "override?"
+    /// boolean would be a second thing to keep in sync, in the backup as well.
+    @AppStorage("tunnelMTU") private var tunnelMTU = TunnelMTU.automatic
+
+    /// The switch is a view onto the sentinel: on = start from the standard
+    /// 1280, off = back to automatic.
+    private var mtuIsManual: Binding<Bool> {
+        Binding(get: { tunnelMTU != TunnelMTU.automatic },
+                set: { tunnelMTU = $0 ? TunnelMTU.standard : TunnelMTU.automatic })
+    }
+
     var body: some View {
         Form {
             Section {
@@ -61,6 +74,31 @@ struct AdvancedView: View {
                 Text("Live Activity")
             } footer: {
                 Text("Shows the connection state and the active server on the Lock Screen, and in the Dynamic Island on iPhone 14 Pro and later. On iOS 17+ it also gets buttons to disconnect and to switch server without opening the app. Requires iOS 16.2 or later. Off by default.\n\nSession time in the collapsed island widens it, so iOS hides part of the status bar — on cellular the network-type label, on Wi-Fi the signal indicator. The clock is always shown on the Lock Screen card and in the expanded island, where there is room for it.")
+            }
+
+            Section {
+                Toggle("Set MTU manually", isOn: mtuIsManual)
+
+                // Shown only while manual: a disabled stepper displaying the
+                // sentinel would have to render "0", which is not a size.
+                if tunnelMTU != TunnelMTU.automatic {
+                    Stepper(value: $tunnelMTU, in: TunnelMTU.range, step: TunnelMTU.step) {
+                        HStack {
+                            Text("MTU")
+                            Spacer()
+                            Text("\(tunnelMTU)")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } header: {
+                Text("Tunnel")
+            } footer: {
+                // The numbers are deliberately in the UI: someone reaches for
+                // this setting while diagnosing, and "what should I try?" is the
+                // next question. Range and reasoning live in TunnelMTU.swift.
+                Text("Size of the largest packet the tunnel carries. Automatic uses \(TunnelMTU.standard); on SRTP-WRAP-A servers automatic means the server's own value, and setting it here overrides that.\n\nLower it (try \(TunnelMTU.standard - 64)) if the tunnel connects but large transfers stall — that is the usual sign that packets are too big for the network's path. Above \(TunnelMTU.frameThreshold) every full-size packet stops fitting one network frame and starts costing two, so raising it that far takes throughput away rather than adding it.\n\nThis setting is for making a difficult network work, not for going faster: measured end to end, throughput barely moves with it.\n\nAllowed range \(TunnelMTU.minimum)–\(TunnelMTU.maximum). Applied on the next connect.")
             }
         }
         .navigationTitle("Advanced")

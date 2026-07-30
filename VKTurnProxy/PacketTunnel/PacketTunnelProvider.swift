@@ -166,14 +166,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
         let dnsServers = config["dns_servers"] as? String ?? "1.1.1.1"
-        let mtu = config["mtu"] as? String ?? "1280"
+        // Clamped, not trusted: this arrives from UserDefaults, which an
+        // imported backup writes — the same trust boundary that made
+        // tunnelAddress and allowedIPs guarded values (build 172).
+        let mtu = String(TunnelMTU.resolve(
+            TunnelMTU.clamp(Int(config["mtu"] as? String ?? "") ?? TunnelMTU.standard)))
+        /// The user set the MTU by hand, so it outranks the WRAP-A server's own.
+        let mtuExplicit = (config["mtu_explicit"] as? Bool) ?? false
         // WRAP-A (amurcanov interop): the server provisions WireGuard via
         // GETCONF during bootstrap; when set, we fetch the minted config below
         // (wgWaitWrapAProvision) and override wg_config + address/dns/mtu — the
         // user entered none of those.
         let isWrapA = (config["use_wrap_a"] as? Bool) ?? false
 
-        logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)")
+        logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)\(mtuExplicit ? " (user-set)" : "")")
         logMsg("proxyConfig=\(proxyConfigJSON)")
 
         // ------------------------------------------------------------------
@@ -319,7 +325,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 effWGConfig = uapi
                 effAddress = addr
                 if let d = prov["dns"] as? String, !d.isEmpty { effDNS = d }
-                if let m = prov["mtu"] as? Int, m > 0 { effMTU = String(m) }
+                // The server's suggestion applies only while the user has not
+                // made a choice; otherwise the Advanced setting would silently
+                // do nothing on exactly the servers that provision an MTU.
+                if !mtuExplicit, let m = prov["mtu"] as? Int, m > 0 {
+                    effMTU = String(TunnelMTU.clamp(m))
+                }
                 self.logMsg("WRAP-A provisioned: address=\(effAddress) dns=\(effDNS) mtu=\(effMTU)")
             }
 

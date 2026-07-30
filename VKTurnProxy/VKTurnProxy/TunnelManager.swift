@@ -125,6 +125,9 @@ extension TunnelConfig {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         let turnOv = parseTurnOverride(s.turnServerOverride)
+        // Global (Settings › Advanced), not per-server: what drives this number
+        // is the network path, which follows the phone rather than the profile.
+        let storedMTU = TunnelMTU.stored(in: d)
         return TunnelConfig(
             privateKey: s.privateKey,
             peerPublicKey: s.peerPublicKey,
@@ -132,6 +135,8 @@ extension TunnelConfig {
             tunnelAddress: s.tunnelAddress,
             dnsServers: s.dnsServers,
             allowedIPs: "0.0.0.0/0",
+            mtu: String(TunnelMTU.resolve(storedMTU)),
+            mtuExplicit: storedMTU != TunnelMTU.automatic,
             vkLink: lines.first ?? vkLink,
             cookieLinks: lines,
             peerAddress: s.peerAddress,
@@ -838,6 +843,9 @@ class TunnelManager: ObservableObject {
                 "tunnel_address": config.tunnelAddress,
                 "dns_servers": config.dnsServers,
                 "mtu": config.mtu,
+                // Whether the number above was chosen by the user — see
+                // TunnelConfig.mtuExplicit for what it decides.
+                "mtu_explicit": config.mtuExplicit,
                 // WRAP-A: tells the extension to fetch the GETCONF-minted WG
                 // config (wgWaitWrapAProvision) and override wg_config +
                 // address/dns/mtu after bootstrap, since the user entered none.
@@ -2246,7 +2254,12 @@ struct TunnelConfig {
     var tunnelAddress: String = "192.168.102.3/24"
     var dnsServers: String = "1.1.1.1"
     var allowedIPs: String = "0.0.0.0/0"
-    var mtu: String = "1280"
+    var mtu: String = String(TunnelMTU.standard)
+    /// True when the user set the MTU by hand (Settings › Advanced). It decides
+    /// precedence on SRTP-WRAP-A only: without it the server's GETCONF value
+    /// wins as it always has, with it the user's number does — otherwise the
+    /// setting would silently do nothing on exactly those servers.
+    var mtuExplicit: Bool = false
     var persistentKeepalive: Int = 25
 
     // Proxy
