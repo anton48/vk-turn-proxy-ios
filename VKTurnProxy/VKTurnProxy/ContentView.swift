@@ -1228,10 +1228,27 @@ struct CaptchaWKWebView: UIViewRepresentable {
         // Intercept fetch/XHR to captchaNotRobot.check — the response contains
         // success_token which is what VK needs for the retry.
         // No need for postMessage interception or iframe wrapper.
+        // The block below replaces window.fetch and XMLHttpRequest.prototype
+        // .open/.send inside VK's captcha page, which is how we read
+        // success_token out of the captchaNotRobot.check response. A patched
+        // native is one of the oldest bot tells there is — `window.fetch
+        // .toString()` stops saying "[native code]" — so build 214 ran the page
+        // passively, with the hooks off, to see whether WE were the reason a
+        // real human tap got BOT.
+        //
+        // DISPROVED (30.07): passive made no difference, still BOT. And on
+        // 31.07 the same hooks were installed in a real Chrome, on a passing
+        // captcha, and it kept passing. Patching fetch is not what VK objects
+        // to. Hooks stay on — without them a solve cannot yield success_token
+        // and the WebView fallback cannot complete a connect at all.
+        let installNetworkHooks = true
+
         let js = """
         (function() {
             var h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.captchaToken;
             if (!h) return;
+
+            var INSTALL_NET_HOOKS = \(installNetworkHooks);
 
             // Helper: extract whichever of device + browser_fp are non-empty
             // from a form-encoded body and post 'profile-capture:' to Swift.
@@ -1275,6 +1292,7 @@ struct CaptchaWKWebView: UIViewRepresentable {
             // Profile fields accumulate on the Swift side via
             // VKProfileCache.update — componentDone gives device, check
             // gives browser_fp; merging produces a complete saved profile.
+            if (INSTALL_NET_HOOKS) {
             var origFetch = window.fetch;
             window.fetch = function() {
                 var url = arguments[0];
@@ -1340,8 +1358,14 @@ struct CaptchaWKWebView: UIViewRepresentable {
                 }
                 return origSend.apply(this, arguments);
             };
+            } // if (INSTALL_NET_HOOKS)
 
-            h.postMessage('init:hooks installed');
+            // The UA rides along so the log shows what the page ACTUALLY sees,
+            // not what we believe we configured — the version token is the
+            // thing under test here.
+            h.postMessage((INSTALL_NET_HOOKS
+                ? 'init:hooks installed'
+                : 'init:PASSIVE — natives untouched') + ' ua=' + navigator.userAgent);
 
             // Page-state detector: 2.5s after first render, look at whether
             // VK showed us an interactive captcha or an "Attempt limit reached"
@@ -1472,10 +1496,25 @@ struct CaptchaWKWebView: UIViewRepresentable {
         contentController.addUserScript(userScript)
         config.userContentController = contentController
 
+        // Do NOT pin a whole User-Agent here. A hardcoded one froze us at
+        // "CPU iPhone OS 17_0 ... Version/17.0" while the WebKit actually
+        // running this page is whatever the device's iOS ships — and VK's
+        // fingerprint script executes INSIDE that engine, so it can compare the
+        // version we claim against the capabilities it can see. Claiming to be
+        // a Safari we are not is the one thing our two failing clients have in
+        // common (the Go solver contradicts it at the TLS layer, this WebView
+        // contradicted it at the version).
+        //
+        // applicationNameForUserAgent only APPENDS to the UA WebKit builds for
+        // itself, so the platform and engine tokens stay truthful and only the
+        // Safari marketing version — which tracks the iOS version — is added.
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        config.applicationNameForUserAgent =
+            "Version/\(os.majorVersion).\(os.minorVersion) Mobile/15E148 Safari/604.1"
+
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
-        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
         // iOS 16.4+ no longer auto-enables Safari Web Inspector for WKWebViews
         // even in Debug builds; explicit opt-in required. Wrapped in #if DEBUG

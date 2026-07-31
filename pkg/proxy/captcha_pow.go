@@ -731,12 +731,22 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	registerAdFpWithMailRu(ctx, client, adFp)
 	fetchAppTracerSession(ctx, client)
 
-	// Step 2: Solve PoW (brute-force SHA-256)
-	hash := solvePoW(powInput, difficulty)
-	if hash == "" {
+	// Step 2: Solve PoW (brute-force SHA-256), then wrap it the way the page
+	// script does — the API wants the v2 envelope, not the bare digest.
+	powStart := time.Now()
+	hexHash, nonce := solvePoW(powInput, difficulty)
+	if hexHash == "" {
 		return "", "", fmt.Errorf("PoW: no solution found within 10M iterations")
 	}
-	log.Printf("pow: solved hash=%s...%s", hash[:8], hash[len(hash)-8:])
+	durationMs := time.Since(powStart).Milliseconds()
+	hash := buildPowResultV2(hexHash, nonce, durationMs)
+	if os.Getenv("VK_POW_V1") == "1" {
+		// Diagnostic: send the pre-2026-07 bare hex digest, to establish
+		// whether the v2 envelope is actually load-bearing or merely correct.
+		hash = hexHash
+	}
+	log.Printf("pow: solved hash=%s...%s nonce=%d duration=%dms (sent as v2 envelope, %d chars)",
+		hexHash[:8], hexHash[len(hexHash)-8:], nonce, durationMs, len(hash))
 
 	// Brief pause after PoW (simulate browser JS execution time)
 	time.Sleep(time.Duration(200+mathrand.Intn(300)) * time.Millisecond)
@@ -934,18 +944,42 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 
 
 // solvePoW brute-forces SHA-256(powInput + nonce) until the hash
-// starts with `difficulty` leading zeros.
-func solvePoW(powInput string, difficulty int) string {
+// starts with `difficulty` leading zeros. Returns the hex digest and the
+// winning nonce — VK's v2 wire format carries BOTH (see buildPowResultV2).
+func solvePoW(powInput string, difficulty int) (string, int) {
 	target := strings.Repeat("0", difficulty)
 	for nonce := 1; nonce <= 10_000_000; nonce++ {
 		data := powInput + strconv.Itoa(nonce)
 		h := sha256.Sum256([]byte(data))
 		hexH := hex.EncodeToString(h[:])
 		if strings.HasPrefix(hexH, target) {
-			return hexH
+			return hexH, nonce
 		}
 	}
-	return ""
+	return "", 0
+}
+
+// buildPowResultV2 wraps a solved PoW in the envelope VK's captcha page has
+// used since (at latest) bundle 1.1.1387:
+//
+//	hash = "v2." + btoa(JSON.stringify({hash, nonce, duration_ms}))
+//
+// The bare hex digest we used to send is the OLD v1 form; VK answers a v1
+// proof with status=BOT and an empty show_captcha_type, which is exactly the
+// dead end the legacy path sat in from ~2026-07 onwards. The math never
+// changed — the inline page script still does SHA-256(input+nonce) until the
+// digest starts with `difficulty` zeros, same as solvePoW. Only the wrapper
+// is new.
+//
+// Encoding details verified against the page's own inline script
+// (2026-07-31): plain btoa, i.e. STANDARD base64 with padding — it does NOT
+// url-encode the alphabet (no +/- or /-to-_ replacement, no = stripping), so
+// the value must be form-escaped by the caller. Key order is the object
+// literal's: hash, nonce, duration_ms (a captured browser body decoded to
+// exactly 102 bytes, which only that order and no whitespace produces).
+func buildPowResultV2(hexHash string, nonce int, durationMs int64) string {
+	payload := fmt.Sprintf(`{"hash":"%s","nonce":%d,"duration_ms":%d}`, hexHash, nonce, durationMs)
+	return "v2." + base64.StdEncoding.EncodeToString([]byte(payload))
 }
 
 // readDecompressedBody decodes an HTTP response body based on the given
@@ -1413,8 +1447,19 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 	// Cross-check with Moroka8/vk-turn-proxy commit 21cf9fa shows
 	// they DO call settings + componentDone — Safari's Inspector
 	// likely missed them due to caching or filter, not absence.
-	log.Printf("pow: 1/4 captchaNotRobot.settings (adFp=EMPTY per Phase 11 WebView lifecycle)")
-	settingsResp, err := vkReq("captchaNotRobot.settings", baseParamsEmptyAdFp+accessTokenSuffix)
+	// VK_ADFP_ON_SETTINGS=1 sends the adFp value on settings too. Resource
+	// timing on a real captcha page (2026-07-31) says the Phase 11 assumption
+	// is wrong: ad.mail.ru/sync-loader.js finishes at ~413ms and settings only
+	// leaves at ~506ms, by which point window.rb_sync.id — the exact source
+	// VK's own getBasicMethodParams reads adFp from — is already populated.
+	settingsParams := baseParamsEmptyAdFp
+	adFpNote := "adFp=EMPTY per Phase 11 WebView lifecycle"
+	if os.Getenv("VK_ADFP_ON_SETTINGS") == "1" {
+		settingsParams = baseParams
+		adFpNote = "adFp=VALUE (VK_ADFP_ON_SETTINGS=1, matches observed page timing)"
+	}
+	log.Printf("pow: 1/4 captchaNotRobot.settings (%s)", adFpNote)
+	settingsResp, err := vkReq("captchaNotRobot.settings", settingsParams+accessTokenSuffix)
 	if err != nil {
 		return "", lastShowType, fmt.Errorf("settings: %w", err)
 	}
@@ -1474,7 +1519,18 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 		log.Printf("pow: no captured browser profile, using generated browser_fp+device")
 	}
 
-	componentData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", browserFp, deviceParam) + accessTokenSuffix
+	// VK_COMPONENTDONE_EMPTY_FP=1 sends browser_fp EMPTY on componentDone, the
+	// way a real captcha page does. Captured from a live passing session
+	// (2026-07-31, same-origin iframe hook installed before the bundle ran):
+	// componentDone carries `browser_fp=` with NO value and only check carries
+	// the 32-hex one. VK's own code reads `analyticsModel.fingerprint ?? ""`,
+	// and at componentDone time it simply has not been computed yet — so a
+	// filled fp there is a value that could not exist in a real browser.
+	componentFp := browserFp
+	if os.Getenv("VK_COMPONENTDONE_EMPTY_FP") == "1" {
+		componentFp = ""
+	}
+	componentData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", componentFp, deviceParam) + accessTokenSuffix
 
 	if _, err := vkReq("captchaNotRobot.componentDone", componentData); err != nil {
 		return "", lastShowType, fmt.Errorf("componentDone: %w", err)
@@ -1541,10 +1597,28 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 			url.QueryEscape("[]"),
 			url.QueryEscape(string(downlinkBytes)),
 			browserFp,
-			hash,
+			// The v2 PoW envelope is standard base64, so it can contain
+			// `+`, `/` and `=` — all of which change meaning in a form body
+			// (`+` would arrive as a space). The old bare hex digest needed
+			// no escaping, which is why this was interpolated raw.
+			url.QueryEscape(hash),
 			url.QueryEscape(answer),
 			debugInfo,
 		) + accessTokenSuffix
+
+		if os.Getenv("VK_DUMP_CHECK_SHAPE") == "1" {
+			shape := make([]string, 0, 16)
+			for _, kv := range strings.Split(checkData, "&") {
+				k, v, _ := strings.Cut(kv, "=")
+				dec, _ := url.QueryUnescape(v)
+				if len(dec) <= 14 {
+					shape = append(shape, k+"="+dec)
+				} else {
+					shape = append(shape, fmt.Sprintf("%s=<%dc>", k, len(dec)))
+				}
+			}
+			log.Printf("pow: check body shape: %s", strings.Join(shape, " | "))
+		}
 
 		checkResp, err := vkReq("captchaNotRobot.check", checkData)
 		if err != nil {
