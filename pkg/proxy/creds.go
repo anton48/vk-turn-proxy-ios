@@ -46,7 +46,36 @@ func vkAPIHost() string {
 // test shows the anon path (api.vk.me link= and api.vk.ru vk_join_link=) rejects
 // the vk.ru join link. NOTE: this is the link we SEND to VK — NOT the user-link
 // parser (Swift BackupManager.stripVkUrl), which must accept BOTH domains.
+//
+// This is the default used by call sites that don't participate in the
+// domain-fallback loop below (currently only proxy.go's RefreshCaptchaURL, a
+// best-effort mid-session captcha-image refresh where a domain miss just
+// means a stale image, not a user-visible failure).
 const vkCallJoinBase = "https://vk.ru/call/join/"
+
+// vkCallJoinDomains are the VK join-link domains GetVKCreds tries, in order,
+// for a FRESH credential fetch (see isFreshFetch in GetVKCreds).
+//
+// Background: VK's vk.com -> vk.ru migration (build 170) is rolling out
+// account-by-account on VK's side, not a single global cutover. A call whose
+// owner VK hasn't migrated yet responds with a fatal "Call not found" /
+// "Join link is not valid" error (fatalCallError, VK codes 951/954/9xxx) to a
+// vk.ru-built join link — even though the SAME call is valid when the link is
+// built with vk.com. That surfaced as "VK returns error: Call not found" for
+// a subset of users right after build 170, with no way to recover short of
+// the developer reverting the constant.
+//
+// Fix: try the steady-state domain (vk.ru) first: on a fatalCallError, retry
+// once with vk.com before giving up and showing the error to the user. Not a
+// blind retry-on-any-error — only fatalCallError triggers the fallback, so a
+// genuinely dead/ended call still fails fast on the second domain too instead
+// of doubling the wait.
+var vkCallJoinDomains = []string{"vk.ru", "vk.com"}
+
+// vkCallJoinBaseFor builds the join-link prefix for one fallback domain.
+func vkCallJoinBaseFor(domain string) string {
+	return "https://" + domain + "/call/join/"
+}
 
 // credExpiryBuffer is the safety margin before a TURN cred's expiry timestamp
 // at which we consider the cred no longer fresh and start refreshing. The
@@ -240,6 +269,48 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		return creds, nil
 	}
 
+	// Domain fallback (build ??? fix for the post-170 "Call not found"
+	// regression — see vkCallJoinDomains docstring). Only a FRESH fetch
+	// retries on a second domain: a captcha/token1 retry is already bound to
+	// whichever domain the original fetch used (token1 + the captcha session
+	// are keyed to that request), so switching domains mid-retry would just
+	// invalidate them. Those retries run once, on the steady-state domain.
+	isFreshFetch := savedToken1 == "" && solvedCaptchaSID == "" && savedClientID == ""
+	domains := vkCallJoinDomains
+	if !isFreshFetch {
+		domains = vkCallJoinDomains[:1]
+	}
+
+	var lastErr error
+	for i, domain := range domains {
+		creds, err := getVKCredsAnon(vkCallJoinBaseFor(domain), linkID, captchaSolver, solvedCaptchaSID, solvedCaptchaKey, solvedCaptchaTs, solvedCaptchaAttempt, savedToken1, savedClientID)
+		if err == nil {
+			return creds, nil
+		}
+		// A fatal call/link error is the one case worth a second domain: VK's
+		// vk.com -> vk.ru migration is rolling out account-by-account, so a
+		// call whose owner isn't migrated yet reports "not found" on a
+		// vk.ru-built link while the same call is fine on vk.com (and vice
+		// versa, once VK finishes the migration and starts sunsetting
+		// vk.com). Any other error (network, captcha exhaustion, ...) is not
+		// domain-related — return it as-is without wasting a second round trip.
+		cu, isFatal := err.(*CallUnavailableError)
+		if isFatal && i < len(domains)-1 {
+			log.Printf("vk: join link fatal on %s (VK error %d: %s) — retrying on %s", domain, cu.Code, cu.Message, domains[i+1])
+			lastErr = err
+			continue
+		}
+		return nil, err
+	}
+	return nil, lastErr
+}
+
+// getVKCredsAnon runs the anonymous credential-fetch flow (VK Calls
+// captcha-free path, then the legacy multi-client_id path) against ONE join
+// domain. Split out of GetVKCreds so the domain-fallback loop above can call
+// it once per candidate domain. joinBase is the "https://<domain>/call/join/"
+// prefix built by vkCallJoinBaseFor.
+func getVKCredsAnon(joinBase, linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1, savedClientID string) (*TURNCreds, error) {
 	// VK Calls captcha-free path (added 2026-05-17 — see creds_vkcalls.go).
 	//
 	// Try this first on FRESH fetches only. Skip on captcha retry because:
@@ -250,14 +321,14 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 	// On any failure (including unexpected captcha gate appearing on the new
 	// path), fall through to the legacy multi-client_id retry loop below.
 	if savedToken1 == "" && solvedCaptchaSID == "" && savedClientID == "" {
-		creds, err := getVKCredsViaVKCallsPath(linkID)
+		creds, err := getVKCredsViaVKCallsPath(linkID, joinBase)
 		if err == nil {
 			log.Printf("vk: success via VK Calls captcha-free path")
 			return creds, nil
 		}
 		// A fatal call/link error (ended, deleted, invalid link) hits the legacy
 		// path identically — don't waste a captcha solve on it, stop now and
-		// surface the VK message.
+		// surface the VK message (the caller may still retry on another domain).
 		if cu, ok := err.(*CallUnavailableError); ok {
 			log.Printf("vk: VK Calls path — call unavailable (VK error %d: %s), not falling back", cu.Code, cu.Message)
 			return nil, err
@@ -351,7 +422,7 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		allTransient := true
 		for credIdx, vc := range creds {
 			log.Printf("vk: trying credentials %d/%d: client_id=%s", credIdx+1, len(creds), vc.ClientID)
-			result, err := getVKCredsWithClientID(linkID, vc, captchaSolver, solvedCaptchaSID, solvedCaptchaKey, solvedCaptchaTs, solvedCaptchaAttempt, savedToken1)
+			result, err := getVKCredsWithClientID(linkID, vc, captchaSolver, solvedCaptchaSID, solvedCaptchaKey, solvedCaptchaTs, solvedCaptchaAttempt, savedToken1, joinBase)
 			if err == nil {
 				log.Printf("vk: success with client_id=%s", vc.ClientID)
 				return result, nil
@@ -387,7 +458,7 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 	return nil, fmt.Errorf("all %d client_ids failed, last error: %w", len(vkCredentialsList), lastErr)
 }
 
-func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1 string) (*TURNCreds, error) {
+func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver CaptchaSolver, solvedCaptchaSID, solvedCaptchaKey string, solvedCaptchaTs, solvedCaptchaAttempt float64, savedToken1, joinBase string) (*TURNCreds, error) {
 	// Phase 10 (build 105) session-unified identity:
 	//
 	// All bootstrap requests below (login.vk.ru, api.vk.ru, calls.okcdn.ru)
@@ -524,14 +595,14 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 	}
 
 	// Step 1.5: call getCallPreview (warms up the session, as in reference impl)
-	previewData := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&access_token=%s&device_id=%s", linkID, token1, deviceID)
+	previewData := fmt.Sprintf("vk_join_link=" + joinBase + "%s&access_token=%s&device_id=%s", linkID, token1, deviceID)
 	_, _ = doRequest(previewData, fmt.Sprintf("https://%s/method/calls.getCallPreview?v=5.282&client_id=%s", vkAPIHost(), vc.ClientID))
 
 	// Step 2: get anonymous call token (with captcha retry)
 	var token2 string
 	var resp map[string]interface{}
 	var err error
-	step2Data := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
+	step2Data := fmt.Sprintf("vk_join_link=" + joinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
 
 	// buildCaptchaRetry builds the step2 body carrying a solved captcha. VK's
 	// new error_code-14 format (2026-06-24) OMITS captcha_sid — it ships only
@@ -540,10 +611,10 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 	// samosvalishe/cacggghp fix); an empty captcha_sid in the body confuses VK.
 	buildCaptchaRetry := func(sid, successToken string, ts, attempt float64) string {
 		if sid == "" {
-			return fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&success_token=%s&device_id=%s",
+			return fmt.Sprintf("vk_join_link=" + joinBase + "%s&name=%s&access_token=%s&success_token=%s&device_id=%s",
 				linkID, escapedName, token1, neturl.QueryEscape(successToken), deviceID)
 		}
-		return fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d&device_id=%s",
+		return fmt.Sprintf("vk_join_link=" + joinBase + "%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d&device_id=%s",
 			linkID, escapedName, token1, sid, neturl.QueryEscape(successToken), ts, int(attempt), deviceID)
 	}
 
@@ -622,7 +693,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 				}
 
 				if powTry < maxPoWRetries {
-					freshData := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
+					freshData := fmt.Sprintf("vk_join_link=" + joinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
 					freshResp, freshErr := doRequest(freshData, step2URL)
 					if freshErr != nil {
 						log.Printf("vk: failed to get fresh captcha for PoW retry: %v", freshErr)
@@ -673,7 +744,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			// anti-bot tooling (sandbox iframe pure fetch check) but it's
 			// for analytics instrumentation, not bot blocking. The actual
 			// issue is purely session_token consumption.
-			freshData := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
+			freshData := fmt.Sprintf("vk_join_link=" + joinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
 			if freshResp, freshErr := doRequest(freshData, step2URL); freshErr == nil {
 				if fSID, fImg, fTs, fAttempt := extractCaptcha(freshResp); fImg != "" {
 					log.Printf("vk: fetched untouched captcha for caller (was sid=%s, now sid=%s)", currentSID, fSID)

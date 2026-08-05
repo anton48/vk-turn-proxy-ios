@@ -86,7 +86,7 @@ func SetForceLegacyCaptcha(b bool) { forceLegacyCaptcha.Store(b) }
 // captcha-free flow. Returns CaptchaRequiredError if a captcha gate
 // unexpectedly appears (caller should fall back to legacy path then).
 // Returns generic error on any other failure (caller can also try legacy).
-func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
+func getVKCredsViaVKCallsPath(linkID, joinBase string) (*TURNCreds, error) {
 	// Diagnostic escape hatch: skip the captcha-free path entirely so
 	// GetVKCreds falls through to the legacy captchaNotRobot.* solver — lets us
 	// exercise a real captcha + observe what VK serves (slider vs checkbox).
@@ -99,7 +99,7 @@ func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
 	deviceID := uuid.New().String()
 	name := generateName()
 	ua := GetSessionUserAgent()
-	linkURL := neturl.QueryEscape(vkCallJoinBase + linkID)
+	linkURL := neturl.QueryEscape(joinBase + linkID)
 	nameEnc := neturl.QueryEscape(name)
 
 	log.Printf("vkcalls: identity — name: %s, device_id: %s, UA: %s", name, deviceID, ua)
