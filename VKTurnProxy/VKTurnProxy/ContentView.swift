@@ -157,7 +157,7 @@ struct ContentView: View {
                     // is empty/invalid (e.g. WRAP-A without a password → Go
                     // disables WRAP-A → broken direct fallback; or a malformed
                     // peerAddress / WG key). Never disables the Disconnect action.
-                    .disabled(tunnel.status != .connected && tunnel.status != .connecting && configValidationError != nil)
+                    .disabled(connectBlocked)
 
                     // Logs & Settings links
                     MainNavigationLinks(tunnel: tunnel)
@@ -253,7 +253,17 @@ struct ContentView: View {
         }
     }
 
+    /// True when Connect is blocked by a required field being empty/invalid.
+    /// Named once and used by BOTH `.disabled` and the button colour: while
+    /// they disagreed the button stayed a confident blue that swallowed taps
+    /// with no explanation, which reads as a broken app rather than as
+    /// "something above is missing".
+    private var connectBlocked: Bool {
+        tunnel.status != .connected && tunnel.status != .connecting && configValidationError != nil
+    }
+
     private var buttonColor: Color {
+        if connectBlocked { return .gray }
         if tunnel.preBootstrapInProgress { return .red }
         switch tunnel.status {
         case .connected, .connecting: return .red
@@ -372,6 +382,8 @@ struct SettingsView: View {
     @State private var showResetProfileConfirm = false
     // VKAuth (cookie login) UI state.
     @State private var showVKAuthLogin = false
+    @State private var showVKCallCreate = false
+    @State private var vkCallStatus = ""
     @State private var showDeleteCookiesConfirm = false
     @State private var vkCookieInfo: VKCookieStore.Stored? = nil
     @State private var alertMessage: String? = nil
@@ -412,6 +424,27 @@ struct SettingsView: View {
             .filter { !$0.isEmpty }
     }
     private var vkLinkPrimary: String { vkLinkLines.first ?? "" }
+
+    /// Create a call with the freshly-obtained token and put its link FIRST in
+    /// the field. First, not appended: `TunnelConfig.make` treats line one as
+    /// the primary call, so a call created just now is the one the next
+    /// connection uses — which is the whole point of pressing the button.
+    /// Existing lines are kept (cookie mode spreads across all of them).
+    @MainActor
+    private func createVKCall(token: String) async {
+        switch await VKCallsAPI.startCall(accessToken: token) {
+        case let .success(created):
+            let link = created.joinLink.trimmingCharacters(in: .whitespacesAndNewlines)
+            if vkLinkLines.contains(link) {
+                vkCallStatus = "VK returned a link that is already in the list."
+                return
+            }
+            vkLink = ([link] + vkLinkLines).joined(separator: "\n")
+            vkCallStatus = "Call created and added as the first link."
+        case let .failure(err):
+            vkCallStatus = err.userMessage
+        }
+    }
     // Cookie-mode connection cap. Shared with the value connect() actually
     // applies (TunnelConfig.effectiveNumConnections) so the label can't drift
     // from what the tunnel does — it did exactly that from build 163 to 181.
@@ -437,6 +470,26 @@ struct SettingsView: View {
                         .font(.caption2).foregroundColor(.secondary)
                 }
                 hint(ConfigValidation.vkLink(vkLinkPrimary))
+
+                // Create a call through VK's API instead of by hand in a
+                // browser. VK now ends a hand-made call the moment its creator
+                // leaves, so links made today die immediately (older ones keep
+                // working) — GitHub issue #69. A call started via calls.start
+                // survives with nobody in it.
+                Button {
+                    vkCallStatus = ""
+                    showVKCallCreate = true
+                } label: {
+                    Label("Get VK call URL", systemImage: "phone.badge.plus")
+                }
+                if !vkCallStatus.isEmpty {
+                    Text(vkCallStatus)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Text("Creates a new VK call FROM YOUR VK ACCOUNT and puts its link at the top of the field above. This is not anonymous: the call belongs to the account you confirm on the next screen, so a burner is recommended. Uses the saved VK login if there is one.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
 
             // One NavigationLink per server (stable identity) — avoids the
@@ -667,6 +720,24 @@ struct SettingsView: View {
                 if case let .harvested(cookieHeader, expiry) = result {
                     VKCookieStore.save(cookieHeader: cookieHeader, expiry: expiry)
                     refreshVKCookieInfo()
+                }
+            }
+        }
+        // Call creation — the OAuth half. M2 stops at the token; creating the
+        // call and writing the link into the field above land in M3/M4.
+        .sheet(isPresented: $showVKCallCreate) {
+            VKOAuthWebView { result in
+                showVKCallCreate = false
+                switch result {
+                case let .token(t):
+                    vkCallStatus = "Creating the call…"
+                    Task { await createVKCall(token: t) }
+                case .needsLogin:
+                    vkCallStatus = "VK did not recognise the saved login. Log in with “Use VK account (cookie) auth” below, then try again."
+                case let .failed(msg):
+                    vkCallStatus = msg
+                case .cancelled:
+                    vkCallStatus = ""
                 }
             }
         }
