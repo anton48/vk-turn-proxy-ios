@@ -15,7 +15,19 @@ import UIKit
 /// appearing at all in testing. Root cause turned out to be unrelated:
 /// stale iOS Simulator state (fixed by Simulator → Device → Erase All
 /// Content and Settings) — confirmed by the SAME failure reproducing on a
-/// completely clean checkout with none of this code present. Restored.
+/// completely clean checkout with none of this code present. Restored, and
+/// this paragraph is the ONE account of that episode: do not re-add the
+/// "UIKit tap gesture broke focus" reading elsewhere, it was the simulator.
+///
+/// Device-verified 2026-08-07 (iPhone SE3) against the case that looks most
+/// dangerous — typing inside a WKWebView, i.e. the VK login and the VK ID
+/// screens, where losing focus mid-form would break the cookie auth the app
+/// depends on. It is not affected, and the reason is structural rather than
+/// lucky: in a WKWebView the first responder is the WKContentView, whose
+/// bounds span the whole page, so every tap on web content is INSIDE the
+/// responder and `shouldReceive` declines the gesture. The recognizer can
+/// only fire outside the web view — e.g. on the sheet's own header — where
+/// dismissing is what you want anyway.
 
 /// Standard "find the current first responder" trick — UIResponder exposes
 /// no direct API for it, so this asks the responder chain itself: `sendAction`

@@ -8,15 +8,15 @@ import os.log
 private let captchaLog = OSLog(subsystem: "com.vkturnproxy.app", category: "Captcha")
 
 extension View {
-    /// Lets a drag on empty Form/List space dismiss the keyboard, the way
-    /// Apple's own Settings app behaves. `.scrollDismissesKeyboard` is the
-    /// framework's own mechanism — unlike a hand-rolled UIKit tap-gesture
-    /// hack (tried and reverted: it broke focus entirely on this SwiftUI
-    /// build, keyboard never appeared at all for ANY field), it is
-    /// guaranteed to compose correctly with SwiftUI's own focus handling
-    /// since Apple implements both. iOS 16+ only; the app's floor is iOS
-    /// 15.0, so pre-16 just keeps the original behavior (dismiss via
-    /// return/back, same as before this fix existed).
+    /// Lets a DRAG on empty Form/List space dismiss the keyboard, the way
+    /// Apple's own Settings app behaves. Half of a pair: this covers dragging,
+    /// `KeyboardDismisser` covers tapping — SwiftUI has no equivalent for the
+    /// tap, which is why that one is hand-rolled in UIKit. The two do not
+    /// overlap and neither substitutes for the other.
+    ///
+    /// iOS 16+ only; the app's floor is iOS 15.0, so pre-16 keeps the original
+    /// behaviour (dismiss via return/back) for drags — the tap path works on
+    /// every version.
     @ViewBuilder
     func dismissKeyboardOnDrag() -> some View {
         if #available(iOS 16.0, *) {
