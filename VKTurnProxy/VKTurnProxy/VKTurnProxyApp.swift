@@ -63,6 +63,11 @@ struct VKTurnProxyApp: App {
                         ConnectionLinkInbox.shared.pendingURL = url
                     }
                 }
+                // Tap-anywhere-to-dismiss-keyboard, wired at the window level
+                // (see KeyboardDismisser.swift) — a plain SwiftUI tap gesture
+                // doesn't reach the empty space inside Form/List, so this is
+                // attached once here for every screen instead.
+                .background(KeyboardDismisser())
         }
     }
 }

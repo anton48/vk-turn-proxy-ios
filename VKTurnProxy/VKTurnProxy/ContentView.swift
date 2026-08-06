@@ -7,6 +7,26 @@ import os.log
 
 private let captchaLog = OSLog(subsystem: "com.vkturnproxy.app", category: "Captcha")
 
+extension View {
+    /// Lets a drag on empty Form/List space dismiss the keyboard, the way
+    /// Apple's own Settings app behaves. `.scrollDismissesKeyboard` is the
+    /// framework's own mechanism — unlike a hand-rolled UIKit tap-gesture
+    /// hack (tried and reverted: it broke focus entirely on this SwiftUI
+    /// build, keyboard never appeared at all for ANY field), it is
+    /// guaranteed to compose correctly with SwiftUI's own focus handling
+    /// since Apple implements both. iOS 16+ only; the app's floor is iOS
+    /// 15.0, so pre-16 just keeps the original behavior (dismiss via
+    /// return/back, same as before this fix existed).
+    @ViewBuilder
+    func dismissKeyboardOnDrag() -> some View {
+        if #available(iOS 16.0, *) {
+            self.scrollDismissesKeyboard(.interactively)
+        } else {
+            self
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var tunnel = TunnelManager.shared
 
@@ -458,7 +478,10 @@ struct SettingsView: View {
                          : "VK Call Link")
                         .font(.caption).foregroundColor(.secondary)
                     TextEditor(text: $vkLink)
-                        .frame(minHeight: vkAuthEnabled ? 110 : 38)
+                        // 38pt was ~1 line — a real join link (vk.ru/call/join/<hash>)
+                        // wraps to 2-3 lines at typical widths and got clipped inside
+                        // the field with no visual hint there was more to scroll to.
+                        .frame(minHeight: vkAuthEnabled ? 110 : 70)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
                 }
@@ -599,6 +622,7 @@ struct SettingsView: View {
                 Text("Backup contains all settings, WireGuard keys, TURN credentials, and the captured browser profile. Treat the exported file as a secret.")
             }
         }
+        .dismissKeyboardOnDrag()
         .navigationTitle("Settings")
         // Share sheet for the freshly-exported temp file. Bound to a
         // sheet(item:) so the file is in scope while the sheet is open

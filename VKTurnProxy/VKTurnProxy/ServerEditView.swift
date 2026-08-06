@@ -188,6 +188,7 @@ struct ServerEditView: View {
                 Text("New creates a server with default settings. Copy duplicates this one. The last server can't be deleted. vkLink and VK account auth are global (Settings screen), not per-server.")
             }
         }
+        .dismissKeyboardOnDrag()
         .navigationTitle(draft.serverName.isEmpty ? "Server" : draft.serverName)
         .navigationBarTitleDisplayMode(.inline)
         // Persist every edit through the store (projects onto the flat keys when
