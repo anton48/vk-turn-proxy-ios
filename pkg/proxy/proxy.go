@@ -367,6 +367,13 @@ type Proxy struct {
 	connTxBytes []atomic.Int64
 	connRxBytes []atomic.Int64
 
+	// groupHello is this tunnel's M3 group hello (0xff 'G' 'R' 'P' + a 16-byte
+	// session id), pre-built once and sent verbatim on every conn so the server
+	// can group this client's connections onto one socket toward WireGuard.
+	// nil when the peer is not our server (WRAP-A / WRAP-S) — see
+	// groupHelloMagic. Immutable after NewProxy, so no lock.
+	groupHello []byte
+
 	// Per-conn last-activity timestamps (UnixNano) for skip-on-recent-tx
 	// wake-probe optimization. Updated alongside connTxBytes/connRxBytes
 	// from the data path goroutines (NOT from probe Writes — probes are
@@ -499,6 +506,8 @@ func NewProxy(cfg Config) *Proxy {
 		}
 	}
 	p.credPool = newCredPool(ctx, poolSize, cfg.CredPoolCooldown, cfg.CredCachePath, p.fetchFreshCreds)
+
+	p.initGroupHello(cfg)
 
 	// Seed slot 0 with pre-fetched TURN creds (from main app's pre-bootstrap
 	// captcha flow). The first conn's get() returns these without an API
@@ -2269,6 +2278,12 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		var seq uint64
 		pingPkt := make([]byte, len(probePingMagic)+8)
 		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
+		// M3 group hello. Sent IMMEDIATELY rather than waiting for the first
+		// tick: until the server sees it this conn stays on its own socket, and
+		// a probeInterval of that is a probeInterval of the old, skewed
+		// downlink at the start of every tunnel. Re-sent on every tick so a
+		// lost hello heals by repetition and a restarted server re-groups us.
+		p.sendGroupHello(dtlsConn)
 		// Tick-gap detector: if the gap between two consecutive ticks is
 		// much larger than probeInterval, our goroutine was suspended
 		// (iOS Network Extension freeze). During that time we couldn't
@@ -4294,6 +4309,63 @@ func isQuotaError(err error) bool {
 // network jitter before declaring a conn dead.
 var probePingMagic = []byte{0xff, 'P', 'N', 'G'}
 
+// groupHelloMagic is the M3 group hello: 0xff 'G' 'R' 'P' + a 16-byte session
+// id, sent on every conn so the server can put one client's connections on one
+// shared socket toward WireGuard. Without it the server has no way to tell two
+// clients apart, and its downlink scheduler has to stay a single-client
+// experiment flag.
+//
+// Same construction as probePingMagic above, and for the same reason: 0xff is
+// outside WireGuard's 1..4 message-type range, so a server that predates this
+// forwards the hello to its WireGuard, which drops it as malformed. Old server
+// + new client therefore costs one dropped 20-byte packet per probe interval.
+//
+// 🚫 NOT SENT IN WRAP-A OR WRAP-S. Those modes talk to a third party's server
+// (amurcanov's, samosvalishe's), which cannot act on grouping and whose
+// handling of an unknown sentinel we have never read. See sendGroupHello.
+var groupHelloMagic = []byte{0xff, 'G', 'R', 'P'}
+
+// groupHelloLen is magic + a 16-byte session id.
+const groupHelloLen = 4 + 16
+
+// initGroupHello builds this tunnel's group hello: one session id per tunnel
+// start, shared by every conn, so the server can put this client's connections
+// on one socket toward WireGuard.
+//
+// 🚫 Skipped for WRAP-A / WRAP-S. Those peers are other people's servers
+// (amurcanov's, samosvalishe's); they cannot act on grouping, and putting an
+// unknown sentinel on their wire buys nothing while risking behaviour we have
+// never read. A failed random draw also disables it — the server then keeps
+// every conn on its own socket, which is the pre-M3 behaviour: correct, slower.
+func (p *Proxy) initGroupHello(cfg Config) {
+	if cfg.UseWrapA || cfg.UseWrapS {
+		return
+	}
+	id, err := uuid.NewRandom()
+	if err != nil {
+		log.Printf("proxy: group hello disabled (uuid: %s) — the server will "+
+			"keep one socket per conn", err)
+		return
+	}
+	hello := make([]byte, 0, groupHelloLen)
+	hello = append(hello, groupHelloMagic...)
+	hello = append(hello, id[:]...)
+	p.groupHello = hello
+	log.Printf("proxy: group hello %s (sent on every conn so the server can "+
+		"schedule this client's downlink as one group)", id)
+}
+
+// sendGroupHello writes this tunnel's group hello to one conn, if the peer is
+// our own server. Errors are ignored on purpose: the hello is an optimisation,
+// it is repeated every probe interval, and a server that never sees one simply
+// keeps the connection on its own socket.
+func (p *Proxy) sendGroupHello(w io.Writer) {
+	if p.groupHello == nil {
+		return
+	}
+	_, _ = w.Write(p.groupHello)
+}
+
 // recvPktPool recycles []byte slices used to hand off freshly-read packets
 // from the per-conn recv goroutines (runDTLSSession, runDirectSession,
 // runSRTPSession) to ReceivePacket via p.recvCh. Producer-side Get in
@@ -4482,6 +4554,12 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		var seq uint64
 		pingPkt := make([]byte, len(probePingMagic)+8)
 		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
+		// M3 group hello. Sent IMMEDIATELY rather than waiting for the first
+		// tick: until the server sees it this conn stays on its own socket, and
+		// a probeInterval of that is a probeInterval of the old, skewed
+		// downlink at the start of every tunnel. Re-sent on every tick so a
+		// lost hello heals by repetition and a restarted server re-groups us.
+		p.sendGroupHello(srtpConn)
 		lastTickAt := time.Now()
 		for {
 			wakeCh := p.wakeChannel()
