@@ -2370,6 +2370,37 @@ extension TunnelConfig {
         min(50, max(2, callLinks * 20))
     }
 
+    /// Ceiling on the Connections slider in anonymous mode.
+    ///
+    /// ⚠️ THIS IS A MEMORY BUDGET, NOT A VK LIMIT. VK issues the allocations
+    /// happily — 50 on a single relay was verified 2026-08-08 with zero 486,
+    /// and throughput scales linearly (59.3 / 79.1 / 98.6 Mbit/s offered at
+    /// N=30/40/50). What bounds this is the Network Extension's ~50 MB jetsam
+    /// budget, which kills silently and without warning.
+    ///
+    /// Measured peak phys_footprint — the exact number iOS jetsam evaluates,
+    /// read via task_info(TASK_VM_INFO) and logged as `rss=`:
+    ///
+    ///   N=30 → 26.6 MB    N=40 → 32.9 MB    N=50 → 33.4 MB
+    ///
+    /// The growth is not linear in N, and the flat step from 40 to 50 is not
+    /// luck: Go's `sys` saturates at 37.3 MB because GOMEMLIMIT is 35, so the
+    /// runtime collects harder rather than growing. The structural per-conn
+    /// cost is small — ~11.6 goroutines ≈ 48 KB of stack — while the visible
+    /// jumps come from transient heap during download bursts (heap-alloc at
+    /// peak: 7.9 MB at N=30 against 16.8 at N=40), which tracks traffic, not
+    /// connection count.
+    ///
+    /// 🚨 So raising this trades headroom for a ceiling that may not be
+    /// reachable anyway: the far end frequently fails to feed even 50 conns
+    /// (the pacer bound only ~25% of ticks in the 2026-08-08 evening runs).
+    /// Before raising it again, run the target N and check TWO numbers in the
+    /// memstats line — peak `rss` and GC cycles per tick. Under ~40 MB with no
+    /// material rise in GC rate is safe; approaching 42-45 MB or a clear jump
+    /// in GC means GOMEMLIMIT is binding, and the question becomes that limit
+    /// rather than this one.
+    static let anonConnCap = 60
+
     /// The conn count actually handed to Go — the stored Connections setting,
     /// clamped by `cookieConnCap` when the cookie path is in use.
     ///

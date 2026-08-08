@@ -73,7 +73,7 @@ struct ServerEditView: View {
     }
     private var cookieConnCap: Int { TunnelConfig.cookieConnCap(callLinks: vkLinkLines.count) }
     private var connectionsUpperBound: Int {
-        vkAuthEnabled ? max(cookieConnCap, draft.numConnections) : max(50, draft.numConnections)
+        vkAuthEnabled ? max(cookieConnCap, draft.numConnections) : max(TunnelConfig.anonConnCap, draft.numConnections)
     }
     private var connectionsLabel: String {
         if vkAuthEnabled && draft.numConnections > cookieConnCap {
