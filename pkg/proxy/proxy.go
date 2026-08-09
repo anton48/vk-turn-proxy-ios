@@ -193,6 +193,21 @@ type Proxy struct {
 	sendChPeak atomic.Int64
 	recvChPeak atomic.Int64
 
+	// sendChBlockNs / sendChBlockCount (build 224): how long producers actually
+	// had to WAIT for room, and how often. This is the number the peak cannot
+	// give: notePeak reads len() AFTER the send, and with dozens of consumers
+	// draining concurrently a genuinely full queue can be recorded as less than
+	// full — so a peak below capacity is NOT proof that nobody blocked.
+	//
+	// Blocked time has no such ambiguity. Zero means the producer was never once
+	// made to wait, which settles "is this queue the limit" outright; a non-zero
+	// total says how much of the interval was spent waiting, which is the size
+	// of the effect rather than a hint that one exists.
+	sendChBlockNs    atomic.Int64
+	sendChBlockCount atomic.Int64
+	recvChBlockNs    atomic.Int64
+	recvChBlockCount atomic.Int64
+
 	// WRAP-A (amurcanov-compatible) transport state. wrapAKey is the derived
 	// HKDF obfuscation key (nil unless UseWrapA). The provision is the
 	// server-minted WireGuard config from GETCONF, populated exactly once by
@@ -1589,14 +1604,50 @@ func notePeak(mark *atomic.Int64, depth int) {
 func (p *Proxy) SendPacket(data []byte) error {
 	buf := make([]byte, len(data))
 	copy(buf, data)
+	// Try without blocking first, so the slow path below runs ONLY when there
+	// was genuinely no room. That is what makes the blocked-time counter exact:
+	// it measures waiting, not the cost of measuring.
 	select {
 	case p.sendCh <- buf:
 		notePeak(&p.sendChPeak, len(p.sendCh))
 		p.txBytes.Add(int64(len(data)))
 		p.txPackets.Add(1)
 		return nil
+	default:
+	}
+	start := time.Now()
+	select {
+	case p.sendCh <- buf:
+		p.sendChBlockNs.Add(int64(time.Since(start)))
+		p.sendChBlockCount.Add(1)
+		notePeak(&p.sendChPeak, len(p.sendCh))
+		p.txBytes.Add(int64(len(data)))
+		p.txPackets.Add(1)
+		return nil
 	case <-p.ctx.Done():
 		return p.ctx.Err()
+	}
+}
+
+// enqueueRecv hands a received packet to ReceivePacket, measuring how long the
+// producer had to wait for room. Returns false if ctx died first — the caller
+// still owns pkt and must return it to the pool.
+func (p *Proxy) enqueueRecv(ctx context.Context, pkt []byte) bool {
+	select {
+	case p.recvCh <- pkt:
+		notePeak(&p.recvChPeak, len(p.recvCh))
+		return true
+	default:
+	}
+	start := time.Now()
+	select {
+	case p.recvCh <- pkt:
+		p.recvChBlockNs.Add(int64(time.Since(start)))
+		p.recvChBlockCount.Add(1)
+		notePeak(&p.recvChPeak, len(p.recvCh))
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -2760,10 +2811,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			}
 			pkt := recvPktPoolGet(n)
 			copy(pkt, buf[:n])
-			select {
-			case p.recvCh <- pkt:
-				notePeak(&p.recvChPeak, len(p.recvCh))
-			case <-connCtx.Done():
+			if !p.enqueueRecv(connCtx, pkt) {
 				recvPktPoolPut(pkt)
 				log.Printf("proxy: [conn %d] DTLS recv goroutine: ctx cancelled during recvCh send", connIdx)
 				return
@@ -2905,10 +2953,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			p.lastRecvTime.Store(time.Now().Unix())
 			pkt := recvPktPoolGet(n)
 			copy(pkt, buf[:n])
-			select {
-			case p.recvCh <- pkt:
-				notePeak(&p.recvChPeak, len(p.recvCh))
-			case <-connCtx.Done():
+			if !p.enqueueRecv(connCtx, pkt) {
 				recvPktPoolPut(pkt)
 				return
 			}
@@ -3119,10 +3164,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			p.lastRecvTime.Store(time.Now().Unix())
 			pkt := recvPktPoolGet(n)
 			copy(pkt, buf[:n])
-			select {
-			case p.recvCh <- pkt:
-				notePeak(&p.recvChPeak, len(p.recvCh))
-			case <-connCtx.Done():
+			if !p.enqueueRecv(connCtx, pkt) {
 				recvPktPoolPut(pkt)
 				return
 			}
@@ -3847,7 +3889,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d recvch-peak=%d/%d",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d recvch-peak=%d/%d recvch-block=%s/%d",
 			label,
 			rssStr,
 			internalStr,
@@ -3872,8 +3914,17 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// period we ever measured, which proved nothing either way.
 			p.sendChPeak.Swap(0),
 			cap(p.sendCh),
+			// Blocked time is the number that settles whether a queue is the
+			// limit: the peak can under-report (len() is read after the send,
+			// and other consumers drain in between), but waiting either
+			// happened or it did not. `0s/0` means the producer was never once
+			// made to wait — a real negative result, not a blind one.
+			time.Duration(p.sendChBlockNs.Swap(0)).Round(time.Microsecond),
+			p.sendChBlockCount.Swap(0),
 			p.recvChPeak.Swap(0),
-			cap(p.recvCh))
+			cap(p.recvCh),
+			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
+			p.recvChBlockCount.Swap(0))
 
 		// Alloc-spike alert (build 140): if heap-alloc grew more than
 		// allocSpikeThreshold (5 MB) between ticks, emit a dedicated
@@ -4900,10 +4951,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 
 			pkt := recvPktPoolGet(n)
 			copy(pkt, buf[:n])
-			select {
-			case p.recvCh <- pkt:
-				notePeak(&p.recvChPeak, len(p.recvCh))
-			case <-connCtx.Done():
+			if !p.enqueueRecv(connCtx, pkt) {
 				recvPktPoolPut(pkt)
 				log.Printf("proxy: [conn %d] SRTP recv goroutine: ctx cancelled during recvCh send", connIdx)
 				return
