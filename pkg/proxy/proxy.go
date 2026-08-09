@@ -175,6 +175,24 @@ type Proxy struct {
 	// don't use srtpwrap). Must run in plain-SRTP mode to exercise it.
 	rtpChPeak atomic.Int64
 
+	// sendChPeak / recvChPeak (build 223, diagnostic): per-interval high-water
+	// marks of the two bridge queues, updated at the PRODUCER and read-and-reset
+	// each memstats tick — the same shape as rtpChPeak above.
+	//
+	// 🚨 THEY REPLACE AN INSTANTANEOUS SAMPLE THAT WAS WORSE THAN USELESS. The
+	// old HEARTBEAT line printed `sendCh=%d/%d` as len() at the sampling moment.
+	// These queues drain in microseconds, so an every-5s sample reads 0 almost
+	// always — and a run of zeroes then looks like evidence that the uplink never
+	// backs up, when it is really evidence of nothing. Worse, the heartbeat is
+	// window-bounded and expired ten seconds BEFORE the first speedtest of every
+	// measurement session on 2026-08-08, so the loaded period — the only period
+	// anyone wanted to know about — was never observed at all.
+	//
+	// A peak answers the actual question: did the queue EVER back up in this
+	// interval. Zero here means zero, and that is a real negative result.
+	sendChPeak atomic.Int64
+	recvChPeak atomic.Int64
+
 	// WRAP-A (amurcanov-compatible) transport state. wrapAKey is the derived
 	// HKDF obfuscation key (nil unless UseWrapA). The provision is the
 	// server-minted WireGuard config from GETCONF, populated exactly once by
@@ -1354,8 +1372,18 @@ func (p *Proxy) wakeChannel() <-chan struct{} {
 // hung at T+33s — vs if the heartbeat continues up to T+37s, the Go
 // runtime was fine and iOS killed it externally.
 //
-// Logs RSS + goroutine count + sendCh/recvCh depths so we also see if
-// any bridge channel filled up before the death.
+// Logs RSS + goroutine count so we also see the shape of the process before
+// the death.
+//
+// ⚠️ IT NO LONGER PRINTS THE QUEUE DEPTHS, deliberately. This heartbeat is
+// window-bounded — it is a cold-start liveness trace, and on 2026-08-08 it
+// expired ten seconds before the first speedtest of every measurement session,
+// so its `sendCh=0/256` never once described a loaded period. Worse, len() at
+// the sampling moment reads 0 on a queue that drains in microseconds even when
+// it IS backing up. Both problems are fixed in the memstats line, which runs
+// for the whole session and reports per-interval PEAKS: `sendch-peak` /
+// `recvch-peak`. Do not add an instantaneous depth back here — two readers of
+// one read-and-reset peak would steal it from each other.
 func (p *Proxy) runDiagnosticHeartbeat(ctx context.Context, window, interval time.Duration) {
 	deadline := time.Now().Add(window)
 	ticker := time.NewTicker(interval)
@@ -1377,14 +1405,12 @@ func (p *Proxy) runDiagnosticHeartbeat(ctx context.Context, window, interval tim
 					rss = fmt.Sprintf("%.1fMB", float64(vm.PhysFootprint)/1024/1024)
 				}
 			}
-			log.Printf("proxy: HEARTBEAT t+%s rss=%s sys=%.1fMB goroutines=%d active-conns=%d sendCh=%d/%d recvCh=%d/%d tx=%d rx=%d",
+			log.Printf("proxy: HEARTBEAT t+%s rss=%s sys=%.1fMB goroutines=%d active-conns=%d tx=%d rx=%d",
 				time.Since(p.startedAt).Round(time.Second),
 				rss,
 				float64(ms.Sys)/1024/1024,
 				runtime.NumGoroutine(),
 				p.activeConns.Load(),
-				len(p.sendCh), cap(p.sendCh),
-				len(p.recvCh), cap(p.recvCh),
 				p.txBytes.Load(), p.rxBytes.Load())
 		}
 	}
@@ -1544,12 +1570,28 @@ func (p *Proxy) runWatchdog() {
 	}
 }
 
+// notePeak raises a high-water mark to depth if it is higher. Called from the
+// producer right after a successful enqueue, so the value reflects the queue as
+// the writer actually left it. Racy between concurrent producers by design —
+// this is a diagnostic, and losing a sample to a lost CAS costs nothing while a
+// lock on the packet path would cost real throughput.
+func notePeak(mark *atomic.Int64, depth int) {
+	d := int64(depth)
+	for {
+		cur := mark.Load()
+		if d <= cur || mark.CompareAndSwap(cur, d) {
+			return
+		}
+	}
+}
+
 // SendPacket sends a WireGuard packet through the tunnel.
 func (p *Proxy) SendPacket(data []byte) error {
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	select {
 	case p.sendCh <- buf:
+		notePeak(&p.sendChPeak, len(p.sendCh))
 		p.txBytes.Add(int64(len(data)))
 		p.txPackets.Add(1)
 		return nil
@@ -2720,6 +2762,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			copy(pkt, buf[:n])
 			select {
 			case p.recvCh <- pkt:
+				notePeak(&p.recvChPeak, len(p.recvCh))
 			case <-connCtx.Done():
 				recvPktPoolPut(pkt)
 				log.Printf("proxy: [conn %d] DTLS recv goroutine: ctx cancelled during recvCh send", connIdx)
@@ -2864,6 +2907,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			copy(pkt, buf[:n])
 			select {
 			case p.recvCh <- pkt:
+				notePeak(&p.recvChPeak, len(p.recvCh))
 			case <-connCtx.Done():
 				recvPktPoolPut(pkt)
 				return
@@ -3077,6 +3121,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			copy(pkt, buf[:n])
 			select {
 			case p.recvCh <- pkt:
+				notePeak(&p.recvChPeak, len(p.recvCh))
 			case <-connCtx.Done():
 				recvPktPoolPut(pkt)
 				return
@@ -3802,7 +3847,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d recvch=%d/%d",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d recvch-peak=%d/%d",
 			label,
 			rssStr,
 			internalStr,
@@ -3821,7 +3866,13 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			txPktDelta,
 			rxPktDelta,
 			p.rtpChPeak.Swap(0),
-			len(p.recvCh),
+			// Read-and-reset: each line reports the worst backlog seen since
+			// the previous line, not the depth at this instant. See the field
+			// docs — the instantaneous version read 0 through every loaded
+			// period we ever measured, which proved nothing either way.
+			p.sendChPeak.Swap(0),
+			cap(p.sendCh),
+			p.recvChPeak.Swap(0),
 			cap(p.recvCh))
 
 		// Alloc-spike alert (build 140): if heap-alloc grew more than
@@ -4851,6 +4902,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			copy(pkt, buf[:n])
 			select {
 			case p.recvCh <- pkt:
+				notePeak(&p.recvChPeak, len(p.recvCh))
 			case <-connCtx.Done():
 				recvPktPoolPut(pkt)
 				log.Printf("proxy: [conn %d] SRTP recv goroutine: ctx cancelled during recvCh send", connIdx)
