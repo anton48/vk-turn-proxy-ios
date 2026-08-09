@@ -2372,33 +2372,48 @@ extension TunnelConfig {
 
     /// Ceiling on the Connections slider in anonymous mode.
     ///
-    /// ⚠️ THIS IS A MEMORY BUDGET, NOT A VK LIMIT. VK issues the allocations
+    /// 🚨 A CEILING, NOT A DEFAULT. The shipped default stays 30
+    /// (`TunnelConfig.numConnections`) — decided 2026-08-09 after the N=60
+    /// runs. 60 is offered to whoever wants it and is not what a fresh
+    /// install gets: jetsam is peak-sensitive, the evidence for 60 is a
+    /// handful of short runs rather than a soak, and in-burst GC roughly
+    /// doubles between N=50 and N=60 (below). Do not re-propose raising the
+    /// default without a multi-hour soak at the target N.
+    ///
+    /// ⚠️ AND IT IS A MEMORY BUDGET, NOT A VK LIMIT. VK issues the allocations
     /// happily — 50 on a single relay was verified 2026-08-08 with zero 486,
     /// and throughput scales linearly (59.3 / 79.1 / 98.6 Mbit/s offered at
-    /// N=30/40/50). What bounds this is the Network Extension's ~50 MB jetsam
-    /// budget, which kills silently and without warning.
+    /// N=30/40/50, 103 at N=60). What bounds this is the Network Extension's
+    /// ~50 MB jetsam budget, which kills silently and without warning.
     ///
     /// Measured peak phys_footprint — the exact number iOS jetsam evaluates,
     /// read via task_info(TASK_VM_INFO) and logged as `rss=`:
     ///
-    ///   N=30 → 26.6 MB    N=40 → 32.9 MB    N=50 → 33.4 MB
+    ///   N=30 → 26.6 MB   N=40 → 32.9 MB   N=50 → 33.4 MB   N=60 → 33.8 MB
     ///
-    /// The growth is not linear in N, and the flat step from 40 to 50 is not
-    /// luck: Go's `sys` saturates at 37.3 MB because GOMEMLIMIT is 35, so the
+    /// The growth is not linear in N, and the flat step from 40 upward is not
+    /// luck: Go's `sys` saturates at ~37 MB because GOMEMLIMIT is 35, so the
     /// runtime collects harder rather than growing. The structural per-conn
     /// cost is small — ~11.6 goroutines ≈ 48 KB of stack — while the visible
     /// jumps come from transient heap during download bursts (heap-alloc at
-    /// peak: 7.9 MB at N=30 against 16.8 at N=40), which tracks traffic, not
+    /// peak is 16.8 MB at N=40, 50 AND 60), which tracks traffic, not
     /// connection count.
     ///
-    /// 🚨 So raising this trades headroom for a ceiling that may not be
-    /// reachable anyway: the far end frequently fails to feed even 50 conns
-    /// (the pacer bound only ~25% of ticks in the 2026-08-08 evening runs).
-    /// Before raising it again, run the target N and check TWO numbers in the
-    /// memstats line — peak `rss` and GC cycles per tick. Under ~40 MB with no
-    /// material rise in GC rate is safe; approaching 42-45 MB or a clear jump
-    /// in GC means GOMEMLIMIT is binding, and the question becomes that limit
-    /// rather than this one.
+    /// 🚨 And raising it trades headroom for a ceiling that may not be reachable
+    /// anyway: the far end frequently fails to feed even 50 conns — the pacer
+    /// bound only ~25% of ticks in the 2026-08-08 evening runs. Before raising
+    /// it again, run the target N and check TWO numbers in the memstats line —
+    /// peak `rss` and GC cycles per tick. Under ~40 MB with no material rise in
+    /// GC is safe; 42-45 MB or a clear jump in GC means GOMEMLIMIT is binding,
+    /// and the question becomes that limit rather than this one.
+    ///
+    /// ⚠️ READ THE GC NUMBER ONLY OVER LOADED TICKS. A whole-run average is
+    /// diluted by idle ones and hides the trend: 10.7/tick at N=60 becomes
+    /// 54.4 restricted to ticks carrying >20k packets, and the in-burst series
+    /// 25.6 / 29.7 / 46.9 / 54.4 at N=30/40/50/60 rises monotonically —
+    /// invisible in the diluted figure, which once produced the wrong verdict
+    /// "GC is not materially above N=50". That climb is the known precursor of
+    /// the build 130-146 GC death-spiral.
     static let anonConnCap = 60
 
     /// The conn count actually handed to Go — the stored Connections setting,
