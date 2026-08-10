@@ -152,6 +152,8 @@ extension TunnelConfig {
             clientID: s.clientID,
             useUDP: s.useUDP,
             forceLegacyCaptcha: d.bool(forKey: "forceLegacyCaptcha"),
+            uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
+            uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
@@ -1816,6 +1818,8 @@ class TunnelManager: ObservableObject {
             "use_dtls": config.useDTLS,
             "use_udp": config.useUDP,
             "force_legacy_captcha": config.forceLegacyCaptcha,
+            "uplink_synth_mbit": config.uplinkSynthMbit,
+            "uplink_synth_sec": config.uplinkSynthSec,
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
             "use_srtp": config.useSrtp,
@@ -2338,6 +2342,14 @@ struct TunnelConfig {
     // reachable only by hand-editing a backup. Default false → no production
     // effect.
     var forceLegacyCaptcha: Bool = false
+    // uplinkSynthMbit / uplinkSynthSec: the paced synthetic uplink in
+    // pkg/proxy/synth.go — a diagnostic that splits the ~19 Mbit/s upload
+    // ceiling into "above SendPacket" vs "at or below it". No UI: set them by
+    // hand in a backup, like forceLegacyCaptcha before build 212. Zero → off,
+    // which is the shipped state. 🚨 The answer is server1's ΣUP, not the
+    // phone's own line, and the server must run with -uplink-reseq=0.
+    var uplinkSynthMbit: Double = 0
+    var uplinkSynthSec: Int = 0
     // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
     // anonymous fallback). The cookie itself lives in the Keychain
     // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.

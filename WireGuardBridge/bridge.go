@@ -141,12 +141,12 @@ func decodeWrapKey(useWrap bool, hexStr string) ([]byte, error) {
 
 // ProxyConfig is the JSON config passed from Swift.
 type ProxyConfig struct {
-	VKLink              string            `json:"vk_link"`
-	PeerAddr            string            `json:"peer_addr"`
-	TurnServer          string            `json:"turn_server,omitempty"`
-	TurnPort            string            `json:"turn_port,omitempty"`
-	UseDTLS             bool              `json:"use_dtls"`
-	UseUDP              bool              `json:"use_udp"`
+	VKLink     string `json:"vk_link"`
+	PeerAddr   string `json:"peer_addr"`
+	TurnServer string `json:"turn_server,omitempty"`
+	TurnPort   string `json:"turn_port,omitempty"`
+	UseDTLS    bool   `json:"use_dtls"`
+	UseUDP     bool   `json:"use_udp"`
 	// UseWrap enables the WRAP layer between DTLS and TURN ChannelData
 	// (see proxy.Config.UseWrap and pkg/proxy/wrap.go). Requires the
 	// peer server to be running cacggghp/vk-turn-proxy with matching
@@ -154,23 +154,23 @@ type ProxyConfig struct {
 	//
 	// NOTE 2026-05-20: WRAP no longer escapes VK's content classifier;
 	// new code should set UseSrtp instead (see proxy.Config.UseSrtp).
-	UseWrap             bool              `json:"use_wrap"`
+	UseWrap bool `json:"use_wrap"`
 	// WrapKeyHex is the 64-character hex encoding of the 32-byte
 	// ChaCha20 shared key. Required when UseWrap is true and must
 	// match the server's -wrap-key value exactly.
-	WrapKeyHex          string            `json:"wrap_key_hex"`
+	WrapKeyHex string `json:"wrap_key_hex"`
 	// SRTP-WRAP-S (samosvalishe/free-turn-proxy interop): UseWrapS turns on the
 	// mode; ObfProfile picks the codec ("rtpopus"|"rtpopus2"|"rtpopus3");
 	// ClientID is the first-DTLS-record allowlist id. Shared key = WrapKeyHex.
-	UseWrapS            bool              `json:"use_wrap_s,omitempty"`
-	ObfProfile          string            `json:"obf_profile,omitempty"`
-	ClientID            string            `json:"client_id,omitempty"`
+	UseWrapS   bool   `json:"use_wrap_s,omitempty"`
+	ObfProfile string `json:"obf_profile,omitempty"`
+	ClientID   string `json:"client_id,omitempty"`
 	// UseSrtp enables the DTLS+SRTP transport (see pkg/proxy/srtpwrap
 	// and proxy.Config.UseSrtp). Requires the peer server to be running
 	// anton48/vk-turn-proxy add-server-srtp-layer with the -srtp flag.
-	UseSrtp             bool              `json:"use_srtp"`
-	NumConns                int `json:"num_conns,omitempty"`
-	CredPoolCooldownSeconds int `json:"cred_pool_cooldown_seconds,omitempty"`
+	UseSrtp                 bool `json:"use_srtp"`
+	NumConns                int  `json:"num_conns,omitempty"`
+	CredPoolCooldownSeconds int  `json:"cred_pool_cooldown_seconds,omitempty"`
 	// VKHostIPs is a hostname→[]IP map pre-resolved by the main app
 	// before startVPNTunnel. The extension can't resolve VK hosts on
 	// its own (no usable DNS context until setTunnelNetworkSettings,
@@ -200,6 +200,20 @@ type ProxyConfig struct {
 	// backup-JSON field. Default false → no production effect.
 	ForceLegacyCaptcha bool `json:"force_legacy_captcha,omitempty"`
 
+	// UplinkSynthMbit / UplinkSynthSec drive the paced synthetic uplink in
+	// pkg/proxy/synth.go — a DIAGNOSTIC that splits the ~19 Mbit/s upload
+	// ceiling into "above SendPacket" (WireGuard, inner TCP) versus "at or below
+	// it" (our transport, the phone's sockets). It runs ONCE, after the pool is
+	// up, then never again for the life of the tunnel. Driven by undocumented
+	// `uplinkSynthMbit` / `uplinkSynthSec` backup-JSON fields, in the idiom of
+	// forceLegacyCaptcha above. Zero → no production effect.
+	//
+	// 🚨 Read the answer as ΣUP in server1's conn-stats, never from the phone's
+	// own line, which reports only what it OFFERED. And run the server with
+	// -uplink-reseq=0, or it will hold the synthetic packets.
+	UplinkSynthMbit float64 `json:"uplink_synth_mbit,omitempty"`
+	UplinkSynthSec  int     `json:"uplink_synth_sec,omitempty"`
+
 	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
 	// session cookie → TURN creds; see pkg/proxy/creds_vkcookie.go). When true,
 	// GetVKCreds uses ONLY the cookie path — NO fallback to the anonymous VK
@@ -226,13 +240,13 @@ type ProxyConfig struct {
 	DeviceID string `json:"device_id,omitempty"`
 }
 
-//export wgTurnOnWithTURN
-//
 // Legacy single-call entry point: starts VK bootstrap AND attaches WireGuard
 // in one synchronous step. Retained so existing callers keep working while
 // PacketTunnelProvider is migrated to the split flow (wgStartVKBootstrap +
 // wgWaitBootstrapReady + wgAttachWireGuard), after which this export can be
 // deleted.
+//
+//export wgTurnOnWithTURN
 func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char) C.int32_t {
 	goSettings := C.GoString(settings)
 	goProxyJSON := C.GoString(proxyConfigJSON)
@@ -267,6 +281,8 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		pcfg.UseWrapS = false
 	}
 	p := proxy.NewProxy(proxy.Config{
+		UplinkSynthMbit:  pcfg.UplinkSynthMbit,
+		UplinkSynthSec:   pcfg.UplinkSynthSec,
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
 		TurnPort:         pcfg.TurnPort,
@@ -353,8 +369,6 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 // wgTurnOff / wgPause / wgResume / wgSetConfig / wgGetStats work on handles
 // from either the legacy or split flow — they just look up tunnelEntry.
 
-//export wgStartVKBootstrap
-//
 // Starts VK bootstrap (API call, TURN allocation, DTLS handshake) in a
 // background goroutine. Does NOT create a TUN device. Returns a tunnel
 // handle immediately, or -1 on immediate config-parse failure.
@@ -364,6 +378,8 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 // expires, error=-1 on fatal failure before any conn came up. Captcha
 // flows remain internal to Proxy — the bootstrap stays "not ready" until
 // captcha is solved AND the first conn completes.
+//
+//export wgStartVKBootstrap
 func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	goProxyJSON := C.GoString(proxyConfigJSON)
 
@@ -420,6 +436,8 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		pcfg.UseWrapS = false
 	}
 	p := proxy.NewProxy(proxy.Config{
+		UplinkSynthMbit:  pcfg.UplinkSynthMbit,
+		UplinkSynthSec:   pcfg.UplinkSynthSec,
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
 		TurnPort:         pcfg.TurnPort,
@@ -478,15 +496,16 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	return C.int32_t(id)
 }
 
-//export wgWaitBootstrapReady
-//
 // Blocks up to timeoutMs waiting for VK bootstrap to report ready. Returns:
-//   1  → first conn established a live DTLS+TURN session
-//   0  → timeout (bootstrap still in progress; try again or give up)
-//  -1  → fatal error before any conn came up, or tunnel handle not found
+//
+//	 1  → first conn established a live DTLS+TURN session
+//	 0  → timeout (bootstrap still in progress; try again or give up)
+//	-1  → fatal error before any conn came up, or tunnel handle not found
 //
 // Safe to call multiple times; the internal signal is replayed so later
 // callers see the same outcome.
+//
+//export wgWaitBootstrapReady
 func wgWaitBootstrapReady(tunnelHandle C.int32_t, timeoutMs C.int32_t) C.int32_t {
 	id := int32(tunnelHandle)
 	tunnelsMu.Lock()
@@ -515,8 +534,6 @@ func wgWaitBootstrapReady(tunnelHandle C.int32_t, timeoutMs C.int32_t) C.int32_t
 	return -1
 }
 
-//export wgAttachWireGuard
-//
 // Attaches a WireGuard device to an already-bootstrapped proxy. The caller
 // is expected to have observed wgWaitBootstrapReady return 1 first (so the
 // first TURN conn is live). Creates the TUN from tunFd, wires it to a
@@ -524,6 +541,8 @@ func wgWaitBootstrapReady(tunnelHandle C.int32_t, timeoutMs C.int32_t) C.int32_t
 //
 // Returns 1 on success, -1 if tunnel handle not found, -2 if a device is
 // already attached, or a negative code in -3..-6 for each setup step.
+//
+//export wgAttachWireGuard
 func wgAttachWireGuard(tunnelHandle C.int32_t, wgConfigSettings *C.char, tunFd C.int32_t) C.int32_t {
 	id := int32(tunnelHandle)
 	tunnelsMu.Lock()
@@ -695,8 +714,6 @@ func wgGetTURNServerIP(tunnelHandle C.int32_t) *C.char {
 	return C.CString(entry.proxy.TURNServerIP())
 }
 
-//export wgWaitWrapAProvision
-//
 // For the SRTP-WRAP-A mode (use_wrap_a=true): blocks up to timeoutMs for the
 // server to mint our WireGuard config via GETCONF over the WRAP-A transport,
 // then returns it as JSON:
@@ -709,6 +726,8 @@ func wgGetTURNServerIP(tunnelHandle C.int32_t) *C.char {
 // address/dns/mtu to build the NEPacketTunnelNetworkSettings and passes "uapi"
 // to wgAttachWireGuard. Returns "" on timeout / error / when the tunnel is not
 // in WRAP-A mode. Call this AFTER wgWaitBootstrapReady returns 1.
+//
+//export wgWaitWrapAProvision
 func wgWaitWrapAProvision(tunnelHandle C.int32_t, timeoutMs C.int32_t) *C.char {
 	id := int32(tunnelHandle)
 	tunnelsMu.Lock()
@@ -814,8 +833,6 @@ func wgWakeHealthCheck(tunnelHandle C.int32_t) {
 	entry.proxy.WakeHealthCheck()
 }
 
-//export wgPathChanged
-//
 // Pre-emptive saturation marking on iOS network-path change. Called
 // from Swift's NWPathMonitor pathUpdateHandler after dedup. For each
 // pool slot with active>0 OR lastUsedAt within ~10 min, marks the slot
@@ -833,6 +850,8 @@ func wgWakeHealthCheck(tunnelHandle C.int32_t) {
 //
 // See evaluated_alternatives_pre_emptive_refresh.md for the empirical
 // disproof of the Refresh(0) approach.
+//
+//export wgPathChanged
 func wgPathChanged(tunnelHandle C.int32_t) {
 	id := int32(tunnelHandle)
 	tunnelsMu.Lock()
@@ -846,8 +865,6 @@ func wgPathChanged(tunnelHandle C.int32_t) {
 	entry.proxy.OnPathChange()
 }
 
-//export wgPathInTransition
-//
 // Pause-only path event handler. Called from Swift's NWPathMonitor on
 // satisfied events with iface=other (which empirically means our own TUN
 // device becoming os-default during the brief recursive-routing window
@@ -865,6 +882,8 @@ func wgPathChanged(tunnelHandle C.int32_t) {
 //
 // See Proxy.OnPathTransition + credPool.ExtendPauseAcquireForTransition
 // for full rationale.
+//
+//export wgPathInTransition
 func wgPathInTransition(tunnelHandle C.int32_t) {
 	id := int32(tunnelHandle)
 	tunnelsMu.Lock()
@@ -878,8 +897,6 @@ func wgPathInTransition(tunnelHandle C.int32_t) {
 	entry.proxy.OnPathTransition()
 }
 
-//export wgLogPathSnapshot
-//
 // Triggers a one-shot pathstats log line. Called by Swift's NWPathMonitor
 // handler on every path transition so transient interfaces (e.g. cellular
 // briefly visited during a wifi-cellular-wifi handover) appear in the
@@ -887,6 +904,8 @@ func wgPathInTransition(tunnelHandle C.int32_t) {
 // state per minute and misses sub-minute transitions. The label argument
 // is appended to "pathstats <label>" so the caller can mark each snapshot
 // (e.g. "wifi-satisfied", "cellular-satisfied").
+//
+//export wgLogPathSnapshot
 func wgLogPathSnapshot(tunnelHandle C.int32_t, label *C.char) {
 	id := int32(tunnelHandle)
 	tunnelsMu.Lock()
@@ -931,8 +950,6 @@ func wgRefreshCaptchaURL(tunnelHandle C.int32_t) *C.char {
 	return C.CString(freshURL)
 }
 
-//export wgSetVKCookieAuth
-//
 // Sets this process's cookie ("VKAuth") cred-path state. The caller — the main
 // app before wgProbeVKCreds, or the extension before wgStartVKBootstrap — reads
 // the harvested logged-in cookie from the shared Keychain and passes it here
@@ -942,6 +959,8 @@ func wgRefreshCaptchaURL(tunnelHandle C.int32_t) *C.char {
 // path (no anonymous fallback). linksJSON is a JSON array of call links — in
 // cookie mode the pool spreads conns across each call's relays (~10 per relay).
 // See pkg/proxy/creds_vkcookie.go.
+//
+//export wgSetVKCookieAuth
 func wgSetVKCookieAuth(enabled C.int32_t, cookie *C.char, linksJSON *C.char) {
 	var links []string
 	if lj := C.GoString(linksJSON); lj != "" {
@@ -950,8 +969,6 @@ func wgSetVKCookieAuth(enabled C.int32_t, cookie *C.char, linksJSON *C.char) {
 	proxy.SetVKCookieAuth(enabled != 0, C.GoString(cookie), links)
 }
 
-//export wgSetForceLegacyCaptcha
-//
 // Sets the force-legacy-captcha diagnostic flag for THIS process. Call it in the
 // main app before wgProbeVKCreds; the extension gets the same value through
 // ProxyConfig.ForceLegacyCaptcha and needs no separate call.
@@ -964,18 +981,20 @@ func wgSetVKCookieAuth(enabled C.int32_t, cookie *C.char, linksJSON *C.char) {
 // the captcha-free path regardless of the setting. Device log 30.07: the probe
 // logged "success via VK Calls captcha-free path" at 21:14:36 while the
 // extension logged "vkcalls skipped (force legacy captcha)" five seconds later.
+//
+//export wgSetForceLegacyCaptcha
 func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 	proxy.SetForceLegacyCaptcha(enabled != 0)
 }
 
-//export wgGetAuthError
-//
 // Returns the current cookie ("VKAuth") fatal-auth message, or "" if none. The
 // extension polls this after bootstrap (cookie mode only): a non-empty value
 // means the logged-in cookie was rejected/expired during a background refresh,
 // so the extension stops the tunnel with a user-readable message (it can't show
 // a login WebView from the background). Process-global; no handle needed. Caller
 // frees the returned C string.
+//
+//export wgGetAuthError
 func wgGetAuthError() *C.char {
 	return C.CString(proxy.CookieAuthFatalError())
 }
@@ -990,19 +1009,21 @@ func wgGetAuthError() *C.char {
 // app still has full network, avoids the deadlock.
 //
 // Inputs (all C strings; "" / 0 mean "not provided"):
-//   linkID, vkHostIPsJSON         — required
-//   savedSID, savedKey, savedTs,
-//   savedAttempt, savedToken1,
-//   savedClientID                 — set on retry after the user solved
-//                                   the captcha in a WebView; the entire
-//                                   tuple is reused as-is to retry step2.
+//
+//	linkID, vkHostIPsJSON         — required
+//	savedSID, savedKey, savedTs,
+//	savedAttempt, savedToken1,
+//	savedClientID                 — set on retry after the user solved
+//	                                the captcha in a WebView; the entire
+//	                                tuple is reused as-is to retry step2.
 //
 // Returns a malloc'd C string with one of these JSON shapes; caller frees:
-//   {"status":"ok","success_token":"...","saved_token1":"...","client_id":"...",
-//    "turn_address":"host:port","turn_username":"...","turn_password":"..."}
-//   {"status":"captcha","captcha_url":"...","sid":"...","ts":...,
-//    "attempt":...,"token1":"...","client_id":"...","is_rate_limit":false}
-//   {"status":"error","message":"..."}
+//
+//	{"status":"ok","success_token":"...","saved_token1":"...","client_id":"...",
+//	 "turn_address":"host:port","turn_username":"...","turn_password":"..."}
+//	{"status":"captcha","captcha_url":"...","sid":"...","ts":...,
+//	 "attempt":...,"token1":"...","client_id":"...","is_rate_limit":false}
+//	{"status":"error","message":"..."}
 //
 //export wgProbeVKCreds
 func wgProbeVKCreds(linkID, vkHostIPsJSON, savedSID, savedKey, savedToken1, savedClientID *C.char, savedTs, savedAttempt C.double) *C.char {

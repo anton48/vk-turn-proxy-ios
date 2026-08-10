@@ -90,6 +90,10 @@ enum BackupManager {
         // never came back out, so a round-trip through Export → Import silently
         // turned it off.
         let forceLegacy = (d.object(forKey: "forceLegacyCaptcha") as? Bool) ?? false
+        // Paced synthetic uplink (diagnostic). Exported so a measurement setup
+        // survives a round-trip, but it has no UI and defaults to off.
+        let synthMbit = (d.object(forKey: "uplinkSynthMbit") as? Double) ?? 0
+        let synthSec = (d.object(forKey: "uplinkSynthSec") as? Int) ?? 0
         // Named servers (build 179+). The legacy flat per-server fields are
         // deliberately NOT written alongside them — a backup from this build is
         // not meant to be readable by 178 and earlier.
@@ -108,6 +112,8 @@ enum BackupManager {
             wrapAPassword: nil,
             turnServerOverride: nil,
             forceLegacyCaptcha: forceLegacy,
+            uplinkSynthMbit: synthMbit,
+            uplinkSynthSec: synthSec,
             vkAuth: vkAuth,
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,
@@ -224,6 +230,8 @@ enum BackupManager {
         // forceLegacyCaptcha: undocumented on-device captcha-test toggle
         // (build 149) — nil-preserves-default pattern.
         if let v = s.forceLegacyCaptcha { d.set(v, forKey: "forceLegacyCaptcha") }
+        if let v = s.uplinkSynthMbit { d.set(v, forKey: "uplinkSynthMbit") }
+        if let v = s.uplinkSynthSec { d.set(v, forKey: "uplinkSynthSec") }
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
         if let v = s.liveActivityEnabled { d.set(v, forKey: "liveActivityEnabled") }
         if let v = s.liveActivityCompactClock { d.set(v, forKey: "liveActivityCompactClock") }

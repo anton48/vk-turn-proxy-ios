@@ -144,6 +144,11 @@ struct AppSettings: Codable {
     /// synthesised Decodable actually decodes it, and Optional so an older
     /// backup without the key leaves the device's own value alone.
     var forceLegacyCaptcha: Bool? = nil
+    /// Paced synthetic uplink (diagnostic, no UI). Zero disables it, which is
+    /// the shipped state; set it by hand in a backup to run one measurement.
+    /// Same Optional/nil-preserves-default pattern as forceLegacyCaptcha above.
+    var uplinkSynthMbit: Double? = nil
+    var uplinkSynthSec: Int? = nil
     /// VKAuth (non-anonymous cookie cred path) toggle. Round-trips in full
     /// backups so the preference is preserved. The cookies themselves are NEVER
     /// in the backup — they live in the Keychain (VKCookieStore). Optional +

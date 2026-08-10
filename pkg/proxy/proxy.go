@@ -33,12 +33,12 @@ import (
 
 // Config holds proxy configuration.
 type Config struct {
-	PeerAddr      string        // vk-turn-proxy server address (host:port)
-	TurnServer    string        // override TURN server host (optional)
-	TurnPort      string        // override TURN port (optional)
-	VKLink        string        // VK call invite link or link ID
-	UseDTLS       bool          // true = DTLS obfuscation (default mode)
-	UseUDP        bool          // true = UDP to TURN, false = TCP
+	PeerAddr         string        // vk-turn-proxy server address (host:port)
+	TurnServer       string        // override TURN server host (optional)
+	TurnPort         string        // override TURN port (optional)
+	VKLink           string        // VK call invite link or link ID
+	UseDTLS          bool          // true = DTLS obfuscation (default mode)
+	UseUDP           bool          // true = UDP to TURN, false = TCP
 	NumConns         int           // number of concurrent connections (default 1)
 	CredPoolCooldown time.Duration // post-failure cooldown per slot in the cred pool; <=0 → default 2m
 	CaptchaSolver    CaptchaSolver // called when VK requires captcha (may be nil)
@@ -54,6 +54,16 @@ type Config struct {
 	// (user toggling VPN, iOS killing the extension and respawning) but
 	// expires naturally on its own clock without active cleanup.
 	CredCachePath string
+
+	// UplinkSynthMbit and UplinkSynthSec drive the paced synthetic uplink in
+	// synth.go — a DIAGNOSTIC that answers whether the ~19 Mbit/s upload
+	// ceiling sits above or below SendPacket. Zero (the default) disables it
+	// entirely; anything else runs ONCE, after the connection pool is up, and
+	// then never again for the life of the tunnel. Read the result as ΣUP in
+	// server1's conn-stats, not from this side. See synth.go for the whole
+	// argument and for the two conditions the run needs.
+	UplinkSynthMbit float64
+	UplinkSynthSec  int
 
 	// UseWrap enables the WRAP obfuscation layer between DTLS and TURN
 	// ChannelData (see pkg/proxy/wrap.go). When true, every packet on
@@ -135,22 +145,22 @@ type Config struct {
 
 // Stats holds live tunnel statistics.
 type Stats struct {
-	TxBytes          int64   `json:"tx_bytes"`
-	RxBytes          int64   `json:"rx_bytes"`
-	ActiveConns      int32   `json:"active_conns"`
-	TotalConns       int32   `json:"total_conns"`
-	TurnRTTms        float64 `json:"turn_rtt_ms"`                 // last TURN Allocate RTT
-	DTLSHandshakeMs  float64 `json:"dtls_handshake_ms"`           // last DTLS handshake time
-	LastHandshakeSec int64   `json:"last_handshake_sec"`          // seconds since last WG handshake
-	Reconnects       int64   `json:"reconnects"`                  // total TURN reconnects
-	CredPoolFilled    int32 `json:"cred_pool_filled"`     // slots usable for NEW conns (fresh: cred present, not expiring within 30 min, not pending, not saturated)
-	CredPoolWithCreds int32 `json:"cred_pool_with_creds"` // slots physically holding a cred — superset of CredPoolFilled. Diverges when a cred crosses the 30-min expiry buffer: drops out of "fresh", but existing conns on it stay alive until VK-side allocation expires
-	CredPoolSize      int32 `json:"cred_pool_size"`       // total cred pool capacity
-	CredPoolDistinctRelays int32 `json:"cred_pool_distinct_relays"` // distinct TURN relay addresses held across filled slots (4th "Pool" number)
-	TunnelUptimeSec   int64 `json:"tunnel_uptime_sec"`    // seconds since the proxy instance was created — the iOS UI uses this to render Uptime independent of main-app lifecycle (resists jetsam-respawn of the main app while extension keeps running)
-	CaptchaImageURL  string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
-	CaptchaSID       string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
-	AuthError        string  `json:"auth_error,omitempty"`        // non-empty when cookie (VKAuth) auth hit an unrecoverable rejection — the iOS app shows it + stops the tunnel
+	TxBytes                int64   `json:"tx_bytes"`
+	RxBytes                int64   `json:"rx_bytes"`
+	ActiveConns            int32   `json:"active_conns"`
+	TotalConns             int32   `json:"total_conns"`
+	TurnRTTms              float64 `json:"turn_rtt_ms"`                 // last TURN Allocate RTT
+	DTLSHandshakeMs        float64 `json:"dtls_handshake_ms"`           // last DTLS handshake time
+	LastHandshakeSec       int64   `json:"last_handshake_sec"`          // seconds since last WG handshake
+	Reconnects             int64   `json:"reconnects"`                  // total TURN reconnects
+	CredPoolFilled         int32   `json:"cred_pool_filled"`            // slots usable for NEW conns (fresh: cred present, not expiring within 30 min, not pending, not saturated)
+	CredPoolWithCreds      int32   `json:"cred_pool_with_creds"`        // slots physically holding a cred — superset of CredPoolFilled. Diverges when a cred crosses the 30-min expiry buffer: drops out of "fresh", but existing conns on it stay alive until VK-side allocation expires
+	CredPoolSize           int32   `json:"cred_pool_size"`              // total cred pool capacity
+	CredPoolDistinctRelays int32   `json:"cred_pool_distinct_relays"`   // distinct TURN relay addresses held across filled slots (4th "Pool" number)
+	TunnelUptimeSec        int64   `json:"tunnel_uptime_sec"`           // seconds since the proxy instance was created — the iOS UI uses this to render Uptime independent of main-app lifecycle (resists jetsam-respawn of the main app while extension keeps running)
+	CaptchaImageURL        string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
+	CaptchaSID             string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
+	AuthError              string  `json:"auth_error,omitempty"`        // non-empty when cookie (VKAuth) auth hit an unrecoverable rejection — the iOS app shows it + stops the tunnel
 }
 
 // Proxy manages the DTLS+TURN tunnel to the peer server.
@@ -297,8 +307,8 @@ type Proxy struct {
 	lastRefreshCaptchaTime atomic.Int64 // unix seconds
 
 	// Stats
-	txBytes     atomic.Int64
-	rxBytes     atomic.Int64
+	txBytes atomic.Int64
+	rxBytes atomic.Int64
 
 	// Per-packet counters added 2026-05-27 (build 140) for diagnostic
 	// of the "kernel-buffered packet flood on attach" hypothesis. After
@@ -311,8 +321,8 @@ type Proxy struct {
 	// (tunnel→app) increments rxPackets per packet we delivered to WG
 	// for decap. Suspect signature: SendPacket rate >>500/s briefly on
 	// fresh-extension attach.
-	txPackets atomic.Int64
-	rxPackets atomic.Int64
+	txPackets   atomic.Int64
+	rxPackets   atomic.Int64
 	activeConns atomic.Int32
 	totalConns  atomic.Int32
 	turnRTTns   atomic.Int64 // nanoseconds
@@ -488,15 +498,15 @@ func NewProxy(cfg Config) *Proxy {
 	ctx, cancel := context.WithCancel(context.Background())
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	p := &Proxy{
-		config:          cfg,
-		ctx:             ctx,
-		cancel:          cancel,
-		sendCh:          make(chan []byte, 256),
-		recvCh:          make(chan []byte, 256),
-		sessCtx:         sessCtx,
-		sessCancel:      sessCancel,
-		captchaCh:       make(chan string, 1),
-		bootstrapDoneCh: make(chan error, 1),
+		config:            cfg,
+		ctx:               ctx,
+		cancel:            cancel,
+		sendCh:            make(chan []byte, 256),
+		recvCh:            make(chan []byte, 256),
+		sessCtx:           sessCtx,
+		sessCancel:        sessCancel,
+		captchaCh:         make(chan string, 1),
+		bootstrapDoneCh:   make(chan error, 1),
 		lastPongTimes:     make([]atomic.Int64, cfg.NumConns),
 		lastPingSeq:       make([]atomic.Uint64, cfg.NumConns),
 		lastPongSeq:       make([]atomic.Uint64, cfg.NumConns),
@@ -689,6 +699,11 @@ func (p *Proxy) Start() error {
 	// [PathMonitor] log lines.
 	go p.logPathStatsLoop(p.ctx)
 
+	// Paced synthetic uplink — returns immediately unless UplinkSynthMbit is
+	// set, in which case it waits for the pool and runs once. Diagnostic only;
+	// see synth.go.
+	go p.runUplinkSynthLoop(p.ctx)
+
 	err = p.startConnections()
 	if err != nil {
 		// Fatal failure before any conn came up — wake any bootstrap waiters
@@ -711,6 +726,7 @@ func (p *Proxy) Start() error {
 //     records a cooldown instead of blocking on user input.
 //   - Fast poll (2s) while there is work to do, slow poll (30s) when all
 //     slots are full or on cooldown.
+//
 // Lifetime = p.ctx (stops on Proxy.Stop).
 func (p *Proxy) growCredPool(ctx context.Context) {
 	// Wait until the first conn has a live DTLS+TURN session. There's no
@@ -1379,6 +1395,7 @@ func (p *Proxy) wakeChannel() <-chan struct{} {
 //   - Captcha-triggered slow ramp-up commonly leaves us at "10/30 active
 //     for 5+ min" while VK rate-limits PoW for our IP. Forcing reconnect
 //     in that state killed 10 working conns and didn't help unstick VK.
+//
 // runDiagnosticHeartbeat fires a single-line log every `interval` for up
 // to `window` total duration. Purpose: confirm the extension process is
 // still alive at known timestamps when otherwise quiet (post-cold-start
@@ -1683,21 +1700,21 @@ func (p *Proxy) GetStats() Stats {
 	poolFresh, poolWithCreds, poolSize := p.credPool.snapshotSize()
 	distinctRelays := p.credPool.distinctRelays()
 	return Stats{
-		TxBytes:           p.txBytes.Load(),
-		RxBytes:           p.rxBytes.Load(),
-		ActiveConns:       p.activeConns.Load(),
-		TotalConns:        p.totalConns.Load(),
-		TurnRTTms:         float64(p.turnRTTns.Load()) / 1e6,
-		DTLSHandshakeMs:   float64(p.dtlsHSns.Load()) / 1e6,
-		Reconnects:        p.reconnects.Load(),
-		CredPoolFilled:    int32(poolFresh),
-		CredPoolWithCreds: int32(poolWithCreds),
-		CredPoolSize:      int32(poolSize),
+		TxBytes:                p.txBytes.Load(),
+		RxBytes:                p.rxBytes.Load(),
+		ActiveConns:            p.activeConns.Load(),
+		TotalConns:             p.totalConns.Load(),
+		TurnRTTms:              float64(p.turnRTTns.Load()) / 1e6,
+		DTLSHandshakeMs:        float64(p.dtlsHSns.Load()) / 1e6,
+		Reconnects:             p.reconnects.Load(),
+		CredPoolFilled:         int32(poolFresh),
+		CredPoolWithCreds:      int32(poolWithCreds),
+		CredPoolSize:           int32(poolSize),
 		CredPoolDistinctRelays: int32(distinctRelays),
-		TunnelUptimeSec:   int64(time.Since(p.startedAt).Seconds()),
-		CaptchaImageURL:   captchaURL,
-		CaptchaSID:        captchaSID,
-		AuthError:         CookieAuthFatalError(),
+		TunnelUptimeSec:        int64(time.Since(p.startedAt).Seconds()),
+		CaptchaImageURL:        captchaURL,
+		CaptchaSID:             captchaSID,
+		AuthError:              CookieAuthFatalError(),
 	}
 }
 
@@ -1793,7 +1810,7 @@ func (p *Proxy) RefreshCaptchaURL() string {
 
 	// Step 2: trigger captcha
 	step2URL := fmt.Sprintf("https://%s/method/calls.getAnonymousToken?v=5.275&client_id=%s", vkAPIHost(), vc.ClientID)
-	step2Data := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s",
+	step2Data := fmt.Sprintf("vk_join_link="+vkCallJoinBase+"%s&name=%s&access_token=%s",
 		linkID, neturl.QueryEscape(name), token1)
 	step2Resp, err := doSimplePost(client, step2Data, step2URL, ua)
 	if err != nil {
@@ -2107,50 +2124,50 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 		clearCookieAuthFatal()
 		creds = c
 	} else {
-	var solver CaptchaSolver
-	if allowCaptchaBlock {
-		solver = p.config.CaptchaSolver
-	}
+		var solver CaptchaSolver
+		if allowCaptchaBlock {
+			solver = p.config.CaptchaSolver
+		}
 
-	// Consume any pre-solved captcha tokens (one-shot — the success_token
-	// is only valid for the exact next step2 call).
-	var solvedSID, solvedKey string
-	var solvedTs, solvedAttempt float64
-	if v := p.lastCaptchaSID.Load(); v != nil {
-		solvedSID, _ = v.(string)
-		if solvedSID != "" {
-			p.lastCaptchaSID.Store("")
+		// Consume any pre-solved captcha tokens (one-shot — the success_token
+		// is only valid for the exact next step2 call).
+		var solvedSID, solvedKey string
+		var solvedTs, solvedAttempt float64
+		if v := p.lastCaptchaSID.Load(); v != nil {
+			solvedSID, _ = v.(string)
+			if solvedSID != "" {
+				p.lastCaptchaSID.Store("")
+			}
 		}
-	}
-	if v := p.lastCaptchaKey.Load(); v != nil {
-		solvedKey, _ = v.(string)
-		if solvedKey != "" {
-			p.lastCaptchaKey.Store("")
+		if v := p.lastCaptchaKey.Load(); v != nil {
+			solvedKey, _ = v.(string)
+			if solvedKey != "" {
+				p.lastCaptchaKey.Store("")
+			}
 		}
-	}
-	if v := p.lastCaptchaTs.Load(); v != nil {
-		solvedTs, _ = v.(float64)
-	}
-	if v := p.lastCaptchaAttempt.Load(); v != nil {
-		solvedAttempt, _ = v.(float64)
-	}
-	var savedToken1 string
-	if v := p.lastCaptchaToken1.Load(); v != nil {
-		savedToken1, _ = v.(string)
-		if savedToken1 != "" {
-			p.lastCaptchaToken1.Store("")
+		if v := p.lastCaptchaTs.Load(); v != nil {
+			solvedTs, _ = v.(float64)
 		}
-	}
+		if v := p.lastCaptchaAttempt.Load(); v != nil {
+			solvedAttempt, _ = v.(float64)
+		}
+		var savedToken1 string
+		if v := p.lastCaptchaToken1.Load(); v != nil {
+			savedToken1, _ = v.(string)
+			if savedToken1 != "" {
+				p.lastCaptchaToken1.Store("")
+			}
+		}
 
-	// solver=nil → CaptchaRequiredError surfaces instead of blocking.
-	// savedClientID="" preserves existing mid-session behavior — proxy.go
-	// doesn't track client_id on captcha-retry today (independent of the
-	// pre-bootstrap captcha flow which does pin client_id strictly).
-	c, err := GetVKCreds(p.linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1, "")
-	if err != nil {
-		return "", nil, fmt.Errorf("get VK creds: %w", err)
-	}
-	creds = c
+		// solver=nil → CaptchaRequiredError surfaces instead of blocking.
+		// savedClientID="" preserves existing mid-session behavior — proxy.go
+		// doesn't track client_id on captcha-retry today (independent of the
+		// pre-bootstrap captcha flow which does pin client_id strictly).
+		c, err := GetVKCreds(p.linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1, "")
+		if err != nil {
+			return "", nil, fmt.Errorf("get VK creds: %w", err)
+		}
+		creds = c
 	} // end else (anonymous path)
 	// Apply the "TURN server" override (Settings → optional turn_server/
 	// turn_port; empty = no override) to every VK-returned address. This is
@@ -3652,8 +3669,8 @@ func (p *Proxy) dumpConnStats(prevTx, prevRx []int64, prevTime time.Time, label 
 	}
 
 	type row struct {
-		idx        int
-		tx, rx     int64 // delta in interval
+		idx          int
+		tx, rx       int64 // delta in interval
 		txCum, rxCum int64
 	}
 	rows := make([]row, n)
@@ -3768,43 +3785,43 @@ var TaskVMInfoFn func() TaskVMInfo
 //
 // Process-level (from Mach task_vm_info, full-process accounting):
 //   - rss:            phys_footprint via Mach task_info — what iOS
-//                     jetsam actually evaluates. The headline number;
-//                     "n/a" if TaskVMInfoFn isn't wired up.
+//     jetsam actually evaluates. The headline number;
+//     "n/a" if TaskVMInfoFn isn't wired up.
 //   - vm-internal:    private/anonymous resident pages — Go heap +
-//                     Swift heap + kernel mbufs + framework state.
-//                     Growth here without Go `sys` rising points at
-//                     non-Go allocation (CFNetwork, mbufs, Swift host).
+//     Swift heap + kernel mbufs + framework state.
+//     Growth here without Go `sys` rising points at
+//     non-Go allocation (CFNetwork, mbufs, Swift host).
 //   - vm-external:    file-backed mappings — binary, frameworks, dyld.
-//                     Should be roughly stable; sharp changes hint
-//                     framework load/unload.
+//     Should be roughly stable; sharp changes hint
+//     framework load/unload.
 //   - vm-reusable:    pages MADV_FREE'd (kernel can reclaim). Go's
-//                     heap-released is a subset. If vm-reusable >>
-//                     heap-released, something non-Go is also freeing.
+//     heap-released is a subset. If vm-reusable >>
+//     heap-released, something non-Go is also freeing.
 //   - vm-compressed:  kernel-compressed (swapped) pages. Growth = we
-//                     got pushed into compressed swap due to system-
-//                     wide pressure (often other apps crowding us).
+//     got pushed into compressed swap due to system-
+//     wide pressure (often other apps crowding us).
 //
 // Go runtime (from runtime.MemStats, Go-only accounting):
 //   - sys:            bytes Go mapped from the OS. On Darwin overstates
-//                     resident by 10-20 MB because released pages stay
-//                     in the address space until kernel reclaim.
+//     resident by 10-20 MB because released pages stay
+//     in the address space until kernel reclaim.
 //   - heap-alloc:     bytes of currently-live heap objects.
 //   - heap-inuse:     in-use spans (>= heap-alloc; gap is fragmentation
-//                     or retained-but-not-live within active spans).
+//     or retained-but-not-live within active spans).
 //   - heap-idle:      bytes in idle (unused) spans, candidates for
-//                     return-to-OS.
+//     return-to-OS.
 //   - heap-released:  bytes Go has explicitly released to the OS via
-//                     madvise. heap-released growing alongside churn
-//                     = scavenger working; stuck at zero while sys
-//                     climbs = scavenger lazy.
+//     madvise. heap-released growing alongside churn
+//     = scavenger working; stuck at zero while sys
+//     climbs = scavenger lazy.
 //   - stack:          total stack memory (NumConns × per-conn goroutines
-//                     × 8 KB initial). Not affected by GOMEMLIMIT.
+//     × 8 KB initial). Not affected by GOMEMLIMIT.
 //   - heap-objects:   count of live objects (rises with allocation
-//                     leaks even when alloc bytes look stable).
+//     leaks even when alloc bytes look stable).
 //   - goroutines:     leak indicator; should stabilise at roughly
-//                     NumConns × small-constant once startup settles.
+//     NumConns × small-constant once startup settles.
 //   - numGC:          GC cycle count; high deltas between ticks mean
-//                     heavy alloc churn even if heap-alloc is steady.
+//     heavy alloc churn even if heap-alloc is steady.
 //
 // Correlation playbook for jetsam attribution:
 //   - rss rising + sys rising together → Go-side allocation. Look at
@@ -4021,16 +4038,16 @@ func pathSnapshotOSDefault() string {
 //
 // What to look for:
 //   - os-default:  current OS-picked source IP for new outbound UDP.
-//                  Compare across ticks to spot rebinds that didn't
-//                  fire a [PathMonitor] event.
+//     Compare across ticks to spot rebinds that didn't
+//     fire a [PathMonitor] event.
 //   - in-sync:     count of currently-allocated conns whose
-//                  allocation-time local IP matches os-default. In
-//                  steady state this should be NumConns/NumConns once
-//                  bootstrap finishes.
+//     allocation-time local IP matches os-default. In
+//     steady state this should be NumConns/NumConns once
+//     bootstrap finishes.
 //   - stale:       any local IPs (and conn counts) that don't match
-//                  os-default. Non-zero stale = some allocations are
-//                  living on a doomed interface. Empty list if none
-//                  (omitted from log to keep the line short).
+//     os-default. Non-zero stale = some allocations are
+//     living on a doomed interface. Empty list if none
+//     (omitted from log to keep the line short).
 //
 // Conns whose connLocalIPs entry is empty (not currently allocated —
 // dormant, bootstrap-pending, or just torn down) are excluded from
@@ -4362,7 +4379,9 @@ func sanitizeLog(s string) string { return strings.ReplaceAll(s, "\x00", "") }
 // server-side stale and the cred pool slot should be invalidated.
 //
 // pion/turn surfaces these as e.g.
-//   "TURN allocate: Allocate error response (error 401: Unauthorized)"
+//
+//	"TURN allocate: Allocate error response (error 401: Unauthorized)"
+//
 // We string-match the numeric codes because pion does not export typed
 // error wrappers we could errors.As against — the Allocate error is
 // constructed via fmt.Errorf with the integer formatted into the message.
@@ -4990,14 +5009,14 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	}
 
 	tc, err := turn.NewClient(&turn.ClientConfig{
-		TURNServerAddr:         turnAddr,
-		Conn:                   ctlConn,
-		Username:               creds.Username,
-		Password:               creds.Password,
-		Realm:                  "okcdn.ru",
-		Software:               "vk-turn-srtp",
+		TURNServerAddr: turnAddr,
+		Conn:           ctlConn,
+		Username:       creds.Username,
+		Password:       creds.Password,
+		Realm:          "okcdn.ru",
+		Software:       "vk-turn-srtp",
 		// Custom factory (not pion's default LogLevelError) so SRTP-path TURN refresh/auth failures feed the silent-degradation watchdog + get sanitized, matching runTURN.
-		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: credSlot},
+		LoggerFactory: &turnLoggerFactory{proxy: p, slot: credSlot},
 		// Match the relay family to the peer (see addrFamilyFor) — was
 		// hardcoded IPv4, which 443'd ("Peer Address Family Mismatch") on an
 		// IPv6 peer (e.g. a DNS name resolving to AAAA) — issue #39.
@@ -5057,7 +5076,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 // Client to the underlying TURN allocation and control conn so a single
 // Close() tears down the whole stack.
 type srtpSessionConn struct {
-	net.Conn // SRTP-wrapped conn
+	net.Conn  // SRTP-wrapped conn
 	relayConn net.PacketConn
 	tc        *turn.Client
 	ctlConn   net.PacketConn
@@ -5081,4 +5100,3 @@ func (s *srtpSessionConn) Close() error {
 	})
 	return firstErr
 }
-
