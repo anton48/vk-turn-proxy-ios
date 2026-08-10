@@ -862,6 +862,34 @@ func (p *Proxy) growCredPool(ctx context.Context) {
 	}
 }
 
+// The connection ramp, at package scope so anything that has to WAIT for the
+// pool computes the wait from the same numbers that create it.
+//
+// 🚨 These were local constants inside startConnections until 2026-08-10, and
+// the synthetic uplink duly picked its 90-second timeout by eyeballing the
+// code — while a 30-conn ramp takes 106.8 s BY CONSTRUCTION. It gave up 17
+// seconds short of a full pool and cost a device run. Anything with a deadline
+// against this ramp must call expectedRampTime; never guess it.
+const (
+	rampBurstSize    = 10
+	rampBurstStagger = 200 * time.Millisecond
+	rampSlowStagger  = 5 * time.Second
+)
+
+// expectedRampTime is when the LAST connection of an n-connection pool is
+// launched, measured from startConnections. Establishment takes longer still,
+// so callers add their own slack. n=30 → 1m46.8s; n=60 → 4m16.8s.
+func expectedRampTime(n int) time.Duration {
+	if n <= rampBurstSize {
+		if n <= 1 {
+			return 0
+		}
+		return time.Duration(n-1) * rampBurstStagger
+	}
+	return time.Duration(rampBurstSize-1)*rampBurstStagger +
+		time.Duration(n-rampBurstSize)*rampSlowStagger
+}
+
 // startConnections launches all connection goroutines using the current session context.
 func (p *Proxy) startConnections() error {
 	p.sessMu.Lock()
@@ -1075,23 +1103,20 @@ func (p *Proxy) startConnections() error {
 	//
 	// For NumConns ≤ burstSize, the slow branch is never taken and
 	// behaviour matches the previous linear stagger (200ms × i).
-	const burstSize = 10
-	const burstStagger = 200 * time.Millisecond
-	const slowStagger = 5 * time.Second
 	for i := 1; i < p.config.NumConns; i++ {
 		p.wg.Add(1)
 		connIdx := i
 		go func() {
 			defer p.wg.Done()
 			var delay time.Duration
-			if connIdx < burstSize {
-				delay = time.Duration(connIdx) * burstStagger
+			if connIdx < rampBurstSize {
+				delay = time.Duration(connIdx) * rampBurstStagger
 			} else {
 				// Burst phase ends at (burstSize-1)*burstStagger after t=0.
 				// Then each subsequent conn launches slowStagger after
 				// the previous one.
-				delay = time.Duration(burstSize-1)*burstStagger +
-					time.Duration(connIdx-burstSize+1)*slowStagger
+				delay = time.Duration(rampBurstSize-1)*rampBurstStagger +
+					time.Duration(connIdx-rampBurstSize+1)*rampSlowStagger
 			}
 			select {
 			case <-time.After(delay):

@@ -67,9 +67,27 @@ const (
 	synthMaxMbit = 200.0
 	synthMaxSec  = 120
 
-	// How long to wait for the connection pool before giving up. The generator
-	// is worthless against a partial pool — the whole point is N-way fan-out.
-	synthPoolWait = 90 * time.Second
+	// 🚨 HOW LONG TO WAIT FOR THE POOL, AND WHY IT IS NOT A NUMBER.
+	//
+	// The first version of this file used a flat 90 s, picked by eyeballing the
+	// code. A 30-connection ramp takes **106.8 s by construction** — 200 ms
+	// apart for the first ten, then 5 s apart for the rest — so the generator
+	// gave up 17 seconds before the pool completed, logged a refusal, and cost
+	// a device run. The device's own HEARTBEAT shows the ramp exactly: one more
+	// conn every 5 s, 30 up at t+1m47s.
+	//
+	// So the wait is DERIVED from the same constants that build the ramp, via
+	// expectedRampTime, plus slack for establishment. Never hardcode it again.
+	synthPoolSlack = 45 * time.Second
+
+	// What fraction of the pool is enough. Not 100%: at 27 of 30 the N-way
+	// fan-out under test is entirely present, and refusing outright wastes a
+	// device run for a 10% shortfall. Below this the run is genuinely
+	// uninterpretable and is skipped.
+	//
+	// ⚠️ Whatever it runs with, the COUNT goes in both the START and DONE lines,
+	// so a partial run can never be mistaken for a full one after the fact.
+	synthMinPoolFrac = 0.9
 )
 
 // runUplinkSynthLoop is the one-shot generator. It returns as soon as the run
@@ -96,7 +114,8 @@ func (p *Proxy) runUplinkSynthLoop(ctx context.Context) {
 	if want <= 0 {
 		want = 1
 	}
-	if !p.waitForConns(ctx, want) {
+	got, ok := p.waitForConns(ctx, want)
+	if !ok {
 		return
 	}
 
@@ -105,11 +124,11 @@ func (p *Proxy) runUplinkSynthLoop(ctx context.Context) {
 	if burst < 1 {
 		burst = 1
 	}
-	log.Printf("uplink-synth: START — target %.1f Mbit/s for %ds over %d conns "+
+	log.Printf("uplink-synth: START — target %.1f Mbit/s for %ds over %d of %d conns "+
 		"(%.0f pkt/s of %d B, bursts of %d every %s). 🚨 The number that matters "+
 		"is ΣUP in server1's conn-stats, NOT this side's; run the server with "+
 		"-uplink-reseq=0 and keep the phone otherwise idle.",
-		mbit, secs, want, pktPerSec, synthPktSize, burst, synthTick)
+		mbit, secs, got, want, pktPerSec, synthPktSize, burst, synthTick)
 
 	var sent, blocked int64
 	buf := make([]byte, synthPktSize)
@@ -147,30 +166,55 @@ func (p *Proxy) runUplinkSynthLoop(ctx context.Context) {
 	elapsed := time.Since(start)
 	offered := float64(sent) * synthPktSize * 8 / elapsed.Seconds() / 1e6
 	log.Printf("uplink-synth: DONE — OFFERED %d packets, %.1f MiB, %.1f Mbit/s over %s "+
-		"(%d sends blocked on sendCh). ⚠️ This is what we offered, not what "+
-		"arrived: read ΣUP at server1 for the answer.",
-		sent, float64(sent)*synthPktSize/(1<<20), offered, elapsed.Round(time.Millisecond), blocked)
+		"across %d of %d conns (%d sends blocked on sendCh). ⚠️ This is what we "+
+		"offered, not what arrived: read ΣUP at server1 for the answer.",
+		sent, float64(sent)*synthPktSize/(1<<20), offered, elapsed.Round(time.Millisecond),
+		got, want, blocked)
 }
 
-// waitForConns blocks until the pool is up, or gives up. Returns false if the
-// run should not happen.
-func (p *Proxy) waitForConns(ctx context.Context, want int32) bool {
-	deadline := time.Now().Add(synthPoolWait)
+// waitForConns blocks until the pool is usable. It returns the count it settled
+// for and whether the run should happen at all.
+//
+// The deadline comes from expectedRampTime, not from a constant — see
+// synthPoolSlack for what guessing it cost.
+func (p *Proxy) waitForConns(ctx context.Context, want int32) (int32, bool) {
+	need := int32(float64(want)*synthMinPoolFrac + 0.999)
+	if need < 1 {
+		need = 1
+	}
+	budget := expectedRampTime(int(want)) + synthPoolSlack
+	deadline := time.Now().Add(budget)
+	log.Printf("uplink-synth: waiting for %d of %d conns, up to %s "+
+		"(the ramp itself takes %s by construction)",
+		need, want, budget.Round(time.Second), expectedRampTime(int(want)).Round(time.Second))
+	lastLog := time.Now()
 	for {
-		if n := p.activeConns.Load(); n >= want {
-			return true
+		n := p.activeConns.Load()
+		if n >= want {
+			return n, true
 		}
 		if time.Now().After(deadline) {
-			// ⚠️ Do NOT run against a partial pool and report the number as if
-			// it meant something. N-way fan-out is the thing under test.
-			log.Printf("uplink-synth: only %d of %d conns after %s — NOT running, "+
-				"a partial pool would produce a number that answers nothing",
-				p.activeConns.Load(), want, synthPoolWait)
-			return false
+			if n >= need {
+				// ⚠️ Runs, but the count rides in every line from here on, so
+				// the number can never be read later as if the pool were full.
+				log.Printf("uplink-synth: %d of %d conns after %s — running anyway, "+
+					"the fan-out under test is present; the count is in the START "+
+					"and DONE lines", n, want, budget.Round(time.Second))
+				return n, true
+			}
+			log.Printf("uplink-synth: only %d of %d conns after %s (needed %d) — NOT "+
+				"running, a pool this partial produces a number that answers nothing",
+				n, want, budget.Round(time.Second), need)
+			return n, false
+		}
+		if time.Since(lastLog) >= 15*time.Second {
+			log.Printf("uplink-synth: %d of %d conns, %s left", n, want,
+				time.Until(deadline).Round(time.Second))
+			lastLog = time.Now()
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return n, false
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
