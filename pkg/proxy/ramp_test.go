@@ -15,8 +15,8 @@ func TestExpectedRampTimeMatchesTheStagger(t *testing.T) {
 	}{
 		{1, 0},
 		{10, 1800 * time.Millisecond},
-		{30, 1800*time.Millisecond + 20*5*time.Second},  // 1m46.8s — the measured 30-conn ramp
-		{60, 1800*time.Millisecond + 50*5*time.Second},  // 4m16.8s
+		{30, 1800*time.Millisecond + 20*5*time.Second}, // 1m46.8s — the measured 30-conn ramp
+		{60, 1800*time.Millisecond + 50*5*time.Second}, // 4m16.8s
 	} {
 		if got := expectedRampTime(c.n); got != c.want {
 			t.Fatalf("expectedRampTime(%d) = %s, want %s", c.n, got, c.want)

@@ -318,6 +318,11 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		log.Printf("wgTurnOnWithTURN: CreateTUNFromFile failed: %s", err)
 		return -5
 	}
+	// Time the uplink read loop — see pkg/proxy/tunstats.go. Transparent
+	// wrapper: only Read is intercepted, and only to measure where the loop's
+	// time goes. It answers "is wireguard-go starved or slow?", which is the
+	// one question left about the ~22 Mbit/s upload ceiling.
+	tunDev = proxy.WrapTUNForStats(tunDev)
 
 	// Create WireGuard device with our custom bind
 	logger := device.NewLogger(device.LogLevelVerbose, "(wireguard-turn) ")
@@ -577,6 +582,11 @@ func wgAttachWireGuard(tunnelHandle C.int32_t, wgConfigSettings *C.char, tunFd C
 		log.Printf("wgAttachWireGuard: CreateTUNFromFile failed: %s", err)
 		return -4
 	}
+	// Time the uplink read loop — see pkg/proxy/tunstats.go. Transparent
+	// wrapper: only Read is intercepted, and only to measure where the loop's
+	// time goes. It answers "is wireguard-go starved or slow?", which is the
+	// one question left about the ~22 Mbit/s upload ceiling.
+	tunDev = proxy.WrapTUNForStats(tunDev)
 
 	logger := device.NewLogger(device.LogLevelVerbose, "(wireguard-turn) ")
 	dev := device.NewDevice(tunDev, bind, logger)

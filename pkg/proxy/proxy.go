@@ -3931,7 +3931,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d recvch-peak=%d/%d recvch-block=%s/%d",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d recvch-peak=%d/%d recvch-block=%s/%d%s",
 			label,
 			rssStr,
 			internalStr,
@@ -3966,7 +3966,11 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			p.recvChPeak.Swap(0),
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
-			p.recvChBlockCount.Swap(0))
+			p.recvChBlockCount.Swap(0),
+			// Empty unless the TUN wrapper is installed — see tunstats.go. It
+			// answers the one question left about the uplink: is wireguard-go
+			// STARVED (~100% of its loop inside tun.Read) or SLOW?
+			tunReadSummary())
 
 		// Alloc-spike alert (build 140): if heap-alloc grew more than
 		// allocSpikeThreshold (5 MB) between ticks, emit a dedicated
