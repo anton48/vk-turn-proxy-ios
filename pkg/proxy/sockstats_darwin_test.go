@@ -54,6 +54,13 @@ func TestSampleTCPInfoReadsARealSocket(t *testing.T) {
 		t.Errorf("cwnd = 0 on an established connection — the struct is probably "+
 			"misaligned; got %+v", info)
 	}
+	// An established peer always advertises something. Zero here would mean the
+	// field is misread, and a misread window is exactly the kind of number that
+	// gets quoted as "the relay is throttling us".
+	if info.sndWnd == 0 {
+		t.Errorf("sndWnd = 0 on an established loopback connection — misaligned "+
+			"or wrong field; got %+v", info)
+	}
 	// The socket buffer must have held something at some point during a 64 KiB
 	// write, but by the time we sample, loopback may already have drained it —
 	// so this is deliberately NOT asserted. Recording why, so nobody adds a
@@ -112,7 +119,7 @@ func TestSummaryOverRealSockets(t *testing.T) {
 		s.register(i, c)
 	}
 	out := s.summary()
-	for _, want := range []string{"sock=3", "sb=", "cwnd=", "srtt=", "rtx=+", "lossrec=", "reord="} {
+	for _, want := range []string{"sock=3", "sb=", "cwnd=", "wnd=", "sbmax-wnd=", "srtt=", "rtx=+", "lossrec=", "reord="} {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary %q is missing %q", out, want)
 		}

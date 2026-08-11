@@ -102,6 +102,33 @@ func TestTheInFlightCaveatIsDocumented(t *testing.T) {
 	}
 }
 
+// 🎯 THE DECISIVE PAIRING. The question the window answers is not "is some
+// connection throttled" but "is the connection that is BACKED UP the throttled
+// one" — so the window must come from the same connection as the deepest buffer,
+// never from a pool-wide minimum that could belong to an idle socket.
+func TestWindowIsReportedForTheConnectionThatIsBackedUp(t *testing.T) {
+	// The deepest buffer is the middle entry; the smallest window belongs to an
+	// idle connection and must NOT be what gets reported.
+	got := windowAtDeepestBuffer([]sbWnd{
+		{sb: 1 << 10, wnd: 1 << 20},
+		{sb: 128 << 10, wnd: 64 << 10}, // backed up, throttled — this one
+		{sb: 0, wnd: 4 << 10},          // idle, tiny window — a decoy
+	})
+	if got != 64<<10 {
+		t.Fatalf("window = %d, want %d — a pool-wide minimum would have reported "+
+			"the idle connection's 4 KiB and invented a throttle that is not there",
+			got, 64<<10)
+	}
+
+	if got := windowAtDeepestBuffer(nil); got != 0 {
+		t.Fatalf("empty pool = %d, want 0", got)
+	}
+	// Ties resolve to the first, deterministically — no map iteration order.
+	if got := windowAtDeepestBuffer([]sbWnd{{sb: 5, wnd: 111}, {sb: 5, wnd: 222}}); got != 111 {
+		t.Fatalf("tie = %d, want the first (111)", got)
+	}
+}
+
 // 🚨 THE GUARD THAT WAS MISSING, AND IT COST A DEVICE RUN. Build 233 registered
 // the socket in runTURN and shipped. SRTP is the production transport and dials
 // its TURN connection somewhere else entirely, so `sock=` appeared in exactly

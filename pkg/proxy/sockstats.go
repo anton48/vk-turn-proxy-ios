@@ -45,8 +45,18 @@ import (
 
 // tcpInfo is the platform-independent subset of what a sampler returns.
 type tcpInfo struct {
-	sbBytes        uint32 // send socket buffer occupancy, INCLUDING in-flight
-	cwnd           uint32 // congestion window in bytes — bounds the in-flight part
+	sbBytes uint32 // send socket buffer occupancy, INCLUDING in-flight
+	cwnd    uint32 // congestion window in bytes — bounds the in-flight part
+
+	// sndWnd is the window the PEER advertises to us — how much the relay is
+	// willing to accept right now. Added in build 235 because the first run with
+	// this sampler excluded the other two reasons a send buffer could stop
+	// draining: cwnd reached 3 MB and never collapsed, and the outer TCP lost
+	// almost nothing (208 retransmits in a whole run, loss-recovery flag never
+	// set). With congestion and loss out, a full buffer means the far end is not
+	// taking the bytes — which is this field.
+	sndWnd uint32
+
 	srttMs         uint32 // smoothed RTT of the OUTER connection, ms
 	rttvarMs       uint32
 	rtxPkts        uint64 // cumulative retransmitted packets on this socket
@@ -120,7 +130,8 @@ func (s *sockStats) summary() string {
 	}
 	sort.Ints(idx)
 
-	var sb, cwnd, srtt []int
+	var sb, cwnd, srtt, wnd []int
+	var pairs []sbWnd
 	var rtxDelta uint64
 	var lossRec, reord int
 	for _, i := range idx {
@@ -131,6 +142,8 @@ func (s *sockStats) summary() string {
 		sb = append(sb, int(info.sbBytes))
 		cwnd = append(cwnd, int(info.cwnd))
 		srtt = append(srtt, int(info.srttMs))
+		wnd = append(wnd, int(info.sndWnd))
+		pairs = append(pairs, sbWnd{sb: int(info.sbBytes), wnd: int(info.sndWnd)})
 		// max(0, …): a reconnect restarts the socket counter, so a smaller
 		// value than last time means "new socket", not "negative retransmits".
 		if prev, seen := s.lastRtx[i]; seen && info.rtxPkts >= prev {
@@ -149,18 +162,51 @@ func (s *sockStats) summary() string {
 	if len(sb) == 0 {
 		return ""
 	}
+	hotWnd := windowAtDeepestBuffer(pairs)
 	sort.Ints(sb)
 	sort.Ints(cwnd)
 	sort.Ints(srtt)
+	sort.Ints(wnd)
 	pct := func(v []int, f float64) int { return v[int(f*float64(len(v)-1))] }
 	// ⚠️ `sb` includes in-flight (SDK's own words) — cwnd is printed next to it
 	// so a reader can see how much of it could be in flight rather than waiting.
 	// srtt's SPREAD is the number that speaks to "the disorder is RTT spread
 	// between connections": min-max across the pool, in one glance.
-	return fmt.Sprintf(" sock=%d sb=%d/%dKiB cwnd=%dKiB srtt=%d/%d-%dms rtx=+%d lossrec=%d reord=%d",
+	return fmt.Sprintf(" sock=%d sb=%d/%dKiB cwnd=%dKiB wnd=%d/%dKiB sbmax-wnd=%dKiB srtt=%d/%d-%dms rtx=+%d lossrec=%d reord=%d",
 		len(sb),
 		pct(sb, 0.5)/1024, sb[len(sb)-1]/1024,
 		pct(cwnd, 0.5)/1024,
+		pct(wnd, 0.5)/1024, wnd[0]/1024,
+		hotWnd/1024,
 		pct(srtt, 0.5), srtt[0], srtt[len(srtt)-1],
 		rtxDelta, lossRec, reord)
+}
+
+// sbWnd pairs one connection's send-buffer occupancy with the window its peer
+// is advertising, so the two can be reported for the SAME connection.
+type sbWnd struct{ sb, wnd int }
+
+// windowAtDeepestBuffer returns the peer window seen by the connection holding
+// the most data.
+//
+// 🎯 THIS IS THE DECISIVE PAIRING, and it is why a pool-wide minimum is not
+// enough. The question is not "is some connection being throttled" but "is the
+// connection that is BACKED UP the one being throttled". A small window
+// somewhere else in the pool proves nothing; a small window on the conn whose
+// buffer is full is the mechanism.
+//
+// ⚠️ Read it together with `cwnd`: a full buffer with a large cwnd AND a large
+// window is neither congestion nor the peer, and would send this back to the
+// drawing board rather than confirming anything.
+func windowAtDeepestBuffer(p []sbWnd) int {
+	if len(p) == 0 {
+		return 0
+	}
+	best := 0
+	for i := 1; i < len(p); i++ {
+		if p[i].sb > p[best].sb {
+			best = i
+		}
+	}
+	return p[best].wnd
 }
