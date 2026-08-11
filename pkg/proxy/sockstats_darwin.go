@@ -41,6 +41,7 @@ func sampleTCPInfo(c *net.TCPConn) (tcpInfo, bool) {
 			sbBytes:        ci.Snd_sbbytes,
 			cwnd:           ci.Snd_cwnd,
 			sndWnd:         ci.Snd_wnd,
+			sndWscale:      ci.Snd_wscale,
 			srttMs:         ci.Srtt,
 			rttvarMs:       ci.Rttvar,
 			rtxPkts:        ci.Txretransmitpackets,

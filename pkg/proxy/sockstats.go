@@ -48,14 +48,35 @@ type tcpInfo struct {
 	sbBytes uint32 // send socket buffer occupancy, INCLUDING in-flight
 	cwnd    uint32 // congestion window in bytes — bounds the in-flight part
 
-	// sndWnd is the window the PEER advertises to us — how much the relay is
-	// willing to accept right now. Added in build 235 because the first run with
-	// this sampler excluded the other two reasons a send buffer could stop
-	// draining: cwnd reached 3 MB and never collapsed, and the outer TCP lost
-	// almost nothing (208 retransmits in a whole run, loss-recovery flag never
-	// set). With congestion and loss out, a full buffer means the far end is not
-	// taking the bytes — which is this field.
+	// sndWnd is how much the far end is willing to accept right now. Added in
+	// build 235 because the first run with this sampler excluded the other two
+	// reasons a send buffer could stop draining: cwnd reached 3 MB and never
+	// collapsed, and the outer TCP lost almost nothing (208 retransmits in a whole
+	// run, loss-recovery flag never set). With congestion and loss out, a full
+	// buffer means the far end is not taking the bytes — which is this field.
+	//
+	// ⚠️ THE SDK'S COMMENT IS ONLY "send widnow in bytes" — it does not say whose.
+	// Reading it as "the window the PEER advertised" is the BSD convention
+	// (`tp->snd_wnd` holds the offered window), which is standard but is an
+	// INFERENCE, not something the header states. Said plainly here because run
+	// 18's whole conclusion rests on it.
 	sndWnd uint32
+
+	// sndWscale is the window scale applied to that window — the scale the RELAY
+	// offered in its SYN-ACK.
+	//
+	// 🚨 IT EXISTS TO KEEP `wnd` HONEST. Run 18 read a flat 41 KiB and concluded
+	// the relay caps each connection at 2.59 Mbit/s. But 41 KiB = 41984 B fits
+	// inside TCP's 16-bit window field, so if the value were ever reported
+	// UNSCALED the true window would be 41984 × 2^wscale — megabytes — and the
+	// conclusion would collapse. BSD keeps `snd_wnd` already scaled, so it should
+	// be fine; printing the scale lets a reader SEE that instead of trusting it.
+	//
+	// ⚠️ It does not SETTLE the question. A capture on the phone does: the
+	// SYN-ACK carries the scale and every ACK carries the raw field, and at the
+	// phone we are the SENDER, which is the right position for in-flight — unlike
+	// the 2026-08-11 reading that was retracted for measuring it at the receiver.
+	sndWscale uint8
 
 	srttMs         uint32 // smoothed RTT of the OUTER connection, ms
 	rttvarMs       uint32
@@ -130,7 +151,7 @@ func (s *sockStats) summary() string {
 	}
 	sort.Ints(idx)
 
-	var sb, cwnd, srtt, wnd []int
+	var sb, cwnd, srtt, wnd, wscale []int
 	var pairs []sbWnd
 	var rtxDelta uint64
 	var lossRec, reord int
@@ -143,6 +164,7 @@ func (s *sockStats) summary() string {
 		cwnd = append(cwnd, int(info.cwnd))
 		srtt = append(srtt, int(info.srttMs))
 		wnd = append(wnd, int(info.sndWnd))
+		wscale = append(wscale, int(info.sndWscale))
 		pairs = append(pairs, sbWnd{sb: int(info.sbBytes), wnd: int(info.sndWnd)})
 		// max(0, …): a reconnect restarts the socket counter, so a smaller
 		// value than last time means "new socket", not "negative retransmits".
@@ -172,14 +194,41 @@ func (s *sockStats) summary() string {
 	// so a reader can see how much of it could be in flight rather than waiting.
 	// srtt's SPREAD is the number that speaks to "the disorder is RTT spread
 	// between connections": min-max across the pool, in one glance.
-	return fmt.Sprintf(" sock=%d sb=%d/%dKiB cwnd=%dKiB wnd=%d/%dKiB sbmax-wnd=%dKiB srtt=%d/%d-%dms rtx=+%d lossrec=%d reord=%d",
+	return fmt.Sprintf(" sock=%d sb=%d/%dKiB cwnd=%dKiB wnd=%d/%dKiB wscale=%s sbmax-wnd=%dKiB srtt=%d/%d-%dms rtx=+%d lossrec=%d reord=%d",
 		len(sb),
 		pct(sb, 0.5)/1024, sb[len(sb)-1]/1024,
 		pct(cwnd, 0.5)/1024,
 		pct(wnd, 0.5)/1024, wnd[0]/1024,
+		formatWscale(wscale),
 		hotWnd/1024,
 		pct(srtt, 0.5), srtt[0], srtt[len(srtt)-1],
 		rtxDelta, lossRec, reord)
+}
+
+// formatWscale renders one number when every connection agrees and a range when
+// they do not.
+//
+// 🎯 Non-uniformity is itself the finding: thirty connections to the same relay
+// should negotiate the same scale, so a range means either the relay is not one
+// machine or something is renegotiating — and either way `wnd` stops being one
+// population and its percentiles stop meaning anything.
+func formatWscale(v []int) string {
+	if len(v) == 0 {
+		return "?"
+	}
+	lo, hi := v[0], v[0]
+	for _, x := range v[1:] {
+		if x < lo {
+			lo = x
+		}
+		if x > hi {
+			hi = x
+		}
+	}
+	if lo == hi {
+		return fmt.Sprintf("%d", lo)
+	}
+	return fmt.Sprintf("%d-%d", lo, hi)
 }
 
 // sbWnd pairs one connection's send-buffer occupancy with the window its peer

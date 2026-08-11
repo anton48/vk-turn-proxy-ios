@@ -102,6 +102,27 @@ func TestTheInFlightCaveatIsDocumented(t *testing.T) {
 	}
 }
 
+// The scale exists to make `wnd` auditable, so it must never quietly average a
+// pool that disagrees — thirty connections to one relay should negotiate the same
+// scale, and a range is itself the finding.
+func TestWscaleShowsOneNumberOrTheRange(t *testing.T) {
+	for _, c := range []struct {
+		in   []int
+		want string
+	}{
+		{nil, "?"},
+		{[]int{7}, "7"},
+		{[]int{7, 7, 7}, "7"},
+		{[]int{0, 0}, "0"},
+		{[]int{7, 8, 7}, "7-8"},
+		{[]int{9, 2}, "2-9"},
+	} {
+		if got := formatWscale(c.in); got != c.want {
+			t.Errorf("formatWscale(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // 🎯 THE DECISIVE PAIRING. The question the window answers is not "is some
 // connection throttled" but "is the connection that is BACKED UP the throttled
 // one" — so the window must come from the same connection as the deepest buffer,

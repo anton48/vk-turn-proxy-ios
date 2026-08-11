@@ -119,7 +119,7 @@ func TestSummaryOverRealSockets(t *testing.T) {
 		s.register(i, c)
 	}
 	out := s.summary()
-	for _, want := range []string{"sock=3", "sb=", "cwnd=", "wnd=", "sbmax-wnd=", "srtt=", "rtx=+", "lossrec=", "reord="} {
+	for _, want := range []string{"sock=3", "sb=", "cwnd=", "wnd=", "wscale=", "sbmax-wnd=", "srtt=", "rtx=+", "lossrec=", "reord="} {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary %q is missing %q", out, want)
 		}
