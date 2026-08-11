@@ -102,6 +102,50 @@ func TestTheInFlightCaveatIsDocumented(t *testing.T) {
 	}
 }
 
+// 🚨 THE GUARD THAT WAS MISSING, AND IT COST A DEVICE RUN. Build 233 registered
+// the socket in runTURN and shipped. SRTP is the production transport and dials
+// its TURN connection somewhere else entirely, so `sock=` appeared in exactly
+// ZERO lines of the first run — the instrument compiled, tested green, and was
+// never fed.
+//
+// The write-timing guard below existed and passed the whole time, because it
+// guards the OTHER half. Guarding one half of a two-part wiring is how you get a
+// green suite and an empty log.
+func TestEveryTURNDialIsRegisteredForSampling(t *testing.T) {
+	src, err := os.ReadFile("proxy.go")
+	if err != nil {
+		t.Fatalf("read proxy.go: %v", err)
+	}
+	lines := strings.Split(string(src), "\n")
+	dials := 0
+	for i, ln := range lines {
+		// Both forms in use: d.DialContext(ctx, "tcp", turnAddr) and
+		// dialer.Dial("tcp", turnAddr).
+		if !strings.Contains(ln, `"tcp", turnAddr`) {
+			continue
+		}
+		dials++
+		registered := false
+		for j := i; j < i+14 && j < len(lines); j++ {
+			if strings.Contains(lines[j], "sockStats.register(") {
+				registered = true
+				break
+			}
+		}
+		if !registered {
+			t.Errorf("proxy.go:%d dials a TURN relay over TCP and never calls "+
+				"sockStats.register — that transport's sockets are invisible, and "+
+				"`sock=` will simply be absent from the log rather than wrong",
+				i+1)
+		}
+	}
+	if dials < 2 {
+		t.Fatalf("found %d TCP dials to turnAddr, expected at least 2 (runTURN and "+
+			"setupSRTPSession) — the scan is not finding them and this test is "+
+			"passing vacuously", dials)
+	}
+}
+
 // 🚨 EVERY WRITE MUST BE TIMED, and there are four places that can forget — the
 // same shape as the sendCh dequeue guard. Validated by sabotage: drop one
 // observe call and this names the line.

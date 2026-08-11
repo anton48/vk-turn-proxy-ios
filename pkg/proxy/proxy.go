@@ -4823,6 +4823,9 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		return fmt.Errorf("SRTP setup: %w", err)
 	}
 	defer srtpConn.Close()
+	// Paired with the register in setupSRTPSession, which cannot defer it: that
+	// function returns the connection and outlives its own frame.
+	defer p.sockStats.unregister(connIdx)
 	context.AfterFunc(connCtx, func() { _ = srtpConn.Close() })
 
 	p.dtlsHSns.Store(int64(time.Since(sessStart)))
@@ -5242,6 +5245,14 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		if err != nil {
 			return nil, fmt.Errorf("dial tcp to relay: %w", err)
 		}
+		// 🚨 THE SECOND DIAL SITE, AND THE ONE THAT MATTERS. Build 233 registered
+		// only runTURN's socket and shipped: SRTP is the production transport and
+		// dials here, so `sock=` never appeared in a single line of the first
+		// device run. Instrument BOTH or neither.
+		//
+		// Unregistered where the session ends rather than by a defer: this
+		// function returns the conn and outlives its own frame.
+		p.sockStats.register(connIdx, tcp)
 		ctlConn = turn.NewSTUNConn(tcp)
 	}
 
