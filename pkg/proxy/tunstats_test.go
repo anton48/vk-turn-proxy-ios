@@ -41,6 +41,88 @@ func resetTunStats() {
 	tunReadBytes.Store(0)
 	tunLastRet.Store(0)
 	tunLastSummary.Store(0)
+	tunStalls.Store(0)
+	tunStallNs.Store(0)
+	tunStallMax.Store(0)
+}
+
+// 🎯🎯 THE TEST THAT JUSTIFIES THE FIELD, and the one to run before deleting it
+// as redundant: it stages the exact arithmetic from tunStallNsThreshold's comment
+// and shows the MEAN cannot see what the stall accounting can.
+//
+// A second in which the phone hands over a stream of packets and then stands
+// still must look, in the mean, exactly like a second in which it did not stand
+// still. If this ever stops being true the field is genuinely redundant; while it
+// is true, the mean is the wrong instrument for the question "why does the sender
+// wait" and this is the evidence.
+func TestTheMeanCannotSeeAStallButTheStallCounterCan(t *testing.T) {
+	const fast = 200
+
+	run := func(stall time.Duration) (mean time.Duration, out string) {
+		resetTunStats()
+		f := &fakeTUN{readDelay: 0, size: 1280}
+		d := WrapTUNForStats(f)
+		bufs, sizes := [][]byte{make([]byte, 2048)}, make([]int, 1)
+		tunReadSummary() // start the window
+		for i := 0; i < fast; i++ {
+			if _, err := d.Read(bufs, sizes, 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if stall > 0 {
+			f.readDelay = stall
+			if _, err := d.Read(bufs, sizes, 0); err != nil {
+				t.Fatal(err)
+			}
+			f.readDelay = 0
+		}
+		// Snapshot the mean before the summary clears the interval.
+		reads := tunReads.Load()
+		mean = time.Duration(tunReadNs.Load() / reads)
+		return mean, tunReadSummary()
+	}
+
+	quiet, quietOut := run(0)
+	stalled, stalledOut := run(60 * time.Millisecond)
+
+	// The mean moves by the stall spread over every read — a few hundred µs on
+	// 200 reads. That is the blindness, stated as an assertion.
+	if stalled > 2*time.Millisecond {
+		t.Fatalf("staging is wrong: the mean rose to %v, so the stall is NOT being "+
+			"diluted and this test proves nothing about the mean's blindness", stalled)
+	}
+	t.Logf("mean wait per read: %v without a stall, %v with a 60 ms one", quiet, stalled)
+
+	if strings.Contains(quietOut, "tun-stall=") {
+		t.Errorf("an interval with no stall printed one: %q — a zero here would be "+
+			"quotable later as \"measured, the phone never waited\"", quietOut)
+	}
+	if !strings.Contains(stalledOut, "tun-stall=1/") {
+		t.Errorf("the 60 ms stall was not reported: %q", stalledOut)
+	}
+	// max must be the real duration, not a bucket edge: this is the number that
+	// answers "how long did the device stand still".
+	if !strings.Contains(stalledOut, "max=6") { // 60ms, rounded to ms
+		t.Errorf("summary %q does not carry the stall's true length", stalledOut)
+	}
+}
+
+// Ordinary inter-packet gaps must not be counted, or a loaded second reads as
+// one long stall and the field becomes another restatement of the packet rate.
+func TestShortWaitsAreNotStalls(t *testing.T) {
+	resetTunStats()
+	d := WrapTUNForStats(&fakeTUN{readDelay: 2 * time.Millisecond, size: 1280})
+	bufs, sizes := [][]byte{make([]byte, 2048)}, make([]int, 1)
+	tunReadSummary()
+	for i := 0; i < 20; i++ {
+		if _, err := d.Read(bufs, sizes, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if out := tunReadSummary(); strings.Contains(out, "tun-stall=") {
+		t.Errorf("2 ms waits were counted as stalls: %q — the threshold is %v and "+
+			"must stay well above the ordinary gap", out, time.Duration(tunStallNsThreshold))
+	}
 }
 
 // 🎯 THE WHOLE POINT: the instrument must separate STARVED from SLOW. If it
