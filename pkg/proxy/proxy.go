@@ -1698,6 +1698,16 @@ func (p *Proxy) enqueueRecv(ctx context.Context, pkt []byte) bool {
 func (p *Proxy) ReceivePacket(buf []byte) (int, error) {
 	select {
 	case pkt := <-p.recvCh:
+		// Downlink disorder is measured HERE and not at the producer side of
+		// recvCh. 🚨 That is not a detail: enqueueRecv is entered by up to 30
+		// goroutines that then race independently for the channel, so the order
+		// observed there is the order they ARRIVED, not the order they won —
+		// measured at ~10x less disorder than the queue actually delivers, and
+		// always in the direction that would have produced the false reading
+		// "the downlink arrives near-ordered". This point is single-threaded
+		// (one conn.ReceiveFunc ⇒ one RoutineReceiveIncoming) and is by
+		// construction the order wireguard-go gets. → rxreorder.go
+		downlinkReorder.observeRx(pkt)
 		n := copy(buf, pkt)
 		// pkt was allocated via recvPktPoolGet by the producer recv
 		// goroutine — return to pool now that contents are copied out.
@@ -3971,6 +3981,12 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// answers the one question left about the uplink: is wireguard-go
 			// STARVED (~100% of its loop inside tun.Read) or SLOW?
 			tunReadSummary())
+
+		// The downlink's own disorder, on its own line so it can be diffed
+		// field-for-field against server1's `reorder(uplink)` line — the two
+		// numbers only mean anything next to each other. Silent when no
+		// transport packet arrived in the interval. → rxreorder.go
+		downlinkReorder.dumpAndReset(time.Now())
 
 		// Alloc-spike alert (build 140): if heap-alloc grew more than
 		// allocSpikeThreshold (5 MB) between ticks, emit a dedicated
