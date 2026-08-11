@@ -172,8 +172,10 @@ type Proxy struct {
 	peer   *net.UDPAddr
 	linkID string
 
-	// For packet I/O from the WireGuard side
-	sendCh chan []byte
+	// For packet I/O from the WireGuard side. sendCh carries a sendItem rather
+	// than a bare []byte so each packet's enqueue instant travels WITH it —
+	// see sendwait.go for why a parallel structure cannot pair them correctly.
+	sendCh chan sendItem
 	recvCh chan []byte
 
 	// rtpChPeak (build 145, diagnostic): per-interval high-water mark of the
@@ -217,6 +219,16 @@ type Proxy struct {
 	sendChBlockCount atomic.Int64
 	recvChBlockNs    atomic.Int64
 	recvChBlockCount atomic.Int64
+
+	// sendWait (build 229): how long each packet WAITED in sendCh, dequeue
+	// minus enqueue, as a histogram read-and-reset per memstats tick. The
+	// third and last of the sendCh statistics, and the only one that can tell
+	// a queue that absorbs a burst harmlessly from one that adds jitter at the
+	// scale the inner TCP reacts to. Depth cannot (it is about how bursty the
+	// producer is) and blocked time cannot (a queue that never blocks its
+	// producer can still hold every packet for 100 ms). Full reasoning, and
+	// what it deliberately cannot see, in sendwait.go.
+	sendWait sendWaitStats
 
 	// WRAP-A (amurcanov-compatible) transport state. wrapAKey is the derived
 	// HKDF obfuscation key (nil unless UseWrapA). The provision is the
@@ -501,7 +513,7 @@ func NewProxy(cfg Config) *Proxy {
 		config:            cfg,
 		ctx:               ctx,
 		cancel:            cancel,
-		sendCh:            make(chan []byte, 256),
+		sendCh:            make(chan sendItem, 256),
 		recvCh:            make(chan []byte, 256),
 		sessCtx:           sessCtx,
 		sessCancel:        sessCancel,
@@ -1646,11 +1658,25 @@ func notePeak(mark *atomic.Int64, depth int) {
 func (p *Proxy) SendPacket(data []byte) error {
 	buf := make([]byte, len(data))
 	copy(buf, data)
+	// The enqueue instant rides with the packet so a writer can price the wait
+	// it actually served — sendwait.go. One clock read per packet, ~25 ns
+	// against the make+copy already above it; the dequeue side adds none,
+	// reusing the time.Now() it needs for the write deadline anyway.
+	//
+	// ⚠️ The stamp is taken BEFORE the send, which is the closest a producer can
+	// get: entering the channel and returning from the send are the same event,
+	// so nothing later can observe the true instant. On the fast path below the
+	// gap is a few nanoseconds. On the SLOW path the packet also carries its own
+	// blocked time, so its residence is over-stated by exactly that — and the
+	// over-statement is BOUNDED, per interval, by the `sendch-block` total
+	// printed beside it on the same memstats line. When that reads `0s/0`, every
+	// residence in the interval is exact.
+	item := sendItem{buf: buf, at: time.Now().UnixNano()}
 	// Try without blocking first, so the slow path below runs ONLY when there
 	// was genuinely no room. That is what makes the blocked-time counter exact:
 	// it measures waiting, not the cost of measuring.
 	select {
-	case p.sendCh <- buf:
+	case p.sendCh <- item:
 		notePeak(&p.sendChPeak, len(p.sendCh))
 		p.txBytes.Add(int64(len(data)))
 		p.txPackets.Add(1)
@@ -1659,7 +1685,7 @@ func (p *Proxy) SendPacket(data []byte) error {
 	}
 	start := time.Now()
 	select {
-	case p.sendCh <- buf:
+	case p.sendCh <- item:
 		p.sendChBlockNs.Add(int64(time.Since(start)))
 		p.sendChBlockCount.Add(1)
 		notePeak(&p.sendChPeak, len(p.sendCh))
@@ -2731,8 +2757,11 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			case <-connCtx.Done():
 				log.Printf("proxy: [conn %d] DTLS send goroutine: ctx cancelled", connIdx)
 				return
-			case pkt := <-p.sendCh:
-				dtlsConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			case item := <-p.sendCh:
+				now := time.Now()
+				p.sendWait.observe(item.at, now.UnixNano())
+				pkt := item.buf
+				dtlsConn.SetWriteDeadline(now.Add(30 * time.Second))
 				if _, err := dtlsConn.Write(pkt); err != nil {
 					log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
 					return
@@ -2979,9 +3008,11 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			select {
 			case <-connCtx.Done():
 				return
-			case pkt := <-p.sendCh:
-				conn1.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, err := conn1.WriteTo(pkt, p.peer); err != nil {
+			case item := <-p.sendCh:
+				now := time.Now()
+				p.sendWait.observe(item.at, now.UnixNano())
+				conn1.SetWriteDeadline(now.Add(30 * time.Second))
+				if _, err := conn1.WriteTo(item.buf, p.peer); err != nil {
 					return
 				}
 			}
@@ -3165,9 +3196,11 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			select {
 			case <-connCtx.Done():
 				return
-			case pkt := <-p.sendCh:
-				dtlsConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, werr := dtlsConn.Write(pkt); werr != nil {
+			case item := <-p.sendCh:
+				now := time.Now()
+				p.sendWait.observe(item.at, now.UnixNano())
+				dtlsConn.SetWriteDeadline(now.Add(30 * time.Second))
+				if _, werr := dtlsConn.Write(item.buf); werr != nil {
 					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, werr)
 					return
 				}
@@ -3870,6 +3903,76 @@ var TaskVMInfoFn func() TaskVMInfo
 // Final dump on shutdown captures the moment-of-death snapshot in
 // the same place — useful when comparing pre-kill state across
 // multiple jetsam incidents.
+// memstatsFastTicks forces the 1 s memstats cadence for as long as it is set,
+// independently of the ALLOC-SPIKE window below. Process-global like
+// forceLegacyCaptcha, and for the same reason: the app and the extension are
+// separate processes with their own copy of this library.
+//
+// 🎯 WHY IT EXISTS. The 1 s cadence is what makes the tunnel readable at the
+// timescale the upload question lives at — the phone's offer against the
+// server's ΣUP, second by second (2026-08-11). Until now it could only be
+// reached by TRIPPING AN ALLOC-SPIKE, i.e. at moments chosen by the garbage
+// collector rather than by whoever is running the measurement: of the three
+// A/B logs collected that night, one had 1 s ticks over the interesting burst,
+// one had them over the dead gap between runs, and one had none at all.
+// A diagnostic you cannot aim is not an instrument.
+var memstatsFastTicks atomic.Bool
+
+// SetMemstatsFastTicks turns the forced 1 s cadence on or off. Safe at any time:
+// the loop re-reads it every tick, so switching it on mid-session costs at worst
+// one 10 s tick of latency and never a reconnect — which matters, because a
+// reconnect re-ramps 30 connections over ~107 s and would destroy the very
+// session being measured.
+func SetMemstatsFastTicks(on bool) { memstatsFastTicks.Store(on) }
+
+// memstatsCadence picks the tick interval, and is the ONLY thing that does.
+//
+// 🚨 It is a separate function so the rule is testable and so there is exactly
+// one of it. Before build 229 the ALLOC-SPIKE path reset the ticker itself; add
+// a second reason to be at 1 s and the two undo each other — a spike landing
+// while the switch is on would drop back to 10 s when the SPIKE's window closed,
+// silently coarsening a measurement already in progress, with nothing in the log
+// that says so. The forced switch therefore outranks the window, and the window
+// closing is not by itself a reason to slow down.
+// memstatsForcedNote explains a change of the Diagnostics switch that does NOT
+// move the cadence — the one case where the log would otherwise show the switch
+// changing and nothing happening.
+//
+// 🚨 THE REPORT THIS CAME FROM (2026-08-11). The switch was turned off at
+// 15:25:46 and the 1s lines kept coming; the run was read as "turning it off
+// does not work". It did work — an ALLOC-SPIKE at 15:25:29 held the window open
+// until 15:25:59, and the tunnel was stopped at 15:25:52, seven seconds before
+// the revert would have been logged. Reconstructing that took the log, the spike
+// list and arithmetic. The instrument should have said it.
+//
+// 🚫 The alternative fix — letting the switch cancel the spike window — was
+// rejected: that window is the jetsam diagnostic, it predates this switch and
+// has nothing to do with it, and a logging preference must not quietly disarm an
+// unrelated safety net. The wait is bounded by the window, ≤30 s.
+func memstatsForcedNote(forced, fast bool, windowLeft time.Duration) string {
+	switch {
+	case !forced && fast:
+		return fmt.Sprintf("switch OFF, but staying at 1s for up to %s — the "+
+			"ALLOC-SPIKE window is still open. This is the spike heuristic, not the switch.",
+			windowLeft.Round(time.Second))
+	case forced && fast:
+		return "switch ON, already at 1s (an ALLOC-SPIKE window was open)"
+	default:
+		return ""
+	}
+}
+
+func memstatsCadence(forced, inSpikeWindow bool, normal, fast, spikeWindow time.Duration) (time.Duration, string) {
+	switch {
+	case forced:
+		return fast, "forced by the Diagnostics switch"
+	case inSpikeWindow:
+		return fast, "ALLOC-SPIKE window, " + spikeWindow.String()
+	default:
+		return normal, ""
+	}
+}
+
 func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 	const normalInterval = 10 * time.Second
 	const highFreqInterval = 1 * time.Second
@@ -3879,10 +3982,23 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 	// heap-alloc +6.6 MB then +10.6 MB tick-over-tick. 5 MB is a tight
 	// gate that catches the spike pattern without triggering on normal
 	// fluctuation (typical tick-delta is ±2 MB under steady idle).
+	//
+	// ⚠️ IT IS A PER-TICK DELTA, AND SINCE BUILD 230 THE TICK LENGTH IS A
+	// VARIABLE. The 5 MB was calibrated against 10 s ticks; at 1 s it is a
+	// tenfold stricter growth RATE, and it samples the GC sawtooth rather than
+	// averaging over several cycles. So spike counts are not comparable between
+	// the two cadences — a definitional consequence, not a measured one. 🚨 The
+	// 2026-08-11 log that raised the question cannot settle which way it goes:
+	// every loaded tick in it came after the switch was already on, so it has no
+	// 10 s control. Do not read a spike rate across cadences without one.
 	const allocSpikeThreshold = 5 * 1024 * 1024 // 5 MB
 
 	tick := time.NewTicker(normalInterval)
 	defer tick.Stop()
+	// The cadence the ticker is currently on. Kept explicitly so the single
+	// decision point below resets the ticker only when it actually changes —
+	// a Reset on every tick would re-phase the 1 s cadence continuously.
+	curInterval := normalInterval
 
 	// Previous-tick state for delta computation. Captured by closure
 	// across dump() calls.
@@ -3900,6 +4016,9 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 	// expires with no further spikes.
 	var inHighFreq bool
 	var highFreqUntil time.Time
+	// Previous state of the Diagnostics switch, so a change that does NOT move
+	// the cadence can still be explained — see memstatsForcedNote.
+	var prevForced bool
 
 	dump := func(label string) {
 		var ms runtime.MemStats
@@ -3941,7 +4060,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d recvch-peak=%d/%d recvch-block=%s/%d%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s recvch-peak=%d/%d recvch-block=%s/%d%s",
 			label,
 			rssStr,
 			internalStr,
@@ -3973,6 +4092,12 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// made to wait — a real negative result, not a blind one.
 			time.Duration(p.sendChBlockNs.Swap(0)).Round(time.Microsecond),
 			p.sendChBlockCount.Swap(0),
+			// Residence: how long each packet WAITED in sendCh, which neither
+			// of the two above can give. Empty when nothing was dequeued.
+			// Percentiles are lower bucket edges (250 µs), max is exact — so
+			// p50 ≤ p90 ≤ p99 ≤ max must hold, and a violation means the
+			// denominator is wrong again. See sendwait.go.
+			p.sendWait.summary(),
 			p.recvChPeak.Swap(0),
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
@@ -4009,23 +4134,44 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 				ms.HeapObjects,
 				gcSinceLastTick)
 			highFreqUntil = time.Now().Add(highFreqDuration)
-			if !inHighFreq {
-				inHighFreq = true
-				log.Printf("proxy: memstats switching to high-freq mode (1s cadence for %s)", highFreqDuration)
-				tick.Reset(highFreqInterval)
-			}
+			inHighFreq = true
 		}
 		prevHeapAlloc = ms.HeapAlloc
 
-		// Revert to normal cadence if high-freq window expired and no
-		// new spike re-extended it. Check after dumping so the final
-		// tick of the high-freq window still emits at 1s cadence
-		// (catches the last sample before reverting).
+		// The high-freq WINDOW closes on its own. Checked after dumping so the
+		// final tick of the window still emits at 1s cadence (catches the last
+		// sample before reverting).
 		if inHighFreq && time.Now().After(highFreqUntil) {
 			inHighFreq = false
-			tick.Reset(normalInterval)
-			log.Printf("proxy: memstats returning to normal cadence (%s)", normalInterval)
 		}
+
+		// 🚨 ONE PLACE DECIDES THE CADENCE (build 229). Two independent reasons
+		// now want 1 s — the ALLOC-SPIKE window and the Diagnostics switch — and
+		// when each reset the ticker itself they could undo each other: a spike
+		// landing while the switch was on would drop back to 10 s when ITS
+		// window closed, silently ending a measurement in progress with nothing
+		// in the log to say why. The switch is re-read every tick, so it needs
+		// no reconnect.
+		forced := memstatsFastTicks.Load()
+		want, why := memstatsCadence(forced, inHighFreq,
+			normalInterval, highFreqInterval, highFreqDuration)
+		if want != curInterval {
+			curInterval = want
+			tick.Reset(want)
+			if want == highFreqInterval {
+				log.Printf("proxy: memstats → 1s cadence (%s)", why)
+			} else {
+				log.Printf("proxy: memstats → normal cadence (%s)", normalInterval)
+			}
+		} else if forced != prevForced {
+			// The switch moved and the cadence did NOT. Say so, or the log shows
+			// "fast ticks = false" followed by 1s lines and no reason.
+			if note := memstatsForcedNote(forced, want == highFreqInterval,
+				time.Until(highFreqUntil)); note != "" {
+				log.Printf("proxy: memstats %s", note)
+			}
+		}
+		prevForced = forced
 	}
 
 	// Emit once at startup so we have a baseline anchor for later
@@ -4896,8 +5042,11 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			case <-connCtx.Done():
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
-			case pkt := <-p.sendCh:
-				_ = srtpConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			case item := <-p.sendCh:
+				now := time.Now()
+				p.sendWait.observe(item.at, now.UnixNano())
+				pkt := item.buf
+				_ = srtpConn.SetWriteDeadline(now.Add(30 * time.Second))
 				if _, err := srtpConn.Write(pkt); err != nil {
 					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
 					return

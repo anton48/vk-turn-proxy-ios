@@ -200,6 +200,18 @@ type ProxyConfig struct {
 	// backup-JSON field. Default false → no production effect.
 	ForceLegacyCaptcha bool `json:"force_legacy_captcha,omitempty"`
 
+	// MemstatsFastTicks forces the memstats line (and everything that rides the
+	// same tick — the sendCh residence histogram, the downlink reorder dump) to
+	// a 1 s cadence instead of 10 s. Diagnostic, default false.
+	//
+	// It exists because 1 s was previously reachable only by tripping an
+	// ALLOC-SPIKE, i.e. at moments the garbage collector chose: of three A/B
+	// logs collected on 2026-08-11, one had 1 s ticks over the burst being
+	// measured, one had them over the dead gap between runs, and one had none.
+	// Carried here so it survives a reconnect; wgSetMemstatsFastTicks below is
+	// the live path, because turning it on must not cost a 107 s connection ramp.
+	MemstatsFastTicks bool `json:"memstats_fast_ticks,omitempty"`
+
 	// UplinkSynthMbit / UplinkSynthSec drive the paced synthetic uplink in
 	// pkg/proxy/synth.go — a DIAGNOSTIC that splits the ~19 Mbit/s upload
 	// ceiling into "above SendPacket" (WireGuard, inner TCP) versus "at or below
@@ -266,6 +278,7 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		proxy.SetVKHostIPs(pcfg.VKHostIPs)
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
+	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	if !pcfg.UseCookieAuth {
 		proxy.SetVKCookieAuth(false, "", nil)
 	}
@@ -403,6 +416,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		proxy.SetVKHostIPs(pcfg.VKHostIPs)
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
+	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	// Defensive: when cookie auth isn't requested, force it OFF (the extension
 	// process can be reused across connects — clear any stale cookie state).
 	// When it IS requested, the extension has already called wgSetVKCookieAuth
@@ -995,6 +1009,24 @@ func wgSetVKCookieAuth(enabled C.int32_t, cookie *C.char, linksJSON *C.char) {
 //export wgSetForceLegacyCaptcha
 func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 	proxy.SetForceLegacyCaptcha(enabled != 0)
+}
+
+// Forces the 1 s memstats cadence on or off in THIS process, without a
+// reconnect. Called by the extension when the app sends `set_memstats_fast:`,
+// and by both ProxyConfig entry points from MemstatsFastTicks.
+//
+// 🚨 THE LIVE PATH IS THE POINT. The same value also rides ProxyConfig, which
+// would be enough if the switch were only ever set before connecting — but the
+// case that matters is deciding mid-session that the next few minutes are worth
+// recording at 1 s, and applying it through a reconnect would re-ramp 30
+// connections over ~107 s and measure the ramp instead of the thing.
+//
+// The extension is the only process that runs logMemStatsLoop, so unlike
+// wgSetForceLegacyCaptcha this needs no companion call in the main app.
+//
+//export wgSetMemstatsFastTicks
+func wgSetMemstatsFastTicks(enabled C.int32_t) {
+	proxy.SetMemstatsFastTicks(enabled != 0)
 }
 
 // Returns the current cookie ("VKAuth") fatal-auth message, or "" if none. The

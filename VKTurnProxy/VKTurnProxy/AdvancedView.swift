@@ -51,6 +51,14 @@ struct AdvancedView: View {
     /// switch nobody can find is a switch nobody tests.
     @AppStorage("forceLegacyCaptcha") private var forceLegacyCaptcha = false
 
+    /// Force the 1 s memstats cadence (build 229). Until now 1 s was reachable
+    /// only by tripping an ALLOC-SPIKE — i.e. at moments the garbage collector
+    /// picked, not the person measuring — which is why of three A/B logs taken
+    /// on 2026-08-11 one had 1 s ticks over the burst, one over the dead gap
+    /// between runs, and one had none. Same rule as the keys above: declared
+    /// HERE, never in ContentView.
+    @AppStorage("memstatsFastTicks") private var memstatsFastTicks = false
+
     var body: some View {
         Form {
             Section {
@@ -117,6 +125,30 @@ struct AdvancedView: View {
                 // person who finds it should be able to tell whether they want it
                 // without reading the source.
                 Text("Skips the captcha-free path VK Calls uses, so getting credentials falls through to the older flow that has to solve a captcha. That solver never runs otherwise, which is exactly why it is hard to test.\n\nLeave this off. On, connecting is slower, can fail where it would have succeeded, and repeated attempts may get the captcha refused for a while. Applied on the next connect.")
+            }
+
+            // 🚨 ITS OWN SECTION, not another row under Diagnostics. A Form
+            // footer belongs to the whole section, so a second unrelated switch
+            // there pushes the first one's explanation below it and the text
+            // reads as if it describes the wrong toggle — which is exactly what
+            // happened when this shipped as one section in build 230.
+            // One footer, one switch, unless the switches are one feature (the
+            // two Live Activity rows above share theirs deliberately).
+            Section {
+                Toggle("Detailed log every second", isOn: $memstatsFastTicks)
+                    // Pushed to a running tunnel instead of waiting for the next
+                    // connect: the reason to reach for this is usually "the next
+                    // few minutes are worth recording", and reconnecting to
+                    // apply it would re-ramp 30 connections over ~107 s and
+                    // record the ramp instead. proxyConfig carries the same
+                    // value, so a later reconnect keeps the setting.
+                    .onChange(of: memstatsFastTicks) { _ in
+                        TunnelManager.shared.applyMemstatsFastTicks()
+                    }
+            } header: {
+                Text("Logging")
+            } footer: {
+                Text("Writes the memory and queue lines once a second instead of once every ten — the resolution needed to see what happens inside a single second of a transfer. Takes effect immediately, on a tunnel that is already connected.\n\nLeave it off for everyday use: the log fills about ten times faster, so it starts discarding its oldest entries after roughly half a day instead of several. Turn it on for a measurement, then off.")
             }
         }
         .navigationTitle("Advanced")

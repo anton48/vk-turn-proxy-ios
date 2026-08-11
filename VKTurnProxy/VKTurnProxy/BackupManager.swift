@@ -94,6 +94,10 @@ enum BackupManager {
         // survives a round-trip, but it has no UI and defaults to off.
         let synthMbit = (d.object(forKey: "uplinkSynthMbit") as? Double) ?? 0
         let synthSec = (d.object(forKey: "uplinkSynthSec") as? Int) ?? 0
+        // 1 s memstats cadence (build 229). Exported for the same reason as the
+        // switch above: a diagnostic that silently resets on a restore is one
+        // nobody can rely on mid-investigation.
+        let fastTicks = (d.object(forKey: "memstatsFastTicks") as? Bool) ?? false
         // Named servers (build 179+). The legacy flat per-server fields are
         // deliberately NOT written alongside them — a backup from this build is
         // not meant to be readable by 178 and earlier.
@@ -114,6 +118,7 @@ enum BackupManager {
             forceLegacyCaptcha: forceLegacy,
             uplinkSynthMbit: synthMbit,
             uplinkSynthSec: synthSec,
+            memstatsFastTicks: fastTicks,
             vkAuth: vkAuth,
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,
@@ -232,6 +237,7 @@ enum BackupManager {
         if let v = s.forceLegacyCaptcha { d.set(v, forKey: "forceLegacyCaptcha") }
         if let v = s.uplinkSynthMbit { d.set(v, forKey: "uplinkSynthMbit") }
         if let v = s.uplinkSynthSec { d.set(v, forKey: "uplinkSynthSec") }
+        if let v = s.memstatsFastTicks { d.set(v, forKey: "memstatsFastTicks") }
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
         if let v = s.liveActivityEnabled { d.set(v, forKey: "liveActivityEnabled") }
         if let v = s.liveActivityCompactClock { d.set(v, forKey: "liveActivityCompactClock") }

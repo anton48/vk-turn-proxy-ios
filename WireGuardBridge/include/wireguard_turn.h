@@ -158,6 +158,20 @@ void wgSetVKCookieAuth(int32_t enabled, const char *cookie, const char *links_js
 /// @param enabled 1 = skip the captcha-free VK Calls path; 0 = normal
 void wgSetForceLegacyCaptcha(int32_t enabled);
 
+/// Force the 1s memstats cadence (Settings > Advanced > Diagnostics) in THIS
+/// process, taking effect on a tunnel that is already connected.
+///
+/// The same value arrives in ProxyConfig.memstats_fast_ticks at the next start;
+/// this entry point exists because the case worth supporting is deciding
+/// mid-session that the next few minutes deserve 1s resolution, and applying
+/// that through a reconnect would re-ramp 30 connections over ~107s and record
+/// the ramp instead of the thing being measured.
+///
+/// Only the extension runs the memstats loop, so unlike wgSetForceLegacyCaptcha
+/// there is nothing for the main app to call.
+/// @param enabled 1 = 1s ticks; 0 = the normal 10s cadence
+void wgSetMemstatsFastTicks(int32_t enabled);
+
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
 /// The extension polls this after bootstrap (cookie mode only) — a non-empty
 /// value means the saved cookie was rejected/expired in the background, so the

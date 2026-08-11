@@ -149,6 +149,12 @@ struct AppSettings: Codable {
     /// Same Optional/nil-preserves-default pattern as forceLegacyCaptcha above.
     var uplinkSynthMbit: Double? = nil
     var uplinkSynthSec: Int? = nil
+    /// 1 s memstats cadence (Settings › Advanced › Diagnostics, build 229).
+    /// Round-trips so a measurement setup survives an export/import — the trap
+    /// `forceLegacyCaptcha` fell into before build 212, where a backup could
+    /// set it but never carried it back out. Same Optional/nil-preserves
+    /// pattern.
+    var memstatsFastTicks: Bool? = nil
     /// VKAuth (non-anonymous cookie cred path) toggle. Round-trips in full
     /// backups so the preference is preserved. The cookies themselves are NEVER
     /// in the backup — they live in the Keychain (VKCookieStore). Optional +

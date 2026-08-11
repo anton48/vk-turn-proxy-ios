@@ -154,6 +154,7 @@ extension TunnelConfig {
             forceLegacyCaptcha: d.bool(forKey: "forceLegacyCaptcha"),
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
+            memstatsFastTicks: d.bool(forKey: "memstatsFastTicks"),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
@@ -956,6 +957,24 @@ class TunnelManager: ObservableObject {
                 }
             }
         } catch {}
+    }
+
+    /// Push the "1 s memstats ticks" switch to a RUNNING extension, so turning
+    /// it on does not require a reconnect.
+    ///
+    /// 🚨 That is the whole reason this exists rather than relying on the same
+    /// value in proxyConfig: the case worth supporting is deciding mid-session
+    /// that the next few minutes deserve 1 s resolution, and reconnecting to
+    /// apply it would re-ramp 30 connections over ~107 s — measuring the ramp
+    /// instead of the thing. proxyConfig still carries it, for the next connect.
+    ///
+    /// No-op when the tunnel is not up; the value is read from UserDefaults at
+    /// the next start, so nothing is lost.
+    func applyMemstatsFastTicks() {
+        let on = UserDefaults.standard.bool(forKey: "memstatsFastTicks")
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_memstats_fast:\(on ? 1 : 0)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
     }
 
     /// Send debug log message to extension (appears in vpn.log).
@@ -1820,6 +1839,7 @@ class TunnelManager: ObservableObject {
             "force_legacy_captcha": config.forceLegacyCaptcha,
             "uplink_synth_mbit": config.uplinkSynthMbit,
             "uplink_synth_sec": config.uplinkSynthSec,
+            "memstats_fast_ticks": config.memstatsFastTicks,
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
             "use_srtp": config.useSrtp,
@@ -2350,6 +2370,12 @@ struct TunnelConfig {
     // phone's own line, and the server must run with -uplink-reseq=0.
     var uplinkSynthMbit: Double = 0
     var uplinkSynthSec: Int = 0
+    // memstatsFastTicks: force the memstats line — and everything riding the
+    // same tick, the sendCh residence histogram and the downlink reorder dump —
+    // to 1 s instead of 10 s. Settings › Advanced › Diagnostics (build 229).
+    // Carried here so it survives a reconnect; the live path that avoids one is
+    // TunnelManager.applyMemstatsFastTicks(). Default false.
+    var memstatsFastTicks: Bool = false
     // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
     // anonymous fallback). The cookie itself lives in the Keychain
     // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.

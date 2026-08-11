@@ -461,6 +461,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
             completionHandler?(freshURL.data(using: .utf8))
+        } else if msg.hasPrefix("set_memstats_fast:") {
+            // Settings › Advanced › Diagnostics, applied to the RUNNING tunnel.
+            // The same value also arrives in proxyConfig at the next start; this
+            // path exists so turning it on mid-session does not cost a
+            // reconnect, which would re-ramp 30 connections over ~107 s and
+            // measure the ramp instead of whatever was being measured.
+            // Process-global in Go, so it needs no tunnelHandle.
+            let on = msg.hasSuffix("1")
+            logMsg("handleAppMessage: memstats fast ticks = \(on)")
+            wgSetMemstatsFastTicks(on ? 1 : 0)
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("debug_log:") {
             let debugMsg = String(msg.dropFirst("debug_log:".count))
             logMsg("[AppDebug] \(debugMsg)")

@@ -39,7 +39,7 @@ func TestNotePeakKeepsTheMaximum(t *testing.T) {
 func TestSendChPeakCatchesABacklogAnInstantaneousSampleWouldMiss(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p := &Proxy{ctx: ctx, sendCh: make(chan []byte, 8)}
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 8)}
 
 	// Fill the queue without draining — a producer burst with no consumer.
 	for i := 0; i < 5; i++ {
@@ -78,7 +78,7 @@ func TestSendChPeakCatchesABacklogAnInstantaneousSampleWouldMiss(t *testing.T) {
 func TestSendAndRecvPeaksAreSeparate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p := &Proxy{ctx: ctx, sendCh: make(chan []byte, 4), recvCh: make(chan []byte, 4)}
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 4), recvCh: make(chan []byte, 4)}
 
 	for i := 0; i < 3; i++ {
 		if err := p.SendPacket([]byte{1}); err != nil {
@@ -99,7 +99,7 @@ func TestSendAndRecvPeaksAreSeparate(t *testing.T) {
 func TestSendBlockedTimeIsZeroWhenThereIsRoom(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p := &Proxy{ctx: ctx, sendCh: make(chan []byte, 8)}
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 8)}
 
 	for i := 0; i < 8; i++ {
 		if err := p.SendPacket([]byte{byte(i)}); err != nil {
@@ -119,7 +119,7 @@ func TestSendBlockedTimeIsZeroWhenThereIsRoom(t *testing.T) {
 func TestSendBlockedTimeMeasuresARealWait(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p := &Proxy{ctx: ctx, sendCh: make(chan []byte, 1)}
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 1)}
 
 	if err := p.SendPacket([]byte{1}); err != nil { // fills it
 		t.Fatalf("SendPacket: %v", err)
@@ -144,7 +144,7 @@ func TestSendBlockedTimeMeasuresARealWait(t *testing.T) {
 // would look like a bottleneck.
 func TestSendBlockedTimeOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &Proxy{ctx: ctx, sendCh: make(chan []byte, 1)}
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 1)}
 	if err := p.SendPacket([]byte{1}); err != nil {
 		t.Fatalf("SendPacket: %v", err)
 	}
