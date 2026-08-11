@@ -230,6 +230,23 @@ type Proxy struct {
 	// what it deliberately cannot see, in sendwait.go.
 	sendWait sendWaitStats
 
+	// writeWait (build 233): how long the writer then spends INSIDE conn.Write —
+	// the mutex in srtpwrap's wrappedConn, the SRTP encrypt, and any blocking
+	// when that connection's kernel send buffer is full. Where sendWait ends,
+	// this begins; they are consecutive, not overlapping, and must never be
+	// added together as if they were one wait.
+	//
+	// 🚨 What it CANNOT see, and what sockStats below exists for: `Write`
+	// returning means the kernel took the bytes, not that they left. A zero here
+	// with a deep `sb=` there is a real state — the socket accepts instantly and
+	// the packet still waits.
+	writeWait sendWaitStats
+
+	// sockStats (build 233): the kernel's own view of the 30 outer TCP sockets.
+	// See sockstats.go for why, and for the field whose SDK comment must be read
+	// before it is quoted.
+	sockStats *sockStats
+
 	// WRAP-A (amurcanov-compatible) transport state. wrapAKey is the derived
 	// HKDF obfuscation key (nil unless UseWrapA). The provision is the
 	// server-minted WireGuard config from GETCONF, populated exactly once by
@@ -514,6 +531,7 @@ func NewProxy(cfg Config) *Proxy {
 		ctx:               ctx,
 		cancel:            cancel,
 		sendCh:            make(chan sendItem, 256),
+		sockStats:         newSockStats(),
 		recvCh:            make(chan []byte, 256),
 		sessCtx:           sessCtx,
 		sessCancel:        sessCancel,
@@ -2762,7 +2780,10 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				p.sendWait.observe(item.at, now.UnixNano())
 				pkt := item.buf
 				dtlsConn.SetWriteDeadline(now.Add(30 * time.Second))
-				if _, err := dtlsConn.Write(pkt); err != nil {
+				w0 := time.Now()
+				_, err := dtlsConn.Write(pkt)
+				p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
+				if err != nil {
 					log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
 					return
 				}
@@ -3012,7 +3033,10 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				now := time.Now()
 				p.sendWait.observe(item.at, now.UnixNano())
 				conn1.SetWriteDeadline(now.Add(30 * time.Second))
-				if _, err := conn1.WriteTo(item.buf, p.peer); err != nil {
+				w0 := time.Now()
+				_, werr := conn1.WriteTo(item.buf, p.peer)
+				p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
+				if werr != nil {
 					return
 				}
 			}
@@ -3200,7 +3224,10 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 				now := time.Now()
 				p.sendWait.observe(item.at, now.UnixNano())
 				dtlsConn.SetWriteDeadline(now.Add(30 * time.Second))
-				if _, werr := dtlsConn.Write(item.buf); werr != nil {
+				w0 := time.Now()
+				_, werr := dtlsConn.Write(item.buf)
+				p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
+				if werr != nil {
 					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, werr)
 					return
 				}
@@ -3381,6 +3408,10 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 			return fmt.Errorf("dial TURN TCP: %w", err)
 		}
 		defer tcpConn.Close()
+		// Registered AFTER the Close defer, so LIFO runs unregister FIRST and
+		// the sampler can never hold a socket that is being torn down.
+		p.sockStats.register(connIdx, tcpConn)
+		defer p.sockStats.unregister(connIdx)
 		turnConn = turn.NewSTUNConn(tcpConn)
 	}
 
@@ -4060,7 +4091,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s recvch-peak=%d/%d recvch-block=%s/%d%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4098,6 +4129,10 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// p50 ≤ p90 ≤ p99 ≤ max must hold, and a violation means the
 			// denominator is wrong again. See sendwait.go.
 			p.sendWait.summary(),
+			// The next leg of the same journey: time spent INSIDE conn.Write.
+			// Consecutive with the above, never additive with it — and blind to
+			// what happens after Write returns, which is what `sock=` measures.
+			p.writeWait.summaryAs("conn-write"),
 			p.recvChPeak.Swap(0),
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
@@ -4105,7 +4140,12 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// Empty unless the TUN wrapper is installed — see tunstats.go. It
 			// answers the one question left about the uplink: is wireguard-go
 			// STARVED (~100% of its loop inside tun.Read) or SLOW?
-			tunReadSummary())
+			tunReadSummary(),
+			// The kernel's own view of the 30 outer sockets — the only thing
+			// that can see a packet waiting AFTER Write returned. 🚨 `sb`
+			// includes in-flight data by the SDK's own definition; read
+			// sockstats.go before quoting it.
+			p.sockStats.summary())
 
 		// The downlink's own disorder, on its own line so it can be diffed
 		// field-for-field against server1's `reorder(uplink)` line — the two
@@ -5047,7 +5087,10 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				p.sendWait.observe(item.at, now.UnixNano())
 				pkt := item.buf
 				_ = srtpConn.SetWriteDeadline(now.Add(30 * time.Second))
-				if _, err := srtpConn.Write(pkt); err != nil {
+				w0 := time.Now()
+				_, werr := srtpConn.Write(pkt)
+				p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
+				if err := werr; err != nil {
 					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
 					return
 				}

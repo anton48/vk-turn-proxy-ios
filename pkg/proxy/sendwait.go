@@ -25,8 +25,29 @@ import (
 // rest — on those seconds the DRAIN paused rather than the producer accelerating
 // — and the next second's offer fell in 6 of 7, median −24% against −1%.
 // 🚨 n=7, spread −96% to +19%, four of the seven following a high tick: that is
-// the shape regression to the mean produces, and it is NOT a finding. It is a
+// the shape regression to the mean produces, and it was NOT a finding. It was a
 // reason to measure.
+//
+// ✅ IT WAS MEASURED, AND THE LEAD IS DEAD — three ways, from one run with this
+// instrument at a 1 s cadence (58 loaded ticks, 14 of them at 256/256):
+//
+//  1. MAGNITUDE. The mechanism needed the 102 ms below. Residence is p50 2.1 ms
+//     and p99 12.1 ms in the FULL ticks, 1.0 / 7.9 elsewhere, and 19.5 ms at
+//     worst in the entire run — against an RTT of ~155 ms.
+//  2. DIRECTION. The same max bounds the DRAIN from below: a packet enqueued at
+//     len == 256 waited at most max, so the writers cleared 256 packets inside
+//     it — >=13155 pkt/s worst, median >=18803 = ~196 Mbit/s of plaintext, 6.6x
+//     to 22x what the phone was offering in that same second. A full queue here
+//     is a producer handing over a batch, not writers falling behind.
+//  3. THE CORRELATION. Split the same ticks by LEVEL instead of by the queue and
+//     the next second is -2% above the median offer against +22% below it;
+//     inside the high half alone, groups matched at 16.8 vs 16.5 Mbit/s, full
+//     gives -1% and not-full -4%. It was regression to the mean, as suspected.
+//
+// ⇒ Keep the instrument — it is what closed the question, and it is the only
+// thing that can reopen it if the queue's behaviour ever changes. But do not
+// re-propose sendCh as the cause of anything without a residence number that
+// contradicts the ones above.
 //
 // THE MEASUREMENT. A queue can be full and harmless or full and destructive, and
 // the two differ only in how long a packet WAITS in it:
@@ -146,7 +167,14 @@ func noteMax64(mark *atomic.Int64, v int64) {
 // project uses exactly that impossibility to catch denominator bugs. So
 // `p50=0s` means half the packets waited under 250 µs, which is the answer
 // "burst absorption" looks like.
-func (s *sendWaitStats) summary() string {
+func (s *sendWaitStats) summary() string { return s.summaryAs("sendch-wait") }
+
+// summaryAs is summary with the field name given, so the same histogram serves
+// the two halves of the question: how long a packet waits FOR a writer
+// (`sendch-wait`), and how long the writer then spends handing it to the socket
+// (`conn-write`). They are different quantities and must not be added: the first
+// ends where the second begins.
+func (s *sendWaitStats) summaryAs(name string) string {
 	var total int64
 	for i := range s.hist {
 		s.scratch[i] = s.hist[i].Swap(0)
@@ -157,7 +185,7 @@ func (s *sendWaitStats) summary() string {
 		return ""
 	}
 	h := s.scratch[:]
-	return fmt.Sprintf(" sendch-wait=%s/%s/%s max=%s over=%d",
+	return fmt.Sprintf(" %s=%s/%s/%s max=%s over=%d", name,
 		sendWaitEdge(rxHistPct(h, total, 0.50)),
 		sendWaitEdge(rxHistPct(h, total, 0.90)),
 		sendWaitEdge(rxHistPct(h, total, 0.99)),
