@@ -20,6 +20,40 @@ import (
 // and its sender reads reordering as loss. A chunk of K keeps K consecutive
 // packets on ONE path, in order.
 //
+// 🚫🚫 SWEPT AND CLOSED, 2026-08-12 — DO NOT RE-RUN THIS SWEEP, AND DO NOT
+// RE-SURFACE THE SETTING. 14 arms (F = 8/16/32 inner flows x K = 1/2/4/8, plus
+// F=8 x K=32/64), live-switched inside ~14 minutes so drift is excluded, moved
+// throughput nothing and the reordering tail nothing.
+//
+// THE LEVER CANNOT ENGAGE, and that is the result — it is NOT "reordering does
+// not matter". The mean chunk was 1.00/1.27/1.48/1.66 at K=1/2/4/8 and stuck at
+// 1.86 at BOTH K=32 and K=64: raising K eightfold moved the real chunk size 12%.
+// The reason is structural and lives two lines below in the drain: ~30 writer
+// goroutines compete for a queue whose MEAN depth is only ~2.8 packets (Little's
+// law, 2560 pkt/s x 1-2 ms residence), so a writer that finishes a write finds
+// that the other 29 already took what was there. Filling a chunk of K needs
+// roughly N*K packets queued at once — 240 at K=8, ~1900 at K=64 — against 2.8.
+// (⚠️ `sendch-peak` reads ~180/256 and is a read-and-reset BURST peak, not depth.)
+//
+// Confirmed independently at the inner receiver: the HOLE RATE stayed flat at
+// 18.1-19.2% of segments across the entire sweep, including the arms where the
+// model below predicted 75% and 87.5% fewer holes. Holes never stopped forming.
+// The only real effect was cosmetic — at K=32, 54.5% of holes close in under a
+// millisecond against ~20% elsewhere, i.e. chunking does tidy immediate adjacent
+// swaps, but never reaches the >155 ms tail that costs throughput.
+//
+// 🚨 AND THE THRESHOLD BELOW WAS WRONG BY A FACTOR when it was written as
+// "K >= F" — the real condition is K > F, practically K >> F: the fraction of
+// same-flow adjacent pairs a chunk protects is max(0, 1 - F/K), which is exactly
+// ZERO at K = F (a flow's packets land at positions 0 and F, i.e. in adjacent
+// chunks on different connections). 12 of the 14 arms therefore predicted 0% and
+// could never have shown anything.
+//
+// The machinery is kept, inert at K=1, driven only by the undocumented
+// `uplink_chunk_k` backup field (the idiom of UplinkSynthMbit) — so it can be
+// re-driven cheaply IF the fan-out architecture ever changes. The Settings entry
+// was removed with the result.
+//
 // 🚨 WHAT IT CAN AND CANNOT DO — read this before scoring a run.
 // Only SAME-FLOW reordering costs throughput: a packet of inner flow A
 // overtaking one of flow B produces no duplicate ACK anywhere. With F inner
@@ -192,7 +226,9 @@ func (p *Proxy) writeChunk(first sendItem, txConnIdx int, write func(pkt []byte,
 		sent++
 
 		if err != nil {
-			p.chunkStats.observe(sent)
+			if k > UplinkChunkOff {
+				p.chunkStats.observe(sent)
+			}
 			return err
 		}
 
@@ -202,7 +238,13 @@ func (p *Proxy) writeChunk(first sendItem, txConnIdx int, write func(pkt []byte,
 		}
 
 		if sent >= k {
-			p.chunkStats.observe(sent)
+			// K=1 is the permanent default now that the experiment is closed, and
+			// every chunk is trivially 1 — recording it would print
+			// ` chunk=1.00/1 over=N` on every tick forever, which is noise, not a
+			// measurement. Only a deliberately raised K reports.
+			if k > UplinkChunkOff {
+				p.chunkStats.observe(sent)
+			}
 			return nil
 		}
 
@@ -212,7 +254,9 @@ func (p *Proxy) writeChunk(first sendItem, txConnIdx int, write func(pkt []byte,
 		default:
 			// Nothing already queued. End the chunk instead of waiting for
 			// one — see the "never waits" property above.
-			p.chunkStats.observe(sent)
+			if k > UplinkChunkOff {
+				p.chunkStats.observe(sent)
+			}
 			return nil
 		}
 	}

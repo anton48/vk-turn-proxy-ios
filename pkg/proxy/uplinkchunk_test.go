@@ -189,6 +189,32 @@ func TestTxAccountingOnlyWhenTheSiteAsksForIt(t *testing.T) {
 	}
 }
 
+// K=1 is the permanent default now that the experiment is closed, so the field
+// must stay OUT of the log entirely: every chunk is trivially 1, and printing
+// ` chunk=1.00/1 over=N` on every tick forever is noise, not a measurement. A
+// deliberately raised K still reports.
+func TestChunkStatsStaySilentWhenChunkingIsOff(t *testing.T) {
+	off := newChunkProxy(t, UplinkChunkOff, 8, 1)
+	queue(off, 5)
+	var got []byte
+	for i := 0; i < 3; i++ {
+		_ = off.writeChunk(<-off.sendCh, 0, recorder(&got))
+	}
+	if s := off.chunkStats.summary(); s != "" {
+		t.Fatalf("at K=1 the summary is %q, want \"\" — the default configuration must "+
+			"not print a chunk field on every tick", s)
+	}
+
+	on := newChunkProxy(t, 4, 8, 1)
+	queue(on, 5)
+	got = nil
+	_ = on.writeChunk(<-on.sendCh, 0, recorder(&got))
+	if s := on.chunkStats.summary(); s == "" {
+		t.Fatal("at K=4 the summary is empty — suppressing K=1 must not suppress a " +
+			"deliberately raised K, or the knob becomes unmeasurable")
+	}
+}
+
 // The instrument that decides whether a run tested anything at all.
 func TestChunkStatsReportMeanMaxAndDenominator(t *testing.T) {
 	var c chunkStats

@@ -226,17 +226,20 @@ type ProxyConfig struct {
 	UplinkSynthMbit float64 `json:"uplink_synth_mbit,omitempty"`
 	UplinkSynthSec  int     `json:"uplink_synth_sec,omitempty"`
 
-	// UplinkChunkK is the uplink-chunking EXPERIMENT: how many consecutive
-	// WireGuard packets one writer hands to ONE relay connection before going
-	// back to compete for the shared queue. 1 (and 0, meaning unset) is exactly
-	// today's behaviour. Surfaced in Settings › Advanced rather than as a hidden
-	// backup field, because it has to be swept on a device by hand — and it is
-	// expected to be REMOVED from that screen once the sweep has answered.
+	// UplinkChunkK is the uplink-chunking experiment, now RETIRED to a
+	// diagnostic: how many consecutive WireGuard packets one writer hands to ONE
+	// relay connection before going back to compete for the shared queue. 1 (and
+	// 0, meaning unset) is exactly today's behaviour.
 	//
-	// 🚨 Before reading a result: it can only help when K is at least the number
-	// of active inner flows (so: the speedtest regime, not iperf3 -P 64), and it
-	// must NOT be scored with the server's `uplinkReorder`, which is flow-blind.
-	// See pkg/proxy/uplinkchunk.go.
+	// 🚫 SWEPT AND CLOSED 2026-08-12 — do not re-run the sweep. 14 arms
+	// (F = 8/16/32 x K = 1..64) moved nothing, because the lever cannot ENGAGE:
+	// the mean chunk was 1.86 even at K=64, since ~30 writer goroutines compete
+	// for a queue whose mean depth is only ~2.8 packets, and filling a chunk of
+	// K needs roughly N*K queued. The Settings screen entry was removed with the
+	// result; this field survives in the idiom of UplinkSynthMbit above — an
+	// undocumented backup-JSON knob, default off, kept so the machinery can be
+	// re-driven if the fan-out architecture ever changes. See
+	// pkg/proxy/uplinkchunk.go for the full finding.
 	UplinkChunkK int `json:"uplink_chunk_k,omitempty"`
 
 	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
@@ -1042,25 +1045,6 @@ func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 //export wgSetMemstatsFastTicks
 func wgSetMemstatsFastTicks(enabled C.int32_t) {
 	proxy.SetMemstatsFastTicks(enabled != 0)
-}
-
-// Sets the uplink chunking K in THIS process, without a reconnect. Called by the
-// extension when the app sends `set_uplink_chunk_k:`, and by both ProxyConfig
-// entry points from UplinkChunkK.
-//
-// 🚨 THE LIVE PATH IS A MEASUREMENT REQUIREMENT, not a convenience. Applying K
-// through a reconnect puts a ~107 s 30-connection ramp between every pair of
-// sweep arms, on a line that has moved 75 -> 363 Mbit/s inside 70 minutes — the
-// arms would differ by drift as much as by K. Live, K can change WITHIN one
-// iperf run, against one state of the line and one set of connections.
-//
-// The value clamps inside SetUplinkChunkK, so a malformed message cannot put an
-// out-of-range K on the hot path. Like wgSetMemstatsFastTicks this needs no
-// companion call in the main app: only the extension carries the writers.
-//
-//export wgSetUplinkChunkK
-func wgSetUplinkChunkK(k C.int32_t) {
-	proxy.SetUplinkChunkK(int(k))
 }
 
 // Returns the current cookie ("VKAuth") fatal-auth message, or "" if none. The
