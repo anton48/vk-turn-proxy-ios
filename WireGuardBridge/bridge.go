@@ -292,6 +292,7 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
+	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
 	if !pcfg.UseCookieAuth {
 		proxy.SetVKCookieAuth(false, "", nil)
 	}
@@ -309,7 +310,6 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	p := proxy.NewProxy(proxy.Config{
 		UplinkSynthMbit:  pcfg.UplinkSynthMbit,
 		UplinkSynthSec:   pcfg.UplinkSynthSec,
-		UplinkChunkK:     pcfg.UplinkChunkK,
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
 		TurnPort:         pcfg.TurnPort,
@@ -431,6 +431,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
+	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
 	// Defensive: when cookie auth isn't requested, force it OFF (the extension
 	// process can be reused across connects — clear any stale cookie state).
 	// When it IS requested, the extension has already called wgSetVKCookieAuth
@@ -471,7 +472,6 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	p := proxy.NewProxy(proxy.Config{
 		UplinkSynthMbit:  pcfg.UplinkSynthMbit,
 		UplinkSynthSec:   pcfg.UplinkSynthSec,
-		UplinkChunkK:     pcfg.UplinkChunkK,
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
 		TurnPort:         pcfg.TurnPort,
@@ -1042,6 +1042,25 @@ func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 //export wgSetMemstatsFastTicks
 func wgSetMemstatsFastTicks(enabled C.int32_t) {
 	proxy.SetMemstatsFastTicks(enabled != 0)
+}
+
+// Sets the uplink chunking K in THIS process, without a reconnect. Called by the
+// extension when the app sends `set_uplink_chunk_k:`, and by both ProxyConfig
+// entry points from UplinkChunkK.
+//
+// 🚨 THE LIVE PATH IS A MEASUREMENT REQUIREMENT, not a convenience. Applying K
+// through a reconnect puts a ~107 s 30-connection ramp between every pair of
+// sweep arms, on a line that has moved 75 -> 363 Mbit/s inside 70 minutes — the
+// arms would differ by drift as much as by K. Live, K can change WITHIN one
+// iperf run, against one state of the line and one set of connections.
+//
+// The value clamps inside SetUplinkChunkK, so a malformed message cannot put an
+// out-of-range K on the hot path. Like wgSetMemstatsFastTicks this needs no
+// companion call in the main app: only the extension carries the writers.
+//
+//export wgSetUplinkChunkK
+func wgSetUplinkChunkK(k C.int32_t) {
+	proxy.SetUplinkChunkK(int(k))
 }
 
 // Returns the current cookie ("VKAuth") fatal-auth message, or "" if none. The

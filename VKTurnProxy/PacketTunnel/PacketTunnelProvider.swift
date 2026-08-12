@@ -472,6 +472,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: memstats fast ticks = \(on)")
             wgSetMemstatsFastTicks(on ? 1 : 0)
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_uplink_chunk_k:") {
+            // Settings › Advanced, applied to the RUNNING tunnel. The reason
+            // this is live and not connect-only is measurement: a K sweep
+            // applied through reconnects puts a ~107 s 30-connection ramp
+            // between every pair of arms, on a line that has moved 75 -> 363
+            // Mbit/s inside 70 minutes, so the arms would differ by drift as
+            // much as by K. Live, K can change WITHIN one iperf run.
+            // Process-global in Go, so it needs no tunnelHandle; clamped there.
+            let raw = String(msg.dropFirst("set_uplink_chunk_k:".count))
+            let k = Int32(raw) ?? 1
+            logMsg("handleAppMessage: uplink chunk K = \(k)")
+            wgSetUplinkChunkK(k)
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("debug_log:") {
             let debugMsg = String(msg.dropFirst("debug_log:".count))
             logMsg("[AppDebug] \(debugMsg)")

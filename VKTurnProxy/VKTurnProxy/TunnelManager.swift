@@ -978,6 +978,24 @@ class TunnelManager: ObservableObject {
         try? session.sendProviderMessage(msg) { _ in }
     }
 
+    /// Push the uplink chunking K to a RUNNING tunnel (Settings › Advanced).
+    ///
+    /// Live rather than connect-only for a measurement reason: applying a K
+    /// sweep through reconnects puts a ~107 s 30-connection ramp between every
+    /// pair of arms, on a line that has been seen to move 75 → 363 Mbit/s
+    /// inside 70 minutes — so the arms would differ by drift as much as by K.
+    /// Live, K can change WITHIN one iperf run, against one state of the line.
+    /// proxyConfig still carries it, so a reconnect keeps the choice.
+    ///
+    /// No-op when the tunnel is not up; the value is read from UserDefaults at
+    /// the next start, so nothing is lost.
+    func applyUplinkChunkK() {
+        let k = UplinkChunk.stored()
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_uplink_chunk_k:\(k)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
     /// Send debug log message to extension (appears in vpn.log).
     private func debugLog(_ message: String) {
         guard let session = manager?.connection as? NETunnelProviderSession,

@@ -172,13 +172,20 @@ struct AdvancedView: View {
                 } label: {
                     Text("Packets per connection")
                 }
+                // Pushed to a running tunnel, like the 1 s logging switch above
+                // and for the same reason: a sweep applied by reconnecting
+                // would re-ramp 30 connections over ~107 s between every pair
+                // of arms and measure the ramp as much as the setting.
+                .onChange(of: uplinkChunkK) { _ in
+                    TunnelManager.shared.applyUplinkChunkK()
+                }
             } header: {
                 Text("Uplink chunking (experiment)")
             } footer: {
                 // Deliberately says what it is FOR and what it cannot do. The
                 // person who finds this switch is measuring, and a knob whose
                 // limits are not stated produces a confident wrong reading.
-                Text("How many packets in a row the tunnel sends over one connection before moving to the next. Upload currently spreads every packet across all connections, which arrive at slightly different times, and the far end reads that shuffling as lost packets — so it slows down although nothing was lost.\n\n1 is the current behaviour and the baseline to compare against. Higher values keep more packets together and in order.\n\nThis is an experiment, not a tuning dial: it can only help when the value is at least as large as the number of transfers running at once, so it should show up on an everyday speed test and do almost nothing on a benchmark with dozens of parallel streams. Applied on the next connect.")
+                Text("How many packets in a row the tunnel sends over one connection before moving to the next. Upload currently spreads every packet across all connections, which arrive at slightly different times, and the far end reads that shuffling as lost packets — so it slows down although nothing was lost.\n\n1 is the current behaviour and the baseline to compare against. Higher values keep more packets together and in order.\n\nThis is an experiment, not a tuning dial: it can only help when the value is at least as large as the number of transfers running at once, so it should show up on an everyday speed test and do almost nothing on a benchmark with dozens of parallel streams.\n\nTakes effect immediately, on a tunnel that is already connected — so a comparison can be made without reconnecting between values.")
             }
         }
         .navigationTitle("Advanced")

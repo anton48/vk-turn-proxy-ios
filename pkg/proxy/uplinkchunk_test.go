@@ -11,14 +11,18 @@ import (
 
 // newChunkProxy builds the minimum Proxy a writer needs: the queue, the two
 // residence histograms writeChunk files into, and the per-conn TX counters.
-func newChunkProxy(k int, queueCap, conns int) *Proxy {
-	p := &Proxy{
+// K is process-global (uplinkchunk.go), so a test that sets it must restore it
+// or it leaks into every test that runs afterwards.
+func newChunkProxy(t *testing.T, k int, queueCap, conns int) *Proxy {
+	t.Helper()
+	prev := uplinkChunkK.Load()
+	t.Cleanup(func() { uplinkChunkK.Store(prev) })
+	SetUplinkChunkK(k)
+	return &Proxy{
 		sendCh:      make(chan sendItem, queueCap),
 		connTxBytes: make([]atomic.Int64, conns),
 		lastTxAt:    make([]atomic.Int64, conns),
 	}
-	p.uplinkChunkK.Store(int64(k))
-	return p
 }
 
 func queue(p *Proxy, n int) {
@@ -39,7 +43,7 @@ func recorder(got *[]byte) func([]byte, time.Time) error {
 // whatever else is queued. This is the control arm of every A/B run, so if it
 // ever chunks, the experiment has no baseline.
 func TestChunkOffTakesExactlyOnePacket(t *testing.T) {
-	p := newChunkProxy(UplinkChunkOff, 8, 1)
+	p := newChunkProxy(t, UplinkChunkOff, 8, 1)
 	queue(p, 5)
 
 	var got []byte
@@ -59,7 +63,7 @@ func TestChunkOffTakesExactlyOnePacket(t *testing.T) {
 // in the producer's order. Order is the whole point — the packets are in
 // WireGuard nonce sequence and keeping them so on one path is the mechanism.
 func TestChunkTakesKPacketsInOrder(t *testing.T) {
-	p := newChunkProxy(3, 8, 1)
+	p := newChunkProxy(t, 3, 8, 1)
 	queue(p, 5)
 
 	var got []byte
@@ -80,7 +84,7 @@ func TestChunkTakesKPacketsInOrder(t *testing.T) {
 // ever blocks, it has become a latency mechanism and the whole argument for it
 // collapses.
 func TestChunkNeverWaitsForPackets(t *testing.T) {
-	p := newChunkProxy(8, 8, 1)
+	p := newChunkProxy(t, 8, 8, 1)
 	queue(p, 2) // far fewer than K
 
 	done := make(chan int, 1)
@@ -109,7 +113,7 @@ func TestChunkNeverWaitsForPackets(t *testing.T) {
 // would strand them. That is the run-20 pathology (a packet committed to a
 // stalled connection cannot be re-routed), and chunking must not deepen it.
 func TestStalledWriteLeavesRemainingPacketsStealable(t *testing.T) {
-	p := newChunkProxy(8, 16, 1)
+	p := newChunkProxy(t, 8, 16, 1)
 	queue(p, 6)
 
 	inWrite := make(chan struct{})
@@ -139,7 +143,7 @@ func TestStalledWriteLeavesRemainingPacketsStealable(t *testing.T) {
 // A failing write ends the chunk and surfaces the error, so the caller can tear
 // the connection down exactly as it did before chunking existed.
 func TestChunkStopsOnWriteError(t *testing.T) {
-	p := newChunkProxy(8, 8, 1)
+	p := newChunkProxy(t, 8, 8, 1)
 	queue(p, 5)
 
 	boom := errors.New("write failed")
@@ -162,7 +166,7 @@ func TestChunkStopsOnWriteError(t *testing.T) {
 // txConnIdx = -1 means "this site never accounted, do not start now". It is what
 // keeps K=1 byte-for-byte identical at the DTLS / direct / WRAP-A sites.
 func TestTxAccountingOnlyWhenTheSiteAsksForIt(t *testing.T) {
-	withIdx := newChunkProxy(4, 8, 2)
+	withIdx := newChunkProxy(t, 4, 8, 2)
 	queue(withIdx, 4)
 	var got []byte
 	_ = withIdx.writeChunk(<-withIdx.sendCh, 1, recorder(&got))
@@ -173,7 +177,7 @@ func TestTxAccountingOnlyWhenTheSiteAsksForIt(t *testing.T) {
 		t.Fatal("lastTxAt was not stamped for an accounting site")
 	}
 
-	noIdx := newChunkProxy(4, 8, 2)
+	noIdx := newChunkProxy(t, 4, 8, 2)
 	queue(noIdx, 4)
 	got = nil
 	_ = noIdx.writeChunk(<-noIdx.sendCh, -1, recorder(&got))
@@ -208,7 +212,7 @@ func TestChunkStatsReportMeanMaxAndDenominator(t *testing.T) {
 // same trap as the pacer's "0 writes delayed". The stats must make that visible
 // rather than let a shallow queue pass for a tested K.
 func TestChunkStatsExposeAKThatNeverEngaged(t *testing.T) {
-	p := newChunkProxy(16, 8, 1)
+	p := newChunkProxy(t, 16, 8, 1)
 	queue(p, 1) // K=16 configured, but only one packet ever available
 
 	var got []byte
@@ -216,6 +220,71 @@ func TestChunkStatsExposeAKThatNeverEngaged(t *testing.T) {
 	if s := p.chunkStats.summary(); !strings.Contains(s, "chunk=1.00/1") {
 		t.Fatalf("summary = %q, want it to show chunks of 1 so a null is readable as "+
 			"'the knob never engaged' rather than 'chunking does not help'", s)
+	}
+}
+
+// 🚨 THE LIVE PATH, and the reason K is a process global rather than a field
+// read once at connect. A sweep applied through reconnects puts a ~107 s
+// 30-connection ramp between every pair of arms, on a line that has moved
+// 75 → 363 Mbit/s inside 70 minutes — the arms would then differ by drift as
+// much as by K. This test asserts the property that makes the clean pairing
+// possible: a K set between two writes is honoured by the SECOND one, with no
+// reconnect and no new Proxy.
+func TestKTakesEffectWithoutAReconnect(t *testing.T) {
+	p := newChunkProxy(t, UplinkChunkOff, 32, 1)
+	queue(p, 12)
+
+	// Arm A: K=1, one packet per grab.
+	var a []byte
+	if err := p.writeChunk(<-p.sendCh, 0, recorder(&a)); err != nil {
+		t.Fatalf("arm A: %v", err)
+	}
+	if len(a) != 1 {
+		t.Fatalf("arm A wrote %d packets, want 1", len(a))
+	}
+
+	// The live switch — the same call the bridge's wgSetUplinkChunkK makes.
+	SetUplinkChunkK(4)
+
+	// Arm B: the very next chunk must already carry 4, on the SAME Proxy.
+	var b []byte
+	if err := p.writeChunk(<-p.sendCh, 0, recorder(&b)); err != nil {
+		t.Fatalf("arm B: %v", err)
+	}
+	if len(b) != 4 {
+		t.Fatalf("after SetUplinkChunkK(4) the next chunk carried %d packets, want 4 — "+
+			"K is not being re-read on the hot path, so a sweep would need a reconnect "+
+			"per arm and every comparison would straddle a 107 s ramp", len(b))
+	}
+
+	// And back down again, so the switch is not one-way.
+	SetUplinkChunkK(UplinkChunkOff)
+	var c []byte
+	if err := p.writeChunk(<-p.sendCh, 0, recorder(&c)); err != nil {
+		t.Fatalf("arm C: %v", err)
+	}
+	if len(c) != 1 {
+		t.Fatalf("after returning K to 1 the next chunk carried %d packets, want 1", len(c))
+	}
+}
+
+// The setter clamps, so a value that reached it from an imported backup or a
+// malformed provider message cannot put an out-of-range K on the hot path.
+func TestSetUplinkChunkKClampsWhatItStores(t *testing.T) {
+	prev := uplinkChunkK.Load()
+	t.Cleanup(func() { uplinkChunkK.Store(prev) })
+
+	SetUplinkChunkK(0) // never configured
+	if got := uplinkChunkK.Load(); got != int64(UplinkChunkOff) {
+		t.Fatalf("SetUplinkChunkK(0) stored %d, want %d (unset must mean off)", got, UplinkChunkOff)
+	}
+	SetUplinkChunkK(1 << 20)
+	if got := uplinkChunkK.Load(); got != int64(UplinkChunkMax) {
+		t.Fatalf("SetUplinkChunkK(huge) stored %d, want %d", got, UplinkChunkMax)
+	}
+	SetUplinkChunkK(-7)
+	if got := uplinkChunkK.Load(); got != int64(UplinkChunkOff) {
+		t.Fatalf("SetUplinkChunkK(-7) stored %d, want %d", got, UplinkChunkOff)
 	}
 }
 

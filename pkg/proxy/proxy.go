@@ -65,18 +65,6 @@ type Config struct {
 	UplinkSynthMbit float64
 	UplinkSynthSec  int
 
-	// UplinkChunkK is how many CONSECUTIVE WireGuard packets one writer hands
-	// to ONE relay connection before returning to compete for sendCh. 1 (the
-	// default) is the behaviour this tunnel has always had — one packet per
-	// grab — and is byte-for-byte identical to the pre-chunking code.
-	//
-	// It is an EXPERIMENT, exposed in Settings › Advanced so it can be swept on
-	// a device, and expected to be removed once it has answered. Read
-	// uplinkchunk.go before setting it: it can only help when K is at least the
-	// number of active inner flows, and it must not be scored with the server's
-	// flow-blind `uplinkReorder` counter.
-	UplinkChunkK int
-
 	// UseWrap enables the WRAP obfuscation layer between DTLS and TURN
 	// ChannelData (see pkg/proxy/wrap.go). When true, every packet on
 	// the wire becomes [nonce][ChaCha20-XOR(WrapKey, nonce, dtls_bytes)],
@@ -254,14 +242,11 @@ type Proxy struct {
 	// the packet still waits.
 	writeWait sendWaitStats
 
-	// uplinkChunkK / chunkStats: the uplink-chunking experiment. K is held in an
-	// atomic rather than read from config on the hot path so that a live setter
-	// can be added later without touching the writers; today it is written once,
-	// in NewProxy, and only read. chunkStats answers "did the knob engage" —
-	// a configured K that never materialises because the queue was shallow is a
-	// run that tested nothing. See uplinkchunk.go.
-	uplinkChunkK atomic.Int64
-	chunkStats   chunkStats
+	// chunkStats: the uplink-chunking experiment's own instrument — it answers
+	// "did the knob engage", because a configured K that never materialises
+	// (shallow queue) is a run that tested nothing. K itself is process-global
+	// and live-settable, in the idiom of memstatsFastTicks; see uplinkchunk.go.
+	chunkStats chunkStats
 
 	// sockStats (build 233): the kernel's own view of the 30 outer TCP sockets.
 	// See sockstats.go for why, and for the field whose SDK comment must be read
@@ -572,11 +557,6 @@ func NewProxy(cfg Config) *Proxy {
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
 	}
-	// Uplink chunking (experiment). Clamped here so every writer can trust the
-	// value without re-checking, and so an out-of-range number from an imported
-	// backup cannot reach the hot path.
-	p.uplinkChunkK.Store(int64(ClampUplinkChunkK(cfg.UplinkChunkK)))
-
 	// Wire up WRAP-A state on the constructed proxy (key + provision channel).
 	if cfg.UseWrapA {
 		p.wrapAKey = wrapAKey

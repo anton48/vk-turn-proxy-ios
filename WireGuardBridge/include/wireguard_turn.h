@@ -172,6 +172,9 @@ void wgSetForceLegacyCaptcha(int32_t enabled);
 /// @param enabled 1 = 1s ticks; 0 = the normal 10s cadence
 void wgSetMemstatsFastTicks(int32_t enabled);
 
+// Uplink chunking K, applied live (no reconnect). See bridge.go.
+void wgSetUplinkChunkK(int32_t k);
+
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
 /// The extension polls this after bootstrap (cookie mode only) — a non-empty
 /// value means the saved cookie was rejected/expired in the background, so the

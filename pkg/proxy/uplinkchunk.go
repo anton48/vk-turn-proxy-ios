@@ -60,8 +60,35 @@ const (
 	UplinkChunkMax = 128
 )
 
+// uplinkChunkK is process-global, in the idiom of memstatsFastTicks, for the
+// same reason and with the same shape: the extension runs exactly one Proxy, the
+// bridge has no handle on it, and the value has to be settable on a tunnel that
+// is ALREADY UP.
+//
+// 🚨 THE LIVE PATH IS THE POINT, and it is a measurement requirement rather than
+// a convenience. Applying K through a reconnect re-ramps 30 connections over
+// ~107 s, so each arm of a sweep would be separated by a ramp on a line that has
+// been seen to move 75 → 363 Mbit/s inside 70 minutes — the arms would differ by
+// drift as much as by K. Live switching allows K to change WITHIN one iperf run,
+// against one state of the line and one set of connections, which is the
+// cleanest pairing available here.
+//
+// The same value also rides ProxyConfig, so a reconnect keeps whatever the user
+// chose.
+//
+// ⚠️ Reading the log across a switch: the change takes effect on the very next
+// chunk, but a memstats tick can straddle it. Discard the tick that contains the
+// switch rather than attributing it to either arm.
+var uplinkChunkK atomic.Int64
+
+// SetUplinkChunkK applies K to this process immediately, without a reconnect.
+// Called by both ProxyConfig entry points and by the extension when the app
+// sends `set_uplink_chunk_k:`. Zero (never configured) and anything below 1
+// clamp to UplinkChunkOff, so the tunnel's behaviour is unchanged by default.
+func SetUplinkChunkK(k int) { uplinkChunkK.Store(int64(ClampUplinkChunkK(k))) }
+
 // ClampUplinkChunkK snaps a configured K into the supported range. The Swift
-// side clamps the same value twice (at the stepper and again on backup import)
+// side clamps the same value twice (at the picker and again on backup import)
 // and the two must agree, so the range lives in one place per language.
 func ClampUplinkChunkK(k int) int {
 	if k < UplinkChunkOff {
@@ -147,7 +174,7 @@ func (c *chunkStats) summary() string {
 // -1 there is what keeps K=1 byte-for-byte identical to the pre-chunking code:
 // this helper must not quietly add accounting a site did not have.
 func (p *Proxy) writeChunk(first sendItem, txConnIdx int, write func(pkt []byte, now time.Time) error) error {
-	k := int(p.uplinkChunkK.Load())
+	k := int(uplinkChunkK.Load())
 	if k < UplinkChunkOff {
 		k = UplinkChunkOff
 	}
