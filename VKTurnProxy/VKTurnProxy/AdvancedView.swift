@@ -59,6 +59,14 @@ struct AdvancedView: View {
     /// HERE, never in ContentView.
     @AppStorage("memstatsFastTicks") private var memstatsFastTicks = false
 
+    /// Diagnostic uplink cwnd probe (build 241). Ephemeral @State, not backed
+    /// up: it is a one-sitting measurement, not a preference. The runner is a
+    /// @StateObject so it survives this pushed view's re-renders while running.
+    @StateObject private var cwndProbe = UplinkCwndProbe()
+    @State private var probeHost = "192.168.102.1:5202"
+    @State private var probeFlows = 8
+    @State private var probeDuration = 20
+
     var body: some View {
         Form {
             Section {
@@ -149,6 +157,35 @@ struct AdvancedView: View {
                 Text("Logging")
             } footer: {
                 Text("Writes the memory and queue lines once a second instead of once every ten — the resolution needed to see what happens inside a single second of a transfer. Takes effect immediately, on a tunnel that is already connected.\n\nLeave it off for everyday use: the log fills about ten times faster, so it starts discarding its oldest entries after roughly half a day instead of several. Turn it on for a measurement, then off.")
+            }
+
+            // 🚨 Its own section (see the note above the Logging one). Diagnostic
+            // only: opens real TCP flows from the app through the tunnel and
+            // reads the kernel's cwnd/flags — the direct answer to "flat window
+            // (growth-starved) vs sawtooth (loss-limited)". Nothing here is a
+            // preference, so it is @State, not @AppStorage — no ContentView key,
+            // no backup entry.
+            Section {
+                TextField("Sink host:port", text: $probeHost)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.numbersAndPunctuation)
+                Stepper("Flows: \(probeFlows)", value: $probeFlows, in: 1...64)
+                Stepper("Duration: \(probeDuration) s", value: $probeDuration, in: 5...60, step: 5)
+                Button(cwndProbe.running ? "Running…" : "Run uplink cwnd probe") {
+                    let parts = probeHost.split(separator: ":", maxSplits: 1)
+                    let h = parts.first.map(String.init) ?? "192.168.102.1"
+                    let p: UInt16 = parts.count > 1 ? (UInt16(parts[1]) ?? 5202) : 5202
+                    cwndProbe.start(host: h, port: p, flows: probeFlows, durationSec: probeDuration)
+                }
+                .disabled(cwndProbe.running)
+                Text(cwndProbe.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Uplink cwnd probe")
+            } footer: {
+                Text("Diagnostic. Opens the chosen number of plain TCP flows to a discard sink through the tunnel, sends bulk data, and logs the kernel's snd_cwnd, srtt, loss-recovery and reordering-detected flags every 100 ms — the direct read of whether each flow's window is held flat or sawtooths.\n\nConnect the tunnel first and keep this screen in the foreground. Start a sink on the far end first (on 192.168.102.1: nc -lk 5202 >/dev/null). Results go to the log as 'cwndprobe' lines — grep them out of the exported log. For a control, run the same with the VPN off against an internet sink in the same minutes.")
             }
         }
         .navigationTitle("Advanced")
