@@ -120,7 +120,7 @@ final class UplinkCwndProbe: ObservableObject {
         var el = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &eff, &el)
         log.log("cwndprobe START host=\(host):\(port) flows=\(fds.count)/\(flows) dur=\(durationSec)s effSndBuf=\(eff)")
-        log.log("cwndprobe CSV t_ms,flow,cwnd,ssthresh,sndwnd,sbbytes,srtt_ms,rttcur_ms,loss,reord,mss,txbytes,rtx")
+        log.log("cwndprobe CSV t_ms,flow,cwnd,ssthresh,sndwnd,sbbytes,srtt_ms,rttcur_ms,loss,reord,mss,txbytes,rtx,deliv_mbit,winuse")
         publish("running: \(fds.count) flows for \(durationSec)s")
 
         let deadline = Date().addingTimeInterval(Double(durationSec))
@@ -149,10 +149,16 @@ final class UplinkCwndProbe: ObservableObject {
             senders.append(t)
         }
 
-        // Sampler on this thread.
+        // Sampler on this thread. Darwin's tcp_connection_info has NO
+        // delivery-rate field (tcpi_delivery_rate is Linux-only), so we derive
+        // it: deliv = Δtxbytes/Δt, and winuse = deliv ÷ (cwnd/srtt) = the % of
+        // its own window the flow actually uses. winuse ≪ 100 = paced /
+        // ACK-clock-limited (window slack); ≈ 100 = at the window edge.
         let start = Date()
         var lossTicks = 0, reordTicks = 0, totalTicks = 0
         let sampleInterval = 0.1
+        var prevTx = [UInt64](repeating: 0, count: fds.count)
+        var prevMs = [Int](repeating: 0, count: fds.count)
         while Date() < deadline {
             let tms = Int(Date().timeIntervalSince(start) * 1000)
             for (i, fd) in fds.enumerated() {
@@ -164,7 +170,13 @@ final class UplinkCwndProbe: ObservableObject {
                     lossTicks += loss
                     reordTicks += reord
                 }
-                log.log("cwndprobe \(tms),\(i),\(s.cwnd),\(s.ssthresh),\(s.sndwnd),\(s.sbbytes),\(s.srttMs),\(s.rttcurMs),\(loss),\(reord),\(s.mss),\(s.txbytes),\(s.rtxPkts)")
+                let dms = tms - prevMs[i]
+                let dtx = s.txbytes >= prevTx[i] ? s.txbytes - prevTx[i] : 0
+                let deliv = dms > 0 ? Double(dtx) * 8 / (Double(dms) / 1000.0) / 1e6 : 0        // Mbit/s
+                let winRate = s.srttMs > 0 ? Double(s.cwnd) * 8 / (Double(s.srttMs) / 1000.0) / 1e6 : 0
+                let winuse = winRate > 0 ? Int((100.0 * deliv / winRate).rounded()) : 0
+                prevTx[i] = s.txbytes; prevMs[i] = tms
+                log.log("cwndprobe \(tms),\(i),\(s.cwnd),\(s.ssthresh),\(s.sndwnd),\(s.sbbytes),\(s.srttMs),\(s.rttcurMs),\(loss),\(reord),\(s.mss),\(s.txbytes),\(s.rtxPkts),\(String(format: "%.2f", deliv)),\(winuse)")
             }
             Thread.sleep(forTimeInterval: sampleInterval)
         }
