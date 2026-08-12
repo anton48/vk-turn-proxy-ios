@@ -154,6 +154,17 @@ func TestSendPacketStampsTheEnqueueInstant(t *testing.T) {
 // This is the test that fails when a FIFTH transport is added and quietly ships
 // uninstrumented. Validated by sabotage: delete any one observe call and it goes
 // red, naming the line.
+//
+// ⚠️ UPDATED WITH UPLINK CHUNKING. The four sites no longer call observe
+// inline — they hand the packet to `p.writeChunk`, which prices every packet it
+// writes (uplinkchunk.go). The property is unchanged, the indirection is new, so
+// a site now satisfies this guard EITHER way. That widening is only safe because
+// of the second half below, which follows the delegation into uplinkchunk.go and
+// checks the instrument is still fed there; without it, routing a transport
+// through a writeChunk that had lost its observe call would pass silently. Same
+// brittleness as the `sockStats.register` scan window: a guard that scans for a
+// call near a line goes red on correct code the moment the call moves, and the
+// fix is to follow the code, never to delete the guard.
 func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 	src, err := os.ReadFile("proxy.go")
 	if err != nil {
@@ -168,21 +179,37 @@ func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 		sites++
 		fed := false
 		for j := i; j < i+5 && j < len(lines); j++ {
-			if strings.Contains(lines[j], "p.sendWait.observe(") {
+			if strings.Contains(lines[j], "p.sendWait.observe(") ||
+				strings.Contains(lines[j], "p.writeChunk(") {
 				fed = true
 				break
 			}
 		}
 		if !fed {
 			t.Errorf("proxy.go:%d dequeues sendCh without calling p.sendWait.observe "+
-				"within 5 lines — that transport's packets are invisible to the "+
-				"residence histogram:\n\t%s", i+1, strings.TrimSpace(ln))
+				"or p.writeChunk within 5 lines — that transport's packets are invisible "+
+				"to the residence histogram:\n\t%s", i+1, strings.TrimSpace(ln))
 		}
 	}
 	if sites < 4 {
 		t.Fatalf("found %d sendCh dequeue sites, expected at least 4 (DTLS, direct, "+
 			"WRAP-A, SRTP) — the scan is not finding them and this test is passing "+
 			"vacuously", sites)
+	}
+
+	// Follow the delegation: whatever writeChunk writes, it must also price.
+	chunkSrc, err := os.ReadFile("uplinkchunk.go")
+	if err != nil {
+		t.Fatalf("read uplinkchunk.go: %v", err)
+	}
+	if !strings.Contains(string(chunkSrc), "p.sendWait.observe(") {
+		t.Fatal("writeChunk no longer calls p.sendWait.observe — every transport now " +
+			"delegates to it, so this one deletion makes the residence histogram blind " +
+			"for the whole uplink while the per-site scan above still passes")
+	}
+	if !strings.Contains(string(chunkSrc), "p.writeWait.observe(") {
+		t.Fatal("writeChunk no longer calls p.writeWait.observe — `conn-write` has gone " +
+			"blind for every transport")
 	}
 }
 

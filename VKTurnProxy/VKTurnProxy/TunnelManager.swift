@@ -155,6 +155,7 @@ extension TunnelConfig {
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
             memstatsFastTicks: d.bool(forKey: "memstatsFastTicks"),
+            uplinkChunkK: UplinkChunk.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
@@ -1840,6 +1841,7 @@ class TunnelManager: ObservableObject {
             "uplink_synth_mbit": config.uplinkSynthMbit,
             "uplink_synth_sec": config.uplinkSynthSec,
             "memstats_fast_ticks": config.memstatsFastTicks,
+            "uplink_chunk_k": config.uplinkChunkK,
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
             "use_srtp": config.useSrtp,
@@ -2376,6 +2378,10 @@ struct TunnelConfig {
     // Carried here so it survives a reconnect; the live path that avoids one is
     // TunnelManager.applyMemstatsFastTicks(). Default false.
     var memstatsFastTicks: Bool = false
+    /// Uplink chunking K (EXPERIMENT, Settings › Advanced). 1 = today's
+    /// behaviour. See UplinkChunk.swift; expected to be removed with the
+    /// setting once the sweep has answered.
+    var uplinkChunkK: Int = UplinkChunk.off
     // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
     // anonymous fallback). The cookie itself lives in the Keychain
     // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.

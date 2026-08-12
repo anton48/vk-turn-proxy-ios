@@ -194,35 +194,60 @@ func TestEveryTURNDialIsRegisteredForSampling(t *testing.T) {
 	}
 }
 
-// 🚨 EVERY WRITE MUST BE TIMED, and there are four places that can forget — the
-// same shape as the sendCh dequeue guard. Validated by sabotage: drop one
-// observe call and this names the line.
+// 🚨 EVERY WRITE MUST BE TIMED. Validated by sabotage: drop the observe call and
+// this goes red.
+//
+// ⚠️ RESHAPED BY UPLINK CHUNKING. The four transports used to time their own
+// writes, and this scanned proxy.go for four `w0 := time.Now()` sites. They now
+// share ONE write path — writeChunk in uplinkchunk.go — so scanning proxy.go
+// found zero and the guard went red on correct code, the same brittleness the
+// `sockStats.register` scan window hit. The property is unchanged, so the guard
+// follows the code instead of being deleted, and it still has two ways to fail:
+// a transport that stops reaching the shared path (first half, and
+// TestEverySendChConsumerUsesWriteChunk), or the shared path losing its clock
+// (second half).
 func TestEveryWriteIsTimed(t *testing.T) {
 	src, err := os.ReadFile("proxy.go")
 	if err != nil {
 		t.Fatalf("read proxy.go: %v", err)
 	}
-	lines := strings.Split(string(src), "\n")
-	sites := 0
+	// Every transport writer reaches the timed path.
+	if writers := strings.Count(string(src), "p.writeChunk("); writers < 4 {
+		t.Fatalf("found %d transports delegating to writeChunk, want at least 4 (DTLS, "+
+			"direct, WRAP-A, SRTP) — a transport writing on its own is not timed", writers)
+	}
+
+	chunkSrc, err := os.ReadFile("uplinkchunk.go")
+	if err != nil {
+		t.Fatalf("read uplinkchunk.go: %v", err)
+	}
+	lines := strings.Split(string(chunkSrc), "\n")
+	timed := 0
 	for i, ln := range lines {
-		// The four transport writers, each pulling from sendCh above it.
 		if !strings.Contains(ln, "w0 := time.Now()") {
 			continue
 		}
-		sites++
-		fed := false
+		timed++
+		wrote, read := false, false
 		for j := i; j < i+4 && j < len(lines); j++ {
+			if strings.Contains(lines[j], "write(item.buf") {
+				wrote = true
+			}
 			if strings.Contains(lines[j], "p.writeWait.observe(w0.UnixNano()") {
-				fed = true
-				break
+				read = true
 			}
 		}
-		if !fed {
-			t.Errorf("proxy.go:%d starts a write clock that nothing reads", i+1)
+		if !wrote {
+			t.Errorf("uplinkchunk.go:%d starts the write clock but no write follows it "+
+				"within 4 lines — the clock is not bracketing the write", i+1)
+		}
+		if !read {
+			t.Errorf("uplinkchunk.go:%d starts a write clock that nothing reads — "+
+				"`conn-write` is blind for EVERY transport, not just one", i+1)
 		}
 	}
-	if sites < 4 {
-		t.Fatalf("found %d timed writes, want at least 4 (DTLS, direct, WRAP-A, "+
-			"SRTP) — that transport's time inside Write is invisible", sites)
+	if timed != 1 {
+		t.Fatalf("found %d timed write paths in uplinkchunk.go, want exactly 1 — "+
+			"if the helper grew a second write, both must be timed and this guard updated", timed)
 	}
 }

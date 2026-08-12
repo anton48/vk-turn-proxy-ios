@@ -59,6 +59,16 @@ struct AdvancedView: View {
     /// HERE, never in ContentView.
     @AppStorage("memstatsFastTicks") private var memstatsFastTicks = false
 
+    /// Uplink chunking (experiment): how many consecutive packets one relay
+    /// connection carries before the next one competes for the queue. 1 is
+    /// today's behaviour and the control arm of any comparison.
+    ///
+    /// 🚨 EXPECTED TO BE REMOVED from this screen once the sweep has answered —
+    /// it is a measurement, not a feature. Same rule as every key here:
+    /// declared on THIS screen, never in ContentView; UplinkChunk.stored()
+    /// serves the non-view readers.
+    @AppStorage("uplinkChunkK") private var uplinkChunkK = UplinkChunk.off
+
     var body: some View {
         Form {
             Section {
@@ -149,6 +159,26 @@ struct AdvancedView: View {
                 Text("Logging")
             } footer: {
                 Text("Writes the memory and queue lines once a second instead of once every ten — the resolution needed to see what happens inside a single second of a transfer. Takes effect immediately, on a tunnel that is already connected.\n\nLeave it off for everyday use: the log fills about ten times faster, so it starts discarding its oldest entries after roughly half a day instead of several. Turn it on for a measurement, then off.")
+            }
+
+            // 🚨 Its own section, and its own footer — see the note above the
+            // Logging section. This one is also TEMPORARY: it is a sweep knob,
+            // and it comes off this screen once the measurement is done.
+            Section {
+                Picker(selection: $uplinkChunkK) {
+                    ForEach(UplinkChunk.choices, id: \.self) { k in
+                        Text(k == UplinkChunk.off ? "1 — off" : "\(k)").tag(k)
+                    }
+                } label: {
+                    Text("Packets per connection")
+                }
+            } header: {
+                Text("Uplink chunking (experiment)")
+            } footer: {
+                // Deliberately says what it is FOR and what it cannot do. The
+                // person who finds this switch is measuring, and a knob whose
+                // limits are not stated produces a confident wrong reading.
+                Text("How many packets in a row the tunnel sends over one connection before moving to the next. Upload currently spreads every packet across all connections, which arrive at slightly different times, and the far end reads that shuffling as lost packets — so it slows down although nothing was lost.\n\n1 is the current behaviour and the baseline to compare against. Higher values keep more packets together and in order.\n\nThis is an experiment, not a tuning dial: it can only help when the value is at least as large as the number of transfers running at once, so it should show up on an everyday speed test and do almost nothing on a benchmark with dozens of parallel streams. Applied on the next connect.")
             }
         }
         .navigationTitle("Advanced")

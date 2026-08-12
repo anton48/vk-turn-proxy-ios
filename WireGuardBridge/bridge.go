@@ -226,6 +226,19 @@ type ProxyConfig struct {
 	UplinkSynthMbit float64 `json:"uplink_synth_mbit,omitempty"`
 	UplinkSynthSec  int     `json:"uplink_synth_sec,omitempty"`
 
+	// UplinkChunkK is the uplink-chunking EXPERIMENT: how many consecutive
+	// WireGuard packets one writer hands to ONE relay connection before going
+	// back to compete for the shared queue. 1 (and 0, meaning unset) is exactly
+	// today's behaviour. Surfaced in Settings › Advanced rather than as a hidden
+	// backup field, because it has to be swept on a device by hand — and it is
+	// expected to be REMOVED from that screen once the sweep has answered.
+	//
+	// 🚨 Before reading a result: it can only help when K is at least the number
+	// of active inner flows (so: the speedtest regime, not iperf3 -P 64), and it
+	// must NOT be scored with the server's `uplinkReorder`, which is flow-blind.
+	// See pkg/proxy/uplinkchunk.go.
+	UplinkChunkK int `json:"uplink_chunk_k,omitempty"`
+
 	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
 	// session cookie → TURN creds; see pkg/proxy/creds_vkcookie.go). When true,
 	// GetVKCreds uses ONLY the cookie path — NO fallback to the anonymous VK
@@ -296,6 +309,7 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	p := proxy.NewProxy(proxy.Config{
 		UplinkSynthMbit:  pcfg.UplinkSynthMbit,
 		UplinkSynthSec:   pcfg.UplinkSynthSec,
+		UplinkChunkK:     pcfg.UplinkChunkK,
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
 		TurnPort:         pcfg.TurnPort,
@@ -457,6 +471,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	p := proxy.NewProxy(proxy.Config{
 		UplinkSynthMbit:  pcfg.UplinkSynthMbit,
 		UplinkSynthSec:   pcfg.UplinkSynthSec,
+		UplinkChunkK:     pcfg.UplinkChunkK,
 		PeerAddr:         pcfg.PeerAddr,
 		TurnServer:       pcfg.TurnServer,
 		TurnPort:         pcfg.TurnPort,

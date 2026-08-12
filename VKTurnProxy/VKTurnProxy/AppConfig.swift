@@ -171,6 +171,13 @@ struct AppSettings: Codable {
     /// above, for the same reason: a preference lost on restore is its own
     /// debugging session.
     var liveActivityCompactClock: Bool? = nil
+    /// Uplink chunking K (Settings › Advanced, EXPERIMENT). `0`/absent means
+    /// "never set" and resolves to 1 = today's behaviour. Round-trips for the
+    /// same reason as memstatsFastTicks: a measurement setup that silently
+    /// resets on a restore is one nobody can rely on mid-investigation — and an
+    /// import-without-export asymmetry is the `forceLegacyCaptcha` trap.
+    /// Expected to be removed with the setting once the sweep has answered.
+    var uplinkChunkK: Int? = nil
     /// Tunnel MTU override (Settings › Advanced, build 209). `0` = automatic,
     /// which is also what an older backup means by omitting the key entirely —
     /// so nil-preserve on import leaves whatever the device already had.

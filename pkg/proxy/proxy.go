@@ -65,6 +65,18 @@ type Config struct {
 	UplinkSynthMbit float64
 	UplinkSynthSec  int
 
+	// UplinkChunkK is how many CONSECUTIVE WireGuard packets one writer hands
+	// to ONE relay connection before returning to compete for sendCh. 1 (the
+	// default) is the behaviour this tunnel has always had — one packet per
+	// grab — and is byte-for-byte identical to the pre-chunking code.
+	//
+	// It is an EXPERIMENT, exposed in Settings › Advanced so it can be swept on
+	// a device, and expected to be removed once it has answered. Read
+	// uplinkchunk.go before setting it: it can only help when K is at least the
+	// number of active inner flows, and it must not be scored with the server's
+	// flow-blind `uplinkReorder` counter.
+	UplinkChunkK int
+
 	// UseWrap enables the WRAP obfuscation layer between DTLS and TURN
 	// ChannelData (see pkg/proxy/wrap.go). When true, every packet on
 	// the wire becomes [nonce][ChaCha20-XOR(WrapKey, nonce, dtls_bytes)],
@@ -241,6 +253,15 @@ type Proxy struct {
 	// with a deep `sb=` there is a real state — the socket accepts instantly and
 	// the packet still waits.
 	writeWait sendWaitStats
+
+	// uplinkChunkK / chunkStats: the uplink-chunking experiment. K is held in an
+	// atomic rather than read from config on the hot path so that a live setter
+	// can be added later without touching the writers; today it is written once,
+	// in NewProxy, and only read. chunkStats answers "did the knob engage" —
+	// a configured K that never materialises because the queue was shallow is a
+	// run that tested nothing. See uplinkchunk.go.
+	uplinkChunkK atomic.Int64
+	chunkStats   chunkStats
 
 	// sockStats (build 233): the kernel's own view of the 30 outer TCP sockets.
 	// See sockstats.go for why, and for the field whose SDK comment must be read
@@ -551,6 +572,11 @@ func NewProxy(cfg Config) *Proxy {
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
 	}
+	// Uplink chunking (experiment). Clamped here so every writer can trust the
+	// value without re-checking, and so an out-of-range number from an imported
+	// backup cannot reach the hot path.
+	p.uplinkChunkK.Store(int64(ClampUplinkChunkK(cfg.UplinkChunkK)))
+
 	// Wire up WRAP-A state on the constructed proxy (key + provision channel).
 	if cfg.UseWrapA {
 		p.wrapAKey = wrapAKey
@@ -2770,20 +2796,23 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	go func() {
 		defer wg.Done()
 		defer connCancel()
+		// One closure per connection, not per packet — see the SRTP send
+		// goroutine for why.
+		writeOne := func(pkt []byte, now time.Time) error {
+			dtlsConn.SetWriteDeadline(now.Add(30 * time.Second))
+			_, werr := dtlsConn.Write(pkt)
+			return werr
+		}
 		for {
 			select {
 			case <-connCtx.Done():
 				log.Printf("proxy: [conn %d] DTLS send goroutine: ctx cancelled", connIdx)
 				return
 			case item := <-p.sendCh:
-				now := time.Now()
-				p.sendWait.observe(item.at, now.UnixNano())
-				pkt := item.buf
-				dtlsConn.SetWriteDeadline(now.Add(30 * time.Second))
-				w0 := time.Now()
-				_, err := dtlsConn.Write(pkt)
-				p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
-				if err != nil {
+				// -1: this site has never maintained the per-conn TX counters,
+				// and writeChunk must not quietly start. That is what keeps
+				// K=1 byte-for-byte identical to the pre-chunking code here.
+				if err := p.writeChunk(item, -1, writeOne); err != nil {
 					log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
 					return
 				}
@@ -3025,18 +3054,20 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	go func() {
 		defer wg.Done()
 		defer connCancel()
+		// One closure per connection, not per packet — see the SRTP send
+		// goroutine for why.
+		writeOne := func(pkt []byte, now time.Time) error {
+			conn1.SetWriteDeadline(now.Add(30 * time.Second))
+			_, werr := conn1.WriteTo(pkt, p.peer)
+			return werr
+		}
 		for {
 			select {
 			case <-connCtx.Done():
 				return
 			case item := <-p.sendCh:
-				now := time.Now()
-				p.sendWait.observe(item.at, now.UnixNano())
-				conn1.SetWriteDeadline(now.Add(30 * time.Second))
-				w0 := time.Now()
-				_, werr := conn1.WriteTo(item.buf, p.peer)
-				p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
-				if werr != nil {
+				// -1: no per-conn TX accounting at this site today.
+				if err := p.writeChunk(item, -1, writeOne); err != nil {
 					return
 				}
 			}
@@ -3216,19 +3247,21 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	go func() {
 		defer wg.Done()
 		defer connCancel()
+		// One closure per connection, not per packet — see the SRTP send
+		// goroutine for why.
+		writeOne := func(pkt []byte, now time.Time) error {
+			dtlsConn.SetWriteDeadline(now.Add(30 * time.Second))
+			_, werr := dtlsConn.Write(pkt)
+			return werr
+		}
 		for {
 			select {
 			case <-connCtx.Done():
 				return
 			case item := <-p.sendCh:
-				now := time.Now()
-				p.sendWait.observe(item.at, now.UnixNano())
-				dtlsConn.SetWriteDeadline(now.Add(30 * time.Second))
-				w0 := time.Now()
-				_, werr := dtlsConn.Write(item.buf)
-				p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
-				if werr != nil {
-					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, werr)
+				// -1: no per-conn TX accounting at this site today.
+				if err := p.writeChunk(item, -1, writeOne); err != nil {
+					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)
 					return
 				}
 			}
@@ -4091,7 +4124,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4133,6 +4166,12 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// Consecutive with the above, never additive with it — and blind to
 			// what happens after Write returns, which is what `sock=` measures.
 			p.writeWait.summaryAs("conn-write"),
+			// How many packets each chunk actually carried. Empty unless
+			// chunking wrote something; at K=1 it reads 1.00/1, which is the
+			// control arm saying so out loud. 🚨 Read it BEFORE believing a
+			// null: a configured K that never materialised (shallow queue)
+			// means the run tested nothing. See uplinkchunk.go.
+			p.chunkStats.summary(),
 			p.recvChPeak.Swap(0),
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
@@ -5080,36 +5119,30 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	go func() {
 		defer wg.Done()
 		defer connCancel()
+		// Hoisted out of the loop on purpose: one closure per CONNECTION rather
+		// than one per packet. At a few thousand packets a second, per-packet
+		// closures are avoidable garbage on a device whose GOMEMLIMIT is 35 MB
+		// and whose history includes a GC death spiral.
+		writeOne := func(pkt []byte, now time.Time) error {
+			_ = srtpConn.SetWriteDeadline(now.Add(30 * time.Second))
+			_, werr := srtpConn.Write(pkt)
+			return werr
+		}
 		for {
 			select {
 			case <-connCtx.Done():
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
+			// connIdx (not -1) below because this site keeps the per-conn TX
+			// counters, which writeChunk maintains per packet: the pre-SRTP
+			// payload bytes — the WireGuard records that came out of sendCh —
+			// not the wire bytes after RTP+SRTP framing. That matches what an
+			// external observer counting WG throughput sees, and keeps the
+			// conn-stats tick reading the same regardless of transport mode.
 			case item := <-p.sendCh:
-				now := time.Now()
-				p.sendWait.observe(item.at, now.UnixNano())
-				pkt := item.buf
-				_ = srtpConn.SetWriteDeadline(now.Add(30 * time.Second))
-				w0 := time.Now()
-				_, werr := srtpConn.Write(pkt)
-				p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
-				if err := werr; err != nil {
+				if err := p.writeChunk(item, connIdx, writeOne); err != nil {
 					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
 					return
-				}
-				// Per-conn TX byte counter, parity with the DTLS path
-				// at proxy.go:2818. Counts the pre-SRTP payload bytes
-				// (WireGuard records that came out of sendCh), not the
-				// wire bytes after RTP+SRTP framing — matches what an
-				// external observer counting WG throughput would see,
-				// and matches the DTLS path's accounting so the conn-
-				// stats tick output reads the same regardless of
-				// transport mode.
-				if connIdx >= 0 && connIdx < len(p.connTxBytes) {
-					p.connTxBytes[connIdx].Add(int64(len(pkt)))
-					// lastTxAt mirror — see DTLS path comment in runTURN
-					// for skip-on-recent-tx rationale.
-					p.lastTxAt[connIdx].Store(time.Now().UnixNano())
 				}
 			}
 		}
