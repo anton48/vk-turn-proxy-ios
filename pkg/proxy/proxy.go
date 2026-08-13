@@ -267,6 +267,34 @@ type Proxy struct {
 	// the packet still waits.
 	writeWait sendWaitStats
 
+	// pathWaitOwn / pathWaitSteal (build 253): sendWait, SPLIT BY THE ROUTE the
+	// packet took to reach a writer. Same histogram, three populations.
+	//
+	// 🎯 THE QUESTION THEY EXIST FOR, and it is the one thing today's
+	// instruments cannot answer. On 2026-08-13 four flows took 3.0 s to open
+	// with k=5 armed, and the flowtrace showed the stall ending in a 3 ms burst
+	// of FIFTEEN steals onto a single connection that belonged to none of those
+	// flows' preferred sets. Two readings fit that equally: the packets sat in
+	// preferred queues nobody drained (stranding), or every writer was busy and
+	// conn 26 simply freed up first (a busy pool). They differ in ONE
+	// observable — how long the packets that came out of a path queue had been
+	// in it:
+	//
+	//   pathq-own/steal ~ sendch-wait   the queues moved like the shared channel;
+	//                                   the pool was busy, nothing was stranded.
+	//   pathq-own/steal >> sendch-wait  packets sat in preferred queues while the
+	//                                   shared channel drained past them. That is
+	//                                   stranding, and it is a property of the
+	//                                   design rather than of the network.
+	//
+	// 🚨 `sendWait` KEEPS ITS MEANING — it still files EVERY packet, so
+	// `sendch-wait` stays comparable with every number recorded since build 229.
+	// These two are additional views of the same items, not a partition of them,
+	// and a shared-route residence is `sendch-wait` minus these rather than a
+	// third field nobody would read.
+	pathWaitOwn   sendWaitStats
+	pathWaitSteal sendWaitStats
+
 	// chunkStats: the uplink-chunking experiment's own instrument — it answers
 	// "did the knob engage", because a configured K that never materialises
 	// (shallow queue) is a run that tested nothing. K itself is process-global
@@ -4161,7 +4189,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s flowkey=%d/%d%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s flowkey=%d/%d%s%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4230,7 +4258,14 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// flow-local path set (PR2): empty while k=0. 🚨 Read `pref=` BEFORE
 			// believing any throughput result — a run whose packets all spilled
 			// tested today's behaviour, not the treatment. → flowpaths.go
-			p.flowPathStats.summary(p.flows))
+			p.flowPathStats.summary(p.flows),
+			// How long the packets that came OUT of a path queue had been in it,
+			// against `sendch-wait` for the same tick. That comparison is what
+			// separates stranding from a merely busy writer pool; either field is
+			// silent when nothing took that route. → the field docs on
+			// pathWaitOwn.
+			p.pathWaitOwn.summaryAs("pathq-own"),
+			p.pathWaitSteal.summaryAs("pathq-steal"))
 
 		// The downlink's own disorder, on its own line so it can be diffed
 		// field-for-field against server1's `reorder(uplink)` line — the two

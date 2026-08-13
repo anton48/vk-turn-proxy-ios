@@ -291,6 +291,20 @@ type flowPathsStats struct {
 	skip   atomic.Int64 // a preferred path skipped as unhealthy
 	keyed  atomic.Int64 // packets that had a flow key at all (0 = keepalive)
 	stolen atomic.Int64 // taken out of ANOTHER connection's path queue
+
+	// qPeak is the deepest any ONE path queue was seen, read-and-reset per
+	// memstats tick.
+	//
+	// ⚠️ IT SATURATES, AND THAT IS WHY IT IS NOT THE MEASUREMENT. The queues are
+	// two deep by design, so under any real load this reads 2 and stops
+	// discriminating — and a depth sampled at the producer cannot tell "deep
+	// because the producer is bursty" from "deep because nothing is draining"
+	// anyway. That is build 223's mistake, which cost a run and was fixed in 224
+	// by measuring WAITING instead. It is printed because a reading of 0 under
+	// traffic would still be informative (nothing was ever queued at all), and
+	// because 2 alongside a long `pathq-own` residence is the exact pair that
+	// says packets sat. The question itself is answered by the residence.
+	qPeak atomic.Int64
 }
 
 func (s *flowPathsStats) snapshotAndReset() (pref, spill, skip, keyed, stolen int64) {
@@ -324,8 +338,9 @@ func (s *flowPathsStats) summary(t *flowTable) string {
 	if total > 0 {
 		prefPct = 100 * float64(pref) / float64(total)
 	}
-	return fmt.Sprintf(" flowpaths=k=%d flows=%d pref=%d/%d=%.1f%% spill=%d skip=%d keyed=%d stolen=%d",
-		k, t.size(), pref, total, prefPct, spill, skip, keyed, stolen)
+	return fmt.Sprintf(" flowpaths=k=%d flows=%d pref=%d/%d=%.1f%% spill=%d skip=%d keyed=%d stolen=%d qpeak=%d/%d",
+		k, t.size(), pref, total, prefPct, spill, skip, keyed, stolen,
+		s.qPeak.Swap(0), flowPathsQueueDepth())
 }
 
 // enqueueFlowPath tries to place the packet on one of the flow's preferred
@@ -365,6 +380,7 @@ func (p *Proxy) enqueueFlowPath(item sendItem, flowKey uint64) bool {
 		select {
 		case p.pathQ[idx] <- item:
 			p.flowPathStats.pref.Add(1)
+			notePeak(&p.flowPathStats.qPeak, len(p.pathQ[idx]))
 			// Wake ONE writer that may be blocked with nothing to do, so a packet
 			// cannot sit in a queue whose owner is stuck inside conn.Write while
 			// every other writer sleeps. Non-blocking: the hint is an edge, not a
@@ -436,6 +452,7 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		if own != nil {
 			select {
 			case item := <-own:
+				item.via = viaOwn
 				p.traceDispatch(item, connIdx, "own")
 				return item, true
 			default:
@@ -445,6 +462,7 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		//    handshake, which carry no flow key by design.
 		select {
 		case item := <-p.sendCh:
+			item.via = viaShared
 			p.traceDispatch(item, connIdx, "shared")
 			return item, true
 		default:
@@ -467,9 +485,11 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		}
 		select {
 		case item := <-own:
+			item.via = viaOwn
 			p.traceDispatch(item, connIdx, "own")
 			return item, true
 		case item := <-p.sendCh:
+			item.via = viaShared
 			p.traceDispatch(item, connIdx, "shared")
 			return item, true
 		case <-p.stealHint:
@@ -531,6 +551,7 @@ func (p *Proxy) stealFromOtherPaths(connIdx int) (sendItem, bool) {
 		}
 		select {
 		case item := <-p.pathQ[idx]:
+			item.via = viaSteal
 			p.flowPathStats.stolen.Add(1)
 			p.traceDispatch(item, connIdx, "steal")
 			return item, true

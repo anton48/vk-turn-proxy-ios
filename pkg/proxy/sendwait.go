@@ -96,7 +96,29 @@ type sendItem struct {
 	flow uint64
 	buf  []byte
 	at   int64 // time.Now().UnixNano() at enqueue; 0 = unstamped, not measured
+
+	// via records WHICH of the three dispatch routes handed this packet to a
+	// writer, so its residence can be filed against that route instead of into
+	// one blended average.
+	//
+	// 🚨 IT IS A FIELD ON THE PACKET FOR THE SAME REASON `at` IS. The route is
+	// known in nextSendItem and the residence is filed one layer down in
+	// writeChunk; a side channel between them would have to pair by arrival
+	// order across ~30 concurrent writers, which is the mispairing this struct's
+	// own doc comment already describes. One byte on an item that carries a
+	// 1300-byte buffer is not a cost.
+	via uint8
 }
+
+// The three routes a packet can reach a writer by. viaShared is the zero value
+// on purpose: an item that nobody stamps is a shared-channel item, which is what
+// every packet was before flow-local paths existed and what every keepalive and
+// handshake still is.
+const (
+	viaShared uint8 = iota
+	viaOwn
+	viaSteal
+)
 
 // Bucket geometry. 250 µs per bucket, 2048 of them = 512 ms, plus one overflow
 // bucket. Linear rather than exponential on purpose: the claim under test names a

@@ -232,6 +232,15 @@ func (p *Proxy) writeChunk(first sendItem, txConnIdx int, write func(pkt []byte,
 		// deadline, as it did before this helper existed.
 		now := time.Now()
 		p.sendWait.observe(item.at, now.UnixNano())
+		// The same residence, filed against the route the packet took. Reading
+		// the stamp twice costs nothing (no extra clock read) and keeps
+		// `sendch-wait` a total rather than one of three partial series.
+		switch item.via {
+		case viaOwn:
+			p.pathWaitOwn.observe(item.at, now.UnixNano())
+		case viaSteal:
+			p.pathWaitSteal.observe(item.at, now.UnixNano())
+		}
 		w0 := time.Now()
 		err := write(item.buf, now)
 		p.writeWait.observe(w0.UnixNano(), time.Now().UnixNano())
