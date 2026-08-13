@@ -242,6 +242,22 @@ type ProxyConfig struct {
 	// pkg/proxy/uplinkchunk.go for the full finding.
 	UplinkChunkK int `json:"uplink_chunk_k,omitempty"`
 
+	// FlowPathsK arms the flow-local path set: how many of the N relay
+	// connections one inner 5-tuple prefers. 0 (unset) is today's behaviour —
+	// every packet races all N. 3-8 pins each flow to a stable subset that it
+	// SPILLS out of the moment those paths are busy.
+	//
+	// 🚨 1 and 2 are clamped UP to 3, never honoured: hard affinity k=1 is a
+	// MEASURED -79% on a single flow (1.69 Mbit/s on one connection against 8.14
+	// on thirty), and the whole reason this lever survives that result is that a
+	// flow saturates at roughly five paths, so k≈5 keeps the fan-out while
+	// sampling five stall processes instead of thirty.
+	//
+	// Undocumented backup-JSON knob in the idiom of UplinkSynthMbit and
+	// UplinkChunkK — default off, no Settings entry until the device A/B (PR3)
+	// says there is something worth shipping. See pkg/proxy/flowpaths.go.
+	FlowPathsK int `json:"flow_paths_k,omitempty"`
+
 	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
 	// session cookie → TURN creds; see pkg/proxy/creds_vkcookie.go). When true,
 	// GetVKCreds uses ONLY the cookie path — NO fallback to the anonymous VK
@@ -296,6 +312,7 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
+	proxy.SetFlowPathsK(pcfg.FlowPathsK)
 	if !pcfg.UseCookieAuth {
 		proxy.SetVKCookieAuth(false, "", nil)
 	}
@@ -435,6 +452,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
+	proxy.SetFlowPathsK(pcfg.FlowPathsK)
 	// Defensive: when cookie auth isn't requested, force it OFF (the extension
 	// process can be reused across connects — clear any stale cookie state).
 	// When it IS requested, the extension has already called wgSetVKCookieAuth

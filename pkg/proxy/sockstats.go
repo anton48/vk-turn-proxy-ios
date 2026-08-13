@@ -104,10 +104,47 @@ type sockStats struct {
 	// socket's counter at zero: a global total would go BACKWARDS and print a
 	// negative delta, which reads as "retransmits were undone".
 	lastRtx map[int]uint64
+
+	// lastSb / lastWnd cache the most recent per-conn sample so the flow-path
+	// health filter can consult it WITHOUT a getsockopt on the packet path —
+	// the "health cache per tick" of the flow-local-path design.
+	//
+	// ⚠️ Read what this is before trusting it: it is refreshed only when
+	// summary() runs, i.e. once per memstats tick (10 s by default, 1 s with
+	// the Diagnostics switch), and `sb` INCLUDES in-flight data. So it is a
+	// stale UPPER BOUND on one connection's queue, which is why the flow-path
+	// health filter defaults OFF and the instantaneous test there is the depth
+	// of the connection's own path queue.
+	lastSb  map[int]int
+	lastWnd map[int]int
 }
 
 func newSockStats() *sockStats {
-	return &sockStats{conns: map[int]*net.TCPConn{}, lastRtx: map[int]uint64{}}
+	return &sockStats{
+		conns:   map[int]*net.TCPConn{},
+		lastRtx: map[int]uint64{},
+		lastSb:  map[int]int{},
+		lastWnd: map[int]int{},
+	}
+}
+
+// lastDepth returns the cached send-buffer occupancy and peer window for one
+// connection. ok is false when nothing has been sampled for it — in which case
+// the caller must treat the path as usable, never as sick: an unsampled
+// connection (UDP transport, or one dialled since the last tick) is not a
+// backed-up one.
+func (s *sockStats) lastDepth(connIdx int) (sb, wnd int, ok bool) {
+	if s == nil {
+		return 0, 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sb, ok = s.lastSb[connIdx]
+	if !ok {
+		return 0, 0, false
+	}
+	wnd = s.lastWnd[connIdx]
+	return sb, wnd, true
 }
 
 // register starts sampling a connection. Safe with a nil receiver or a nil conn
@@ -135,6 +172,11 @@ func (s *sockStats) unregister(connIdx int) {
 	s.mu.Lock()
 	delete(s.conns, connIdx)
 	delete(s.lastRtx, connIdx)
+	// Drop the cached depth too: a reconnect reuses the index, and a stale
+	// "backed up" reading would otherwise mark a brand-new socket sick until
+	// the next tick overwrote it.
+	delete(s.lastSb, connIdx)
+	delete(s.lastWnd, connIdx)
 	s.mu.Unlock()
 }
 
@@ -166,6 +208,10 @@ func (s *sockStats) summary() string {
 		wnd = append(wnd, int(info.sndWnd))
 		wscale = append(wscale, int(info.sndWscale))
 		pairs = append(pairs, sbWnd{sb: int(info.sbBytes), wnd: int(info.sndWnd)})
+		// Same values, kept per conn for the flow-path health filter (see
+		// lastDepth). Written under the same lock that guards the maps above.
+		s.lastSb[i] = int(info.sbBytes)
+		s.lastWnd[i] = int(info.sndWnd)
 		// max(0, …): a reconnect restarts the socket counter, so a smaller
 		// value than last time means "new socket", not "negative retransmits".
 		if prev, seen := s.lastRtx[i]; seen && info.rtxPkts >= prev {

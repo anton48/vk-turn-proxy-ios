@@ -349,11 +349,49 @@ func TestEverySendChConsumerUsesWriteChunk(t *testing.T) {
 	}
 	text := string(src)
 
-	consumers := strings.Count(text, "<-p.sendCh:")
+	// 🚨 THIS GUARD WENT RED ON CORRECT CODE when PR2 moved the receive out of
+	// the four writers and into nextSendItem — the FOURTH time a source-scan
+	// window has been invalidated by a refactor here (after sockStats.register
+	// and the two writeChunk hoists). It was FOLLOWED into the new code rather
+	// than widened or deleted, and both ends of the chain are kept: the four
+	// sites must go through the helper, AND the helper must still take from the
+	// shared channel. Counting call sites alone would pass for a helper that had
+	// quietly dropped sendCh — which would strand every spilled packet and every
+	// keepalive, the exact failure this file's history is made of.
+	consumers := strings.Count(text, "p.nextSendItem(")
 	if consumers != 4 {
-		t.Fatalf("found %d `<-p.sendCh:` consumer sites in proxy.go, expected 4 "+
+		t.Fatalf("found %d `p.nextSendItem(` consumer sites in proxy.go, expected 4 "+
 			"(DTLS, direct, WRAP-A, SRTP). If a transport was added, wire it through "+
-			"writeChunk and update this guard.", consumers)
+			"nextSendItem + writeChunk and update this guard.", consumers)
+	}
+	if n := strings.Count(stripComments(text), "<-p.sendCh:"); n != 0 {
+		t.Fatalf("%d writer(s) in proxy.go still receive from p.sendCh directly — they "+
+			"bypass the flow-local path queue and would never see a sticky packet", n)
+	}
+
+	fp, err := os.ReadFile("flowpaths.go")
+	if err != nil {
+		t.Fatalf("read flowpaths.go: %v", err)
+	}
+	// 🚨 SCAN THE CODE, NOT THE PROSE — this guard was written without the strip
+	// below and PASSED under a sabotage that deleted the real receive, because
+	// nextSendItem's own doc comment quotes `case item := <-p.sendCh:` while
+	// explaining what k=0 degenerates to. Same family as the build-232 scan that
+	// matched a function's own declaration. Caught only by running the sabotage.
+	helper := stripComments(string(fp))
+	if !strings.Contains(helper, "func (p *Proxy) nextSendItem(") {
+		t.Fatal("nextSendItem is not declared in flowpaths.go — this guard now scans the " +
+			"wrong file and has become vacuous")
+	}
+	// The other end of the chain, and the reason this is not just a rename of
+	// the old count: the helper must offer BOTH sources.
+	if !strings.Contains(helper, "case item := <-p.sendCh:") {
+		t.Fatal("nextSendItem no longer receives from the shared sendCh: spilled packets " +
+			"and keepalives (flowKey=0, which never reach a path queue) would never be sent")
+	}
+	if !strings.Contains(helper, "case item := <-own:") {
+		t.Fatal("nextSendItem no longer receives from the connection's own path queue: the " +
+			"flow-local set would be written but never read, so the lever silently does nothing")
 	}
 
 	calls := strings.Count(text, "p.writeChunk(")
@@ -369,4 +407,20 @@ func TestEverySendChConsumerUsesWriteChunk(t *testing.T) {
 		t.Fatal("writeChunk is declared in proxy.go; this guard counts declarations as calls " +
 			"and has become vacuous — move the declaration back to uplinkchunk.go")
 	}
+}
+
+// stripComments removes // line comments so a source-scan guard reads CODE.
+// Without it a guard can be satisfied by the very sentence that explains the
+// code it is supposed to protect — which is how the flow-path guard above
+// passed under a sabotage that had deleted the real receive.
+func stripComments(src string) string {
+	lines := strings.Split(src, "\n")
+	out := lines[:0]
+	for _, ln := range lines {
+		if i := strings.Index(ln, "//"); i >= 0 {
+			ln = ln[:i]
+		}
+		out = append(out, ln)
+	}
+	return strings.Join(out, "\n")
 }

@@ -170,15 +170,28 @@ func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read proxy.go: %v", err)
 	}
+	// 🚨 THE SCAN TARGET MOVED IN PR2 AND THIS GUARD WENT RED ON CORRECT CODE —
+	// fifth instance in this package. The four writers no longer receive from
+	// the channel themselves; they call nextSendItem, which offers the shared
+	// sendCh and the connection's own flow-path queue. So the site to scan is
+	// the CALL, and the delegation chain below (nextSendItem → writeChunk →
+	// observe) is what keeps the guard from being a rename.
 	lines := strings.Split(string(src), "\n")
 	sites := 0
 	for i, ln := range lines {
-		if !strings.Contains(ln, "<-p.sendCh") {
+		if !strings.Contains(ln, "p.nextSendItem(") {
 			continue
 		}
 		sites++
 		fed := false
-		for j := i; j < i+5 && j < len(lines); j++ {
+		// ⚠️ 16 lines, not 5. The call is now separated from the write by the
+		// `if !ok` cancellation branch and, at the SRTP site, by the six-line
+		// comment explaining why that site passes connIdx rather than -1.
+		// Widening a scan window is the weaker fix — it was preferred here only
+		// because the alternative was moving an explanation away from the line
+		// it explains. The delegation assertion at the end of this test is what
+		// actually keeps the guard honest.
+		for j := i; j < i+16 && j < len(lines); j++ {
 			if strings.Contains(lines[j], "p.sendWait.observe(") ||
 				strings.Contains(lines[j], "p.writeChunk(") {
 				fed = true

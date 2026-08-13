@@ -212,6 +212,18 @@ func (p *Proxy) writeChunk(first sendItem, txConnIdx int, write func(pkt []byte,
 	if k < UplinkChunkOff {
 		k = UplinkChunkOff
 	}
+	// 🚫 CHUNKING AND THE FLOW-LOCAL PATH SET MUST NOT RUN TOGETHER, and this is
+	// the enforcement rather than a note in a file nobody reads. Two reasons.
+	// Mechanically, the drain below takes the next packet from the SHARED
+	// sendCh, so with a flow set armed a chunk would pull other flows' spilled
+	// packets onto this connection and quietly undo the stickiness it was
+	// supposed to compose with. Experimentally, they aim at the same target by
+	// different means, so an arm with both on could not attribute its result to
+	// either — and this project has already paid for one confounded sweep.
+	// Chunking is the retired lever, so it is the one that yields.
+	if flowPathsK.Load() > FlowPathsOff {
+		k = UplinkChunkOff
+	}
 
 	item := first
 	sent := 0

@@ -207,9 +207,21 @@ type Proxy struct {
 
 	// flow-local path set (PR1): count packets that arrived with a non-zero
 	// inner-flow key, so an on-device run can confirm the WG patch delivers
-	// keys through real traffic. Dispatch by the key lands in PR2.
+	// keys through real traffic. ✅ Confirmed on device in build 244:
+	// flowkey=284541/284545 over 97 loaded ticks, 8 unkeyed packets in the
+	// whole session (the keepalives, which take the flow-agnostic SendPacket).
 	flowKeyNonZero atomic.Int64
 	flowKeyTotal   atomic.Int64
+
+	// flow-local path set (PR2): the dispatch itself. pathQ is one SHALLOW
+	// queue per connection — a flow's packets prefer the k queues of its own
+	// set, and spill to the shared sendCh the moment those are busy. flows
+	// holds the key → set mapping; flowPathStats answers "did it engage".
+	// All three are inert while flowPathsK is 0, which is the default.
+	// → flowpaths.go for why k=1 is refused and why the queues are 2 deep.
+	pathQ         []chan sendItem
+	flows         *flowTable
+	flowPathStats flowPathsStats
 
 	// sendChBlockNs / sendChBlockCount (build 224): how long producers actually
 	// had to WAIT for room, and how often. This is the number the peak cannot
@@ -555,6 +567,8 @@ func NewProxy(cfg Config) *Proxy {
 		firstPingAt:       make([]atomic.Int64, cfg.NumConns),
 		firstPongAt:       make([]atomic.Int64, cfg.NumConns),
 		lastActiveProbeAt: make([]atomic.Int64, cfg.NumConns),
+		pathQ:             newPathQueues(cfg.NumConns),
+		flows:             newFlowTable(cfg.NumConns),
 		connTxBytes:       make([]atomic.Int64, cfg.NumConns),
 		connRxBytes:       make([]atomic.Int64, cfg.NumConns),
 		lastTxAt:          make([]atomic.Int64, cfg.NumConns),
@@ -1716,6 +1730,20 @@ func (p *Proxy) SendPacketFlow(data []byte, flowKey uint64) error {
 	// printed beside it on the same memstats line. When that reads `0s/0`, every
 	// residence in the interval is exact.
 	item := sendItem{buf: buf, at: time.Now().UnixNano()}
+	// Flow-local path set (PR2), inert unless flow_paths_k is set. A packet that
+	// lands on one of its flow's preferred paths is done here; everything else —
+	// k=0, a keepalive with no key, or a preferred set that is momentarily busy —
+	// falls through to exactly the shared-channel code below, unchanged.
+	//
+	// ⚠️ WHEN k>0, `sendch-block` AND `sendch-peak` DESCRIBE THE SPILL PATH ONLY.
+	// They keep their meaning (waiting for any of 30 writers), but their
+	// denominator is no longer every packet — read them beside `flowpaths=`,
+	// never alone.
+	if p.enqueueFlowPath(item, flowKey) {
+		p.txBytes.Add(int64(len(data)))
+		p.txPackets.Add(1)
+		return nil
+	}
 	// Try without blocking first, so the slow path below runs ONLY when there
 	// was genuinely no room. That is what makes the blocked-time counter exact:
 	// it measures waiting, not the cost of measuring.
@@ -2804,18 +2832,21 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			return werr
 		}
 		for {
-			select {
-			case <-connCtx.Done():
+			// nextSendItem takes this connection's own flow-path queue first and
+			// the shared sendCh otherwise; with the lever off it IS the shared
+			// sendCh. connIdx addresses the path queue — the -1 below is a
+			// separate question, about TX accounting.
+			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
+			if !ok {
 				log.Printf("proxy: [conn %d] DTLS send goroutine: ctx cancelled", connIdx)
 				return
-			case item := <-p.sendCh:
-				// -1: this site has never maintained the per-conn TX counters,
-				// and writeChunk must not quietly start. That is what keeps
-				// K=1 byte-for-byte identical to the pre-chunking code here.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
-					log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
-					return
-				}
+			}
+			// -1: this site has never maintained the per-conn TX counters,
+			// and writeChunk must not quietly start. That is what keeps
+			// K=1 byte-for-byte identical to the pre-chunking code here.
+			if err := p.writeChunk(item, -1, writeOne); err != nil {
+				log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
+				return
 			}
 		}
 	}()
@@ -3062,14 +3093,13 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			return werr
 		}
 		for {
-			select {
-			case <-connCtx.Done():
+			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
+			if !ok {
 				return
-			case item := <-p.sendCh:
-				// -1: no per-conn TX accounting at this site today.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
-					return
-				}
+			}
+			// -1: no per-conn TX accounting at this site today.
+			if err := p.writeChunk(item, -1, writeOne); err != nil {
+				return
 			}
 		}
 	}()
@@ -3255,15 +3285,14 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			return werr
 		}
 		for {
-			select {
-			case <-connCtx.Done():
+			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
+			if !ok {
 				return
-			case item := <-p.sendCh:
-				// -1: no per-conn TX accounting at this site today.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
-					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)
-					return
-				}
+			}
+			// -1: no per-conn TX accounting at this site today.
+			if err := p.writeChunk(item, -1, writeOne); err != nil {
+				log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)
+				return
 			}
 		}
 	}()
@@ -4124,7 +4153,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s flowkey=%d/%d",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s flowkey=%d/%d%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4186,10 +4215,14 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// sockstats.go before quoting it.
 			p.sockStats.summary(),
 			// flow-local path set (PR1): non-zero / total keys this tick. On a
-			// real tunnel N should be >0 (WG patch delivers keys); dispatch by
-			// them is PR2. Read-and-reset so each line is per-interval.
+			// real tunnel N should be >0 — device-confirmed in build 244 at
+			// 284541/284545. Read-and-reset so each line is per-interval.
 			p.flowKeyNonZero.Swap(0),
-			p.flowKeyTotal.Swap(0))
+			p.flowKeyTotal.Swap(0),
+			// flow-local path set (PR2): empty while k=0. 🚨 Read `pref=` BEFORE
+			// believing any throughput result — a run whose packets all spilled
+			// tested today's behaviour, not the treatment. → flowpaths.go
+			p.flowPathStats.summary(p.flows))
 
 		// The downlink's own disorder, on its own line so it can be diffed
 		// field-for-field against server1's `reorder(uplink)` line — the two
@@ -5134,21 +5167,20 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			return werr
 		}
 		for {
-			select {
-			case <-connCtx.Done():
+			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
+			if !ok {
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
+			}
 			// connIdx (not -1) below because this site keeps the per-conn TX
 			// counters, which writeChunk maintains per packet: the pre-SRTP
 			// payload bytes — the WireGuard records that came out of sendCh —
 			// not the wire bytes after RTP+SRTP framing. That matches what an
 			// external observer counting WG throughput sees, and keeps the
 			// conn-stats tick reading the same regardless of transport mode.
-			case item := <-p.sendCh:
-				if err := p.writeChunk(item, connIdx, writeOne); err != nil {
-					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
-					return
-				}
+			if err := p.writeChunk(item, connIdx, writeOne); err != nil {
+				log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
+				return
 			}
 		}
 	}()
