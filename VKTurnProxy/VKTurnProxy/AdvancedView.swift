@@ -191,15 +191,20 @@ struct AdvancedView: View {
                 .onChange(of: flowPathsK) { _ in
                     TunnelManager.shared.applyFlowPathsK()
                 }
-                Toggle("Spread the sets over all paths", isOn: $flowPathsCover)
-                    .disabled(flowPathsK == FlowPaths.off)
+                // 🚨 NOT disabled while k is Off, and that was a real defect in
+                // build 257. This is a SESSION mode that has to be armed BEFORE a
+                // measurement, and k is 0 at rest — the A/B runner restores k=0 on
+                // every exit path — so gating it on k>0 made it unreachable in
+                // exactly the workflow it exists for. It simply has no effect
+                // until a set is armed, which the footer says.
+                Toggle("Least-used paths first", isOn: $flowPathsCover)
                     .onChange(of: flowPathsCover) { _ in
                         TunnelManager.shared.applyFlowPathsCover()
                     }
             } header: {
                 Text("Uplink experiment")
             } footer: {
-                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.\n\nSpreading the sets makes each connection choose the least-used paths, so the few paths a connection prefers still add up to all of them. It changes what the setting above measures, so set it before a measurement rather than during one.")
+                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.\n\nLeast-used paths first changes HOW those few paths are picked: each new connection takes the ones carrying the fewest others, so the small sets still add up to all of them. It does nothing while the setting above is Off, and it changes what that setting measures — so turn it on before a measurement, not during one.")
             }
 
             // 🚨 Its own section (see the note above the Logging one). Diagnostic
