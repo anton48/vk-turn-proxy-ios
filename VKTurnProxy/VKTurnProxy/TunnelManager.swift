@@ -155,6 +155,7 @@ extension TunnelConfig {
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
             memstatsFastTicks: d.bool(forKey: "memstatsFastTicks"),
+            flowPathsK: FlowPaths.stored(in: d),
             uplinkChunkK: UplinkChunk.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
@@ -975,6 +976,26 @@ class TunnelManager: ObservableObject {
         let on = UserDefaults.standard.bool(forKey: "memstatsFastTicks")
         guard let session = manager?.connection as? NETunnelProviderSession,
               let msg = "set_memstats_fast:\(on ? 1 : 0)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
+    /// Push the flow-local path set size to a RUNNING tunnel.
+    ///
+    /// 🚨 This is a measurement requirement, not a convenience. Each value of k
+    /// is an arm of an A/B, and applying one through a reconnect would re-ramp
+    /// 30 connections over ~107 s between every pair of arms — on a line
+    /// measured to move 75 → 363 Mbit/s inside 70 minutes. Live, k changes
+    /// WITHIN one iperf run: one state of the line, one set of connections.
+    ///
+    /// ⚠️ A memstats tick can straddle the switch. Discard the tick containing
+    /// it rather than attributing it to either arm.
+    ///
+    /// No-op when the tunnel is down; proxyConfig carries the same value to the
+    /// next start, so nothing is lost.
+    func applyFlowPathsK() {
+        let k = FlowPaths.stored(in: UserDefaults.standard)
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_flow_paths_k:\(k)".data(using: .utf8) else { return }
         try? session.sendProviderMessage(msg) { _ in }
     }
 
@@ -1841,6 +1862,7 @@ class TunnelManager: ObservableObject {
             "uplink_synth_sec": config.uplinkSynthSec,
             "memstats_fast_ticks": config.memstatsFastTicks,
             "uplink_chunk_k": config.uplinkChunkK,
+            "flow_paths_k": config.flowPathsK,
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
             "use_srtp": config.useSrtp,
@@ -2377,6 +2399,12 @@ struct TunnelConfig {
     // Carried here so it survives a reconnect; the live path that avoids one is
     // TunnelManager.applyMemstatsFastTicks(). Default false.
     var memstatsFastTicks: Bool = false
+    /// Flow-local path set size (EXPERIMENT, Settings › Advanced). 0 = off =
+    /// today's behaviour, every packet racing all N connections. 3-8 pins each
+    /// inner flow to that many preferred paths, with a spill to the rest.
+    /// Carried here so a reconnect keeps the arm; the live path that avoids a
+    /// reconnect is TunnelManager.applyFlowPathsK(). See FlowPaths.swift.
+    var flowPathsK: Int = FlowPaths.off
     /// Uplink chunking K (EXPERIMENT, Settings › Advanced). 1 = today's
     /// behaviour. See UplinkChunk.swift; expected to be removed with the
     /// setting once the sweep has answered.

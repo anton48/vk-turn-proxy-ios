@@ -101,6 +101,12 @@ var (
 // config cannot put k=1 (or k=99) on the hot path.
 func SetFlowPathsK(k int) { flowPathsK.Store(int64(ClampFlowPathsK(k))) }
 
+// SetFlowPathsHealth arms the per-tick health filter. Default OFF: it is a
+// SECOND arm of the experiment, not part of the first — see pathHealthy for
+// why its signal is weak (a stale upper bound against a 100-277 ms stall) and
+// why the instantaneous test is the depth of the connection's own queue.
+func SetFlowPathsHealth(on bool) { flowPathsHealth.Store(on) }
+
 // ClampFlowPathsK snaps a configured k into the supported range: 0 stays off,
 // 1-2 clamp UP to FlowPathsMin (never down toward the refuted k=1), and anything
 // above FlowPathsMax clamps down.

@@ -58,6 +58,12 @@ struct AdvancedView: View {
     /// between runs, and one had none. Same rule as the keys above: declared
     /// HERE, never in ContentView.
     @AppStorage("memstatsFastTicks") private var memstatsFastTicks = false
+    // 🚨 Declared HERE and nowhere else — never in ContentView or SettingsView.
+    // An @AppStorage is subscribed even when unused, and a write to a key the
+    // NavigationView host observes re-renders the host and tears down whatever
+    // screen is pushed (build 177, GitHub #65). Verified with
+    // `grep -c flowPathsK ContentView.swift` = 0.
+    @AppStorage("flowPathsK") private var flowPathsK = FlowPaths.off
 
     /// Diagnostic uplink cwnd probe (build 241). Ephemeral @State, not backed
     /// up: it is a one-sitting measurement, not a preference. The runner is a
@@ -157,6 +163,36 @@ struct AdvancedView: View {
                 Text("Logging")
             } footer: {
                 Text("Writes the memory and queue lines once a second instead of once every ten — the resolution needed to see what happens inside a single second of a transfer. Takes effect immediately, on a tunnel that is already connected.\n\nLeave it off for everyday use: the log fills about ten times faster, so it starts discarding its oldest entries after roughly half a day instead of several. Turn it on for a measurement, then off.")
+            }
+
+            // 🚨 ITS OWN SECTION, and the note above the Logging one says why:
+            // a Form footer belongs to the SECTION, so putting this picker in
+            // with the logging switch would leave that switch's explanation
+            // reading as if it described this one. Build 230 shipped exactly
+            // that bug once.
+            //
+            // EXPERIMENT, like uplink chunking before it — this row is expected
+            // to be removed once the A/B has answered, and it is default Off.
+            Section {
+                Picker("Flow-local paths", selection: $flowPathsK) {
+                    ForEach(FlowPaths.choices, id: \.self) { k in
+                        Text(FlowPaths.label(k)).tag(k)
+                    }
+                }
+                // Live, for the reason the logging switch is live and one more:
+                // this is an A/B knob. Applying an arm through a reconnect would
+                // put a ~107 s 30-connection ramp between every pair of arms on
+                // a line that has been seen to move 75 → 363 Mbit/s inside 70
+                // minutes, so the arms would differ by drift as much as by k —
+                // the very thing the knob exists to measure. Switching live
+                // keeps one state of the line, one set of connections, one ramp.
+                .onChange(of: flowPathsK) { _ in
+                    TunnelManager.shared.applyFlowPathsK()
+                }
+            } header: {
+                Text("Uplink experiment")
+            } footer: {
+                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.")
             }
 
             // 🚨 Its own section (see the note above the Logging one). Diagnostic

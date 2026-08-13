@@ -98,6 +98,10 @@ enum BackupManager {
         // switch above: a diagnostic that silently resets on a restore is one
         // nobody can rely on mid-investigation.
         let fastTicks = (d.object(forKey: "memstatsFastTicks") as? Bool) ?? false
+        // Flow-local path set (experiment). Snapped on the way out for the
+        // same reason as the chunk K below, and exported as well as imported
+        // so Export→Import cannot silently clear the arm mid-measurement.
+        let flowK = FlowPaths.stored(in: d)
         // Uplink chunking K (experiment). Snapped on the way out as well as in:
         // the picker can only show supported values, so exporting an unsnapped
         // one would produce a backup whose restore shows a different number
@@ -124,6 +128,7 @@ enum BackupManager {
             uplinkSynthMbit: synthMbit,
             uplinkSynthSec: synthSec,
             memstatsFastTicks: fastTicks,
+            flowPathsK: flowK,
             vkAuth: vkAuth,
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,
@@ -244,6 +249,10 @@ enum BackupManager {
         if let v = s.uplinkSynthMbit { d.set(v, forKey: "uplinkSynthMbit") }
         if let v = s.uplinkSynthSec { d.set(v, forKey: "uplinkSynthSec") }
         if let v = s.memstatsFastTicks { d.set(v, forKey: "memstatsFastTicks") }
+        // Clamped on the way in: a hand-edited backup is untrusted, and the
+        // one value that must never survive it is k=1 (a measured −79% on a
+        // single flow). FlowPaths.clamp sends 1 and 2 UP to 3; Go clamps again.
+        if let v = s.flowPathsK { d.set(FlowPaths.clamp(v), forKey: "flowPathsK") }
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
         if let v = s.liveActivityEnabled { d.set(v, forKey: "liveActivityEnabled") }
         if let v = s.liveActivityCompactClock { d.set(v, forKey: "liveActivityCompactClock") }

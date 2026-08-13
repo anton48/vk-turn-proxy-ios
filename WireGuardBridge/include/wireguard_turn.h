@@ -172,6 +172,14 @@ void wgSetForceLegacyCaptcha(int32_t enabled);
 /// @param enabled 1 = 1s ticks; 0 = the normal 10s cadence
 void wgSetMemstatsFastTicks(int32_t enabled);
 
+/// Applies the flow-local path set size to the running tunnel, without a
+/// reconnect — each k is an A/B arm, and a reconnect between arms inserts a
+/// ~107s 30-connection ramp on a line that drifts several fold within an hour.
+/// The Go side clamps (0 = off; 1 and 2 clamp UP to 3, the measured -79% of
+/// k=1 must be unreachable; max 8).
+/// @param k 0 = off (every packet races all paths); 3-8 = preferred set size
+void wgSetFlowPathsK(int32_t k);
+
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
 /// The extension polls this after bootstrap (cookie mode only) — a non-empty
 /// value means the saved cookie was rejected/expired in the background, so the

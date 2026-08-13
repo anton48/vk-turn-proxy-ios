@@ -472,6 +472,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: memstats fast ticks = \(on)")
             wgSetMemstatsFastTicks(on ? 1 : 0)
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_flow_paths_k:") {
+            // Settings › Advanced › Uplink experiment, applied to the RUNNING
+            // tunnel — each k is an A/B arm, and a reconnect between arms would
+            // insert a ~107 s 30-connection ramp on a line that drifts several
+            // fold within an hour. Go clamps the value again at the sink, so a
+            // malformed message cannot put an unsupported k on the hot path.
+            // Process-global in Go, so it needs no tunnelHandle.
+            let raw = Int(msg.dropFirst("set_flow_paths_k:".count)) ?? 0
+            logMsg("handleAppMessage: flow-local path set k = \(raw)")
+            wgSetFlowPathsK(Int32(raw))
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("debug_log:") {
             let debugMsg = String(msg.dropFirst("debug_log:".count))
             logMsg("[AppDebug] \(debugMsg)")

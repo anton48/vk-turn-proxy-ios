@@ -258,6 +258,11 @@ type ProxyConfig struct {
 	// says there is something worth shipping. See pkg/proxy/flowpaths.go.
 	FlowPathsK int `json:"flow_paths_k,omitempty"`
 
+	// FlowPathsHealth arms the flow-path health filter — the SECOND arm of the
+	// same experiment, kept separate so the first one (stickiness alone) can be
+	// attributed. Default off; no UI, backup JSON only. See pathHealthy.
+	FlowPathsHealth bool `json:"flow_paths_health,omitempty"`
+
 	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
 	// session cookie → TURN creds; see pkg/proxy/creds_vkcookie.go). When true,
 	// GetVKCreds uses ONLY the cookie path — NO fallback to the anonymous VK
@@ -313,6 +318,7 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
 	proxy.SetFlowPathsK(pcfg.FlowPathsK)
+	proxy.SetFlowPathsHealth(pcfg.FlowPathsHealth)
 	if !pcfg.UseCookieAuth {
 		proxy.SetVKCookieAuth(false, "", nil)
 	}
@@ -453,6 +459,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
 	proxy.SetFlowPathsK(pcfg.FlowPathsK)
+	proxy.SetFlowPathsHealth(pcfg.FlowPathsHealth)
 	// Defensive: when cookie auth isn't requested, force it OFF (the extension
 	// process can be reused across connects — clear any stale cookie state).
 	// When it IS requested, the extension has already called wgSetVKCookieAuth
@@ -1059,6 +1066,24 @@ func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 //
 // The extension is the only process that runs logMemStatsLoop, so unlike
 // wgSetForceLegacyCaptcha this needs no companion call in the main app.
+//
+//export wgSetFlowPathsK
+func wgSetFlowPathsK(k C.int32_t) {
+	proxy.SetFlowPathsK(int(k))
+}
+
+// Applies the flow-local path set size to THIS process without a reconnect.
+// Called by the extension when the app sends `set_flow_paths_k:`, and by both
+// ProxyConfig entry points from FlowPathsK.
+//
+// 🚨 THE LIVE PATH IS A MEASUREMENT REQUIREMENT, not a convenience. Every value
+// of k is an arm of an A/B; applying one through a reconnect puts a ~107 s
+// 30-connection ramp between arms on a line measured to move 75 → 363 Mbit/s
+// inside 70 minutes, so the arms would differ by drift as much as by k. Live, k
+// changes WITHIN one iperf run.
+//
+// proxy.SetFlowPathsK CLAMPS (0 off; 1 and 2 up to 3; max 8), so a malformed
+// message cannot put the refuted k=1 on the hot path.
 //
 //export wgSetMemstatsFastTicks
 func wgSetMemstatsFastTicks(enabled C.int32_t) {

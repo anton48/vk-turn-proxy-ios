@@ -155,6 +155,11 @@ struct AppSettings: Codable {
     /// set it but never carried it back out. Same Optional/nil-preserves
     /// pattern.
     var memstatsFastTicks: Bool? = nil
+    /// Flow-local path set size (EXPERIMENT). Optional so an older backup
+    /// decodes unchanged. Exported AND imported — the pair matters: the
+    /// forceLegacyCaptcha trap was a field that imported but never exported,
+    /// so Export→Import silently cleared it.
+    var flowPathsK: Int? = nil
     /// VKAuth (non-anonymous cookie cred path) toggle. Round-trips in full
     /// backups so the preference is preserved. The cookies themselves are NEVER
     /// in the backup — they live in the Keychain (VKCookieStore). Optional +
