@@ -11,13 +11,20 @@ import Foundation
 /// arm lengths and the run order all vary per arm — the three quantities the
 /// pairing depends on. Here they are constants.
 ///
-/// 🚨 THE PLAN BELOW IS THE PRE-REGISTERED ONE. It is not a starting point to
-/// tune while looking at results: primary F=16/k=5, F=8 with k=8 (the coverage
-/// correction — at F=8/k=5 about seven of thirty connections get no sticky
-/// traffic and the aggregate would fall for a structural reason that reads as a
-/// KILL of the mechanism), four 15 s arms per run, three runs per phase with the
-/// starting arm alternated so order effects cancel. Changing it after seeing a
-/// number turns the experiment into a search.
+/// 🚨 THE PLAN IS PRE-REGISTERED AND IS NOT A KNOB TO TUNE WHILE WATCHING
+/// RESULTS. It changed once, on 2026-08-13, and the reason it is not a search:
+/// the first plan measured F=16/k=5 (+27.7% then +16.6%, 12/12 pairs) and
+/// F=8/k=8 (+42.9% on two pairs, then −5.9% on six — withdrawn), while the
+/// SPEEDTEST, the workload a user feels, got 30% WORSE at k=5. The first plan
+/// had deliberately paired F=8 with k=8 to AVOID the coverage corner — and that
+/// is exactly the corner a speedtest runs in, so it was never measured. This
+/// plan measures it, with a prediction registered before the run rather than an
+/// explanation fitted after: a connection is in no flow's set with probability
+/// ((N−k)/N)^F, so at F=4/k=5 about 48% of the pool (≈14 of 30) should be
+/// NEAR-IDLE in the treatment arms. Idle conns AND a throughput drop confirm the
+/// coverage explanation and close the lever on its merits; all conns busy WITH a
+/// drop refutes it and the −30% needs another cause. Phase C repeats the one arm
+/// that worked, as a positive control on the session itself.
 ///
 /// The runner writes `flowab` markers to the same log as the probe, so the
 /// parser aligns arms on the log's own timestamps instead of a stopwatch.
@@ -33,18 +40,20 @@ final class UplinkFlowABRunner: ObservableObject {
         let name: String
         let flows: Int
         let treatment: Int
+        let runs: Int
     }
 
-    /// 🚨 Coverage decides these pairings, not preference. A connection is in no
-    /// flow's set with probability ((N−k)/N)^F, so at F=8 a k of 5 leaves ~23% of
-    /// the pool unused; k=8 brings that to ~8%. At F=16, k=5 already leaves only
-    /// ~5%, which is why F=16 is the primary arm.
+    /// 🚨 k IS ONE NUMBER BUT COVERAGE DEPENDS ON F — that is the thing under
+    /// test now. Predicted share of the pool receiving no sticky traffic,
+    /// ((30−k)/30)^F: **F=4/k=5 → 48%**, F=8/k=5 → 23%, F=16/k=5 → 5%. The first
+    /// two are the corner a speedtest lives in and the corner the previous plan
+    /// stepped around; the third is the arm already measured twice and is here
+    /// only to prove the session is comparable.
     private let phases = [
-        Phase(name: "A", flows: 16, treatment: 5),
-        Phase(name: "B", flows: 8, treatment: 8),
+        Phase(name: "A", flows: 4, treatment: 5, runs: 2),
+        Phase(name: "B", flows: 8, treatment: 5, runs: 2),
+        Phase(name: "C", flows: 16, treatment: 5, runs: 1),
     ]
-
-    private let runsPerPhase = 3
     private let armSec = 15
     private let armsPerRun = 4
     /// Between runs: the pipeline holds MiB that keep draining after the sender
@@ -53,7 +62,7 @@ final class UplinkFlowABRunner: ObservableObject {
     private let cooldownSec = 10
 
     var estimatedSeconds: Int {
-        phases.count * runsPerPhase * (armSec * armsPerRun + cooldownSec)
+        phases.reduce(0) { $0 + $1.runs * (armSec * armsPerRun + cooldownSec) }
     }
 
     func start(host: String, port: UInt16, probe: UplinkCwndProbe) {
@@ -72,14 +81,14 @@ final class UplinkFlowABRunner: ObservableObject {
         let runSec = armSec * armsPerRun
         var runIdx = 0
         var aborted = 0
-        let total = phases.count * runsPerPhase
+        let total = phases.reduce(0) { $0 + $1.runs }
 
-        log.log("flowab PLAN host=\(host):\(port) phases=\(phases.count) runsPerPhase=\(runsPerPhase) "
+        log.log("flowab PLAN host=\(host):\(port) phases=\(phases.count) runs=\(total) "
             + "armSec=\(armSec) armsPerRun=\(armsPerRun) cooldownSec=\(cooldownSec) "
             + "estimated=\(estimatedSeconds)s — pairs are scored per arm AFTER discarding 4s past each flip")
 
         for phase in phases {
-            for r in 0..<runsPerPhase {
+            for r in 0..<phase.runs {
                 if cancelled { break }
                 runIdx += 1
 
