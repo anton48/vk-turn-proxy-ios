@@ -96,7 +96,33 @@ var (
 	flowPathsK      atomic.Int64
 	flowPathsDepth  atomic.Int64
 	flowPathsHealth atomic.Bool
+	flowPathsCover  atomic.Bool
 )
+
+// SetFlowPathsCover switches assignment from independent random sets to a GREEDY
+// COVER: a new flow takes the k connections currently carrying the fewest flows.
+//
+// 🎯 WHY IT EXISTS, and it is a discriminator rather than an optimisation. Two
+// requirements pull against each other — COVERAGE (the union of the per-flow sets
+// keeps every allocation fed) and LOCALITY (each flow walks a small set) — and a
+// single global k was refuted twice on device precisely because it cannot hold
+// both. But the same two sessions say coverage is NOT the whole cause: measured
+// 2026-08-13, the coverage deficit falls threefold across F=4/8/16 (43 -> 17 -> 13
+// points) while the throughput loss barely moves (-21.9 / -21.3 / -16.6%), and at
+// F>=8 the loss EXCEEDS the deficit. So something beyond uncovered paths is being
+// paid, and the candidate is the locality cost itself — "a flow saturates at ~5
+// allocations" is an INFERENCE (8.14/1.69 = 4.8), never a measurement.
+//
+// A greedy cover pins coverage near 100% at any (F, k) with F*k >= N, which makes
+// the next run read cleanly instead of ambiguously:
+//
+//	throughput recovers          -> coverage WAS the cause; the lever works.
+//	budget-cov ~100%, loss stays -> coverage was NEVER the cause, and the whole
+//	                                family closes in one session instead of three.
+//
+// 🚫 It is deliberately NOT the default: the random assignment is what every
+// recorded number was measured on, and one variable at a time.
+func SetFlowPathsCover(on bool) { flowPathsCover.Store(on) }
 
 // SetFlowPathsK applies the set size to this process. Clamped, so a malformed
 // config cannot put k=1 (or k=99) on the hot path.
@@ -159,6 +185,12 @@ type flowEntry struct {
 	// the ones that matter (a SYN is the whole flow's progress) and tracing
 	// every packet of a bulk transfer would drown the log.
 	traceLeft atomic.Int32
+
+	// cover records WHICH assignment built this set. A flow whose mode no longer
+	// matches is re-assigned on its next lookup, so flipping the mode live cannot
+	// leave a run measuring a mixture of both — the failure that would make the
+	// result unattributable rather than merely noisy.
+	cover bool
 }
 
 // flowTable maps inner-flow key → preferred set.
@@ -173,12 +205,20 @@ type flowTable struct {
 	m        map[uint64]*flowEntry
 	numPaths int
 	salt     uint64
+
+	// assign[i] is how many LIVE flows currently hold connection i in their set.
+	// Only maintained for cover-assigned entries, and it must be released on both
+	// exits (eviction and re-assignment after a k change) or the counts drift up,
+	// every path looks equally loaded, and the greedy cover silently degenerates
+	// into a fixed round-robin by index.
+	assign []int32
 }
 
 func newFlowTable(numPaths int) *flowTable {
 	return &flowTable{
 		m:        make(map[uint64]*flowEntry, 64),
 		numPaths: numPaths,
+		assign:   make([]int32, numPaths),
 		// A fixed per-process salt so two flows that collide in one session do
 		// not collide in every session. Derived from the table's own address era
 		// rather than a clock: this file must stay deterministic under test.
@@ -201,14 +241,25 @@ func (t *flowTable) paths(key uint64, k int) *flowEntry {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if e, ok := t.m[key]; ok && len(e.paths) == k {
+	cover := flowPathsCover.Load()
+	if e, ok := t.m[key]; ok && len(e.paths) == k && e.cover == cover {
 		e.lastUse.Store(now)
 		return e
+	} else if ok {
+		// Width or mode changed: give the old set's counts back before building
+		// the new one, or this flow is charged to the pool twice.
+		t.releaseLocked(e)
+		delete(t.m, key)
 	}
 	if len(t.m) >= flowPathsMaxFlows {
 		t.evictLocked(now)
 	}
-	e := &flowEntry{paths: assignPaths(key^t.salt, k, t.numPaths)}
+	var e *flowEntry
+	if cover {
+		e = &flowEntry{paths: t.assignCoverLocked(key^t.salt, k), cover: true}
+	} else {
+		e = &flowEntry{paths: assignPaths(key^t.salt, k, t.numPaths)}
+	}
 	e.traceLeft.Store(flowTraceBudget)
 	e.lastUse.Store(now)
 	t.m[key] = e
@@ -225,6 +276,7 @@ func (t *flowTable) evictLocked(now int64) {
 	for k, e := range t.m {
 		at := e.lastUse.Load()
 		if at < cutoff {
+			t.releaseLocked(e)
 			delete(t.m, k)
 			freed++
 			continue
@@ -234,8 +286,64 @@ func (t *flowTable) evictLocked(now int64) {
 		}
 	}
 	if freed == 0 && len(t.m) > 0 {
+		t.releaseLocked(t.m[oldestKey])
 		delete(t.m, oldestKey)
 	}
+}
+
+// releaseLocked returns a set's paths to the pool's assignment counts.
+func (t *flowTable) releaseLocked(e *flowEntry) {
+	if e == nil || !e.cover {
+		return
+	}
+	for _, p := range e.paths {
+		if int(p) < len(t.assign) && t.assign[p] > 0 {
+			t.assign[p]--
+		}
+	}
+}
+
+// assignCoverLocked picks the k connections carrying the FEWEST live flows.
+//
+// 🚨 This is the whole difference from assignPaths, and it is about COVERAGE, not
+// about picking "good" connections — the pool is measured homogeneous under load
+// (ack_rtt p50/p90/p99 ~ 120/155/180 on every one of 30, corr(baseRTT, bytes) =
+// +0.05), so there is nothing to steer toward. What independent random sets waste
+// is OVERLAP: at F=4 and k=9 they reach ~23 distinct paths of 30, while sets built
+// to complement each other reach 28-32 at k=7-8. Same locality, more coverage.
+//
+// The scan starts at a key-derived offset so that ties — and early on every count
+// is a tie — do not hand the first flows the same low indices every time.
+//
+// O(N*k) under the table lock, but only on a flow's FIRST packet: 30*5 = 150
+// comparisons against a table that turns over a few flows a second.
+func (t *flowTable) assignCoverLocked(key uint64, k int) []int32 {
+	n := t.numPaths
+	if k > n {
+		k = n
+	}
+	out := make([]int32, 0, k)
+	taken := make([]bool, n)
+	start := int(key % uint64(n))
+	for len(out) < k {
+		best, bestCount := -1, int32(1<<30)
+		for j := 0; j < n; j++ {
+			i := (start + j) % n
+			if taken[i] {
+				continue
+			}
+			if t.assign[i] < bestCount {
+				best, bestCount = i, t.assign[i]
+			}
+		}
+		if best < 0 {
+			break
+		}
+		taken[best] = true
+		t.assign[best]++
+		out = append(out, int32(best))
+	}
+	return out
 }
 
 func (t *flowTable) size() int {
@@ -338,8 +446,12 @@ func (s *flowPathsStats) summary(t *flowTable) string {
 	if total > 0 {
 		prefPct = 100 * float64(pref) / float64(total)
 	}
-	return fmt.Sprintf(" flowpaths=k=%d flows=%d pref=%d/%d=%.1f%% spill=%d skip=%d keyed=%d stolen=%d qpeak=%d/%d",
-		k, t.size(), pref, total, prefPct, spill, skip, keyed, stolen,
+	mode := "rand"
+	if flowPathsCover.Load() {
+		mode = "cover"
+	}
+	return fmt.Sprintf(" flowpaths=k=%d/%s flows=%d pref=%d/%d=%.1f%% spill=%d skip=%d keyed=%d stolen=%d qpeak=%d/%d",
+		k, mode, t.size(), pref, total, prefPct, spill, skip, keyed, stolen,
 		s.qPeak.Swap(0), flowPathsQueueDepth())
 }
 

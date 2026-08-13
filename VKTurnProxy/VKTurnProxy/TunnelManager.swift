@@ -156,6 +156,7 @@ extension TunnelConfig {
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
             memstatsFastTicks: d.bool(forKey: "memstatsFastTicks"),
             flowPathsK: FlowPaths.stored(in: d),
+            flowPathsCover: FlowPaths.coverStored(in: d),
             uplinkChunkK: UplinkChunk.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
@@ -996,6 +997,19 @@ class TunnelManager: ObservableObject {
         let k = FlowPaths.stored(in: UserDefaults.standard)
         guard let session = manager?.connection as? NETunnelProviderSession,
               let msg = "set_flow_paths_k:\(k)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
+    /// Applies the assignment mode live, for the same reason k applies live.
+    ///
+    /// ⚠️ A flow keeps the set it was given until its next lookup finds the mode
+    /// changed, at which point it is re-assigned — so flipping this mid-run does
+    /// not leave a mixture, but it does mean the flows in flight at the instant
+    /// of the flip are re-cut. Set it BEFORE a measurement, not during one.
+    func applyFlowPathsCover() {
+        let on = FlowPaths.coverStored(in: UserDefaults.standard)
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_flow_paths_cover:\(on ? 1 : 0)".data(using: .utf8) else { return }
         try? session.sendProviderMessage(msg) { _ in }
     }
 
@@ -1863,6 +1877,7 @@ class TunnelManager: ObservableObject {
             "memstats_fast_ticks": config.memstatsFastTicks,
             "uplink_chunk_k": config.uplinkChunkK,
             "flow_paths_k": config.flowPathsK,
+            "flow_paths_cover": config.flowPathsCover,
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
             "use_srtp": config.useSrtp,
@@ -2405,6 +2420,11 @@ struct TunnelConfig {
     /// Carried here so a reconnect keeps the arm; the live path that avoids a
     /// reconnect is TunnelManager.applyFlowPathsK(). See FlowPaths.swift.
     var flowPathsK: Int = FlowPaths.off
+    /// Choose the flow's k paths by a GREEDY COVER rather than independently at
+    /// random — the second arm of the same experiment. It changes what a given k
+    /// MEANS, so a run must record which mode produced it; the memstats line
+    /// carries `k=5/cover` or `k=5/rand` for exactly that reason.
+    var flowPathsCover: Bool = false
     /// Uplink chunking K (EXPERIMENT, Settings › Advanced). 1 = today's
     /// behaviour. See UplinkChunk.swift; expected to be removed with the
     /// setting once the sweep has answered.

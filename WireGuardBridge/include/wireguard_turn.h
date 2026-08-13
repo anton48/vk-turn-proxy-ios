@@ -179,6 +179,7 @@ void wgSetMemstatsFastTicks(int32_t enabled);
 /// k=1 must be unreachable; max 8).
 /// @param k 0 = off (every packet races all paths); 3-8 = preferred set size
 void wgSetFlowPathsK(int32_t k);
+void wgSetFlowPathsCover(int32_t on);
 
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
 /// The extension polls this after bootstrap (cookie mode only) — a non-empty

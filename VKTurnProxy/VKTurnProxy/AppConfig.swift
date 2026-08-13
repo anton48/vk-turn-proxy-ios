@@ -160,6 +160,12 @@ struct AppSettings: Codable {
     /// forceLegacyCaptcha trap was a field that imported but never exported,
     /// so Export→Import silently cleared it.
     var flowPathsK: Int? = nil
+    /// The flow-path assignment mode (greedy cover vs independent random). Its
+    /// own key rather than a wider k, because it changes what a given k MEANS —
+    /// a backup that carried k alone would silently restore a different
+    /// experiment. Optional so an older backup imports as "random", which is
+    /// what every recorded measurement used.
+    var flowPathsCover: Bool? = nil
     /// VKAuth (non-anonymous cookie cred path) toggle. Round-trips in full
     /// backups so the preference is preserved. The cookies themselves are NEVER
     /// in the backup — they live in the Keychain (VKCookieStore). Optional +

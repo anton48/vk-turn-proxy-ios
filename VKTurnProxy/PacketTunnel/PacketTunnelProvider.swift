@@ -483,6 +483,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: flow-local path set k = \(raw)")
             wgSetFlowPathsK(Int32(raw))
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_flow_paths_cover:") {
+            // The SECOND arm of the flow-path experiment: it changes what a given
+            // k means, so the Go side logs the mode and the memstats line carries
+            // it, or two sessions get compared without anything saying they used
+            // different assignments.
+            let raw = Int(msg.dropFirst("set_flow_paths_cover:".count)) ?? 0
+            logMsg("handleAppMessage: flow-path assignment = \(raw != 0 ? "cover" : "random")")
+            wgSetFlowPathsCover(Int32(raw))
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("debug_log:") {
             let debugMsg = String(msg.dropFirst("debug_log:".count))
             logMsg("[AppDebug] \(debugMsg)")

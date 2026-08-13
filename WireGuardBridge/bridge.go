@@ -263,6 +263,20 @@ type ProxyConfig struct {
 	// attributed. Default off; no UI, backup JSON only. See pathHealthy.
 	FlowPathsHealth bool `json:"flow_paths_health,omitempty"`
 
+	// FlowPathsCover switches the flow-local set from independent RANDOM
+	// assignment to a GREEDY COVER — a new flow takes the k connections carrying
+	// the fewest live flows.
+	//
+	// 🎯 It exists to DISCRIMINATE, not to optimise. A static global k is refuted
+	// twice on device, but the same sessions say coverage is not the whole cause:
+	// the coverage deficit falls threefold across F=4/8/16 while the loss barely
+	// moves, and at F>=8 the loss exceeds the deficit. A cover pins coverage near
+	// 100% at any (F, k) with F*k >= N, so the next run reads cleanly — throughput
+	// recovers and coverage was the cause, or budget-cov reads ~100% with the loss
+	// intact and the whole family closes in one session. Default OFF: every
+	// recorded number was measured on the random assignment.
+	FlowPathsCover bool `json:"flow_paths_cover,omitempty"`
+
 	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
 	// session cookie → TURN creds; see pkg/proxy/creds_vkcookie.go). When true,
 	// GetVKCreds uses ONLY the cookie path — NO fallback to the anonymous VK
@@ -319,6 +333,7 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
 	proxy.SetFlowPathsK(pcfg.FlowPathsK)
 	proxy.SetFlowPathsHealth(pcfg.FlowPathsHealth)
+	proxy.SetFlowPathsCover(pcfg.FlowPathsCover)
 	if !pcfg.UseCookieAuth {
 		proxy.SetVKCookieAuth(false, "", nil)
 	}
@@ -460,6 +475,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
 	proxy.SetFlowPathsK(pcfg.FlowPathsK)
 	proxy.SetFlowPathsHealth(pcfg.FlowPathsHealth)
+	proxy.SetFlowPathsCover(pcfg.FlowPathsCover)
 	// Defensive: when cookie auth isn't requested, force it OFF (the extension
 	// process can be reused across connects — clear any stale cookie state).
 	// When it IS requested, the extension has already called wgSetVKCookieAuth
@@ -1067,6 +1083,17 @@ func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 // The extension is the only process that runs logMemStatsLoop, so unlike
 // wgSetForceLegacyCaptcha this needs no companion call in the main app.
 //
+// Switches the assignment mode live. A flow whose mode no longer matches is
+// re-assigned on its next lookup, so a flip cannot leave a run measuring a
+// mixture of the two — which would make the result unattributable rather than
+// merely noisy.
+//
+//export wgSetFlowPathsCover
+func wgSetFlowPathsCover(on C.int32_t) {
+	proxy.SetFlowPathsCover(on != 0)
+	log.Printf("handleAppMessage: flow-path assignment = %s", map[bool]string{true: "cover", false: "random"}[on != 0])
+}
+
 //export wgSetFlowPathsK
 func wgSetFlowPathsK(k C.int32_t) {
 	proxy.SetFlowPathsK(int(k))

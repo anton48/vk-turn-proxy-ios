@@ -51,6 +51,13 @@ enum FlowPaths {
         clamp(defaults.integer(forKey: "flowPathsK"))
     }
 
+    /// Whether the flow's k paths are chosen by a GREEDY COVER (the k
+    /// connections carrying the fewest live flows) instead of independently at
+    /// random. Off is what every recorded measurement was taken on.
+    static func coverStored(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: "flowPathsCover")
+    }
+
     /// Label for the picker and for the settings summary.
     static func label(_ k: Int) -> String {
         k == off ? "Off (all paths)" : "\(k) paths"

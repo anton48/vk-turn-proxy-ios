@@ -64,6 +64,7 @@ struct AdvancedView: View {
     // screen is pushed (build 177, GitHub #65). Verified with
     // `grep -c flowPathsK ContentView.swift` = 0.
     @AppStorage("flowPathsK") private var flowPathsK = FlowPaths.off
+    @AppStorage("flowPathsCover") private var flowPathsCover = false
 
     /// Diagnostic uplink cwnd probe (build 241). Ephemeral @State, not backed
     /// up: it is a one-sitting measurement, not a preference. The runner is a
@@ -190,10 +191,15 @@ struct AdvancedView: View {
                 .onChange(of: flowPathsK) { _ in
                     TunnelManager.shared.applyFlowPathsK()
                 }
+                Toggle("Spread the sets over all paths", isOn: $flowPathsCover)
+                    .disabled(flowPathsK == FlowPaths.off)
+                    .onChange(of: flowPathsCover) { _ in
+                        TunnelManager.shared.applyFlowPathsCover()
+                    }
             } header: {
                 Text("Uplink experiment")
             } footer: {
-                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.")
+                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.\n\nSpreading the sets makes each connection choose the least-used paths, so the few paths a connection prefers still add up to all of them. It changes what the setting above measures, so set it before a measurement rather than during one.")
             }
 
             // 🚨 Its own section (see the note above the Logging one). Diagnostic
