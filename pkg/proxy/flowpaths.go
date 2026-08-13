@@ -549,8 +549,8 @@ func (p *Proxy) noteDispatch(item sendItem, connIdx int, via string) {
 	// what `coverage` has to be counted over. Putting it after any of the trace
 	// filters would count only keyed packets with trace budget left, i.e. a
 	// handful per flow, and the field would read as a dead pool under full load.
-	if connIdx >= 0 && connIdx < len(p.lastDispatchAt) {
-		p.lastDispatchAt[connIdx].Store(time.Now().UnixNano())
+	if connIdx >= 0 && connIdx < len(p.dispatchBytes) {
+		p.dispatchBytes[connIdx].Add(int64(len(item.buf)))
 	}
 	if item.flow == 0 || p.flows == nil {
 		return
@@ -594,45 +594,61 @@ func (p *Proxy) stealFromOtherPaths(connIdx int) (sendItem, bool) {
 	return sendItem{}, false
 }
 
-// coverageSummary renders how much of the pool actually carried a packet in the
-// last second: `coverage=16/30=53%/1s`.
+// budgetCoverageSummary renders how much of the pool carried at least HALF an
+// even share of this tick's bytes: `budget-cov=24/30=80%`.
 //
-// 🎯 THIS IS THE QUANTITY A FLOW-LOCAL PATH SET HAS TO STEER, and it had no
-// instrument until now — every previous coverage number was counted post-hoc off
-// server1's per-conn dump, hours after the run. Two independent requirements
-// pull against each other: COVERAGE, that the union of the per-flow sets stays
-// near N so every allocation is fed, and LOCALITY, that each flow walks a small
-// set. A single global k cannot hold both — measured 2026-08-13, k=5 leaves
-// 13-15 of 30 connections near-idle at F=4 against 0 at k=0 — so any design that
-// replaces the constant (adaptive k(F_active), covering/partition sets, a forced
-// spill onto cold paths) is steering exactly this number and needs to see it live.
+// 🎯 THIS IS THE QUANTITY A FLOW-LOCAL PATH SET HAS TO STEER, and getting the
+// PREDICATE right took two attempts. Two requirements pull against each other:
+// COVERAGE, that the union of the per-flow sets keeps the allocations fed, and
+// LOCALITY, that each flow walks a small set. A single global k cannot hold both
+// — measured 2026-08-13 — so every design that replaces the constant (adaptive
+// k(F_active), covering/partition sets, a forced spill onto cold paths) steers
+// this number and has to see it live.
 //
-// ⚠️ It is printed at EVERY k, deliberately. The k=0 arm is the baseline the
-// treatment has to be read against: work-stealing should light the whole pool, so
-// a control arm that does not read ~100% means the load, not the lever, is what
-// is small.
+// 🚨 THE FIRST VERSION ASKED THE WRONG QUESTION AND THE DEVICE SAID SO. Build 255
+// counted connections that carried ANY packet in the last second, and it read
+// 100% in EVERY arm — k=0 and k=5, at F=4, 8 and 16 — against a set-membership
+// bound of 52% at F=4/k=5, because spill and steal keep every connection
+// technically non-idle. A controller thresholding that at 0.85·N would never
+// fire, not even with half the pool at a fifth of its capacity. "Not idle" and
+// "carrying its share" are different questions and only the second is about
+// budget.
 //
-// ⚠️ A 1-SECOND LOOKBACK READ AT TICK TIME — not an interval statistic. At the 1 s
-// cadence a measurement run uses they coincide; at the default 10 s cadence this
-// samples the last tenth of the tick. The window rides in the field name so the
-// number cannot be quoted as "the whole interval".
+// The predicate is integer-exact and cannot degenerate: with total T over N
+// connections a connection counts when 2·N·bytes >= T, i.e. at least half of
+// T/N. An evenly loaded pool reads N/N; a pool where half the connections carry
+// everything reads N/2; and a single hot connection reads 1/N.
 //
-// Silent when nothing dispatched at all, so an idle phone prints no 0/30 that
-// could later pass for a measured collapse.
-func (p *Proxy) coverageSummary(nowNs int64) string {
-	n := len(p.lastDispatchAt)
+// ⚠️ It is relative to the POOL'S OWN even share, not to VK's ~2.07 Mbit/s
+// per-allocation policer — this side cannot see that knee. 100% means the load
+// is spread, NOT that the budget is full.
+//
+// ⚠️ Read-and-reset, so the window is the whole tick. At 1 s ticks that is a
+// second; at the default 10 s it averages ten, which smooths bursts by design.
+//
+// Printed at every k: the k=0 arm is the baseline the treatment is read against,
+// and a control that does not read near 100% means the load is small, not the
+// lever. Silent when nothing was dispatched, so an idle phone prints no 0/30
+// that could later pass for a measured collapse.
+func (p *Proxy) budgetCoverageSummary() string {
+	n := len(p.dispatchBytes)
 	if n == 0 {
 		return ""
 	}
-	cutoff := nowNs - int64(time.Second)
-	live := 0
-	for i := range p.lastDispatchAt {
-		if p.lastDispatchAt[i].Load() > cutoff {
-			live++
-		}
+	bytes := make([]int64, n)
+	var total int64
+	for i := range p.dispatchBytes {
+		bytes[i] = p.dispatchBytes[i].Swap(0)
+		total += bytes[i]
 	}
-	if live == 0 {
+	if total == 0 {
 		return ""
 	}
-	return fmt.Sprintf(" coverage=%d/%d=%.0f%%/1s", live, n, 100*float64(live)/float64(n))
+	fed := 0
+	for _, b := range bytes {
+		if 2*int64(n)*b >= total {
+			fed++
+		}
+	}
+	return fmt.Sprintf(" budget-cov=%d/%d=%.0f%%", fed, n, 100*float64(fed)/float64(n))
 }

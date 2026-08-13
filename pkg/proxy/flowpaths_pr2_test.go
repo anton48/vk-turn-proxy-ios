@@ -35,7 +35,7 @@ func newFlowProxy(t *testing.T, numConns int) (*Proxy, context.CancelFunc) {
 		// skipped and the field reads empty — which is what an idle pool also
 		// looks like, so a harness that omits it would make the coverage tests
 		// pass for the wrong reason.
-		lastDispatchAt: make([]atomic.Int64, numConns),
+		dispatchBytes: make([]atomic.Int64, numConns),
 	}
 	return p, cancel
 }

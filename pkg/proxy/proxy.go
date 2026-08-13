@@ -295,9 +295,28 @@ type Proxy struct {
 	pathWaitOwn   sendWaitStats
 	pathWaitSteal sendWaitStats
 
-	// lastDispatchAt[i] is when connection i last had a packet handed to it,
-	// UnixNano. It exists for ONE field — `coverage` — and it is the quantity a
-	// flow-local path set has to steer.
+	// dispatchBytes[i] is how many bytes were handed to connection i this tick,
+	// read-and-reset. It exists for ONE field — `budget-cov` — and it is the
+	// quantity a flow-local path set has to steer.
+	//
+	// 🚨 IT REPLACES A FIELD THAT MEASURED THE WRONG THING, AND THE LESSON IS THE
+	// POINT. Build 255 printed `coverage` = the share of connections that carried
+	// ANY packet in the last second. On device it read **100% in every arm** —
+	// k=0 and k=5, F=4/8/16 — against a set-membership bound of 52% at F=4/k=5,
+	// because spill and steal keep every connection technically non-idle. Yet the
+	// same run had connections carrying a small fraction of their share. "Not
+	// idle" and "carrying its share" are different questions, and only the second
+	// is about budget: a threshold of 0.85·N on the first would never fire, even
+	// with half the pool at a fifth of its capacity.
+	//
+	// The predicate is therefore **≥ half of an even share**: with total bytes T
+	// over N connections the even share is T/N, and a connection counts when
+	// 2·N·bytes ≥ T. It cannot degenerate — an evenly loaded pool reads N/N, and a
+	// pool where half the connections carry everything reads N/2.
+	//
+	// ✅ And the window is now the TICK, not a lookback: the counters are swapped
+	// at read, so the number covers the whole interval instead of sampling its
+	// last second.
 	//
 	// 🎯 WHY IT IS A NEW ARRAY AND NOT `lastTxAt`. Coverage is only honest if it
 	// sees the WHOLE pool: three of the four writer sites pass `txConnIdx = -1`
@@ -308,11 +327,7 @@ type Proxy struct {
 	// skip-on-recent-tx and must not acquire a second meaning. This is stamped in
 	// the single dispatch funnel, where every writer passes a real connIdx.
 	//
-	// ⚠️ It is a 1-second LOOKBACK read at tick time, not an interval statistic.
-	// At the 1 s cadence a measurement run uses, the two coincide; at the default
-	// 10 s cadence it samples the last tenth of the interval. The field carries
-	// its own window (`/1s`) so it cannot be quoted as "the whole tick".
-	lastDispatchAt []atomic.Int64
+	dispatchBytes []atomic.Int64
 
 	// chunkStats: the uplink-chunking experiment's own instrument — it answers
 	// "did the knob engage", because a configured K that never materialises
@@ -627,7 +642,7 @@ func NewProxy(cfg Config) *Proxy {
 		connTxBytes:       make([]atomic.Int64, cfg.NumConns),
 		connRxBytes:       make([]atomic.Int64, cfg.NumConns),
 		lastTxAt:          make([]atomic.Int64, cfg.NumConns),
-		lastDispatchAt:    make([]atomic.Int64, cfg.NumConns),
+		dispatchBytes:     make([]atomic.Int64, cfg.NumConns),
 		lastRxAt:          make([]atomic.Int64, cfg.NumConns),
 		connLocalIPs:      make([]atomic.Value, cfg.NumConns),
 		wakeCh:            make(chan struct{}),
@@ -4286,11 +4301,11 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// pathWaitOwn.
 			p.pathWaitOwn.summaryAs("pathq-own"),
 			p.pathWaitSteal.summaryAs("pathq-steal"),
-			// How much of the pool carried anything in the last second. Printed
-			// at EVERY k on purpose: the k=0 arm is the baseline: work-stealing
-			// should light the whole pool, and a control that does not read
-			// ~100% means the LOAD is small, not the lever. → flowpaths.go
-			p.coverageSummary(time.Now().UnixNano()))
+			// How much of the pool carried at least HALF an even share this
+			// tick. Printed at EVERY k on purpose: the k=0 arm is the baseline —
+			// work-stealing should spread evenly, so a control that does not read
+			// near 100% means the LOAD is small, not the lever. → flowpaths.go
+			p.budgetCoverageSummary())
 
 		// The downlink's own disorder, on its own line so it can be diffed
 		// field-for-field against server1's `reorder(uplink)` line — the two

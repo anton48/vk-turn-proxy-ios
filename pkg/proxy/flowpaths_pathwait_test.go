@@ -189,82 +189,147 @@ func TestFlipReachesAWriterThatIsAlreadyParked(t *testing.T) {
 	}
 }
 
-// `coverage` must count EVERY dispatch route and EVERY writer, because the whole
-// point of the field is to say how much of the pool is being fed.
+// `budget-cov` must count EVERY dispatch route and EVERY writer, because the
+// whole point of the field is to say how the pool's load is spread.
 //
 // 🚨 The dangerous failure is silent and one-sided: stamp it after any of
 // noteDispatch's trace filters and it counts only keyed packets with trace budget
-// left — a handful per flow — so a fully-lit pool under load reads as a collapse
-// and any controller steering on it would spill traffic it did not need to.
-func TestCoverageCountsEveryDispatchRoute(t *testing.T) {
+// left — a handful per flow — so a fully-loaded pool reads as a collapse and any
+// controller steering on it would spill traffic it did not need to.
+func TestBudgetCoverageCountsEveryDispatchRoute(t *testing.T) {
 	armFlowPaths(t, 5)
 	p, cancel := newFlowProxy(t, 30)
 	defer cancel()
 	done := make(chan struct{})
 
-	if s := p.coverageSummary(time.Now().UnixNano()); s != "" {
-		t.Fatalf("coverage = %q on an idle pool, want silence — a 0/30 printed "+
+	if s := p.budgetCoverageSummary(); s != "" {
+		t.Fatalf("budget-cov = %q on an idle pool, want silence — a 0/30 printed "+
 			"forever would later pass for a measured collapse", s)
 	}
 
-	// One packet down each route, onto three different connections. The keepalive
-	// (flow 0) is the case that matters most: it takes the shared channel BY
-	// DESIGN and is filtered out of the trace, so if the stamp sits behind that
-	// filter this is the dispatch that vanishes.
-	p.pathQ[7] <- sendItem{buf: []byte{1}, flow: 0xaa}
+	// One equal-sized packet down each route, onto three different connections.
+	// The keepalive (flow 0) is the case that matters most: it takes the shared
+	// channel BY DESIGN and is filtered out of the trace, so if the stamp sits
+	// behind that filter this is the dispatch that vanishes.
+	p.pathQ[7] <- sendItem{buf: make([]byte, 100), flow: 0xaa}
 	if _, ok := p.nextSendItem(done, 7); !ok { // own
 		t.Fatal("own dispatch failed")
 	}
-	p.pathQ[5] <- sendItem{buf: []byte{2}, flow: 0xbb}
+	p.pathQ[5] <- sendItem{buf: make([]byte, 100), flow: 0xbb}
 	if _, ok := p.nextSendItem(done, 9); !ok { // steal: lands on 9, not 5
 		t.Fatal("steal dispatch failed")
 	}
-	p.sendCh <- sendItem{buf: []byte{3}}        // flow 0 = a keepalive
-	if _, ok := p.nextSendItem(done, 21); !ok { // shared
+	p.sendCh <- sendItem{buf: make([]byte, 100)} // flow 0 = a keepalive
+	if _, ok := p.nextSendItem(done, 21); !ok {  // shared
 		t.Fatal("shared dispatch failed")
 	}
 
-	if s := p.coverageSummary(time.Now().UnixNano()); s != " coverage=3/30=10%/1s" {
-		t.Fatalf("coverage = %q, want ' coverage=3/30=10%%/1s' — the three routes "+
+	if s := p.budgetCoverageSummary(); s != " budget-cov=3/30=10%" {
+		t.Fatalf("budget-cov = %q, want ' budget-cov=3/30=10%%' — the three routes "+
 			"are own(7), steal(9, the STEALER not the owner) and shared(21, a "+
 			"keepalive the trace filters out)", s)
 	}
 
-	// And it is a LOOKBACK, not a cumulative count: the same three conns must
-	// fall out of the window once they are older than a second.
-	if s := p.coverageSummary(time.Now().Add(2 * time.Second).UnixNano()); s != "" {
-		t.Fatalf("coverage = %q two seconds later, want silence — a conn that "+
-			"stopped sending must go cold, or the field can only ever rise", s)
+	// Read-and-reset: the next tick starts empty, or the field reports the
+	// session's worst moment on every line forever.
+	if s := p.budgetCoverageSummary(); s != "" {
+		t.Fatalf("budget-cov = %q on the second read, want silence", s)
+	}
+}
+
+// 🎯 THE PREDICATE ITSELF, and it is the reason this field was rewritten.
+//
+// Build 255 asked "did this connection carry ANYTHING in the last second" and
+// read 100% in every arm on device — k=0 and k=5, F=4/8/16 — against a
+// set-membership bound of 52% at F=4/k=5, because spill and steal keep every
+// connection technically non-idle while it carries a fraction of its share. The
+// question that is about BUDGET is "did it carry at least half of an even
+// share", and these cases pin it, including the boundary.
+func TestBudgetCoverageUsesHalfAnEvenShare(t *testing.T) {
+	armFlowPaths(t, 5)
+	feed := func(p *Proxy, perConn map[int]int) {
+		for idx, n := range perConn {
+			p.noteDispatch(sendItem{buf: make([]byte, n)}, idx, "own")
+		}
+	}
+
+	t.Run("even pool reads 100%", func(t *testing.T) {
+		p, cancel := newFlowProxy(t, 30)
+		defer cancel()
+		m := map[int]int{}
+		for i := 0; i < 30; i++ {
+			m[i] = 100
+		}
+		feed(p, m)
+		if s := p.budgetCoverageSummary(); s != " budget-cov=30/30=100%" {
+			t.Fatalf("budget-cov = %q, want 100%% — an evenly loaded pool is the "+
+				"definition of full coverage", s)
+		}
+	})
+
+	t.Run("half the pool carrying everything reads 50%", func(t *testing.T) {
+		p, cancel := newFlowProxy(t, 30)
+		defer cancel()
+		m := map[int]int{}
+		for i := 0; i < 15; i++ {
+			m[i] = 200
+		}
+		feed(p, m)
+		if s := p.budgetCoverageSummary(); s != " budget-cov=15/30=50%" {
+			t.Fatalf("budget-cov = %q, want 50%% — this is the shape the old field "+
+				"could not see at all", s)
+		}
+	})
+
+	// The boundary: 29 conns at 100 B, one at X. A conn counts when
+	// 2*N*bytes >= total, so with total = 2900+X the cut is X = 50.
+	for _, tc := range []struct {
+		x    int
+		want string
+	}{{49, " budget-cov=29/30=97%"}, {50, " budget-cov=30/30=100%"}} {
+		t.Run("boundary", func(t *testing.T) {
+			p, cancel := newFlowProxy(t, 30)
+			defer cancel()
+			m := map[int]int{29: tc.x}
+			for i := 0; i < 29; i++ {
+				m[i] = 100
+			}
+			feed(p, m)
+			if s := p.budgetCoverageSummary(); s != tc.want {
+				t.Fatalf("x=%d: budget-cov = %q, want %q — half an even share is "+
+					"an exact integer test, not a float comparison", tc.x, s, tc.want)
+			}
+		})
 	}
 }
 
 // The second way the stamp can be put in the wrong place: behind the trace
 // BUDGET. Each flow gets flowTraceBudget lines, so a stamp below that check
 // counts a flow's first three packets and nothing after — under a bulk transfer
-// the field would decay to near zero while the pool was fully lit.
-func TestCoverageSurvivesTheTraceBudget(t *testing.T) {
+// the field would decay while the pool was fully loaded.
+func TestBudgetCoverageSurvivesTheTraceBudget(t *testing.T) {
 	armFlowPaths(t, 5)
 	p, cancel := newFlowProxy(t, 30)
 	defer cancel()
 	done := make(chan struct{})
 
 	const flow = uint64(0xc0ffee)
-	// Spend the budget on one connection, then dispatch the SAME flow onto a
-	// connection that has not been seen yet.
 	for i := 0; i < flowTraceBudget+2; i++ {
-		p.pathQ[3] <- sendItem{buf: []byte{byte(i)}, flow: flow}
+		p.pathQ[3] <- sendItem{buf: make([]byte, 100), flow: flow}
 		if _, ok := p.nextSendItem(done, 3); !ok {
 			t.Fatalf("dispatch %d failed", i)
 		}
 	}
-	p.pathQ[17] <- sendItem{buf: []byte{9}, flow: flow}
+	// Same flow, budget long spent, onto a connection not yet seen. It carries
+	// 100 of 600 bytes over 30 conns — an even share is 20, so it counts.
+	p.pathQ[17] <- sendItem{buf: make([]byte, 100), flow: flow}
 	if _, ok := p.nextSendItem(done, 17); !ok {
 		t.Fatal("dispatch onto the fresh conn failed")
 	}
 
-	if s := p.coverageSummary(time.Now().UnixNano()); s != " coverage=2/30=7%/1s" {
-		t.Fatalf("coverage = %q, want ' coverage=2/30=7%%/1s' — a flow whose trace "+
-			"budget is spent still carries traffic, and the pool it lights must "+
+	if s := p.budgetCoverageSummary(); s != " budget-cov=2/30=7%" {
+		t.Fatalf("budget-cov = %q, want ' budget-cov=2/30=7%%' — a flow whose trace "+
+			"budget is spent still carries traffic, and the pool it loads must "+
 			"still be counted", s)
 	}
 }
