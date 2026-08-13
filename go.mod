@@ -10,8 +10,8 @@ require (
 	github.com/pion/logging v0.2.4
 	github.com/pion/turn/v5 v5.0.2
 	github.com/refraction-networking/utls v1.8.2
-	golang.org/x/sys v0.40.0
 	golang.org/x/net v0.48.0
+	golang.org/x/sys v0.40.0
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
 )
 
@@ -37,3 +37,5 @@ require (
 	golang.org/x/crypto v0.47.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 )
+
+replace golang.zx2c4.com/wireguard => ./WireGuardBridge/third_party/wireguard-go

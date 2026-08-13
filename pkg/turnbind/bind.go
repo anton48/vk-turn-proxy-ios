@@ -70,10 +70,23 @@ func (b *TURNBind) SetMark(mark uint32) error {
 	return nil
 }
 
-// Send sends WireGuard packets through the DTLS/TURN proxy.
+// Send sends WireGuard packets through the DTLS/TURN proxy. Keepalives and
+// handshakes arrive here with no flow key; data flows come via SendWithFlows.
 func (b *TURNBind) Send(bufs [][]byte, ep conn.Endpoint) error {
-	for _, buf := range bufs {
-		if err := b.proxy.SendPacket(buf); err != nil {
+	return b.SendWithFlows(bufs, ep, nil)
+}
+
+// SendWithFlows implements conn.FlowSender: each packet carries its inner-flow
+// key (a hash of the 5-tuple, 0 = unknown/keepalive) computed in the patched
+// WireGuard TUN-read path, so the proxy dispatcher can keep a flow on a stable
+// subset of TURN paths (flow-local path set). PR1: carried, not yet dispatched.
+func (b *TURNBind) SendWithFlows(bufs [][]byte, ep conn.Endpoint, flowKeys []uint64) error {
+	for i, buf := range bufs {
+		var fk uint64
+		if i < len(flowKeys) {
+			fk = flowKeys[i]
+		}
+		if err := b.proxy.SendPacketFlow(buf, fk); err != nil {
 			return err
 		}
 	}

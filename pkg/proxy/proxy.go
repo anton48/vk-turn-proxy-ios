@@ -205,6 +205,12 @@ type Proxy struct {
 	sendChPeak atomic.Int64
 	recvChPeak atomic.Int64
 
+	// flow-local path set (PR1): count packets that arrived with a non-zero
+	// inner-flow key, so an on-device run can confirm the WG patch delivers
+	// keys through real traffic. Dispatch by the key lands in PR2.
+	flowKeyNonZero atomic.Int64
+	flowKeyTotal   atomic.Int64
+
 	// sendChBlockNs / sendChBlockCount (build 224): how long producers actually
 	// had to WAIT for room, and how often. This is the number the peak cannot
 	// give: notePeak reads len() AFTER the send, and with dozens of consumers
@@ -1679,7 +1685,21 @@ func notePeak(mark *atomic.Int64, depth int) {
 }
 
 // SendPacket sends a WireGuard packet through the tunnel.
+// SendPacket is the flow-agnostic entry (keepalives, handshakes, tests, synth).
 func (p *Proxy) SendPacket(data []byte) error {
+	return p.SendPacketFlow(data, 0)
+}
+
+// SendPacketFlow is SendPacket carrying the inner-flow key (a hash of the
+// 5-tuple, 0 = unknown/keepalive) computed in the patched WireGuard TUN-read
+// path. PR1 only ACCOUNTS the key (flowKeyNonZero, so an on-device run confirms
+// the plumbing) and still dispatches via the shared sendCh; PR2 pins a flow to
+// a stable subset of paths by it.
+func (p *Proxy) SendPacketFlow(data []byte, flowKey uint64) error {
+	p.flowKeyTotal.Add(1)
+	if flowKey != 0 {
+		p.flowKeyNonZero.Add(1)
+	}
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	// The enqueue instant rides with the packet so a writer can price the wait
@@ -4104,7 +4124,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s flowkey=%d/%d",
 			label,
 			rssStr,
 			internalStr,
@@ -4164,7 +4184,12 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// that can see a packet waiting AFTER Write returned. 🚨 `sb`
 			// includes in-flight data by the SDK's own definition; read
 			// sockstats.go before quoting it.
-			p.sockStats.summary())
+			p.sockStats.summary(),
+			// flow-local path set (PR1): non-zero / total keys this tick. On a
+			// real tunnel N should be >0 (WG patch delivers keys); dispatch by
+			// them is PR2. Read-and-reset so each line is per-interval.
+			p.flowKeyNonZero.Swap(0),
+			p.flowKeyTotal.Swap(0))
 
 		// The downlink's own disorder, on its own line so it can be diffed
 		// field-for-field against server1's `reorder(uplink)` line — the two

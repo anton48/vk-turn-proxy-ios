@@ -40,3 +40,5 @@ require (
 )
 
 replace github.com/cacggghp/vk-turn-proxy => ..
+
+replace golang.zx2c4.com/wireguard => ./third_party/wireguard-go
