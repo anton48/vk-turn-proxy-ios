@@ -99,10 +99,27 @@ final class UplinkFlowABRunner: ObservableObject {
                 log.log("flowab RUN r=\(runIdx)/\(total) phase=\(phase.name) F=\(phase.flows) "
                     + "treat=\(phase.treatment) arms=\(arms.map(String.init).joined(separator: ","))")
 
-                let startedAt = Date()
                 DispatchQueue.main.async {
                     probe.start(host: host, port: port, flows: phase.flows, durationSec: runSec)
                 }
+                // 🚨 WAIT FOR BYTES, NOT FOR THE CALL. The first version started
+                // the arm clock here, and in run 5 of 2026-08-13 the probe spent
+                // 25.8 s connecting its flows through the tunnel — so two arms
+                // were flipped over an idle link and that run had to be thrown
+                // away. `running` is true the instant start() is called;
+                // `sending` is true when the CSV's t_ms starts counting.
+                let connectDeadline = Date().addingTimeInterval(60)
+                while !probe.sending && Date() < connectDeadline && !cancelled {
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+                if !probe.sending {
+                    log.log("flowab ABORT r=\(runIdx) — the flows never came up within 60s; "
+                        + "check the sink and that the tunnel is up")
+                    aborted += 1
+                    cancelled = true
+                    break
+                }
+                let startedAt = Date()
                 log.log("flowab ARM r=\(runIdx) i=1/\(armsPerRun) k=\(arms[0]) t=0")
 
                 var armAborted = false

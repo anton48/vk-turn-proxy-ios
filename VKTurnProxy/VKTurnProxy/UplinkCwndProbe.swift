@@ -34,6 +34,13 @@ import Darwin
 
 final class UplinkCwndProbe: ObservableObject {
     @Published var running = false
+    /// True once the flows are up and bytes are actually moving — i.e. when the
+    /// CSV's t_ms starts counting. 🚨 NOT the same as `running`, which is set the
+    /// moment start() is called: connecting the flows through the tunnel took
+    /// **25.8 s** in one recorded run, and anything that schedules against
+    /// `running` would spend that time measuring an idle link. The A/B runner
+    /// waits on THIS.
+    @Published var sending = false
     @Published var status = "idle"
 
     // TCP_CONNECTION_INFO from <netinet/tcp.h>. Byte offsets into the returned
@@ -113,7 +120,8 @@ final class UplinkCwndProbe: ObservableObject {
         }
         if fds.isEmpty {
             log.log("cwndprobe ERROR: 0/\(flows) connected to \(host):\(port) — is the tunnel up and the sink listening?")
-            publish("failed: 0/\(flows) connected", running: false)
+            DispatchQueue.main.async { self.sending = false }
+        publish("failed: 0/\(flows) connected", running: false)
             return
         }
         var eff: Int32 = 0
@@ -122,6 +130,7 @@ final class UplinkCwndProbe: ObservableObject {
         log.log("cwndprobe START host=\(host):\(port) flows=\(fds.count)/\(flows) dur=\(durationSec)s effSndBuf=\(eff)")
         log.log("cwndprobe CSV t_ms,flow,cwnd,ssthresh,sndwnd,sbbytes,srtt_ms,rttcur_ms,loss,reord,mss,txbytes,rtx,deliv_mbit,winuse")
         publish("running: \(fds.count) flows for \(durationSec)s")
+        DispatchQueue.main.async { self.sending = true }
 
         let deadline = Date().addingTimeInterval(Double(durationSec))
 
@@ -188,6 +197,7 @@ final class UplinkCwndProbe: ObservableObject {
         let pctLoss = totalTicks > 0 ? 100 * lossTicks / totalTicks : 0
         let pctReord = totalTicks > 0 ? 100 * reordTicks / totalTicks : 0
         log.log("cwndprobe DONE flows=\(fds.count) dur=\(durationSec)s — flow0 was inLossRecovery \(pctLoss)% of ticks, reorderingSeen \(pctReord)% of ticks. Grep 'cwndprobe' from the exported log; a FLAT cwnd with reord set and loss clear = growth-starvation, a sawtooth with loss set = AIMD.")
+        DispatchQueue.main.async { self.sending = false }
         publish("done: \(fds.count) flows, \(durationSec)s — grep 'cwndprobe' in logs", running: false)
     }
 }
