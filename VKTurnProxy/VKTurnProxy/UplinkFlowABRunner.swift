@@ -26,6 +26,18 @@ import Foundation
 /// drop refutes it and the −30% needs another cause. Phase C repeats the one arm
 /// that worked, as a positive control on the session itself.
 ///
+/// 🚨 IT CHANGED A SECOND TIME ON 2026-08-14 — phase A's k went 5 → 8 — and this
+/// one is NOT a post-hoc fit either, because the condition it satisfies was
+/// written in `assignCoverLocked` before the run that motivated it. A greedy
+/// cover can only reach every path when **F·k ≥ N**: at F=4/k=5 that is 20
+/// assignments over 30 paths, so 67% is the CEILING on `budget-cov` and the run
+/// measured 70% — AT it. So the F=4 arm never tested variant B's prescription
+/// (its own note says k=7-8 there); it tested B held below its own precondition.
+/// F=4/k=8 gives 32 ≥ 30 and is the only configuration in the plan where B can
+/// hold. 🚨 Phases B and C keep k=5 deliberately: they already satisfy F·k ≥ N
+/// and changing them would make the session incomparable with `flowtest`
+/// (14.08) — one variable, not three.
+///
 /// The runner writes `flowab` markers to the same log as the probe, so the
 /// parser aligns arms on the log's own timestamps instead of a stopwatch.
 final class UplinkFlowABRunner: ObservableObject {
@@ -46,12 +58,37 @@ final class UplinkFlowABRunner: ObservableObject {
 
     /// 🚨 k IS ONE NUMBER BUT COVERAGE DEPENDS ON F — that is the thing under
     /// test now. Predicted share of the pool receiving no sticky traffic,
-    /// ((30−k)/30)^F: **F=4/k=5 → 48%**, F=8/k=5 → 23%, F=16/k=5 → 5%. The first
-    /// two are the corner a speedtest lives in and the corner the previous plan
+    /// ((30−k)/30)^F: F=4/k=5 → 48%, F=8/k=5 → 23%, F=16/k=5 → 5%. The first
+    /// two are the corner a speedtest lives in and the corner the first plan
     /// stepped around; the third is the arm already measured twice and is here
     /// only to prove the session is comparable.
+    ///
+    /// 🎯 PHASE A IS NOW F=4/k=8, AND THE PREDICTION IS REGISTERED HERE, BEFORE
+    /// THE RUN. Under the greedy cover a flow takes the k least-assigned paths,
+    /// so 4 flows × 8 = 32 assignments spread over 30 paths reach **all 30**:
+    /// set-membership coverage 100%, against a 67% ceiling at k=5 (measured 70%,
+    /// i.e. at the ceiling). Three branches, and each closes something:
+    ///  • `budget-cov` ≥95% AND the paired delta ≥ +15% ⇒ KEEP — the deficit was
+    ///    the whole story and k must simply scale with F (design A/B, not D).
+    ///  • `budget-cov` ≥95% AND the delta flat ⇒ full coverage buys nothing at
+    ///    the flow count real speedtests use, and the family closes on merit:
+    ///    stickiness has now been given its best case and returned zero.
+    ///  • `budget-cov` still well below 95% ⇒ membership is not the binding
+    ///    constraint and the residue is INTRA-SET UNEVENNESS — the mechanism
+    ///    named at F=16 (87% measured against a 95% bound) and never measured.
+    ///
+    /// ⚠️ THE ARM CONFOUNDS COVERAGE WITH LOCALITY, AND THAT IS UNAVOIDABLE
+    /// HERE, NOT AN OVERSIGHT. F·k ≥ 30 at F=4 needs k ≥ 7.5, so k=8 is the only
+    /// value that can hold coverage — and `FlowPaths.maximum` is 8 precisely
+    /// because beyond ~8 of 30 the "subset" stops being one. So this arm sits at
+    /// the endpoint of the coverage/locality trade-off the reframe names: a
+    /// FLAT result cannot separate "coverage was fixed and stickiness is worth
+    /// nothing" from "the treatment was diluted toward the control". It can
+    /// still KILL — a drop at ~100% coverage rules coverage out as the residual
+    /// cause — and a KEEP would then need k=6 (24 < 30, still short) to
+    /// attribute the gain to one of the two.
     private let phases = [
-        Phase(name: "A", flows: 4, treatment: 5, runs: 2),
+        Phase(name: "A", flows: 4, treatment: 8, runs: 2),
         Phase(name: "B", flows: 8, treatment: 5, runs: 2),
         Phase(name: "C", flows: 16, treatment: 5, runs: 1),
     ]
@@ -93,8 +130,17 @@ final class UplinkFlowABRunner: ObservableObject {
         var aborted = 0
         let total = phases.reduce(0) { $0 + $1.runs }
 
+        // 🚨 THE PLAN RECORDS WHICH TREATMENT WAS ARMED, NOT JUST WHICH k. The
+        // runner flips k; it does NOT touch the cover toggle, so a session run
+        // with "Least-used paths first" off measures RANDOM sets and would be
+        // filed as variant B by its k alone. The mode is on every `flowpaths=`
+        // line too, but that is the instrument — this is the plan, and the two
+        // disagreeing is exactly what a reader needs to see.
+        let cover = FlowPaths.coverStored()
         log.log("flowab PLAN host=\(host):\(port) phases=\(phases.count) runs=\(total) "
             + "armSec=\(armSec) armsPerRun=\(armsPerRun) cooldownSec=\(cooldownSec) "
+            + "cover=\(cover ? "on" : "off") "
+            + "arms=\(phases.map { "\($0.name):F=\($0.flows)/k=\($0.treatment)" }.joined(separator: " ")) "
             + "estimated=\(estimatedSeconds)s — pairs are scored per arm AFTER discarding 4s past each flip")
 
         for phase in phases {
