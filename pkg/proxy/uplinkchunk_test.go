@@ -389,6 +389,13 @@ func TestEverySendChConsumerUsesWriteChunk(t *testing.T) {
 		t.Fatal("nextSendItem no longer receives from the shared sendCh: spilled packets " +
 			"and keepalives (flowKey=0, which never reach a path queue) would never be sent")
 	}
+	// The third end of the chain, added after a device run: a queued packet must
+	// be reachable by other writers, or the lever stalls every new TCP flow.
+	if !strings.Contains(helper, "p.stealFromOtherPaths(") {
+		t.Fatal("nextSendItem no longer sweeps the other path queues: a packet whose " +
+			"owner is stuck inside conn.Write becomes unreachable, which measured " +
+			"26-39s to open a flow on device")
+	}
 	if !strings.Contains(helper, "case item := <-own:") {
 		t.Fatal("nextSendItem no longer receives from the connection's own path queue: the " +
 			"flow-local set would be written but never read, so the lever silently does nothing")

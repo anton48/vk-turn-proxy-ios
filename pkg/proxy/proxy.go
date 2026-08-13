@@ -222,6 +222,13 @@ type Proxy struct {
 	pathQ         []chan sendItem
 	flows         *flowTable
 	flowPathStats flowPathsStats
+	// stealHint wakes ONE idle writer after a packet is placed in a path queue,
+	// and stealCursor rotates where a sweep starts. Together they are what makes
+	// a queued packet re-routable: without them a packet whose owner is stuck
+	// inside conn.Write waits for that one writer, which on device turned
+	// opening a TCP flow into a 26-39 s operation. → flowpaths.go
+	stealHint   chan struct{}
+	stealCursor atomic.Uint32
 
 	// sendChBlockNs / sendChBlockCount (build 224): how long producers actually
 	// had to WAIT for room, and how often. This is the number the peak cannot
@@ -569,6 +576,7 @@ func NewProxy(cfg Config) *Proxy {
 		lastActiveProbeAt: make([]atomic.Int64, cfg.NumConns),
 		pathQ:             newPathQueues(cfg.NumConns),
 		flows:             newFlowTable(cfg.NumConns),
+		stealHint:         make(chan struct{}, 1),
 		connTxBytes:       make([]atomic.Int64, cfg.NumConns),
 		connRxBytes:       make([]atomic.Int64, cfg.NumConns),
 		lastTxAt:          make([]atomic.Int64, cfg.NumConns),

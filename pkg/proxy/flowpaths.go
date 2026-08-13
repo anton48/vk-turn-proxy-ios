@@ -280,14 +280,15 @@ func assignPaths(key uint64, k, numPaths int) []int32 {
 // split: if spill dominates, the flow never used its set and the run tested
 // NOTHING, whatever the throughput did.
 type flowPathsStats struct {
-	pref  atomic.Int64 // placed on a preferred path
-	spill atomic.Int64 // preferred set busy → shared sendCh (the "soft" firing)
-	skip  atomic.Int64 // a preferred path skipped as unhealthy
-	keyed atomic.Int64 // packets that had a flow key at all (0 = keepalive)
+	pref   atomic.Int64 // placed on a preferred path
+	spill  atomic.Int64 // preferred set busy → shared sendCh (the "soft" firing)
+	skip   atomic.Int64 // a preferred path skipped as unhealthy
+	keyed  atomic.Int64 // packets that had a flow key at all (0 = keepalive)
+	stolen atomic.Int64 // taken out of ANOTHER connection's path queue
 }
 
-func (s *flowPathsStats) snapshotAndReset() (pref, spill, skip, keyed int64) {
-	return s.pref.Swap(0), s.spill.Swap(0), s.skip.Swap(0), s.keyed.Swap(0)
+func (s *flowPathsStats) snapshotAndReset() (pref, spill, skip, keyed, stolen int64) {
+	return s.pref.Swap(0), s.spill.Swap(0), s.skip.Swap(0), s.keyed.Swap(0), s.stolen.Swap(0)
 }
 
 // summary renders one memstats field group, or "" while the lever is off — the
@@ -308,7 +309,7 @@ func (s *flowPathsStats) snapshotAndReset() (pref, spill, skip, keyed int64) {
 //     nothing was ever eligible. That is a plumbing regression, not a result.
 func (s *flowPathsStats) summary(t *flowTable) string {
 	k := int(flowPathsK.Load())
-	pref, spill, skip, keyed := s.snapshotAndReset()
+	pref, spill, skip, keyed, stolen := s.snapshotAndReset()
 	if k <= FlowPathsOff {
 		return ""
 	}
@@ -317,8 +318,8 @@ func (s *flowPathsStats) summary(t *flowTable) string {
 	if total > 0 {
 		prefPct = 100 * float64(pref) / float64(total)
 	}
-	return fmt.Sprintf(" flowpaths=k=%d flows=%d pref=%d/%d=%.1f%% spill=%d skip=%d keyed=%d",
-		k, t.size(), pref, total, prefPct, spill, skip, keyed)
+	return fmt.Sprintf(" flowpaths=k=%d flows=%d pref=%d/%d=%.1f%% spill=%d skip=%d keyed=%d stolen=%d",
+		k, t.size(), pref, total, prefPct, spill, skip, keyed, stolen)
 }
 
 // enqueueFlowPath tries to place the packet on one of the flow's preferred
@@ -358,6 +359,15 @@ func (p *Proxy) enqueueFlowPath(item sendItem, flowKey uint64) bool {
 		select {
 		case p.pathQ[idx] <- item:
 			p.flowPathStats.pref.Add(1)
+			// Wake ONE writer that may be blocked with nothing to do, so a packet
+			// cannot sit in a queue whose owner is stuck inside conn.Write while
+			// every other writer sleeps. Non-blocking: the hint is an edge, not a
+			// count, and a missed one costs nothing because every writer also
+			// sweeps before it blocks.
+			select {
+			case p.stealHint <- struct{}{}:
+			default:
+			}
 			return true
 		default:
 			// Busy. Try the next path in the set rather than waiting — waiting
@@ -410,23 +420,82 @@ func (p *Proxy) pathHealthy(connIdx int) bool {
 // a receive on a nil channel never fires, and this is exactly the old
 // `case item := <-p.sendCh:` — byte-for-byte behaviour, one indirection.
 func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool) {
+	sticky := flowPathsK.Load() > FlowPathsOff
 	var own chan sendItem
-	if connIdx >= 0 && connIdx < len(p.pathQ) && flowPathsK.Load() > FlowPathsOff {
+	if sticky && connIdx >= 0 && connIdx < len(p.pathQ) {
 		own = p.pathQ[connIdx]
 	}
-	if own != nil {
+	for {
+		// 1. Own queue — the preference the whole design exists to express.
+		if own != nil {
+			select {
+			case item := <-own:
+				return item, true
+			default:
+			}
+		}
+		// 2. The shared channel — spilled packets, and every keepalive and
+		//    handshake, which carry no flow key by design.
+		select {
+		case item := <-p.sendCh:
+			return item, true
+		default:
+		}
+		// 3. STEAL, and only here. 🚨 THIS IS THE FIX FOR THE DEFECT THAT
+		//    DISQUALIFIED THE FIRST IMPLEMENTATION ON DEVICE: a packet placed in a
+		//    path queue could not be taken by anyone else, so if its owner was
+		//    blocked inside conn.Write the packet waited — and a flow whose entire
+		//    progress is ONE packet (a SYN) waited with it. Measured: opening new
+		//    flows through the tunnel took 26-39 s with a set armed against
+		//    0.5-1.9 s without, 6 times out of 6 across three sessions.
+		//    Stealing LAST is what keeps this from destroying the stickiness it
+		//    protects: a writer only reaches here with nothing of its own and
+		//    nothing shared to send, so the packet it takes is one that was
+		//    otherwise going to sit.
+		if sticky {
+			if item, ok := p.stealFromOtherPaths(connIdx); ok {
+				return item, true
+			}
+		}
 		select {
 		case item := <-own:
+			return item, true
+		case item := <-p.sendCh:
+			return item, true
+		case <-p.stealHint:
+			// Something was queued to SOME path while we had nothing to do. Loop
+			// round to the sweep above rather than stealing here, so the owner
+			// still gets first refusal on its own packet.
+			continue
+		case <-done:
+			return sendItem{}, false
+		}
+	}
+}
+
+// stealFromOtherPaths takes one packet from another connection's queue, or
+// reports that every other queue was empty. Never blocks.
+//
+// The scan starts at a rotating offset rather than at zero: thirty writers all
+// sweeping from index 0 would contend on the same queue and would systematically
+// rescue the low-numbered connections first.
+func (p *Proxy) stealFromOtherPaths(connIdx int) (sendItem, bool) {
+	n := len(p.pathQ)
+	if n < 2 {
+		return sendItem{}, false
+	}
+	start := int(p.stealCursor.Add(1))
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		if idx == connIdx {
+			continue
+		}
+		select {
+		case item := <-p.pathQ[idx]:
+			p.flowPathStats.stolen.Add(1)
 			return item, true
 		default:
 		}
 	}
-	select {
-	case item := <-own:
-		return item, true
-	case item := <-p.sendCh:
-		return item, true
-	case <-done:
-		return sendItem{}, false
-	}
+	return sendItem{}, false
 }

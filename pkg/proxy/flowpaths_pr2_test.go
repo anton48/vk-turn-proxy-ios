@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // armFlowPaths sets the process-global lever for one test and restores it after.
@@ -24,10 +25,11 @@ func newFlowProxy(t *testing.T, numConns int) (*Proxy, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Proxy{
-		ctx:    ctx,
-		sendCh: make(chan sendItem, 8),
-		pathQ:  newPathQueues(numConns),
-		flows:  newFlowTable(numConns),
+		ctx:       ctx,
+		sendCh:    make(chan sendItem, 8),
+		pathQ:     newPathQueues(numConns),
+		flows:     newFlowTable(numConns),
+		stealHint: make(chan struct{}, 1),
 	}
 	return p, cancel
 }
@@ -271,5 +273,82 @@ func TestSummarySilentWhenOffLoudWhenArmed(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Fatalf("summary %q is missing %q", s, want)
 		}
+	}
+}
+
+// 🎯 THE TEST THE THIRD DEVICE SESSION PAID FOR. A packet sitting in one
+// connection's path queue must be reachable by every other writer. Without this
+// the packet waits for its owner, and a flow whose entire progress is ONE packet
+// — a SYN — waits with it: measured at 26-39 s to open a flow with a set armed,
+// against 0.5-1.9 s without, six times out of six.
+func TestStrandedPacketIsStolen(t *testing.T) {
+	armFlowPaths(t, 5)
+	p, cancel := newFlowProxy(t, 30)
+	defer cancel()
+	done := make(chan struct{})
+
+	// Connection 5 owns a packet and (as far as this test is concerned) is stuck
+	// inside conn.Write and will never come back for it.
+	p.pathQ[5] <- sendItem{buf: []byte{42}}
+
+	item, ok := p.nextSendItem(done, 7)
+	if !ok || len(item.buf) != 1 || item.buf[0] != 42 {
+		t.Fatalf("writer 7 did not rescue the packet stranded on writer 5 (ok=%v) — a "+
+			"queued packet is unreachable again, which is the defect that took 26-39s "+
+			"to open a TCP flow on device", ok)
+	}
+	if n := p.flowPathStats.stolen.Load(); n != 1 {
+		t.Fatalf("stolen counter = %d, want 1 — the instrument that shows whether the "+
+			"rescue path is being used at all is not counting", n)
+	}
+}
+
+// Stealing must be the LAST resort: a writer takes its own packet first, or the
+// preference the whole design expresses is destroyed by its own repair.
+func TestOwnQueueBeatsSteal(t *testing.T) {
+	armFlowPaths(t, 5)
+	p, cancel := newFlowProxy(t, 30)
+	defer cancel()
+	done := make(chan struct{})
+
+	p.pathQ[3] <- sendItem{buf: []byte{9}} // someone else's
+	p.pathQ[7] <- sendItem{buf: []byte{7}} // our own
+	item, _ := p.nextSendItem(done, 7)
+	if item.buf[0] != 7 {
+		t.Fatalf("writer 7 took %d, want its own packet 7 — stealing has overtaken the "+
+			"preference it exists to protect", item.buf[0])
+	}
+	if n := p.flowPathStats.stolen.Load(); n != 0 {
+		t.Fatalf("stole %d packets while it had its own to send", n)
+	}
+}
+
+// The shared channel carries spilled packets AND every keepalive and handshake.
+// It must be served before another connection's queue is raided.
+func TestSharedBeatsSteal(t *testing.T) {
+	armFlowPaths(t, 5)
+	p, cancel := newFlowProxy(t, 30)
+	defer cancel()
+	done := make(chan struct{})
+
+	p.pathQ[3] <- sendItem{buf: []byte{9}}
+	p.sendCh <- sendItem{buf: []byte{1}}
+	item, _ := p.nextSendItem(done, 7)
+	if item.buf[0] != 1 {
+		t.Fatalf("writer 7 took %d, want the shared-channel packet 1 — keepalives and "+
+			"spilled packets would queue behind a raid", item.buf[0])
+	}
+}
+
+// A writer with nothing anywhere must still block rather than spin, and must
+// still honour cancellation.
+func TestStealSweepDoesNotSpin(t *testing.T) {
+	armFlowPaths(t, 5)
+	p, cancel := newFlowProxy(t, 30)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { time.Sleep(50 * time.Millisecond); close(done) }()
+	if _, ok := p.nextSendItem(done, 2); ok {
+		t.Fatal("nextSendItem returned an item from an empty proxy")
 	}
 }
