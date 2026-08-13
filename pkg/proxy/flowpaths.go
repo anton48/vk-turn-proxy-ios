@@ -475,7 +475,7 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 			select {
 			case item := <-own:
 				item.via = viaOwn
-				p.traceDispatch(item, connIdx, "own")
+				p.noteDispatch(item, connIdx, "own")
 				return item, true
 			default:
 			}
@@ -485,7 +485,7 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		select {
 		case item := <-p.sendCh:
 			item.via = viaShared
-			p.traceDispatch(item, connIdx, "shared")
+			p.noteDispatch(item, connIdx, "shared")
 			return item, true
 		default:
 		}
@@ -508,11 +508,11 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		select {
 		case item := <-own:
 			item.via = viaOwn
-			p.traceDispatch(item, connIdx, "own")
+			p.noteDispatch(item, connIdx, "own")
 			return item, true
 		case item := <-p.sendCh:
 			item.via = viaShared
-			p.traceDispatch(item, connIdx, "shared")
+			p.noteDispatch(item, connIdx, "shared")
 			return item, true
 		case <-p.stealHint:
 			// Something was queued to SOME path while we had nothing to do. Loop
@@ -530,7 +530,8 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 // exists for.
 const flowTraceBudget = 3
 
-// traceDispatch names the connection a flow's packet actually left on.
+// noteDispatch stamps the coverage clock, then names the connection a flow's
+// packet actually left on.
 //
 // 🚨 THIS IS THE INSTRUMENT FOR THE OPEN QUESTION, and it exists because three
 // mechanisms have now been proposed for the same stall and two were refuted by
@@ -540,7 +541,17 @@ const flowTraceBudget = 3
 // they were handed to and whether that connection was carrying anything else.
 // This line closes that gap: join it to server1's per-conn UP by relay port and
 // the answer is one of three, with no room left for a story.
-func (p *Proxy) traceDispatch(item sendItem, connIdx int, via string) {
+func (p *Proxy) noteDispatch(item sendItem, connIdx int, via string) {
+	// COVERAGE FIRST, and unconditionally — before every early return below.
+	//
+	// 🎯 This is the one funnel every dispatch passes through, on all four writer
+	// transports and on all three routes (own / shared / steal), which is exactly
+	// what `coverage` has to be counted over. Putting it after any of the trace
+	// filters would count only keyed packets with trace budget left, i.e. a
+	// handful per flow, and the field would read as a dead pool under full load.
+	if connIdx >= 0 && connIdx < len(p.lastDispatchAt) {
+		p.lastDispatchAt[connIdx].Store(time.Now().UnixNano())
+	}
 	if item.flow == 0 || p.flows == nil {
 		return
 	}
@@ -575,10 +586,53 @@ func (p *Proxy) stealFromOtherPaths(connIdx int) (sendItem, bool) {
 		case item := <-p.pathQ[idx]:
 			item.via = viaSteal
 			p.flowPathStats.stolen.Add(1)
-			p.traceDispatch(item, connIdx, "steal")
+			p.noteDispatch(item, connIdx, "steal")
 			return item, true
 		default:
 		}
 	}
 	return sendItem{}, false
+}
+
+// coverageSummary renders how much of the pool actually carried a packet in the
+// last second: `coverage=16/30=53%/1s`.
+//
+// 🎯 THIS IS THE QUANTITY A FLOW-LOCAL PATH SET HAS TO STEER, and it had no
+// instrument until now — every previous coverage number was counted post-hoc off
+// server1's per-conn dump, hours after the run. Two independent requirements
+// pull against each other: COVERAGE, that the union of the per-flow sets stays
+// near N so every allocation is fed, and LOCALITY, that each flow walks a small
+// set. A single global k cannot hold both — measured 2026-08-13, k=5 leaves
+// 13-15 of 30 connections near-idle at F=4 against 0 at k=0 — so any design that
+// replaces the constant (adaptive k(F_active), covering/partition sets, a forced
+// spill onto cold paths) is steering exactly this number and needs to see it live.
+//
+// ⚠️ It is printed at EVERY k, deliberately. The k=0 arm is the baseline the
+// treatment has to be read against: work-stealing should light the whole pool, so
+// a control arm that does not read ~100% means the load, not the lever, is what
+// is small.
+//
+// ⚠️ A 1-SECOND LOOKBACK READ AT TICK TIME — not an interval statistic. At the 1 s
+// cadence a measurement run uses they coincide; at the default 10 s cadence this
+// samples the last tenth of the tick. The window rides in the field name so the
+// number cannot be quoted as "the whole interval".
+//
+// Silent when nothing dispatched at all, so an idle phone prints no 0/30 that
+// could later pass for a measured collapse.
+func (p *Proxy) coverageSummary(nowNs int64) string {
+	n := len(p.lastDispatchAt)
+	if n == 0 {
+		return ""
+	}
+	cutoff := nowNs - int64(time.Second)
+	live := 0
+	for i := range p.lastDispatchAt {
+		if p.lastDispatchAt[i].Load() > cutoff {
+			live++
+		}
+	}
+	if live == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" coverage=%d/%d=%.0f%%/1s", live, n, 100*float64(live)/float64(n))
 }

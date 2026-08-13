@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -30,6 +31,11 @@ func newFlowProxy(t *testing.T, numConns int) (*Proxy, context.CancelFunc) {
 		pathQ:     newPathQueues(numConns),
 		flows:     newFlowTable(numConns),
 		stealHint: make(chan struct{}, 1),
+		// Sized exactly as NewProxy sizes it. Without this the coverage stamp is
+		// skipped and the field reads empty — which is what an idle pool also
+		// looks like, so a harness that omits it would make the coverage tests
+		// pass for the wrong reason.
+		lastDispatchAt: make([]atomic.Int64, numConns),
 	}
 	return p, cancel
 }

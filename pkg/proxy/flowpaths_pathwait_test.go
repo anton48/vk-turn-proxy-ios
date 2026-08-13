@@ -188,3 +188,83 @@ func TestFlipReachesAWriterThatIsAlreadyParked(t *testing.T) {
 			"of them round the loop. That is the 5.2 s connect measured on device.")
 	}
 }
+
+// `coverage` must count EVERY dispatch route and EVERY writer, because the whole
+// point of the field is to say how much of the pool is being fed.
+//
+// 🚨 The dangerous failure is silent and one-sided: stamp it after any of
+// noteDispatch's trace filters and it counts only keyed packets with trace budget
+// left — a handful per flow — so a fully-lit pool under load reads as a collapse
+// and any controller steering on it would spill traffic it did not need to.
+func TestCoverageCountsEveryDispatchRoute(t *testing.T) {
+	armFlowPaths(t, 5)
+	p, cancel := newFlowProxy(t, 30)
+	defer cancel()
+	done := make(chan struct{})
+
+	if s := p.coverageSummary(time.Now().UnixNano()); s != "" {
+		t.Fatalf("coverage = %q on an idle pool, want silence — a 0/30 printed "+
+			"forever would later pass for a measured collapse", s)
+	}
+
+	// One packet down each route, onto three different connections. The keepalive
+	// (flow 0) is the case that matters most: it takes the shared channel BY
+	// DESIGN and is filtered out of the trace, so if the stamp sits behind that
+	// filter this is the dispatch that vanishes.
+	p.pathQ[7] <- sendItem{buf: []byte{1}, flow: 0xaa}
+	if _, ok := p.nextSendItem(done, 7); !ok { // own
+		t.Fatal("own dispatch failed")
+	}
+	p.pathQ[5] <- sendItem{buf: []byte{2}, flow: 0xbb}
+	if _, ok := p.nextSendItem(done, 9); !ok { // steal: lands on 9, not 5
+		t.Fatal("steal dispatch failed")
+	}
+	p.sendCh <- sendItem{buf: []byte{3}}        // flow 0 = a keepalive
+	if _, ok := p.nextSendItem(done, 21); !ok { // shared
+		t.Fatal("shared dispatch failed")
+	}
+
+	if s := p.coverageSummary(time.Now().UnixNano()); s != " coverage=3/30=10%/1s" {
+		t.Fatalf("coverage = %q, want ' coverage=3/30=10%%/1s' — the three routes "+
+			"are own(7), steal(9, the STEALER not the owner) and shared(21, a "+
+			"keepalive the trace filters out)", s)
+	}
+
+	// And it is a LOOKBACK, not a cumulative count: the same three conns must
+	// fall out of the window once they are older than a second.
+	if s := p.coverageSummary(time.Now().Add(2 * time.Second).UnixNano()); s != "" {
+		t.Fatalf("coverage = %q two seconds later, want silence — a conn that "+
+			"stopped sending must go cold, or the field can only ever rise", s)
+	}
+}
+
+// The second way the stamp can be put in the wrong place: behind the trace
+// BUDGET. Each flow gets flowTraceBudget lines, so a stamp below that check
+// counts a flow's first three packets and nothing after — under a bulk transfer
+// the field would decay to near zero while the pool was fully lit.
+func TestCoverageSurvivesTheTraceBudget(t *testing.T) {
+	armFlowPaths(t, 5)
+	p, cancel := newFlowProxy(t, 30)
+	defer cancel()
+	done := make(chan struct{})
+
+	const flow = uint64(0xc0ffee)
+	// Spend the budget on one connection, then dispatch the SAME flow onto a
+	// connection that has not been seen yet.
+	for i := 0; i < flowTraceBudget+2; i++ {
+		p.pathQ[3] <- sendItem{buf: []byte{byte(i)}, flow: flow}
+		if _, ok := p.nextSendItem(done, 3); !ok {
+			t.Fatalf("dispatch %d failed", i)
+		}
+	}
+	p.pathQ[17] <- sendItem{buf: []byte{9}, flow: flow}
+	if _, ok := p.nextSendItem(done, 17); !ok {
+		t.Fatal("dispatch onto the fresh conn failed")
+	}
+
+	if s := p.coverageSummary(time.Now().UnixNano()); s != " coverage=2/30=7%/1s" {
+		t.Fatalf("coverage = %q, want ' coverage=2/30=7%%/1s' — a flow whose trace "+
+			"budget is spent still carries traffic, and the pool it lights must "+
+			"still be counted", s)
+	}
+}

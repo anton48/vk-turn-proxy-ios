@@ -295,6 +295,25 @@ type Proxy struct {
 	pathWaitOwn   sendWaitStats
 	pathWaitSteal sendWaitStats
 
+	// lastDispatchAt[i] is when connection i last had a packet handed to it,
+	// UnixNano. It exists for ONE field — `coverage` — and it is the quantity a
+	// flow-local path set has to steer.
+	//
+	// 🎯 WHY IT IS A NEW ARRAY AND NOT `lastTxAt`. Coverage is only honest if it
+	// sees the WHOLE pool: three of the four writer sites pass `txConnIdx = -1`
+	// into writeChunk (deliberately — they never kept per-conn TX counters, and
+	// K=1 parity depends on it), so anything derived there would measure one
+	// transport out of four and read as a coverage collapse that is really a
+	// bookkeeping gap. `lastTxAt` also belongs to the wake-probe's
+	// skip-on-recent-tx and must not acquire a second meaning. This is stamped in
+	// the single dispatch funnel, where every writer passes a real connIdx.
+	//
+	// ⚠️ It is a 1-second LOOKBACK read at tick time, not an interval statistic.
+	// At the 1 s cadence a measurement run uses, the two coincide; at the default
+	// 10 s cadence it samples the last tenth of the interval. The field carries
+	// its own window (`/1s`) so it cannot be quoted as "the whole tick".
+	lastDispatchAt []atomic.Int64
+
 	// chunkStats: the uplink-chunking experiment's own instrument — it answers
 	// "did the knob engage", because a configured K that never materialises
 	// (shallow queue) is a run that tested nothing. K itself is process-global
@@ -608,6 +627,7 @@ func NewProxy(cfg Config) *Proxy {
 		connTxBytes:       make([]atomic.Int64, cfg.NumConns),
 		connRxBytes:       make([]atomic.Int64, cfg.NumConns),
 		lastTxAt:          make([]atomic.Int64, cfg.NumConns),
+		lastDispatchAt:    make([]atomic.Int64, cfg.NumConns),
 		lastRxAt:          make([]atomic.Int64, cfg.NumConns),
 		connLocalIPs:      make([]atomic.Value, cfg.NumConns),
 		wakeCh:            make(chan struct{}),
@@ -4189,7 +4209,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s flowkey=%d/%d%s%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s flowkey=%d/%d%s%s%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4265,7 +4285,12 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// silent when nothing took that route. → the field docs on
 			// pathWaitOwn.
 			p.pathWaitOwn.summaryAs("pathq-own"),
-			p.pathWaitSteal.summaryAs("pathq-steal"))
+			p.pathWaitSteal.summaryAs("pathq-steal"),
+			// How much of the pool carried anything in the last second. Printed
+			// at EVERY k on purpose: the k=0 arm is the baseline: work-stealing
+			// should light the whole pool, and a control that does not read
+			// ~100% means the LOAD is small, not the lever. → flowpaths.go
+			p.coverageSummary(time.Now().UnixNano()))
 
 		// The downlink's own disorder, on its own line so it can be diffed
 		// field-for-field against server1's `reorder(uplink)` line — the two
