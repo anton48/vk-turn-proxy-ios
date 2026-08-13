@@ -89,8 +89,13 @@ import (
 // under exactly the load being measured. The server's resequencer already paid
 // for this once, with an arrival time kept in a map beside the packet.
 type sendItem struct {
-	buf []byte
-	at  int64 // time.Now().UnixNano() at enqueue; 0 = unstamped, not measured
+	// flow is the inner 5-tuple hash (0 = keepalive/handshake). Carried here
+	// only so the writer can NAME the connection a flow's first packets went
+	// out on — the measurement for "what happens to a packet after
+	// conn.Write". → flowpaths.go
+	flow uint64
+	buf  []byte
+	at   int64 // time.Now().UnixNano() at enqueue; 0 = unstamped, not measured
 }
 
 // Bucket geometry. 250 µs per bucket, 2048 of them = 512 ms, plus one overflow

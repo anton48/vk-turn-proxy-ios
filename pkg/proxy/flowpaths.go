@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -154,6 +155,10 @@ type flowEntry struct {
 	paths   []int32 // k distinct connection indices, stable for the flow's life
 	rr      atomic.Uint32
 	lastUse atomic.Int64 // UnixNano, for the idle sweep
+	// budget for the dispatch trace below: the first few packets of a flow are
+	// the ones that matter (a SYN is the whole flow's progress) and tracing
+	// every packet of a bulk transfer would drown the log.
+	traceLeft atomic.Int32
 }
 
 // flowTable maps inner-flow key → preferred set.
@@ -204,6 +209,7 @@ func (t *flowTable) paths(key uint64, k int) *flowEntry {
 		t.evictLocked(now)
 	}
 	e := &flowEntry{paths: assignPaths(key^t.salt, k, t.numPaths)}
+	e.traceLeft.Store(flowTraceBudget)
 	e.lastUse.Store(now)
 	t.m[key] = e
 	return e
@@ -430,6 +436,7 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		if own != nil {
 			select {
 			case item := <-own:
+				p.traceDispatch(item, connIdx, "own")
 				return item, true
 			default:
 			}
@@ -438,6 +445,7 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		//    handshake, which carry no flow key by design.
 		select {
 		case item := <-p.sendCh:
+			p.traceDispatch(item, connIdx, "shared")
 			return item, true
 		default:
 		}
@@ -459,8 +467,10 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		}
 		select {
 		case item := <-own:
+			p.traceDispatch(item, connIdx, "own")
 			return item, true
 		case item := <-p.sendCh:
+			p.traceDispatch(item, connIdx, "shared")
 			return item, true
 		case <-p.stealHint:
 			// Something was queued to SOME path while we had nothing to do. Loop
@@ -471,6 +481,35 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 			return sendItem{}, false
 		}
 	}
+}
+
+// flowTraceBudget is how many of a flow's packets get a dispatch line. Three is
+// enough to cover a SYN and its first retransmits, which is the case the trace
+// exists for.
+const flowTraceBudget = 3
+
+// traceDispatch names the connection a flow's packet actually left on.
+//
+// 🚨 THIS IS THE INSTRUMENT FOR THE OPEN QUESTION, and it exists because three
+// mechanisms have now been proposed for the same stall and two were refuted by
+// measurement. What is known: with a set armed, opening a TCP flow takes 26-39 s
+// (6/6), the packets ARE dispatched (pref=100%, spill=0, stolen=0, queues empty,
+// sb=0), and they do NOT reach server1. What is NOT known is which connection
+// they were handed to and whether that connection was carrying anything else.
+// This line closes that gap: join it to server1's per-conn UP by relay port and
+// the answer is one of three, with no room left for a story.
+func (p *Proxy) traceDispatch(item sendItem, connIdx int, via string) {
+	if item.flow == 0 || p.flows == nil {
+		return
+	}
+	p.flows.mu.Lock()
+	e := p.flows.m[item.flow]
+	p.flows.mu.Unlock()
+	if e == nil || e.traceLeft.Add(-1) < 0 {
+		return
+	}
+	log.Printf("proxy: flowtrace key=%016x conn=%d via=%s bytes=%d paths=%v",
+		item.flow, connIdx, via, len(item.buf), e.paths)
 }
 
 // stealFromOtherPaths takes one packet from another connection's queue, or
@@ -493,6 +532,7 @@ func (p *Proxy) stealFromOtherPaths(connIdx int) (sendItem, bool) {
 		select {
 		case item := <-p.pathQ[idx]:
 			p.flowPathStats.stolen.Add(1)
+			p.traceDispatch(item, connIdx, "steal")
 			return item, true
 		default:
 		}

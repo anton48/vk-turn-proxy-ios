@@ -1737,7 +1737,7 @@ func (p *Proxy) SendPacketFlow(data []byte, flowKey uint64) error {
 	// over-statement is BOUNDED, per interval, by the `sendch-block` total
 	// printed beside it on the same memstats line. When that reads `0s/0`, every
 	// residence in the interval is exact.
-	item := sendItem{buf: buf, at: time.Now().UnixNano()}
+	item := sendItem{buf: buf, at: time.Now().UnixNano(), flow: flowKey}
 	// Flow-local path set (PR2), inert unless flow_paths_k is set. A packet that
 	// lands on one of its flow's preferred paths is done here; everything else —
 	// k=0, a keepalive with no key, or a preferred set that is momentarily busy —
