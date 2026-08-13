@@ -69,6 +69,7 @@ struct AdvancedView: View {
     /// up: it is a one-sitting measurement, not a preference. The runner is a
     /// @StateObject so it survives this pushed view's re-renders while running.
     @StateObject private var cwndProbe = UplinkCwndProbe()
+    @StateObject private var flowAB = UplinkFlowABRunner()
     @State private var probeHost = "192.168.102.1:5202"
     @State private var probeFlows = 8
     @State private var probeDuration = 20
@@ -214,14 +215,31 @@ struct AdvancedView: View {
                     let p: UInt16 = parts.count > 1 ? (UInt16(parts[1]) ?? 5202) : 5202
                     cwndProbe.start(host: h, port: p, flows: probeFlows, durationSec: probeDuration)
                 }
-                .disabled(cwndProbe.running)
+                .disabled(cwndProbe.running || flowAB.running)
                 Text(cwndProbe.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                // The scripted A/B. Same feature, same section, same footer:
+                // it drives the probe above rather than being a second unrelated
+                // switch (which is what the one-footer-one-switch rule forbids).
+                Button(flowAB.running ? "Running the A/B…" : "Run flow-path A/B (~\(flowAB.estimatedSeconds / 60) min)") {
+                    let parts = probeHost.split(separator: ":", maxSplits: 1)
+                    let h = parts.first.map(String.init) ?? "192.168.102.1"
+                    let p: UInt16 = parts.count > 1 ? (UInt16(parts[1]) ?? 5202) : 5202
+                    flowAB.start(host: h, port: p, probe: cwndProbe)
+                }
+                .disabled(cwndProbe.running || flowAB.running)
+                if flowAB.running {
+                    Button("Stop the A/B", role: .destructive) { flowAB.cancel() }
+                }
+                Text(flowAB.status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {
                 Text("Uplink cwnd probe")
             } footer: {
-                Text("Diagnostic. Opens the chosen number of plain TCP flows to a discard sink through the tunnel, sends bulk data, and logs the kernel's snd_cwnd, srtt, loss-recovery and reordering-detected flags every 100 ms — the direct read of whether each flow's window is held flat or sawtooths.\n\nConnect the tunnel first and keep this screen in the foreground. Start a sink on the far end first (on 192.168.102.1: nc -lk 5202 >/dev/null). Results go to the log as 'cwndprobe' lines — grep them out of the exported log. For a control, run the same with the VPN off against an internet sink in the same minutes.")
+                Text("Diagnostic. Opens the chosen number of plain TCP flows to a discard sink through the tunnel, sends bulk data, and logs the kernel's snd_cwnd, srtt, loss-recovery and reordering-detected flags every 100 ms — the direct read of whether each flow's window is held flat or sawtooths.\n\nConnect the tunnel first and keep this screen in the foreground. Start a sink on the far end first (on 192.168.102.1: nc -lk 5202 >/dev/null). Results go to the log as 'cwndprobe' lines — grep them out of the exported log. For a control, run the same with the VPN off against an internet sink in the same minutes.\n\nThe A/B button runs the pre-registered comparison by itself: six 60-second runs, flipping the flow-path setting every 15 seconds and alternating which arm starts, with the flow count changing between phases. It writes 'flowab' markers so the arms can be cut out of the log exactly, and it restores the setting to Off when it finishes or is stopped. Keep this screen in the foreground for the whole run, and take a VPN-off control before and after it.")
             }
         }
         .navigationTitle("Advanced")
