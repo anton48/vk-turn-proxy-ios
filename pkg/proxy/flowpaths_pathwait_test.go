@@ -137,3 +137,54 @@ func itoaDepth(d int) string {
 	}
 	return "?"
 }
+
+// A writer that parked while the lever was OFF must serve its path queue as soon
+// as the lever is turned ON — without waiting for a packet on the shared channel
+// to send it round the outside of the loop.
+//
+// 🚨 THIS IS A REGRESSION TEST FOR A MEASURED DEVICE DEFECT, not a hypothetical.
+// nextSendItem used to read k once, above its loop. Every idle writer therefore
+// held `own = nil` and `sticky = false` from before the flip, and `continue` on
+// the wake hint returned to a top of loop that never re-read them — so it skipped
+// its own queue and skipped the steal sweep and blocked again. On 2026-08-13,
+// four flows opened 5.2 s after a 0→5 flip while the extension logged tx-pkt
+// 5-6/s in, pref=100%, qpeak=2/2 and NOT ONE dequeue by any route.
+//
+// The sabotage is to hoist the two reads back above the loop: it compiles, and
+// this test then times out with the packet still in the queue.
+func TestFlipReachesAWriterThatIsAlreadyParked(t *testing.T) {
+	armFlowPaths(t, FlowPathsOff) // parked while the lever is OFF
+	p, cancel := newFlowProxy(t, 30)
+	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
+
+	got := make(chan sendItem, 1)
+	go func() {
+		if item, ok := p.nextSendItem(done, 7); ok {
+			got <- item
+		}
+	}()
+	// Let it reach the blocking select with the lever still off.
+	time.Sleep(50 * time.Millisecond)
+
+	SetFlowPathsK(5)
+	// Exactly what enqueueFlowPath does: place, then hint once, non-blocking.
+	p.pathQ[7] <- sendItem{buf: []byte{7}}
+	select {
+	case p.stealHint <- struct{}{}:
+	default:
+	}
+
+	select {
+	case item := <-got:
+		if len(item.buf) != 1 || item.buf[0] != 7 {
+			t.Fatalf("got %v, want the queued packet", item.buf)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a writer parked before the flip never took the packet from its OWN " +
+			"path queue — every idle writer is holding pre-flip state, so a queued " +
+			"packet is unreachable until a SHARED-channel packet happens to send one " +
+			"of them round the loop. That is the 5.2 s connect measured on device.")
+	}
+}

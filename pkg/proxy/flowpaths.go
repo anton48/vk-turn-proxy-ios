@@ -442,12 +442,34 @@ func (p *Proxy) pathHealthy(connIdx int) bool {
 // a receive on a nil channel never fires, and this is exactly the old
 // `case item := <-p.sendCh:` — byte-for-byte behaviour, one indirection.
 func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool) {
-	sticky := flowPathsK.Load() > FlowPathsOff
-	var own chan sendItem
-	if sticky && connIdx >= 0 && connIdx < len(p.pathQ) {
-		own = p.pathQ[connIdx]
-	}
 	for {
+		// 🚨 RE-READ k ON EVERY ITERATION. Hoisting these two out of the loop was
+		// a real defect with a device signature, and it is worth the atomic load
+		// to keep them here.
+		//
+		// A writer with nothing to do blocks INSIDE this loop. If k changes from
+		// 0 to 5 while it is parked — which is exactly what an A/B arm switch
+		// does, and what a user toggling the setting does — the hoisted values
+		// stay at their pre-flip state: `own` nil and `sticky` false. The
+		// stealHint wakes it, `continue` returns here, and with stale values it
+		// skips its own queue AND skips the steal sweep, so it re-blocks. A
+		// packet sitting in a path queue is then unreachable by every parked
+		// writer, and reachable only by one that happens to RETURN and be called
+		// again — which needs a packet on the SHARED channel, i.e. a keepalive.
+		//
+		// Measured on 2026-08-13 (build 253, `vpn.wifi.7.log`): opening four
+		// flows right after a 0→5 flip took 5.2 s, with tx-pkt 5-6/s going in,
+		// pref=100%, qpeak=2/2 (the queues FULL), stolen=0, and sendch-wait /
+		// pathq-own / pathq-steal all SILENT for five consecutive seconds — not
+		// one packet dequeued by any route. It then cleared all at once. That is
+		// this, and it also explains the spread (0.2-5.2 s): each shared-channel
+		// packet refreshes exactly ONE writer, so whether a flow's k paths
+		// include a refreshed one is a matter of luck.
+		sticky := flowPathsK.Load() > FlowPathsOff
+		var own chan sendItem
+		if sticky && connIdx >= 0 && connIdx < len(p.pathQ) {
+			own = p.pathQ[connIdx]
+		}
 		// 1. Own queue — the preference the whole design exists to express.
 		if own != nil {
 			select {
