@@ -32,7 +32,8 @@ final class UplinkFlowABRunner: ObservableObject {
     @Published var running = false
     @Published var status = "idle"
 
-    private var cancelled = false
+    private let cancelledFlag = AtomicFlag()
+    private var cancelled: Bool { cancelledFlag.get() }
 
     /// One phase of the plan: a flow count and the treatment k to compare
     /// against 0 at that flow count.
@@ -68,13 +69,22 @@ final class UplinkFlowABRunner: ObservableObject {
     func start(host: String, port: UInt16, probe: UplinkCwndProbe) {
         guard !running else { return }
         running = true
-        cancelled = false
+        cancelledFlag.set(false)
+        self.probe = probe
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.run(host: host, port: port, probe: probe)
         }
     }
 
-    func cancel() { cancelled = true }
+    /// 🚨 Stops the TRAFFIC as well as the schedule. The first version only set a
+    /// flag the runner checked between 15-second arms and left the probe sending,
+    /// so Stop appeared to do nothing for up to a minute — reported from device.
+    func cancel() {
+        cancelledFlag.set(true)
+        probe?.stop()
+    }
+
+    private weak var probe: UplinkCwndProbe?
 
     private func run(host: String, port: UInt16, probe: UplinkCwndProbe) {
         let log = SharedLogger.shared
@@ -125,7 +135,7 @@ final class UplinkFlowABRunner: ObservableObject {
                     log.log("flowab ABORT r=\(runIdx) — the flows never came up within 60s; "
                         + "check the sink and that the tunnel is up")
                     aborted += 1
-                    cancelled = true
+                    cancelledFlag.set(true)
                     break
                 }
                 let startedAt = Date()
@@ -152,7 +162,7 @@ final class UplinkFlowABRunner: ObservableObject {
                 }
                 if armAborted {
                     aborted += 1
-                    if !cancelled { cancelled = true } // an abort ends the plan
+                    cancelledFlag.set(true) // an abort ends the plan
                     break
                 }
 
@@ -195,9 +205,14 @@ final class UplinkFlowABRunner: ObservableObject {
         }
     }
 
+    /// Sleeps in short slices so Stop is felt immediately. A single
+    /// Thread.sleep(15) is why the first version took up to an arm to react.
     private func sleep(seconds: Int) {
         guard seconds > 0 else { return }
-        Thread.sleep(forTimeInterval: TimeInterval(seconds))
+        let deadline = Date().addingTimeInterval(TimeInterval(seconds))
+        while Date() < deadline && !cancelled {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
     }
 
     private func publish(_ s: String, running r: Bool? = nil) {

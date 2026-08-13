@@ -34,6 +34,10 @@ import Darwin
 
 final class UplinkCwndProbe: ObservableObject {
     @Published var running = false
+    /// Set by stop(); the send loop checks it every tick. Without this the A/B
+    /// runner could stop ITSELF but not the traffic it started, so pressing Stop
+    /// looked like nothing happened for up to a minute.
+    private let stopped = AtomicFlag()
     /// True once the flows are up and bytes are actually moving — i.e. when the
     /// CSV's t_ms starts counting. 🚨 NOT the same as `running`, which is set the
     /// moment start() is called: connecting the flows through the tunnel took
@@ -47,8 +51,13 @@ final class UplinkCwndProbe: ObservableObject {
     // struct, validated on Darwin against a loopback transfer (M1 gate).
     private let optTCPConnectionInfo: Int32 = 0x106
 
+    /// Ask the run to end early. Safe from any thread; the loop notices within a
+    /// tick and tears the flows down through its normal path.
+    func stop() { stopped.set(true) }
+
     func start(host: String, port: UInt16, flows: Int, durationSec: Int) {
         guard !running else { return }
+        stopped.set(false)
         running = true
         status = "connecting…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -145,7 +154,7 @@ final class UplinkCwndProbe: ObservableObject {
         var senders: [Thread] = []
         for fd in fds {
             let t = Thread {
-                while Date() < deadline {
+                while Date() < deadline && !self.stopped.get() {
                     let n = send(fd, bufPtr, bufSize, 0)
                     if n <= 0 {
                         if n < 0 && errno == EINTR { continue }
@@ -168,7 +177,7 @@ final class UplinkCwndProbe: ObservableObject {
         let sampleInterval = 0.1
         var prevTx = [UInt64](repeating: 0, count: fds.count)
         var prevMs = [Int](repeating: 0, count: fds.count)
-        while Date() < deadline {
+        while Date() < deadline && !stopped.get() {
             let tms = Int(Date().timeIntervalSince(start) * 1000)
             for (i, fd) in fds.enumerated() {
                 guard let s = sample(fd) else { continue }
@@ -200,4 +209,15 @@ final class UplinkCwndProbe: ObservableObject {
         DispatchQueue.main.async { self.sending = false }
         publish("done: \(fds.count) flows, \(durationSec)s — grep 'cwndprobe' in logs", running: false)
     }
+}
+
+
+/// A boolean shared between the UI thread and the probe's worker threads. Small
+/// enough to hand-roll, and a plain Bool here would be a data race — the kind
+/// that works in testing and stops working on a loaded phone.
+final class AtomicFlag {
+    private let lock = NSLock()
+    private var value = false
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
+    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
