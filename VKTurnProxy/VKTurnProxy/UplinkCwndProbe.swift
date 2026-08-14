@@ -88,7 +88,7 @@ final class UplinkCwndProbe: ObservableObject {
     // old column is kept in place, honestly named, so the parser's fixed 13-field
     // prefix still matches and old logs stay readable.
     private struct Info {
-        var cwnd, ssthresh, sndwnd, sbbytes, rttcurMs, srttMs, flags, mss: UInt32
+        var cwnd, ssthresh, sndwnd, sbbytes, rttcurMs, srttMs, flags, mss, rto: UInt32
         var txbytes, rxRtxPkts, txRtxBytes: UInt64
     }
     private func sample(_ fd: Int32) -> Info? {
@@ -101,6 +101,16 @@ final class UplinkCwndProbe: ObservableObject {
         func u64(_ o: Int) -> UInt64 { raw.load(fromByteOffset: o, as: UInt64.self) }
         return Info(cwnd: u32(24), ssthresh: u32(20), sndwnd: u32(28), sbbytes: u32(32),
                     rttcurMs: u32(40), srttMs: u32(44), flags: u32(8), mss: u32(16),
+                    // 🎯 rto (offset 12) is now sampled EVERY TICK, not only at
+                    // connect. The upload's limit was traced to a SPURIOUS RTO
+                    // — half the retransmits arrive at a receiver that already
+                    // had the data, at an original→duplicate median of 1203 ms
+                    // against a 120 ms srtt — so a firing timer is the event to
+                    // catch, and `rto` doubling is the signal already validated
+                    // against a black hole (1000→2000→4000→8000→16000 ms).
+                    // Paired with the extension's `rxgap` field it answers
+                    // whether the timer fires because FEEDBACK STOPPED.
+                    rto: u32(12),
                     txbytes: u64(64), rxRtxPkts: u64(104), txRtxBytes: u64(72))
     }
 
@@ -278,7 +288,7 @@ final class UplinkCwndProbe: ObservableObject {
         var el = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &eff, &el)
         log.log("cwndprobe START host=\(host):\(port) flows=\(fds.count)/\(flows) dur=\(durationSec)s effSndBuf=\(eff)")
-        log.log("cwndprobe CSV t_ms,flow,cwnd,ssthresh,sndwnd,sbbytes,srtt_ms,rttcur_ms,loss,reord,mss,txbytes,rxrtx_pkts,deliv_mbit,winuse,txrtx_bytes")
+        log.log("cwndprobe CSV t_ms,flow,cwnd,ssthresh,sndwnd,sbbytes,srtt_ms,rttcur_ms,loss,reord,mss,txbytes,rxrtx_pkts,deliv_mbit,winuse,txrtx_bytes,rto_ms")
         publish("running: \(fds.count) flows for \(durationSec)s")
         DispatchQueue.main.async { self.sending = true }
 
@@ -335,7 +345,7 @@ final class UplinkCwndProbe: ObservableObject {
                 let winRate = s.srttMs > 0 ? Double(s.cwnd) * 8 / (Double(s.srttMs) / 1000.0) / 1e6 : 0
                 let winuse = winRate > 0 ? Int((100.0 * deliv / winRate).rounded()) : 0
                 prevTx[i] = s.txbytes; prevMs[i] = tms
-                log.log("cwndprobe \(tms),\(i),\(s.cwnd),\(s.ssthresh),\(s.sndwnd),\(s.sbbytes),\(s.srttMs),\(s.rttcurMs),\(loss),\(reord),\(s.mss),\(s.txbytes),\(s.rxRtxPkts),\(String(format: "%.2f", deliv)),\(winuse),\(s.txRtxBytes)")
+                log.log("cwndprobe \(tms),\(i),\(s.cwnd),\(s.ssthresh),\(s.sndwnd),\(s.sbbytes),\(s.srttMs),\(s.rttcurMs),\(loss),\(reord),\(s.mss),\(s.txbytes),\(s.rxRtxPkts),\(String(format: "%.2f", deliv)),\(winuse),\(s.txRtxBytes),\(s.rto)")
             }
             Thread.sleep(forTimeInterval: sampleInterval)
         }

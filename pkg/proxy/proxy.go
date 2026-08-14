@@ -195,6 +195,12 @@ type Proxy struct {
 	// than the shared channel it is compared against: an arm must differ from
 	// its control in the treatment, not in its queue geometry.
 	//
+	// rxGap: the gap between consecutive DOWNLINK arrivals — during an upload
+	// the downlink is nothing but ACKs, so this is the feedback gap, and the
+	// upload's limit was traced to a SPURIOUS RTO that only fires when feedback
+	// stops. See rxgap.go for what it can and cannot conclude.
+	rxGap rxGapStats
+
 	// dupStats: what the duplication mode actually did this interval, including
 	// the second copies it had to DROP. Read-and-reset per memstats tick.
 	dupStats dupStats
@@ -1802,6 +1808,11 @@ func (p *Proxy) enqueueSend(ch chan sendItem, data []byte) error {
 // producer had to wait for room. Returns false if ctx died first — the caller
 // still owns pkt and must return it to the pool.
 func (p *Proxy) enqueueRecv(ctx context.Context, pkt []byte) bool {
+	// 🚨 STAMPED ON ARRIVAL, NOT ON SUCCESSFUL ENQUEUE. The question is when the
+	// packet reached us, and the slow path below can add milliseconds of its own
+	// while recvCh is full — folding that into the gap would make a full queue
+	// look like missing feedback, which is the opposite of what this measures.
+	p.rxGap.observe(time.Now().UnixNano())
 	select {
 	case p.recvCh <- pkt:
 		notePeak(&p.recvChPeak, len(p.recvCh))
@@ -4178,7 +4189,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4238,6 +4249,13 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
 			p.recvChBlockCount.Swap(0),
+			// 🎯 THE FEEDBACK GAP. During an upload the downlink carries only
+			// ACKs, so a gap here is a gap in the sender's feedback — and the
+			// upload's limit is a SPURIOUS RTO, which is exactly what a feedback
+			// gap causes. `ge1s` is the bucket that decides it (Darwin's minimum
+			// RTO is ~1 s; the measured original→duplicate median was 1203 ms).
+			// ⚠️ Read it beside tx-pkt: on an idle tunnel these are keepalives.
+			p.rxGap.summary(),
 			// Empty unless the TUN wrapper is installed — see tunstats.go. It
 			// answers the one question left about the uplink: is wireguard-go
 			// STARVED (~100% of its loop inside tun.Read) or SLOW?
