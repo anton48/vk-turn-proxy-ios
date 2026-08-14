@@ -93,6 +93,14 @@ func (b *TURNBind) SendWithFlows(bufs [][]byte, ep conn.Endpoint, flowKeys []uin
 	return nil
 }
 
+// ObserveInboundAck implements conn.FlowReceiver: the patched WireGuard calls
+// it for each inbound PURE TCP ACK with the inner-flow key hashed from the
+// plaintext, just before the packet reaches the TUN. Forwarded to the proxy,
+// where the memstats line lives.
+func (b *TURNBind) ObserveInboundAck(flowKey uint64) {
+	b.proxy.ObserveInboundAck(flowKey)
+}
+
 // ParseEndpoint creates a TURNEndpoint from a string.
 func (b *TURNBind) ParseEndpoint(s string) (conn.Endpoint, error) {
 	return &TURNEndpoint{addr: s}, nil

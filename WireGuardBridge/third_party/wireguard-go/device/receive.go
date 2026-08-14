@@ -428,6 +428,10 @@ func (device *Device) RoutineHandshake(id int) {
 
 func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 	device := peer.device
+	// The optional downlink flow hook, resolved ONCE per goroutine rather than
+	// per packet — the same discipline as hoisting a closure out of a hot loop.
+	// nil for any Bind that does not implement it, i.e. for upstream binds.
+	flowRx, _ := device.net.bind.(conn.FlowReceiver)
 	defer func() {
 		device.log.Verbosef("%v - Routine: sequential receiver - stopped", peer)
 		peer.stopping.Done()
@@ -505,6 +509,14 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			default:
 				device.log.Verbosef("Packet with invalid IP version from %v", peer)
 				continue
+			}
+
+			// 🎯 THE FEEDBACK-GAP HOOK, on the only side where the inner 5-tuple
+			// is readable. Pure ACKs only — see isPureTCPAck. The type assertion
+			// is hoisted above the loop (flowRx) so this costs one nil check per
+			// packet, not one interface lookup.
+			if flowRx != nil && isPureTCPAck(elem.packet) {
+				flowRx.ObserveInboundAck(flowKeyOf(elem.packet))
 			}
 
 			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])

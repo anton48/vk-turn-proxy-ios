@@ -178,6 +178,13 @@ type Proxy struct {
 	sendCh chan sendItem
 	recvCh chan []byte
 
+	// ackGap: per-inner-flow gaps between inbound ACKs, fed by the patched
+	// wireguard-go through conn.FlowReceiver. The aggregate version of this
+	// measurement refuted the POOL-WIDE feedback stall; this one can see a
+	// single flow's ACKs pause, which is the size of event that matters when
+	// `rto` is only ~3x `srtt`. See ackgap.go.
+	ackGap ackGapStats
+
 	// rtpChPeak (build 145, diagnostic): per-interval high-water mark of the
 	// plain DTLS+SRTP path's per-conn rtpCh depth, updated at the demux
 	// producer (srtpwrap.runDemuxFromPacketConn) and read-and-reset each
@@ -4224,7 +4231,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s flowkey=%d/%d%s%s%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s flowkey=%d/%d%s%s%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4276,6 +4283,12 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
 			p.recvChBlockCount.Swap(0),
+			// 🎯 Per-flow ACK gaps. Read it as a RATE: `flows=` gives the
+			// denominator, and the comparison is against the ~28% of loaded
+			// seconds in which some flow's cwnd is collapsed. Buckets start at
+			// 250 ms because the probe measured `rto` at 371-632 ms, not at the
+			// 1 s of folklore.
+			p.ackGap.summary(),
 			// Empty unless the TUN wrapper is installed — see tunstats.go. It
 			// answers the one question left about the uplink: is wireguard-go
 			// STARVED (~100% of its loop inside tun.Read) or SLOW?

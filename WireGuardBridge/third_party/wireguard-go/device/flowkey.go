@@ -5,7 +5,7 @@ package device
 // not part of upstream wireguard-go.
 //
 //   - TCP/UDP get the full 5-tuple; other protocols get the 3-tuple (host pair
-//     + proto), so they are still sticky by host pair.
+//   - proto), so they are still sticky by host pair.
 //   - Direction is NOT normalized: only the uplink (app->server) is made sticky;
 //     the downlink is a different flow handled elsewhere.
 //   - 0 is reserved for "unknown" (too short / unparseable / keepalive).
@@ -55,4 +55,46 @@ func flowKeyOf(pkt []byte) uint64 {
 		h = fnvPrime // never return the reserved "unknown" value for a real flow
 	}
 	return h
+}
+
+// isPureTCPAck reports whether a plaintext IP packet is a TCP segment carrying
+// NO payload — i.e. a bare acknowledgement.
+//
+// 🎯 On the ciphertext side this could only ever be approximated by SIZE, and an
+// aggregate counter built that way had to guess a byte range and still admitted
+// background ACKs and DNS answers. Here the packet is in the clear, so the test
+// is exact: total length minus the IP header minus the TCP data offset is zero.
+//
+// ⚠️ It therefore MISSES an ACK piggybacked on data, which is correct for the
+// case under study (during an upload the return direction carries no data) and
+// would under-count on a bidirectional flow. Said here rather than discovered
+// later.
+func isPureTCPAck(pkt []byte) bool {
+	switch {
+	case len(pkt) >= 20 && pkt[0]>>4 == 4:
+		if pkt[9] != 6 { // not TCP
+			return false
+		}
+		ihl := int(pkt[0]&0x0f) * 4
+		total := int(pkt[2])<<8 | int(pkt[3])
+		if ihl < 20 || total < ihl+20 || total > len(pkt) {
+			return false
+		}
+		if len(pkt) < ihl+13 {
+			return false
+		}
+		doff := int(pkt[ihl+12]>>4) * 4
+		return doff >= 20 && ihl+doff == total
+	case len(pkt) >= 40 && pkt[0]>>4 == 6:
+		if pkt[6] != 6 { // next-header, no extension headers on the WG data path
+			return false
+		}
+		payload := int(pkt[4])<<8 | int(pkt[5])
+		if payload < 20 || 40+payload > len(pkt) || len(pkt) < 53 {
+			return false
+		}
+		doff := int(pkt[52]>>4) * 4
+		return doff >= 20 && doff == payload
+	}
+	return false
 }

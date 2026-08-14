@@ -81,6 +81,27 @@ type FlowSender interface {
 	SendWithFlows(bufs [][]byte, ep Endpoint, flowKeys []uint64) error
 }
 
+// FlowReceiver is the DOWNLINK twin of FlowSender, and it exists for one
+// measurement: the upload was traced to a SPURIOUS RTO — half the retransmits
+// arrive at a receiver that already had the data, at an original→duplicate
+// median of 1203 ms against a 120 ms srtt — and a timer that fires over a
+// healthy data path means the sender stopped getting FEEDBACK.
+//
+// An AGGREGATE version of that measurement was built first and refuted the
+// POOL-WIDE form: 81 collapsed-cwnd seconds against 13 ticks with any feedback
+// gap. What it could not see is a gap in ONE flow's ACKs while the other flows
+// keep the aggregate busy — and with an RTO of ~371 ms against an srtt of
+// ~120 ms, barely 3x, that is exactly the size of event that matters.
+//
+// Seeing it requires the inner 5-tuple, which is ciphertext everywhere except
+// here: the plaintext side of WireGuard. Binds that do not implement this are
+// simply not called, so upstream binds are unaffected.
+type FlowReceiver interface {
+	// ObserveInboundAck is called once per inbound PURE TCP ACK (no payload)
+	// with its inner-flow key, just before the packet is written to the TUN.
+	ObserveInboundAck(flowKey uint64)
+}
+
 // An Endpoint maintains the source/destination caching for a peer.
 //
 //	dst: the remote address of a peer ("endpoint" in uapi terminology)
