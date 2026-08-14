@@ -201,6 +201,12 @@ type Proxy struct {
 	// stops. See rxgap.go for what it can and cannot conclude.
 	rxGap rxGapStats
 
+	// rxAckGap: the same gap, but counting ONLY records small enough to be a
+	// bare inner ACK. Under a full tunnel the downlink carries every app's
+	// traffic, and background bulk would otherwise fill the very gaps this is
+	// looking for. See isAckSized in rxgap.go.
+	rxAckGap rxGapStats
+
 	// dupStats: what the duplication mode actually did this interval, including
 	// the second copies it had to DROP. Read-and-reset per memstats tick.
 	dupStats dupStats
@@ -1812,7 +1818,11 @@ func (p *Proxy) enqueueRecv(ctx context.Context, pkt []byte) bool {
 	// packet reached us, and the slow path below can add milliseconds of its own
 	// while recvCh is full — folding that into the gap would make a full queue
 	// look like missing feedback, which is the opposite of what this measures.
-	p.rxGap.observe(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	p.rxGap.observe(now)
+	if isAckSized(len(pkt)) {
+		p.rxAckGap.observe(now)
+	}
 	select {
 	case p.recvCh <- pkt:
 		notePeak(&p.recvChPeak, len(p.recvCh))
@@ -4189,7 +4199,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4256,6 +4266,12 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// RTO is ~1 s; the measured original→duplicate median was 1203 ms).
 			// ⚠️ Read it beside tx-pkt: on an idle tunnel these are keepalives.
 			p.rxGap.summary(),
+			// 🚨 And the same gap over ACK-SIZED records only. The all-packet
+			// field above is contaminated by every other app on the device —
+			// under a full tunnel their traffic comes through here too, and it
+			// can only FILL gaps, never create them. This one narrows to what an
+			// inner ACK can be. Neither is clean; read them together.
+			p.rxAckGap.summaryAs("ackgap"),
 			// Empty unless the TUN wrapper is installed — see tunstats.go. It
 			// answers the one question left about the uplink: is wireguard-go
 			// STARVED (~100% of its loop inside tun.Read) or SLOW?

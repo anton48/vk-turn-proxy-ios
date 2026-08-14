@@ -116,3 +116,53 @@ func TestTheDownlinkPathFeedsTheCounter(t *testing.T) {
 		t.Fatalf("unexpected field shape: %q", s)
 	}
 }
+
+// TestBackgroundBULKDoesNotFeedTheAckGap is the user's correction turned into a
+// guard: under a full tunnel the downlink carries every app on the device, and
+// that traffic can only FILL the gaps this instrument looks for. The ACK-sized
+// field must therefore ignore bulk — and must ignore WireGuard keepalives at the
+// other end, or a 10 s keepalive cadence would cap the observable gap.
+func TestBackgroundBulkDoesNotFeedTheAckGap(t *testing.T) {
+	cases := []struct {
+		name string
+		size int
+		ack  bool
+	}{
+		{"WireGuard keepalive (16+0+16)", 32, false},
+		{"bare IPv4 ACK with timestamps (16+52+16)", 84, true},
+		{"bare IPv6 ACK (16+64+16)", 96, true},
+		{"upper bound", 128, true},
+		{"one past the bound", 129, false},
+		{"a bulk background packet", 1420, false},
+		{"empty", 0, false},
+	}
+	for _, c := range cases {
+		if got := isAckSized(c.size); got != c.ack {
+			t.Errorf("%s (%d B): isAckSized = %v, want %v", c.name, c.size, got, c.ack)
+		}
+	}
+}
+
+// TestTheTwoGapFieldsAreIndEPENDENT: a bulk arrival must advance the all-packet
+// gap and leave the ACK-sized one untouched, or the narrowing buys nothing.
+func TestTheTwoGapFieldsAreIndependent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &Proxy{ctx: ctx, recvCh: make(chan []byte, 8)}
+
+	p.enqueueRecv(ctx, make([]byte, 84)) // an ACK
+	time.Sleep(20 * time.Millisecond)
+	p.enqueueRecv(ctx, make([]byte, 1420)) // background bulk
+	time.Sleep(20 * time.Millisecond)
+	p.enqueueRecv(ctx, make([]byte, 1420)) // more background bulk
+
+	all := p.rxGap.summary()
+	ack := p.rxAckGap.summaryAs("ackgap")
+	if all == "" {
+		t.Fatal("the all-packet field saw nothing")
+	}
+	if ack != "" {
+		t.Fatalf("bulk fed the ACK-sized field: %q — the narrowing is not working, "+
+			"and background traffic would keep masking the gaps we are hunting", ack)
+	}
+}
