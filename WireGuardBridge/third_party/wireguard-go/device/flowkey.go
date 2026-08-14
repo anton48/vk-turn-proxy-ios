@@ -98,3 +98,41 @@ func isPureTCPAck(pkt []byte) bool {
 	}
 	return false
 }
+
+// tcpAckNumber returns the cumulative acknowledgement number of a plaintext TCP
+// packet, and whether the ACK flag is actually set.
+//
+// 🚨 THIS IS THE QUANTITY THE RETRANSMISSION TIMER CARES ABOUT, and the reason a
+// second counter exists. An RTO is reset by acknowledgements that ADVANCE the
+// window. A first attempt counted ACK ARRIVALS instead, and the two diverge
+// exactly when there is a hole: the receiver emits duplicate ACKs at full
+// cadence — arrivals look perfectly healthy — while this number does not move
+// and the sender's timer runs anyway.
+//
+// Any TCP packet with the ACK flag counts, not only a bare one: an
+// acknowledgement piggybacked on data advances the window just as well.
+func tcpAckNumber(pkt []byte) (uint32, bool) {
+	var off int
+	switch {
+	case len(pkt) >= 20 && pkt[0]>>4 == 4:
+		if pkt[9] != 6 {
+			return 0, false
+		}
+		off = int(pkt[0]&0x0f) * 4
+	case len(pkt) >= 40 && pkt[0]>>4 == 6:
+		if pkt[6] != 6 {
+			return 0, false
+		}
+		off = 40
+	default:
+		return 0, false
+	}
+	if off < 20 || len(pkt) < off+20 {
+		return 0, false
+	}
+	if pkt[off+13]&0x10 == 0 { // ACK flag clear: the field is undefined
+		return 0, false
+	}
+	a := pkt[off+8:]
+	return uint32(a[0])<<24 | uint32(a[1])<<16 | uint32(a[2])<<8 | uint32(a[3]), true
+}

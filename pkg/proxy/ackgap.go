@@ -131,9 +131,134 @@ func (a *ackGapStats) summary() string {
 		time.Duration(maxNs).Round(time.Millisecond))
 }
 
+// ackAdvStats measures the gap between successive ADVANCES of a flow's
+// cumulative acknowledgement — the quantity a retransmission timer actually
+// watches.
+//
+// 🚨 WHY THIS EXISTS SEPARATELY FROM ackGapStats, and it is the correction that
+// matters: `ackGap` counts ACK ARRIVALS and refuted "feedback goes silent"
+// (per-flow, F=16: 45% of loaded seconds have a collapsed cwnd but only 12% of
+// ticks contain ANY flow pausing ≥ the measured 371 ms RTO; median per-tick max
+// 124 ms). But an RTO is reset by acknowledgements that MOVE, and duplicate ACKs
+// arrive at full cadence while the cumulative number stands still. So the
+// refuted claim and the live claim are different quantities, and only this one
+// can collapse a window.
+//
+// 🎯 BUCKET EDGES SIT ON THE THRESHOLD, not around it. The previous counter
+// bucketed at 250/500/1000 ms while the deciding value — the RTO the probe
+// measures — is 371 ms, and the two neighbouring buckets differed by a factor of
+// 39 in frequency, so the pair could not answer the question at all. `ge371` is
+// therefore an explicit edge, with `ge486` for the p90 of the same measurement.
+//
+// `dups` is reported beside the gaps because it is the direct signature of the
+// mechanism: many non-advancing ACKs alongside long advance gaps is a stalled
+// cumulative acknowledgement, which is exactly the picture an unrepaired hole
+// produces.
+type ackAdvStats struct {
+	mu       sync.Mutex
+	lastAck  map[uint64]uint32
+	lastMove map[uint64]int64
+	seen     map[uint64]struct{}
+	advances int64
+	dups     int64
+	ge250    int64
+	ge371    int64
+	ge486    int64
+	ge1s     int64
+	idle     int64
+	maxNs    int64
+}
+
+// observe records one inbound acknowledgement for flowKey.
+func (a *ackAdvStats) observe(flowKey uint64, ackNum uint32, now int64) {
+	if flowKey == 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.lastAck == nil {
+		a.lastAck = make(map[uint64]uint32, 64)
+		a.lastMove = make(map[uint64]int64, 64)
+		a.seen = make(map[uint64]struct{}, 64)
+	}
+	prevAck, known := a.lastAck[flowKey]
+	if !known {
+		a.lastAck[flowKey] = ackNum
+		a.lastMove[flowKey] = now
+		return
+	}
+	// 🚨 SIGNED 32-bit comparison, not `>`: the sequence space wraps, and a
+	// naive comparison would read every wrap as a 4 GB regression and then
+	// treat every subsequent ACK as a duplicate for the rest of the flow.
+	if int32(ackNum-prevAck) <= 0 {
+		a.dups++
+		return
+	}
+	prevMove := a.lastMove[flowKey]
+	a.lastAck[flowKey] = ackNum
+	a.lastMove[flowKey] = now
+	if prevMove == 0 || now <= prevMove {
+		return
+	}
+	gap := now - prevMove
+	if gap > ackGapIdleCapNs {
+		a.idle++
+		return
+	}
+	a.seen[flowKey] = struct{}{}
+	a.advances++
+	if gap > a.maxNs {
+		a.maxNs = gap
+	}
+	switch {
+	case gap >= 1_000_000_000:
+		a.ge1s++
+		fallthrough
+	case gap >= 486_000_000:
+		a.ge486++
+		fallthrough
+	case gap >= 371_000_000:
+		a.ge371++
+		fallthrough
+	case gap >= 250_000_000:
+		a.ge250++
+	}
+}
+
+func (a *ackAdvStats) summary() string {
+	now := time.Now().UnixNano()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for k, t := range a.lastMove {
+		if now-t > ackGapForgetNs {
+			delete(a.lastMove, k)
+			delete(a.lastAck, k)
+		}
+	}
+	adv, dups := a.advances, a.dups
+	g250, g371, g486, g1s := a.ge250, a.ge371, a.ge486, a.ge1s
+	idle, maxNs := a.idle, a.maxNs
+	flows := len(a.seen)
+	a.advances, a.dups, a.ge250, a.ge371, a.ge486, a.ge1s, a.idle, a.maxNs = 0, 0, 0, 0, 0, 0, 0, 0
+	a.seen = make(map[uint64]struct{}, 64)
+	if adv == 0 && dups == 0 && idle == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" ackadv=flows=%d adv=%d dup=%d ge250=%d ge371=%d ge486=%d ge1s=%d idle=%d max=%s",
+		flows, adv, dups, g250, g371, g486, g1s, idle,
+		time.Duration(maxNs).Round(time.Millisecond))
+}
+
 // ObserveInboundAck is the proxy's end of conn.FlowReceiver: the patched
-// wireguard-go calls it for every inbound PURE TCP ACK, just before the packet
-// reaches the TUN, with the inner-flow key it hashed from the plaintext.
-func (p *Proxy) ObserveInboundAck(flowKey uint64) {
-	p.ackGap.observe(flowKey, time.Now().UnixNano())
+// wireguard-go calls it for every inbound TCP packet CARRYING an acknowledgement,
+// just before the packet reaches the TUN.
+//
+// Two counters, two questions: `pureAck` gates the ARRIVAL cadence (refuted),
+// and every acknowledgement feeds the ADVANCE cadence (the live one).
+func (p *Proxy) ObserveInboundAck(flowKey uint64, ackNum uint32, pureAck bool) {
+	now := time.Now().UnixNano()
+	if pureAck {
+		p.ackGap.observe(flowKey, now)
+	}
+	p.ackAdv.observe(flowKey, ackNum, now)
 }

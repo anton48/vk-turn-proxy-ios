@@ -515,8 +515,11 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			// is readable. Pure ACKs only — see isPureTCPAck. The type assertion
 			// is hoisted above the loop (flowRx) so this costs one nil check per
 			// packet, not one interface lookup.
-			if flowRx != nil && isPureTCPAck(elem.packet) {
-				flowRx.ObserveInboundAck(flowKeyOf(elem.packet))
+			if flowRx != nil {
+				if ack, ok := tcpAckNumber(elem.packet); ok {
+					flowRx.ObserveInboundAck(flowKeyOf(elem.packet), ack,
+						isPureTCPAck(elem.packet))
+				}
 			}
 
 			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])

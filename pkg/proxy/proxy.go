@@ -185,6 +185,11 @@ type Proxy struct {
 	// `rto` is only ~3x `srtt`. See ackgap.go.
 	ackGap ackGapStats
 
+	// ackAdv: the gap between successive ADVANCES of each flow's cumulative
+	// acknowledgement — what a retransmission timer actually watches, and the
+	// correction to ackGap, which counts arrivals. See ackgap.go.
+	ackAdv ackAdvStats
+
 	// rtpChPeak (build 145, diagnostic): per-interval high-water mark of the
 	// plain DTLS+SRTP path's per-conn rtpCh depth, updated at the demux
 	// producer (srtpwrap.runDemuxFromPacketConn) and read-and-reset each
@@ -4231,7 +4236,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s flowkey=%d/%d%s%s%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s%s flowkey=%d/%d%s%s%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4289,6 +4294,11 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// 250 ms because the probe measured `rto` at 371-632 ms, not at the
 			// 1 s of folklore.
 			p.ackGap.summary(),
+			// 🎯 The DECIDING field. Bucket edges sit ON the measured RTO
+			// (371 p50, 486 p90) rather than around it, and `dup` beside the
+			// gaps is the direct signature: many non-advancing ACKs with long
+			// advance gaps is a stalled cumulative acknowledgement.
+			p.ackAdv.summary(),
 			// Empty unless the TUN wrapper is installed — see tunstats.go. It
 			// answers the one question left about the uplink: is wireguard-go
 			// STARVED (~100% of its loop inside tun.Read) or SLOW?

@@ -97,8 +97,8 @@ func (b *TURNBind) SendWithFlows(bufs [][]byte, ep conn.Endpoint, flowKeys []uin
 // it for each inbound PURE TCP ACK with the inner-flow key hashed from the
 // plaintext, just before the packet reaches the TUN. Forwarded to the proxy,
 // where the memstats line lives.
-func (b *TURNBind) ObserveInboundAck(flowKey uint64) {
-	b.proxy.ObserveInboundAck(flowKey)
+func (b *TURNBind) ObserveInboundAck(flowKey uint64, ackNum uint32, pureAck bool) {
+	b.proxy.ObserveInboundAck(flowKey, ackNum, pureAck)
 }
 
 // ParseEndpoint creates a TURNEndpoint from a string.

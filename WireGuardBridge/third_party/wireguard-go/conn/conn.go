@@ -97,9 +97,16 @@ type FlowSender interface {
 // here: the plaintext side of WireGuard. Binds that do not implement this are
 // simply not called, so upstream binds are unaffected.
 type FlowReceiver interface {
-	// ObserveInboundAck is called once per inbound PURE TCP ACK (no payload)
-	// with its inner-flow key, just before the packet is written to the TUN.
-	ObserveInboundAck(flowKey uint64)
+	// ObserveInboundAck is called once per inbound TCP packet CARRYING AN ACK,
+	// just before it is written to the TUN, with the inner-flow key, the
+	// cumulative acknowledgement number, and whether the packet was a bare ACK.
+	//
+	// Both facts are passed because two different questions are being asked:
+	// `pureAck` feeds the ARRIVAL cadence (did feedback go silent — refuted),
+	// while `ackNum` feeds the ADVANCE cadence (did feedback stop MOVING —
+	// which is what actually resets a retransmission timer). They diverge
+	// precisely when there is a hole in the upload stream.
+	ObserveInboundAck(flowKey uint64, ackNum uint32, pureAck bool)
 }
 
 // An Endpoint maintains the source/destination caching for a peer.
