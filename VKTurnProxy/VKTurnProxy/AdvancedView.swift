@@ -65,6 +65,9 @@ struct AdvancedView: View {
     // `grep -c flowPathsK ContentView.swift` = 0.
     @AppStorage("flowPathsK") private var flowPathsK = FlowPaths.off
     @AppStorage("flowPathsCover") private var flowPathsCover = false
+    // Same pop rule: declared HERE only. `grep -c uplinkSynthMbit
+    // ContentView.swift` = 0.
+    @AppStorage(UplinkSynth.key) private var uplinkSynthMbit = UplinkSynth.off
 
     /// Diagnostic uplink cwnd probe (build 241). Ephemeral @State, not backed
     /// up: it is a one-sitting measurement, not a preference. The runner is a
@@ -201,10 +204,32 @@ struct AdvancedView: View {
                     .onChange(of: flowPathsCover) { _ in
                         TunnelManager.shared.applyFlowPathsCover()
                     }
+                // 🚨 A PACED GENERATOR, NOT A SECOND PROBE, AND THE REASON IS
+                // THE WHOLE POINT: TCP cannot HOLD a load level — its
+                // congestion control ramps until it meets something, which is
+                // why per-connection load wandered 28-101% of the knee inside
+                // one recorded run. The question this answers needs a level
+                // held: does the loss the server measures from WireGuard's own
+                // counter space move between ~30%, ~60% and ~95% of the
+                // per-allocation knee? Flat at 30% and VK's meter cannot be the
+                // cause, because a bucket that is never emptied cannot clip.
+                //
+                // ⚠️ It ADDS to real traffic rather than replacing it, and it
+                // bypasses the inner TCP entirely — so read the answer at the
+                // server (ΣUP, `lost`, `cum-lost`, and the by-idx split that
+                // separates this stream from the real one), never here.
+                Picker("Synthetic uplink load", selection: $uplinkSynthMbit) {
+                    ForEach(UplinkSynth.choices, id: \.self) { m in
+                        Text(UplinkSynth.label(m)).tag(m)
+                    }
+                }
+                .onChange(of: uplinkSynthMbit) { _ in
+                    TunnelManager.shared.applyUplinkSynthMbit()
+                }
             } header: {
                 Text("Uplink experiment")
             } footer: {
-                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.\n\nLeast-used paths first changes HOW those few paths are picked: each new connection takes the ones carrying the fewest others, so the small sets still add up to all of them. It does nothing while the setting above is Off, and it changes what that setting measures — so turn it on before a measurement, not during one.")
+                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.\n\nLeast-used paths first changes HOW those few paths are picked: each new connection takes the ones carrying the fewest others, so the small sets still add up to all of them. It does nothing while the setting above is Off, and it changes what that setting measures — so turn it on before a measurement, not during one.\n\nSynthetic uplink load sends paced filler traffic through the tunnel at a fixed rate, to hold the connections at a chosen share of what each one is allowed to carry. It applies to a tunnel that is already connected, it ADDS to whatever else the phone is sending, and it stops itself after ten minutes so a level left on cannot keep the radio busy. Off is the normal setting; the answer is read on the server, not here.")
             }
 
             // 🚨 Its own section (see the note above the Logging one). Diagnostic

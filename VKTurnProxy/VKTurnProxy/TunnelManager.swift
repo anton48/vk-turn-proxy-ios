@@ -1000,6 +1000,25 @@ class TunnelManager: ObservableObject {
         try? session.sendProviderMessage(msg) { _ in }
     }
 
+    /// Applies the paced synthetic's target rate to the RUNNING tunnel.
+    ///
+    /// 🚨 Live for the same reason k is: the levels are arms of a
+    /// dose-response, and a reconnect between them would insert a ~107 s
+    /// thirty-connection ramp on a line that drifts several fold within an
+    /// hour. The Go side clamps again and starts a fresh safety-stopped arm on
+    /// every call, so a level left on cannot run the radio flat.
+    ///
+    /// No-op when the tunnel is down; nothing carries it to the next start,
+    /// which is deliberate — a diagnostic load must never survive a reconnect
+    /// into a session nobody meant to run it in.
+    func applyUplinkSynthMbit() {
+        let mbit = UplinkSynth.stored(in: UserDefaults.standard)
+        let centi = Int((mbit * 100).rounded())
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_uplink_synth_centimbit:\(centi)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
     /// Applies the assignment mode live, for the same reason k applies live.
     ///
     /// ⚠️ A flow keeps the set it was given until its next lookup finds the mode

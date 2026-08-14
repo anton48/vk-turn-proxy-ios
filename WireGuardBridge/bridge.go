@@ -1099,6 +1099,30 @@ func wgSetFlowPathsK(k C.int32_t) {
 	proxy.SetFlowPathsK(int(k))
 }
 
+// Sets the paced synthetic uplink's target rate on THIS process without a
+// reconnect, in hundredths of a Mbit/s. 0 stops it.
+//
+// 🚨 LIVE FOR THE SAME REASON k IS: the experiment it exists for is a
+// DOSE-RESPONSE — hold the pool at ~30%, ~60% and ~95% of the per-allocation
+// knee and ask whether the loss the server measures from WireGuard's own
+// counter space moves. Applying a level through a reconnect would put a ~107 s
+// thirty-connection ramp between arms on a line that moves 75 → 363 Mbit/s
+// inside 70 minutes.
+//
+// 🎯 AND WHY A SYNTHETIC RATHER THAN THE cwnd PROBE: TCP cannot HOLD a level —
+// its congestion control ramps until it meets something, which is why per-conn
+// load wandered 28-101% of the knee inside one `udptest6` run. Only a paced
+// generator can ask what happens at 30% of the knee.
+//
+// proxy.SetUplinkSynthMbit clamps to [0, 200] and every call starts a fresh
+// safety-stopped arm, so a malformed message cannot run the radio flat.
+//
+//export wgSetUplinkSynthCentiMbit
+func wgSetUplinkSynthCentiMbit(centi C.int32_t) {
+	proxy.SetUplinkSynthMbit(float64(centi) / 100)
+	log.Printf("handleAppMessage: uplink-synth target = %.2f Mbit/s", float64(centi)/100)
+}
+
 // Applies the flow-local path set size to THIS process without a reconnect.
 // Called by the extension when the app sends `set_flow_paths_k:`, and by both
 // ProxyConfig entry points from FlowPathsK.

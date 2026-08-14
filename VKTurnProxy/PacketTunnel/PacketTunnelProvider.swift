@@ -483,6 +483,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: flow-local path set k = \(raw)")
             wgSetFlowPathsK(Int32(raw))
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_uplink_synth_centimbit:") {
+            // Settings › Advanced › Uplink synthetic, applied to the RUNNING
+            // tunnel: each level is an arm of the loss dose-response, and TCP
+            // cannot hold a level, so this generator is the only way to ask
+            // what happens at a chosen fraction of the per-allocation knee.
+            // Hundredths of a Mbit/s so the wire stays integer. Go clamps at
+            // the sink and re-arms its safety stop on every call.
+            // Process-global in Go, so it needs no tunnelHandle.
+            let raw = Int(msg.dropFirst("set_uplink_synth_centimbit:".count)) ?? 0
+            logMsg("handleAppMessage: uplink-synth target = \(Double(raw) / 100) Mbit/s")
+            wgSetUplinkSynthCentiMbit(Int32(raw))
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("set_flow_paths_cover:") {
             // The SECOND arm of the flow-path experiment: it changes what a given
             // k means, so the Go side logs the mode and the memstats line carries

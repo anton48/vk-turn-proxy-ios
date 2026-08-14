@@ -179,6 +179,10 @@ void wgSetMemstatsFastTicks(int32_t enabled);
 /// k=1 must be unreachable; max 8).
 /// @param k 0 = off (every packet races all paths); 3-8 = preferred set size
 void wgSetFlowPathsK(int32_t k);
+
+// Paced synthetic uplink: target rate in HUNDREDTHS of a Mbit/s, 0 = off.
+// Applied live; every call starts a fresh safety-stopped arm.
+void wgSetUplinkSynthCentiMbit(int32_t centiMbit);
 void wgSetFlowPathsCover(int32_t on);
 
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
