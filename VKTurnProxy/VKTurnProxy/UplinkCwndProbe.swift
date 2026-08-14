@@ -152,6 +152,28 @@ final class UplinkCwndProbe: ObservableObject {
     /// It also resolves ONCE. The serial version called `getaddrinfo` per flow,
     /// so with a hostname sink F blocking lookups were themselves inside the
     /// "connect time" it reported.
+    /// Close a LOADED socket so the run ends when it ends.
+    ///
+    /// 🚨 Why this is not a plain `close()`. Each flow carries `SO_SNDBUF` = 2 MB
+    /// on purpose (keep it cwnd-limited, not sndbuf-limited), and a graceful
+    /// close hands that backlog to the kernel to deliver in the background. On
+    /// 2026-08-14 (`udptest4`) that was measured: the probe printed DONE, seven
+    /// of eight flows closed, and the eighth kept delivering **0.08 Mbit/s =
+    /// exactly one MSS per RTT** — `cwnd` had collapsed in its last second — so
+    /// its 2 MB would have taken ~200 s to drain, with the sink counting it as a
+    /// live connection the whole time. A run that follows would then be scored
+    /// against a stale flow it cannot see.
+    ///
+    /// `SO_LINGER {1, 0}` makes `close()` send RST and discard the backlog: the
+    /// flow stops when the measurement stops. Nothing is lost that we measure —
+    /// the sender-side truth is the probe's own `txbytes`, and the sink's
+    /// delivered figure SHOULD NOT include a post-run tail.
+    private func abortClose(_ fd: Int32) {
+        var lg = linger(l_onoff: 1, l_linger: 0)
+        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, socklen_t(MemoryLayout<linger>.size))
+        close(fd)
+    }
+
     private func connectAll(host: String, port: UInt16, flows: Int,
                             deadlineSec: Double) -> [Int32] {
         let log = SharedLogger.shared
@@ -263,7 +285,7 @@ final class UplinkCwndProbe: ObservableObject {
         // not by the runner, which can only say "they never came up".
         let fds = connectAll(host: host, port: port, flows: flows, deadlineSec: 45)
         if stopped.get() {
-            for fd in fds { close(fd) }
+            for fd in fds { abortClose(fd) }
             DispatchQueue.main.async { self.sending = false }
             publish("stopped during connect", running: false)
             return
@@ -340,7 +362,14 @@ final class UplinkCwndProbe: ObservableObject {
             Thread.sleep(forTimeInterval: sampleInterval)
         }
 
-        for fd in fds { close(fd) } // unblocks any sender parked in send()
+        // RST rather than a graceful close: see abortClose. It also unblocks
+        // any sender parked in send().
+        for fd in fds { abortClose(fd) }
+        // Make the teardown VISIBLE. Without this line the property is silent —
+        // nothing in either log says whether the run's backlog was discarded or
+        // handed to the kernel to dribble out for minutes. With it, the sink's
+        // conn count dropping to 0 within a second of this line is the check.
+        log.log("cwndprobe TEARDOWN flows=\(fds.count) aborted with SO_LINGER 0 — the sink should show conns=0 at once; any connection still delivering after this line is NOT ours")
         for t in senders { while !t.isFinished { Thread.sleep(forTimeInterval: 0.01) } }
         bufPtr.deallocate()
 
