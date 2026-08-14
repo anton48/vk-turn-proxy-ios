@@ -212,6 +212,16 @@ func (p *Proxy) writeChunk(first sendItem, txConnIdx int, write func(pkt []byte,
 	if k < UplinkChunkOff {
 		k = UplinkChunkOff
 	}
+	// 🚨 FORCE K=1 WHILE AN UPLINK-DUPLICATION ARM IS ARMED. The drain below
+	// takes further packets from the SHARED channel specifically, so under
+	// duplication a chunk started from a group queue would pull unrelated
+	// control packets onto its connection and silently mix two experiments on
+	// one writer. K is 1 by default and its Settings entry was removed with the
+	// closed sweep, so this only guards the undocumented backup field — the same
+	// guard chunking already carries against the flow-local path set.
+	if uplinkDupMode.Load() != UplinkDupOff {
+		k = UplinkChunkOff
+	}
 
 	item := first
 	sent := 0

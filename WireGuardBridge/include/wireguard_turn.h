@@ -172,6 +172,12 @@ void wgSetForceLegacyCaptcha(int32_t enabled);
 /// @param enabled 1 = 1s ticks; 0 = the normal 10s cadence
 void wgSetMemstatsFastTicks(int32_t enabled);
 
+// Uplink-duplication arm: 0 = off, 1 = single group (width control), 2 = duplicate
+// over two disjoint connection groups. Applied live, no reconnect.
+// 🚨 THIS HEADER IS HAND-MAINTAINED — a new //export that is not declared here is
+// invisible to Swift and the build stops. Fourth time this trap is recorded.
+void wgSetUplinkDupMode(int32_t mode);
+
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
 /// The extension polls this after bootstrap (cookie mode only) — a non-empty
 /// value means the saved cookie was rejected/expired in the background, so the

@@ -63,6 +63,15 @@ struct AdvancedView: View {
     /// up: it is a one-sitting measurement, not a preference. The runner is a
     /// @StateObject so it survives this pushed view's re-renders while running.
     @StateObject private var cwndProbe = UplinkCwndProbe()
+    /// The scripted uplink-duplication A/B. Same lifetime reasoning as the
+    /// probe: a @StateObject so it survives this pushed view's re-renders while
+    /// a six-minute plan is running.
+    @StateObject private var dupAB = UplinkDupABRunner()
+    /// 🚨 @AppStorage, not @State: the runner writes the same key, and the
+    /// picker must follow the arm it arms. It is an experiment switch, so it is
+    /// deliberately NOT in any backup — a restore must never bring back an
+    /// armed arm whose ceiling is half the budget.
+    @AppStorage("uplinkDupMode") private var uplinkDupMode = UplinkDup.off
     @State private var probeHost = "192.168.102.1:5202"
     @State private var probeFlows = 8
     @State private var probeDuration = 20
@@ -182,10 +191,37 @@ struct AdvancedView: View {
                 Text(cwndProbe.status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                // The scripted comparison. Same section as the probe on
+                // purpose: the probe is its load generator AND its instrument,
+                // and switching an arm must not mean leaving this screen.
+                Picker("Uplink duplication", selection: $uplinkDupMode) {
+                    ForEach(UplinkDup.choices, id: \.self) { m in
+                        Text(UplinkDup.label(m)).tag(m)
+                    }
+                }
+                .onChange(of: uplinkDupMode) { _ in
+                    TunnelManager.shared.applyUplinkDupMode()
+                }
+                Button(dupAB.running
+                       ? "Running the A/B…"
+                       : "Run duplication A/B (~\(dupAB.estimatedSeconds / 60) min)") {
+                    let parts = probeHost.split(separator: ":", maxSplits: 1)
+                    let h = parts.first.map(String.init) ?? "192.168.102.1"
+                    let p: UInt16 = parts.count > 1 ? (UInt16(parts[1]) ?? 5202) : 5202
+                    dupAB.start(host: h, port: p, probe: cwndProbe)
+                }
+                .disabled(dupAB.running || cwndProbe.running)
+                if dupAB.running {
+                    Button("Stop the A/B", role: .destructive) { dupAB.cancel() }
+                }
+                Text(dupAB.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text("Uplink cwnd probe")
             } footer: {
-                Text("Diagnostic. Opens the chosen number of plain TCP flows to a discard sink through the tunnel, sends bulk data, and logs the kernel's snd_cwnd, srtt, loss-recovery and reordering-detected flags every 100 ms — the direct read of whether each flow's window is held flat or sawtooths.\n\nConnect the tunnel first and keep this screen in the foreground. Start a sink on the far end first (on 192.168.102.1: nc -lk 5202 >/dev/null). Results go to the log as 'cwndprobe' lines — grep them out of the exported log. For a control, run the same with the VPN off against an internet sink in the same minutes.")
+                Text("Diagnostic. Opens the chosen number of plain TCP flows to a discard sink through the tunnel, sends bulk data, and logs the kernel's snd_cwnd, srtt, loss-recovery and reordering-detected flags every 100 ms — the direct read of whether each flow's window is held flat or sawtooths.\n\nConnect the tunnel first and keep this screen in the foreground. Start a sink on the far end first (on 192.168.102.1: nc -lk 5202 >/dev/null). Results go to the log as 'cwndprobe' lines — grep them out of the exported log. For a control, run the same with the VPN off against an internet sink in the same minutes.\n\nUplink duplication is a DIAGNOSTIC and not a usable mode: sending every packet twice halves the ceiling to about 31 Mbit/s. It exists to test whether delivering the earliest of two copies shrinks the late-packet tail — the question a forward-error-correction scheme would answer far more cheaply. The middle setting sends one copy over the same 15 connections, so the two effects can be told apart. The A/B button runs the whole comparison itself and restores Off when it finishes or is stopped; keep this screen in the foreground and take a VPN-off control before and after.")
             }
         }
         .navigationTitle("Advanced")

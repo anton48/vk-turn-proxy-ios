@@ -173,12 +173,18 @@ func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 	lines := strings.Split(string(src), "\n")
 	sites := 0
 	for i, ln := range lines {
-		if !strings.Contains(ln, "<-p.sendCh") {
+		// ⚠️ THE SCAN MOVED WITH THE CODE, IT WAS NOT WEAKENED. The four
+		// transports used to dequeue `<-p.sendCh` inline; the uplink-duplication
+		// experiment gave them a single entry point, p.nextUplinkItem, which
+		// also watches the writer's group queue. This guard went RED on correct
+		// code when that landed — which is the guard working — and following it
+		// here is the documented alternative to deleting it.
+		if !strings.Contains(ln, "p.nextUplinkItem(") {
 			continue
 		}
 		sites++
 		fed := false
-		for j := i; j < i+5 && j < len(lines); j++ {
+		for j := i; j < i+9 && j < len(lines); j++ {
 			if strings.Contains(lines[j], "p.sendWait.observe(") ||
 				strings.Contains(lines[j], "p.writeChunk(") {
 				fed = true
@@ -186,15 +192,26 @@ func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 			}
 		}
 		if !fed {
-			t.Errorf("proxy.go:%d dequeues sendCh without calling p.sendWait.observe "+
-				"or p.writeChunk within 5 lines — that transport's packets are invisible "+
+			t.Errorf("proxy.go:%d takes an uplink packet without calling p.sendWait.observe "+
+				"or p.writeChunk within 9 lines — that transport's packets are invisible "+
 				"to the residence histogram:\n\t%s", i+1, strings.TrimSpace(ln))
 		}
 	}
 	if sites < 4 {
-		t.Fatalf("found %d sendCh dequeue sites, expected at least 4 (DTLS, direct, "+
+		t.Fatalf("found %d uplink dequeue sites, expected at least 4 (DTLS, direct, "+
 			"WRAP-A, SRTP) — the scan is not finding them and this test is passing "+
 			"vacuously", sites)
+	}
+
+	// The SECOND way to fail: nobody may go round the single entry point. A
+	// transport that took a packet straight off a channel would be timed by
+	// nothing, and the scan above would not even see it.
+	for i, ln := range lines {
+		if strings.Contains(ln, "<-p.sendCh") || strings.Contains(ln, "<-p.groupCh") {
+			t.Errorf("proxy.go:%d dequeues an uplink queue directly instead of through "+
+				"p.nextUplinkItem — it bypasses both the instrument and the group "+
+				"routing:\n\t%s", i+1, strings.TrimSpace(ln))
+		}
 	}
 
 	// Follow the delegation: whatever writeChunk writes, it must also price.

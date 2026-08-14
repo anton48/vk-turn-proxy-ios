@@ -156,6 +156,7 @@ extension TunnelConfig {
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
             memstatsFastTicks: d.bool(forKey: "memstatsFastTicks"),
             uplinkChunkK: UplinkChunk.stored(in: d),
+            uplinkDupMode: UplinkDup.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
@@ -975,6 +976,24 @@ class TunnelManager: ObservableObject {
         let on = UserDefaults.standard.bool(forKey: "memstatsFastTicks")
         guard let session = manager?.connection as? NETunnelProviderSession,
               let msg = "set_memstats_fast:\(on ? 1 : 0)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
+    /// Switch the uplink-duplication arm on a RUNNING tunnel.
+    ///
+    /// 🚨 The live path is the measurement, not a convenience: an arm applied
+    /// through a reconnect would carry a ~107 s thirty-connection ramp, and on a
+    /// line measured moving 75 → 363 Mbit/s in ~70 minutes the arms would then
+    /// differ by drift as much as by treatment. proxyConfig still carries the
+    /// value, so a reconnect mid-run keeps the arm instead of silently dropping
+    /// back to the control.
+    ///
+    /// No-op when the tunnel is down; the value is read from UserDefaults at the
+    /// next start, so nothing is lost.
+    func applyUplinkDupMode() {
+        let mode = UplinkDup.stored()
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_uplink_dup_mode:\(mode)".data(using: .utf8) else { return }
         try? session.sendProviderMessage(msg) { _ in }
     }
 
@@ -1841,6 +1860,7 @@ class TunnelManager: ObservableObject {
             "uplink_synth_sec": config.uplinkSynthSec,
             "memstats_fast_ticks": config.memstatsFastTicks,
             "uplink_chunk_k": config.uplinkChunkK,
+            "uplink_dup_mode": config.uplinkDupMode,
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
             "use_srtp": config.useSrtp,
@@ -2381,6 +2401,12 @@ struct TunnelConfig {
     /// behaviour. See UplinkChunk.swift; expected to be removed with the
     /// setting once the sweep has answered.
     var uplinkChunkK: Int = UplinkChunk.off
+    /// Uplink duplication arm (EXPERIMENT, Settings › Advanced). 0 = off.
+    /// Carried here so a reconnect DURING a run keeps the arm it was measuring
+    /// rather than silently reverting to the control; the live path that avoids
+    /// the reconnect entirely is TunnelManager.applyUplinkDupMode().
+    /// See UplinkDup.swift — not a production mode, ceiling ~31 Mbit/s.
+    var uplinkDupMode: Int = UplinkDup.off
     // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
     // anonymous fallback). The cookie itself lives in the Keychain
     // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.

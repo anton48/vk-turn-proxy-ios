@@ -242,6 +242,20 @@ type ProxyConfig struct {
 	// pkg/proxy/uplinkchunk.go for the full finding.
 	UplinkChunkK int `json:"uplink_chunk_k,omitempty"`
 
+	// UplinkDupMode is the uplink-DUPLICATION experiment — the falsification
+	// test for systematic FEC over WireGuard packets, and NOT a production
+	// mode: at 100% redundancy the useful ceiling is half the allocation
+	// budget (~31 Mbit/s at N=30). 0 = off (today's behaviour), 1 = bulk
+	// traffic on group 0 only (the WIDTH control), 2 = every bulk packet sent
+	// twice over two disjoint groups of connections.
+	//
+	// It rides the config so a reconnect keeps whatever arm was chosen, but the
+	// arms are switched LIVE through wgSetUplinkDupMode — a reconnect would put
+	// a ~107 s thirty-connection ramp between every pair of arms on a line
+	// measured moving 75 -> 363 Mbit/s in ~70 minutes. See
+	// pkg/proxy/uplinkdup.go for the design and the three registered outcomes.
+	UplinkDupMode int `json:"uplink_dup_mode,omitempty"`
+
 	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
 	// session cookie → TURN creds; see pkg/proxy/creds_vkcookie.go). When true,
 	// GetVKCreds uses ONLY the cookie path — NO fallback to the anonymous VK
@@ -296,6 +310,7 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
+	proxy.SetUplinkDupMode(pcfg.UplinkDupMode)
 	if !pcfg.UseCookieAuth {
 		proxy.SetVKCookieAuth(false, "", nil)
 	}
@@ -435,6 +450,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
+	proxy.SetUplinkDupMode(pcfg.UplinkDupMode)
 	// Defensive: when cookie auth isn't requested, force it OFF (the extension
 	// process can be reused across connects — clear any stale cookie state).
 	// When it IS requested, the extension has already called wgSetVKCookieAuth
@@ -1045,6 +1061,23 @@ func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 //export wgSetMemstatsFastTicks
 func wgSetMemstatsFastTicks(enabled C.int32_t) {
 	proxy.SetMemstatsFastTicks(enabled != 0)
+}
+
+// Switches the uplink-duplication arm in THIS process, without a reconnect.
+// Called by the extension when the app sends `set_uplink_dup_mode:`, and by both
+// ProxyConfig entry points from UplinkDupMode. 0 = off, 1 = single group (the
+// width control), 2 = duplicate over two disjoint groups; anything else clamps
+// to off, so a malformed provider message cannot put an unknown arm on the hot
+// path.
+//
+// 🚨 THE LIVE PATH IS THE MEASUREMENT, not a convenience: applying an arm
+// through a reconnect would put a ~107 s thirty-connection ramp between every
+// pair of arms, and the arms would then differ by drift as much as by treatment.
+// See pkg/proxy/uplinkdup.go.
+//
+//export wgSetUplinkDupMode
+func wgSetUplinkDupMode(mode C.int32_t) {
+	proxy.SetUplinkDupMode(int(mode))
 }
 
 // Returns the current cookie ("VKAuth") fatal-auth message, or "" if none. The

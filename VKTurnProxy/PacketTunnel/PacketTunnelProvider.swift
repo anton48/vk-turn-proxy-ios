@@ -472,6 +472,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: memstats fast ticks = \(on)")
             wgSetMemstatsFastTicks(on ? 1 : 0)
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_uplink_dup_mode:") {
+            // The uplink-duplication A/B arm, applied to the RUNNING tunnel —
+            // Settings › Advanced, or the scripted runner. Go clamps anything
+            // it does not recognise to off, so a malformed message cannot arm
+            // an unknown treatment. Process-global in Go, no tunnelHandle.
+            let mode = Int(msg.dropFirst("set_uplink_dup_mode:".count)) ?? 0
+            logMsg("handleAppMessage: uplink dup mode = \(mode)")
+            wgSetUplinkDupMode(Int32(mode))
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("debug_log:") {
             let debugMsg = String(msg.dropFirst("debug_log:".count))
             logMsg("[AppDebug] \(debugMsg)")

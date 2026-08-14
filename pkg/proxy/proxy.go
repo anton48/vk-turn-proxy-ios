@@ -178,6 +178,27 @@ type Proxy struct {
 	sendCh chan sendItem
 	recvCh chan []byte
 
+	// groupCh — the two DISJOINT connection groups of the uplink-duplication
+	// experiment (uplinkdup.go). Writer i serves groupCh[i%2] in EVERY mode,
+	// alongside sendCh; the mode is read only by the producer, which decides
+	// what to put where.
+	//
+	// 🚨 THAT ASYMMETRY IS THE DESIGN, and it is the build-254 lesson from the
+	// closed flow-paths lever: there a writer read the mode ONCE above its
+	// blocking select, so a writer parked under the old mode kept an obsolete
+	// channel set and a queued packet became reachable only via a keepalive.
+	// Here no writer's channel set depends on the mode at all, so the defect
+	// cannot exist — in `off` the group channels simply never receive anything.
+	groupCh [2]chan sendItem
+
+	// Each group is as deep as sendCh (256) so a group is not a narrower pipe
+	// than the shared channel it is compared against: an arm must differ from
+	// its control in the treatment, not in its queue geometry.
+	//
+	// dupStats: what the duplication mode actually did this interval, including
+	// the second copies it had to DROP. Read-and-reset per memstats tick.
+	dupStats dupStats
+
 	// rtpChPeak (build 145, diagnostic): per-interval high-water mark of the
 	// plain DTLS+SRTP path's per-conn rtpCh depth, updated at the demux
 	// producer (srtpwrap.runDemuxFromPacketConn) and read-and-reset each
@@ -537,6 +558,7 @@ func NewProxy(cfg Config) *Proxy {
 		ctx:               ctx,
 		cancel:            cancel,
 		sendCh:            make(chan sendItem, 256),
+		groupCh:           [2]chan sendItem{make(chan sendItem, 256), make(chan sendItem, 256)},
 		sockStats:         newSockStats(),
 		recvCh:            make(chan []byte, 256),
 		sessCtx:           sessCtx,
@@ -1679,7 +1701,62 @@ func notePeak(mark *atomic.Int64, depth int) {
 }
 
 // SendPacket sends a WireGuard packet through the tunnel.
+//
+// 🚨 THE DUPLICATION MODE IS READ HERE AND NOWHERE ELSE ON THE PACKET PATH.
+// Writers serve a channel set that never depends on it (proxy.groupCh), so the
+// producer alone decides where a packet goes and a mode flip cannot strand
+// anything in a queue no parked writer is watching — the build-254 defect of the
+// closed flow-paths lever, designed out rather than fixed.
 func (p *Proxy) SendPacket(data []byte) error {
+	mode := int(uplinkDupMode.Load())
+	if mode == UplinkDupOff || !isUplinkBulk(data) {
+		if mode != UplinkDupOff {
+			// Keepalives and handshakes keep the shared channel in every mode,
+			// so all N connections keep carrying traffic even while bulk data
+			// is confined to one group. See uplinkdup.go: an arm that lets half
+			// the pool idle damages the NEXT arm, not just its own.
+			p.dupStats.ctl.Add(1)
+		}
+		return p.enqueueSend(p.sendCh, data)
+	}
+
+	p.dupStats.bulk.Add(1)
+	if err := p.enqueueSend(p.groupCh[0], data); err != nil {
+		return err
+	}
+	if mode == UplinkDupBoth {
+		// 🚨 THE SECOND COPY IS BEST-EFFORT AND THE FIRST NEVER IS. Blocking on
+		// group 1 would let a stalled half of the pool throttle the whole
+		// uplink, turning a redundancy experiment into a latency one. A dropped
+		// copy is counted instead, and `drop` beside `copies` is what says
+		// whether a dup arm actually ran as one.
+		//
+		// A SEPARATE buffer, not a shared slice: the transports below may frame
+		// or obfuscate in place (WRAP-A XORs), and two writers holding one
+		// backing array is the kind of corruption that would surface as a
+		// handshake failure ten minutes later.
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		select {
+		case p.groupCh[1] <- sendItem{buf: buf, at: time.Now().UnixNano()}:
+			p.dupStats.copies.Add(1)
+		default:
+			p.dupStats.dropped.Add(1)
+		}
+	}
+	return nil
+}
+
+// enqueueSend puts one packet on a specific uplink channel, carrying the
+// fast-path/slow-path split and the counters that SendPacket has always had.
+//
+// 🚨 txBytes / txPackets are incremented HERE, i.e. ONCE PER PACKET OFFERED, and
+// the duplicate copy above deliberately does not touch them. `tx-pkt` and
+// `tun-mbit` must keep meaning "what WireGuard handed us", or every historical
+// number on this line becomes incomparable and the wire/useful ratio the whole
+// experiment turns on could not be read at all. The duplicate is WIRE, and the
+// wire is measured at the server.
+func (p *Proxy) enqueueSend(ch chan sendItem, data []byte) error {
 	buf := make([]byte, len(data))
 	copy(buf, data)
 	// The enqueue instant rides with the packet so a writer can price the wait
@@ -1700,8 +1777,8 @@ func (p *Proxy) SendPacket(data []byte) error {
 	// was genuinely no room. That is what makes the blocked-time counter exact:
 	// it measures waiting, not the cost of measuring.
 	select {
-	case p.sendCh <- item:
-		notePeak(&p.sendChPeak, len(p.sendCh))
+	case ch <- item:
+		notePeak(&p.sendChPeak, len(ch))
 		p.txBytes.Add(int64(len(data)))
 		p.txPackets.Add(1)
 		return nil
@@ -1709,10 +1786,10 @@ func (p *Proxy) SendPacket(data []byte) error {
 	}
 	start := time.Now()
 	select {
-	case p.sendCh <- item:
+	case ch <- item:
 		p.sendChBlockNs.Add(int64(time.Since(start)))
 		p.sendChBlockCount.Add(1)
-		notePeak(&p.sendChPeak, len(p.sendCh))
+		notePeak(&p.sendChPeak, len(ch))
 		p.txBytes.Add(int64(len(data)))
 		p.txPackets.Add(1)
 		return nil
@@ -2784,18 +2861,17 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			return werr
 		}
 		for {
-			select {
-			case <-connCtx.Done():
+			item, ok := p.nextUplinkItem(connCtx.Done(), connIdx)
+			if !ok {
 				log.Printf("proxy: [conn %d] DTLS send goroutine: ctx cancelled", connIdx)
 				return
-			case item := <-p.sendCh:
-				// -1: this site has never maintained the per-conn TX counters,
-				// and writeChunk must not quietly start. That is what keeps
-				// K=1 byte-for-byte identical to the pre-chunking code here.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
-					log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
-					return
-				}
+			}
+			// -1: this site has never maintained the per-conn TX counters,
+			// and writeChunk must not quietly start. That is what keeps
+			// K=1 byte-for-byte identical to the pre-chunking code here.
+			if err := p.writeChunk(item, -1, writeOne); err != nil {
+				log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
+				return
 			}
 		}
 	}()
@@ -3042,14 +3118,13 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			return werr
 		}
 		for {
-			select {
-			case <-connCtx.Done():
+			item, ok := p.nextUplinkItem(connCtx.Done(), connIdx)
+			if !ok {
 				return
-			case item := <-p.sendCh:
-				// -1: no per-conn TX accounting at this site today.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
-					return
-				}
+			}
+			// -1: no per-conn TX accounting at this site today.
+			if err := p.writeChunk(item, -1, writeOne); err != nil {
+				return
 			}
 		}
 	}()
@@ -3235,15 +3310,14 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			return werr
 		}
 		for {
-			select {
-			case <-connCtx.Done():
+			item, ok := p.nextUplinkItem(connCtx.Done(), connIdx)
+			if !ok {
 				return
-			case item := <-p.sendCh:
-				// -1: no per-conn TX accounting at this site today.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
-					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)
-					return
-				}
+			}
+			// -1: no per-conn TX accounting at this site today.
+			if err := p.writeChunk(item, -1, writeOne); err != nil {
+				log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)
+				return
 			}
 		}
 	}()
@@ -4104,7 +4178,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4152,6 +4226,14 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// null: a configured K that never materialised (shallow queue)
 			// means the run tested nothing. See uplinkchunk.go.
 			p.chunkStats.summary(),
+			// 🚨 The uplink-duplication ARM, printed on EVERY tick even when it
+			// is off. An arm that cannot be identified from the log is an arm
+			// that gets scored as another one — build 257 renamed a field, its
+			// own scorer went blind, and a session with 154 engaged ticks was
+			// filed as "a blind run". `copies` beside `drop` is the second
+			// guard: a dup arm whose second copies were mostly dropped is a
+			// single-group arm wearing the wrong label. See uplinkdup.go.
+			p.dupStats.summary(),
 			p.recvChPeak.Swap(0),
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
@@ -5108,22 +5190,28 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			_, werr := srtpConn.Write(pkt)
 			return werr
 		}
+		// connIdx (not -1) in the writeChunk call below because this site keeps
+		// the per-conn TX counters, which writeChunk maintains per packet: the
+		// pre-SRTP payload bytes — the WireGuard records that came out of the
+		// uplink queues — not the wire bytes after RTP+SRTP framing. That
+		// matches what an external observer counting WG throughput sees, and
+		// keeps the conn-stats tick reading the same regardless of transport
+		// mode. ⚠️ Under duplication it therefore reports WIRE packets: both
+		// copies pass through here, on two different connections.
+		//
+		// ⚠️ The comment lives ABOVE the loop rather than between the dequeue
+		// and the write because TestEverySendChDequeueFeedsTheInstrument scans
+		// a tight window after each dequeue site, and a tight window is what
+		// gives that guard its teeth.
 		for {
-			select {
-			case <-connCtx.Done():
+			item, ok := p.nextUplinkItem(connCtx.Done(), connIdx)
+			if !ok {
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
-			// connIdx (not -1) below because this site keeps the per-conn TX
-			// counters, which writeChunk maintains per packet: the pre-SRTP
-			// payload bytes — the WireGuard records that came out of sendCh —
-			// not the wire bytes after RTP+SRTP framing. That matches what an
-			// external observer counting WG throughput sees, and keeps the
-			// conn-stats tick reading the same regardless of transport mode.
-			case item := <-p.sendCh:
-				if err := p.writeChunk(item, connIdx, writeOne); err != nil {
-					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
-					return
-				}
+			}
+			if err := p.writeChunk(item, connIdx, writeOne); err != nil {
+				log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
+				return
 			}
 		}
 	}()

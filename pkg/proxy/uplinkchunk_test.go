@@ -349,11 +349,14 @@ func TestEverySendChConsumerUsesWriteChunk(t *testing.T) {
 	}
 	text := string(src)
 
-	consumers := strings.Count(text, "<-p.sendCh:")
+	// ⚠️ Followed from `<-p.sendCh:` to p.nextUplinkItem when the
+	// uplink-duplication experiment gave the four transports one entry point
+	// that watches both the shared queue and the writer's group queue.
+	consumers := strings.Count(text, "p.nextUplinkItem(")
 	if consumers != 4 {
-		t.Fatalf("found %d `<-p.sendCh:` consumer sites in proxy.go, expected 4 "+
+		t.Fatalf("found %d p.nextUplinkItem( consumer sites in proxy.go, expected 4 "+
 			"(DTLS, direct, WRAP-A, SRTP). If a transport was added, wire it through "+
-			"writeChunk and update this guard.", consumers)
+			"nextUplinkItem and writeChunk and update this guard.", consumers)
 	}
 
 	calls := strings.Count(text, "p.writeChunk(")
@@ -368,5 +371,10 @@ func TestEverySendChConsumerUsesWriteChunk(t *testing.T) {
 	if strings.Contains(text, "func (p *Proxy) writeChunk(") {
 		t.Fatal("writeChunk is declared in proxy.go; this guard counts declarations as calls " +
 			"and has become vacuous — move the declaration back to uplinkchunk.go")
+	}
+	if strings.Contains(text, "func (p *Proxy) nextUplinkItem(") {
+		t.Fatal("nextUplinkItem is declared in proxy.go; this guard would count its " +
+			"declaration as a consumer site and has become vacuous — it belongs in " +
+			"uplinkdup.go")
 	}
 }

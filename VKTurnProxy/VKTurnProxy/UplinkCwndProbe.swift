@@ -34,14 +34,30 @@ import Darwin
 
 final class UplinkCwndProbe: ObservableObject {
     @Published var running = false
+    /// Set by stop(); the send loop checks it every tick. Without this the A/B
+    /// runner could stop ITSELF but not the traffic it started, so pressing Stop
+    /// looked like nothing happened for up to a minute.
+    private let stopped = AtomicFlag()
+    /// True once the flows are up and bytes are actually moving — i.e. when the
+    /// CSV's t_ms starts counting. 🚨 NOT the same as `running`, which is set the
+    /// moment start() is called: connecting the flows through the tunnel took
+    /// **25.8 s** in one recorded run, and anything that schedules against
+    /// `running` would spend that time measuring an idle link. The A/B runner
+    /// waits on THIS.
+    @Published var sending = false
     @Published var status = "idle"
 
     // TCP_CONNECTION_INFO from <netinet/tcp.h>. Byte offsets into the returned
     // struct, validated on Darwin against a loopback transfer (M1 gate).
     private let optTCPConnectionInfo: Int32 = 0x106
 
+    /// Ask the run to end early. Safe from any thread; the loop notices within a
+    /// tick and tears the flows down through its normal path.
+    func stop() { stopped.set(true) }
+
     func start(host: String, port: UInt16, flows: Int, durationSec: Int) {
         guard !running else { return }
+        stopped.set(false)
         running = true
         status = "connecting…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -61,9 +77,19 @@ final class UplinkCwndProbe: ObservableObject {
     // One read of the kernel's connection info. Read-only and safe on a socket
     // another thread is blocked writing to (same guarantee sockstats_darwin.go
     // relies on).
+    // 🚨 `rxRtxPkts` USED TO BE CALLED `rtxPkts` AND THE CSV COLUMN `rtx`, AND
+    // THAT WAS A MISLABEL. The u64 block was pinned by driving 10 MB through a
+    // loopback socket: offset 64 came back EXACTLY equal to the bytes handed to
+    // send(), which fixes the ordering — 56 txpackets, 64 txbytes, 72
+    // txretransmitBYTES, 80 rxpackets, 88 rxbytes, 96 rxoutoforder, 104
+    // rxretransmitPACKETS. So offset 104 is the RECEIVE side and reads ~0 by
+    // construction on an upload-only flow: the old `rtx` column could never have
+    // shown sender retransmits. `txRtxBytes` (72) is the sender-side one. The
+    // old column is kept in place, honestly named, so the parser's fixed 13-field
+    // prefix still matches and old logs stay readable.
     private struct Info {
         var cwnd, ssthresh, sndwnd, sbbytes, rttcurMs, srttMs, flags, mss: UInt32
-        var txbytes, rtxPkts: UInt64
+        var txbytes, rxRtxPkts, txRtxBytes: UInt64
     }
     private func sample(_ fd: Int32) -> Info? {
         let cap = 256
@@ -75,53 +101,186 @@ final class UplinkCwndProbe: ObservableObject {
         func u64(_ o: Int) -> UInt64 { raw.load(fromByteOffset: o, as: UInt64.self) }
         return Info(cwnd: u32(24), ssthresh: u32(20), sndwnd: u32(28), sbbytes: u32(32),
                     rttcurMs: u32(40), srttMs: u32(44), flags: u32(8), mss: u32(16),
-                    txbytes: u64(64), rtxPkts: u64(104))
+                    txbytes: u64(64), rxRtxPkts: u64(104), txRtxBytes: u64(72))
     }
 
-    // Resolves a numeric IP OR a hostname via getaddrinfo (the earlier
-    // inet_addr() accepted only dotted-quad, so `fra10.48.org` failed with
-    // "0/8 connected"). Runs on the background run() thread, so the blocking
-    // resolve is fine. Tries each returned address; v4 or v6.
-    private func connectOne(host: String, port: UInt16) -> Int32 {
+    // The kernel's view of a socket that is still HANDSHAKING: `tcpi_state` at
+    // offset 0 (2 = SYN_SENT, 4 = ESTABLISHED, per <netinet/tcp_fsm.h>) and
+    // `tcpi_rto` at 12, the retransmit timeout in ms.
+    //
+    // 🚨 THE FIELD CHOICE IS MEASURED, NOT ASSUMED, AND THE OBVIOUS CHOICE WAS
+    // BLIND. Driven against a black hole (192.0.2.1, RFC 5737 TEST-NET-1, which
+    // answers nothing) on Darwin, with the SYN provably being retransmitted:
+    //
+    //   tcpi_rto (12)                 1000 → 2000 → 4000 ms   ← doubles, USABLE
+    //   tcpi_txpackets (56)           0 for 10 s              ← starts only at ESTABLISHED
+    //   offset 104                    0 for 10 s              ← receive-side, see below
+    //
+    // So a stalled handshake is read off the BACKOFF, not off a packet counter:
+    //   state 2, rto DOUBLING   — the SYN left this socket and nobody answered;
+    //                             it dies at or below utun.
+    //   state 2, rto PINNED at its initial value for seconds — the kernel is not
+    //                             even retransmitting, i.e. nothing went out.
+    // A `state` of 0 while mid-connect would mean the option or the offset is
+    // wrong, so the value is logged raw rather than decoded.
+    private func handshakeState(_ fd: Int32) -> (state: UInt8, rto: UInt32)? {
+        let cap = 256
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: cap, alignment: 8)
+        defer { raw.deallocate() }
+        var len = socklen_t(cap)
+        if getsockopt(fd, Int32(IPPROTO_TCP), optTCPConnectionInfo, raw, &len) != 0 { return nil }
+        return (raw.load(fromByteOffset: 0, as: UInt8.self),
+                raw.load(fromByteOffset: 12, as: UInt32.self))
+    }
+
+    /// Opens all `flows` sockets and handshakes them CONCURRENTLY, then hands
+    /// back blocking fds for the send phase.
+    ///
+    /// 🚨 THIS REPLACES A SERIAL BLOCKING LOOP, AND THE DEFECT IS WORTH NAMING
+    /// BECAUSE IT CORRUPTED THE ONE NUMBER A WHOLE INVESTIGATION TURNED ON. The
+    /// old version called a blocking `connect()` per flow in a `for` loop, so
+    /// flow i+1 did not start its handshake until flow i finished. What it
+    /// reported as "the flows took 26-39 s to come up" is therefore a **SUM over
+    /// F flows**, not the wall clock a real workload pays — Ookla opens its four
+    /// upload flows at once. A per-flow cost of a few seconds reads as half a
+    /// minute at F=8 purely through the loop. Every recorded connect-stall number
+    /// predates this fix and must be re-read as Σ.
+    ///
+    /// So this is a fix and an instrument at once: `wall` vs `sum` in the summary
+    /// line is exactly the discriminator, printed by the thing being accused.
+    ///
+    /// It also resolves ONCE. The serial version called `getaddrinfo` per flow,
+    /// so with a hostname sink F blocking lookups were themselves inside the
+    /// "connect time" it reported.
+    private func connectAll(host: String, port: UInt16, flows: Int,
+                            deadlineSec: Double) -> [Int32] {
+        let log = SharedLogger.shared
+        let t0 = Date()
+
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
         hints.ai_socktype = SOCK_STREAM
         var res: UnsafeMutablePointer<addrinfo>?
-        if getaddrinfo(host, String(port), &hints, &res) != 0 { return -1 }
-        defer { if res != nil { freeaddrinfo(res) } }
-        var ai = res
-        while let a = ai {
-            let fd = socket(a.pointee.ai_family, a.pointee.ai_socktype, a.pointee.ai_protocol)
-            if fd >= 0 {
-                var sb: Int32 = 2 << 20 // 2 MB: keep the flow cwnd-limited, not sndbuf-limited
-                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, socklen_t(MemoryLayout<Int32>.size))
-                if connect(fd, a.pointee.ai_addr, a.pointee.ai_addrlen) == 0 { return fd }
+        guard getaddrinfo(host, String(port), &hints, &res) == 0, let ai = res else {
+            log.log("cwndprobe ERROR: cannot resolve \(host):\(port)")
+            return []
+        }
+        defer { freeaddrinfo(res) }
+        let resolveMs = Int(Date().timeIntervalSince(t0) * 1000)
+
+        var pending: [Int32] = []
+        var connected: [Int32] = []
+        var connectMs: [Int] = []
+        var startedAt: [Int32: Date] = [:]
+
+        for _ in 0..<flows {
+            let fd = socket(ai.pointee.ai_family, ai.pointee.ai_socktype, ai.pointee.ai_protocol)
+            if fd < 0 { continue }
+            var sb: Int32 = 2 << 20 // 2 MB: keep the flow cwnd-limited, not sndbuf-limited
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sb, socklen_t(MemoryLayout<Int32>.size))
+            _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+            startedAt[fd] = Date()
+            if connect(fd, ai.pointee.ai_addr, ai.pointee.ai_addrlen) == 0 {
+                connected.append(fd)
+                connectMs.append(0)
+            } else if errno == EINPROGRESS {
+                pending.append(fd)
+            } else {
+                log.log("cwndprobe CONNECT-FAIL immediate errno=\(errno)")
                 close(fd)
             }
-            ai = a.pointee.ai_next
         }
-        return -1
+
+        let deadline = Date().addingTimeInterval(deadlineSec)
+        var lastReport = Date.distantPast
+        while !pending.isEmpty && Date() < deadline && !stopped.get() {
+            var pfds = pending.map { pollfd(fd: $0, events: Int16(POLLOUT), revents: 0) }
+            _ = poll(&pfds, nfds_t(pfds.count), 100)
+            var stillPending: [Int32] = []
+            for p in pfds {
+                if p.revents == 0 { stillPending.append(p.fd); continue }
+                var err: Int32 = 0
+                var el = socklen_t(MemoryLayout<Int32>.size)
+                getsockopt(p.fd, SOL_SOCKET, SO_ERROR, &err, &el)
+                let ms = Int(Date().timeIntervalSince(startedAt[p.fd] ?? t0) * 1000)
+                if err == 0 {
+                    let rto = handshakeState(p.fd)?.rto ?? 0
+                    log.log("cwndprobe CONNECT flow=\(connected.count) ms=\(ms) rto=\(rto)")
+                    connected.append(p.fd)
+                    connectMs.append(ms)
+                } else {
+                    log.log("cwndprobe CONNECT-FAIL ms=\(ms) err=\(err)")
+                    close(p.fd)
+                }
+            }
+            pending = stillPending
+
+            // THE INSTRUMENT. While anything is still handshaking, print the
+            // kernel's own view of it once a second. A stall now names itself.
+            if !pending.isEmpty && Date().timeIntervalSince(lastReport) >= 1.0 {
+                lastReport = Date()
+                for fd in pending {
+                    guard let hs = handshakeState(fd) else {
+                        log.log("cwndprobe CONNECTING fd=\(fd) — TCP_CONNECTION_INFO unreadable")
+                        continue
+                    }
+                    let ms = Int(Date().timeIntervalSince(startedAt[fd] ?? t0) * 1000)
+                    log.log("cwndprobe CONNECTING fd=\(fd) ms=\(ms) state=\(hs.state) rto=\(hs.rto)")
+                }
+            }
+        }
+
+        for fd in pending {
+            let ms = Int(Date().timeIntervalSince(startedAt[fd] ?? t0) * 1000)
+            if let hs = handshakeState(fd) {
+                log.log("cwndprobe CONNECT-TIMEOUT ms=\(ms) state=\(hs.state) rto=\(hs.rto)")
+            } else {
+                log.log("cwndprobe CONNECT-TIMEOUT ms=\(ms) — state unreadable")
+            }
+            close(fd)
+        }
+
+        // The send phase wants BLOCKING sockets: a blocked send() is the
+        // measurement (it means the flow is cwnd/sndbuf-limited).
+        for fd in connected {
+            _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) & ~O_NONBLOCK)
+        }
+
+        let wallMs = Int(Date().timeIntervalSince(t0) * 1000)
+        let sumMs = connectMs.reduce(0, +)
+        let maxMs = connectMs.max() ?? 0
+        log.log("cwndprobe CONNECTED \(connected.count)/\(flows) wall=\(wallMs)ms "
+            + "max=\(maxMs)ms sum=\(sumMs)ms resolve=\(resolveMs)ms — 🚨 the serial "
+            + "version reported SUM; wall is what a parallel workload actually pays")
+        return connected
     }
 
     private func run(host: String, port: UInt16, flows: Int, durationSec: Int) {
         let log = SharedLogger.shared
 
-        var fds: [Int32] = []
-        for _ in 0..<flows {
-            let fd = connectOne(host: host, port: port)
-            if fd >= 0 { fds.append(fd) }
+        // 45 s, deliberately under the A/B runner's 60 s abort, so a slow
+        // handshake is reported by the probe — with per-flow kernel state — and
+        // not by the runner, which can only say "they never came up".
+        let fds = connectAll(host: host, port: port, flows: flows, deadlineSec: 45)
+        if stopped.get() {
+            for fd in fds { close(fd) }
+            DispatchQueue.main.async { self.sending = false }
+            publish("stopped during connect", running: false)
+            return
         }
         if fds.isEmpty {
             log.log("cwndprobe ERROR: 0/\(flows) connected to \(host):\(port) — is the tunnel up and the sink listening?")
-            publish("failed: 0/\(flows) connected", running: false)
+            DispatchQueue.main.async { self.sending = false }
+        publish("failed: 0/\(flows) connected", running: false)
             return
         }
         var eff: Int32 = 0
         var el = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &eff, &el)
         log.log("cwndprobe START host=\(host):\(port) flows=\(fds.count)/\(flows) dur=\(durationSec)s effSndBuf=\(eff)")
-        log.log("cwndprobe CSV t_ms,flow,cwnd,ssthresh,sndwnd,sbbytes,srtt_ms,rttcur_ms,loss,reord,mss,txbytes,rtx,deliv_mbit,winuse")
+        log.log("cwndprobe CSV t_ms,flow,cwnd,ssthresh,sndwnd,sbbytes,srtt_ms,rttcur_ms,loss,reord,mss,txbytes,rxrtx_pkts,deliv_mbit,winuse,txrtx_bytes")
         publish("running: \(fds.count) flows for \(durationSec)s")
+        DispatchQueue.main.async { self.sending = true }
 
         let deadline = Date().addingTimeInterval(Double(durationSec))
 
@@ -136,7 +295,7 @@ final class UplinkCwndProbe: ObservableObject {
         var senders: [Thread] = []
         for fd in fds {
             let t = Thread {
-                while Date() < deadline {
+                while Date() < deadline && !self.stopped.get() {
                     let n = send(fd, bufPtr, bufSize, 0)
                     if n <= 0 {
                         if n < 0 && errno == EINTR { continue }
@@ -159,7 +318,7 @@ final class UplinkCwndProbe: ObservableObject {
         let sampleInterval = 0.1
         var prevTx = [UInt64](repeating: 0, count: fds.count)
         var prevMs = [Int](repeating: 0, count: fds.count)
-        while Date() < deadline {
+        while Date() < deadline && !stopped.get() {
             let tms = Int(Date().timeIntervalSince(start) * 1000)
             for (i, fd) in fds.enumerated() {
                 guard let s = sample(fd) else { continue }
@@ -176,7 +335,7 @@ final class UplinkCwndProbe: ObservableObject {
                 let winRate = s.srttMs > 0 ? Double(s.cwnd) * 8 / (Double(s.srttMs) / 1000.0) / 1e6 : 0
                 let winuse = winRate > 0 ? Int((100.0 * deliv / winRate).rounded()) : 0
                 prevTx[i] = s.txbytes; prevMs[i] = tms
-                log.log("cwndprobe \(tms),\(i),\(s.cwnd),\(s.ssthresh),\(s.sndwnd),\(s.sbbytes),\(s.srttMs),\(s.rttcurMs),\(loss),\(reord),\(s.mss),\(s.txbytes),\(s.rtxPkts),\(String(format: "%.2f", deliv)),\(winuse)")
+                log.log("cwndprobe \(tms),\(i),\(s.cwnd),\(s.ssthresh),\(s.sndwnd),\(s.sbbytes),\(s.srttMs),\(s.rttcurMs),\(loss),\(reord),\(s.mss),\(s.txbytes),\(s.rxRtxPkts),\(String(format: "%.2f", deliv)),\(winuse),\(s.txRtxBytes)")
             }
             Thread.sleep(forTimeInterval: sampleInterval)
         }
@@ -188,6 +347,18 @@ final class UplinkCwndProbe: ObservableObject {
         let pctLoss = totalTicks > 0 ? 100 * lossTicks / totalTicks : 0
         let pctReord = totalTicks > 0 ? 100 * reordTicks / totalTicks : 0
         log.log("cwndprobe DONE flows=\(fds.count) dur=\(durationSec)s — flow0 was inLossRecovery \(pctLoss)% of ticks, reorderingSeen \(pctReord)% of ticks. Grep 'cwndprobe' from the exported log; a FLAT cwnd with reord set and loss clear = growth-starvation, a sawtooth with loss set = AIMD.")
+        DispatchQueue.main.async { self.sending = false }
         publish("done: \(fds.count) flows, \(durationSec)s — grep 'cwndprobe' in logs", running: false)
     }
+}
+
+
+/// A boolean shared between the UI thread and the probe's worker threads. Small
+/// enough to hand-roll, and a plain Bool here would be a data race — the kind
+/// that works in testing and stops working on a loaded phone.
+final class AtomicFlag {
+    private let lock = NSLock()
+    private var value = false
+    func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
+    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
