@@ -15,7 +15,10 @@
 //  • the load never moved at all — the first version caught only this;
 //  • it moved and then DIED, leaving a positive byte delta across the arm while
 //    the arm was 99% idle. "Some bytes moved" is not "the load was running";
-//    only the age of the LAST byte separates them;
+//  • it moved, STOPPED FOR MOST OF THE ARM, and resumed just before the end —
+//    which has a positive delta, a live probe AND a fresh last byte. 🎯 The only
+//    quantity that means "throughout" is the WORST GAP inside the arm, so that
+//    is what this judges on; freshness at the end passed a 98%-solo arm;
 //  • the probe ended by its own lifecycle — which used to be checked at the next
 //    arm's boundary, so a death inside the LAST arm was never seen and the run
 //    printed DONE.
@@ -42,12 +45,12 @@ enum LoadWitness {
     /// is last because it is the only one that needs a threshold, so it must
     /// never be the label on a case the other two already explain exactly.
     static func judge(movedBytes: UInt64,
-                      idleMs: Int,
+                      worstGapMs: Int,
                       probeStillRunning: Bool,
                       staleMs: Int) -> Verdict {
         if movedBytes == 0 { return .noBytes }
         if !probeStillRunning { return .ended }
-        if idleMs > staleMs { return .stalled(ms: idleMs) }
+        if worstGapMs > staleMs { return .stalled(ms: worstGapMs) }
         return .ok
     }
 
@@ -58,7 +61,7 @@ enum LoadWitness {
         case .ok:            return "the load was up throughout"
         case .noBytes:       return "NO BYTES MOVED at all"
         case .ended:         return "the probe had already ended"
-        case .stalled(let m): return "the load had been stalled for \(m)ms at the arm's end"
+        case .stalled(let m): return "the load stood still for \(m)ms inside this arm"
         }
     }
 }

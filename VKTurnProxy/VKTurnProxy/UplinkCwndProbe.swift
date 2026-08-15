@@ -77,7 +77,10 @@ final class UplinkCwndProbe: ObservableObject {
     /// Taken from `TCP_CONNECTION_INFO`'s own `txbytes` rather than from our
     /// `send()` returns, so it is the kernel's statement rather than ours.
     private let progress = LoadProgress()
-    func loadProgress() -> (bytes: UInt64, lastAdvance: Date) { progress.snapshot() }
+    func loadProgress() -> (bytes: UInt64, idleMs: Int, worstGapMs: Int) { progress.snapshot() }
+    /// Open a new scoring window. A runner calls this at each arm's start so the
+    /// gap watermark measures THAT arm and not the run.
+    func beginLoadWindow() { progress.openWindow() }
 
     /// Ask the run to end early. Safe from any thread; the loop notices within a
     /// tick and tears the flows down through its normal path.
@@ -446,26 +449,3 @@ final class AtomicFlag {
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
 
-/// How much has moved, and when it last did. Same hand-rolled shape as
-/// `AtomicFlag`.
-///
-/// 🎯 IT CARRIES A TIMESTAMP BECAUSE A TOTAL CANNOT ANSWER THE QUESTION. A
-/// reader asking "was the load alive during this arm" gets "yes" from a single
-/// byte sent in the arm's first second, and an arm that was 99% idle scores as a
-/// loaded one. Only "when did it last advance" distinguishes them, and the
-/// reader gets both so it can also print how stale the answer is.
-///
-/// Fed by POSITIVE DELTAS so a skipped sample costs nothing: see the sampler.
-final class LoadProgress {
-    private let lock = NSLock()
-    private var total: UInt64 = 0
-    private var last = Date.distantPast
-    func advance(by delta: UInt64) {
-        guard delta > 0 else { return }
-        lock.lock(); total &+= delta; last = Date(); lock.unlock()
-    }
-    func reset() { lock.lock(); total = 0; last = Date.distantPast; lock.unlock() }
-    func snapshot() -> (bytes: UInt64, lastAdvance: Date) {
-        lock.lock(); defer { lock.unlock() }; return (total, last)
-    }
-}

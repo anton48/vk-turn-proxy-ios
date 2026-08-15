@@ -4,6 +4,7 @@
 //   swiftc VKTurnProxy/VKTurnProxy/UplinkChunk.swift \
 //          VKTurnProxy/VKTurnProxy/ProbeDuration.swift \
 //          VKTurnProxy/VKTurnProxy/LoadWitness.swift \
+//          VKTurnProxy/VKTurnProxy/LoadProgress.swift \
 //          VKTurnProxy/VKTurnProxy/DiagnosticRunLock.swift \
 //          tools/swiftcheck/main.swift -o /tmp/chunkcheck && /tmp/chunkcheck
 //
@@ -185,8 +186,8 @@ do {
 //    for one second and idles for the other 119.
 do {
     let stale = 2000
-    func judge(_ moved: UInt64, _ idle: Int, _ up: Bool) -> LoadWitness.Verdict {
-        LoadWitness.judge(movedBytes: moved, idleMs: idle, probeStillRunning: up, staleMs: stale)
+    func judge(_ moved: UInt64, _ worstGap: Int, _ up: Bool) -> LoadWitness.Verdict {
+        LoadWitness.judge(movedBytes: moved, worstGapMs: worstGap, probeStillRunning: up, staleMs: stale)
     }
 
     check(judge(1 << 20, 100, true) == .ok, "moving, fresh, alive => ok")
@@ -194,7 +195,7 @@ do {
     // 🚨 THE CASE "SOME BYTES MOVED" LET THROUGH: a probe that sent for a second
     // and then died leaves a big positive delta across the whole arm.
     check(judge(64 << 20, 118_000, true) == .stalled(ms: 118_000),
-          "a big delta does NOT excuse a load that stopped 118 s ago")
+          "a big delta does NOT excuse a 118 s hole inside the arm")
     check(judge(1, stale + 1, true) == .stalled(ms: stale + 1), "one ms past the bound is stale")
     check(judge(1 << 20, stale, true) == .ok, "the bound itself is not stale")
 
@@ -208,6 +209,70 @@ do {
     for v: LoadWitness.Verdict in [.noBytes, .ended, .stalled(ms: 5), .ok] {
         check(!LoadWitness.reason(v).isEmpty, "the verdict has a reason string")
     }
+}
+
+// 9. 🚨 THE GAP WATERMARK — the quantity that actually means "throughout".
+//    Freshness at the arm's END passed `1 s of load / 117 s of nothing / 2 s of
+//    load`: positive delta, live probe, fresh last byte, 98% solo. Driven here
+//    with a FAKE MONOTONIC CLOCK so the arithmetic is exact and nothing sleeps.
+//
+//    SABOTAGE SEEN TO FAIL: in `advance`, use `lastAdvanceNs` alone as the
+//    reference instead of `max(lastAdvanceNs, windowStartNs)`. Compiles, and the
+//    charge-from-window-start check goes red — a gap that began in the previous
+//    arm would then be billed to this one in full.
+do {
+    var clockNs: UInt64 = 1_000_000_000          // never starts at 0
+    let sec: (Double) -> UInt64 = { UInt64($0 * 1_000_000_000) }
+    let p = LoadProgress(clock: { clockNs })
+
+    p.reset()
+    p.openWindow()
+
+    // The arm that used to pass: one second of load, then a long hole, then a
+    // late burst that leaves the END looking perfect.
+    p.advance(by: 1 << 20)
+    clockNs += sec(1)
+    p.advance(by: 1 << 20)
+    clockNs += sec(117)                           // the hole
+    p.advance(by: 1 << 20)
+    clockNs += sec(2)
+    p.advance(by: 1 << 20)
+
+    let a = p.snapshot()
+    check(a.idleMs == 0, "the last byte is fresh — which is exactly why idle cannot decide")
+    check(a.worstGapMs == 117_000, "the 117 s hole is what the arm actually suffered (got \(a.worstGapMs))")
+    check(LoadWitness.judge(movedBytes: a.bytes, worstGapMs: a.worstGapMs,
+                            probeStillRunning: true, staleMs: 2000) == .stalled(ms: 117_000),
+          "…and the verdict is stalled, where freshness said ok")
+
+    // A NEW ARM MUST NOT INHERIT IT, or one bad arm condemns the rest of the run.
+    p.openWindow()
+    clockNs += sec(0.1)
+    p.advance(by: 1 << 20)
+    check(p.snapshot().worstGapMs == 100, "openWindow restarts the watermark (got \(p.snapshot().worstGapMs))")
+
+    // A gap STILL OPEN at the end counts — it is the case the end-of-arm check
+    // did catch, and it must survive the change.
+    clockNs += sec(30)
+    check(p.snapshot().worstGapMs == 30_000, "an open gap is charged without waiting for it to close")
+    check(p.snapshot().idleMs == 30_000, "and it is the idle time too")
+
+    // A gap that began BEFORE the window is charged only from the window's start.
+    p.openWindow()
+    clockNs += sec(5)
+    p.advance(by: 1 << 20)
+    check(p.snapshot().worstGapMs == 5_000,
+          "the pre-window part of a gap belongs to the previous arm (got \(p.snapshot().worstGapMs))")
+
+    // Totals accumulate across windows; only the watermark restarts.
+    check(p.snapshot().bytes == 6 << 20,
+          "openWindow leaves the byte total alone (got \(p.snapshot().bytes >> 20) MiB of 6)")
+
+    // 🚨 A CLOCK THAT NEVER MOVES MUST NOT INVENT A STALL. On a monotonic clock
+    // that is the only degenerate case; on `Date()` a backward NTP step would
+    // have produced a NEGATIVE idle that compares as fresh.
+    p.openWindow()
+    check(p.snapshot().worstGapMs == 0, "no elapsed time, no gap")
 }
 
 print(failures == 0 ? "PASS" : "FAIL (\(failures))")

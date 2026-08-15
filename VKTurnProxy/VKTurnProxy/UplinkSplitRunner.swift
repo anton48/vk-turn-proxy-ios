@@ -77,9 +77,14 @@ final class UplinkSplitRunner: ObservableObject {
     /// drain when it goes the other way.
     private let settleSec = 12
 
-    /// How stale the load's last byte may be at an arm's end before the arm is
-    /// called unloaded. The sampler advances every ~100 ms under load, so this is
-    /// 20 sample intervals.
+    /// The longest the load may stand still ANYWHERE INSIDE an arm before the arm
+    /// is called unloaded. The sampler advances every ~100 ms under load, so this
+    /// is 20 sample intervals.
+    ///
+    /// 🚨 IT IS THE WORST GAP, NOT THE FRESHNESS AT THE END, and the difference
+    /// is a whole arm: `1 s of load · 117 s of nothing · 2 s of load` ends with a
+    /// positive delta, a live probe and a fresh last byte — and was 98% solo.
+    /// *(User-caught, 2026-08-16.)*
     ///
     /// ⚠️ IT IS CHOSEN, NOT MEASURED, AND THAT IS THE ONE THING TO CHECK IF IT
     /// EVER FIRES ON A HEALTHY RUN. The deepest aggregate silence on record here
@@ -435,21 +440,23 @@ final class UplinkSplitRunner: ObservableObject {
             // the remaining 119 leaves a POSITIVE delta, so the arm passes while
             // having been 99% unloaded. What the arm needs is that the load was
             // alive AT ITS END. *(User-caught, 2026-08-16.)*
+            probe.beginLoadWindow()
             let before = probe.loadProgress()
             sleep(seconds: armSec)
             let after = probe.loadProgress()
             var stillUp = false
             DispatchQueue.main.sync { stillUp = probe.running }
             let moved = after.bytes &- before.bytes
-            let idleMs = Int(Date().timeIntervalSince(after.lastAdvance) * 1000)
+            let idleMs = after.idleMs
+            let worstGapMs = after.worstGapMs
             var loadNote = ""
             if wantsLoad {
                 // ⚠️ `idle` is PRINTED ON EVERY LOADED ARM, not only when it
                 // fails, because the threshold below is the one number here that
                 // was chosen rather than measured. The first run's own idle
                 // figures are what should set it. → feedback_measuring_on_this_line
-                loadNote = " load=+\(moved / (1 << 20))MiB idle=\(idleMs)ms"
-                let verdict = LoadWitness.judge(movedBytes: moved, idleMs: idleMs,
+                loadNote = " load=+\(moved / (1 << 20))MiB idle=\(idleMs)ms gapmax=\(worstGapMs)ms"
+                let verdict = LoadWitness.judge(movedBytes: moved, worstGapMs: worstGapMs,
                                                 probeStillRunning: stillUp,
                                                 staleMs: staleLoadMs)
                 if verdict != .ok {
