@@ -1019,6 +1019,18 @@ class TunnelManager: ObservableObject {
         try? session.sendProviderMessage(msg) { _ in }
     }
 
+    /// Applies the uplink POOL SPLIT to the RUNNING tunnel: `n` connections
+    /// carry the synthetic, the rest carry WireGuard, 0 = off.
+    ///
+    /// 🚨 No setting behind it and none must be added — the split A/B runner is
+    /// the only caller, and it passes the value as an ARGUMENT so an arm can
+    /// never be overridden by stored state.
+    func applyUplinkSplitN(_ n: Int) {
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_uplink_split_n:\(max(0, n))".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
     /// Applies the uplink chunk size to the RUNNING tunnel.
     ///
     /// 🚨 THERE IS NO SETTING BEHIND THIS, and that is deliberate. Chunking is a

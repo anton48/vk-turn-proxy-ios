@@ -86,6 +86,7 @@ struct AdvancedView: View {
     @ObservedObject private var pairedAB = UplinkPairedRunner.shared
     @ObservedObject private var flowAB = UplinkFlowABRunner.shared
     @ObservedObject private var synthAB = UplinkSynthRunner.shared
+    @ObservedObject private var splitAB = UplinkSplitRunner.shared
     @State private var probeHost = "192.168.102.1:5202"
 
     /// The sink address, parsed once. It used to be split inline at every call
@@ -323,11 +324,28 @@ struct AdvancedView: View {
                     let (h, p) = probeTarget()
                     pairedAB.start(host: h, port: p, probe: cwndProbe)
                 }
-                .disabled(pairedAB.running || synthAB.running || cwndProbe.running || flowAB.running)
+                .disabled(pairedAB.running || synthAB.running || splitAB.running || cwndProbe.running || flowAB.running)
                 if pairedAB.running {
                     Button("Stop the paired A/B", role: .destructive) { pairedAB.cancel() }
                 }
                 Text(pairedAB.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                // The same synthetic beside the same real TCP, but with the pool
+                // SPLIT so the two streams stop sharing allocations — the one
+                // thing a capture at server1 cannot separate on its own.
+                Button(splitAB.running
+                        ? "Running the split A/B…"
+                        : "Run shared-vs-split A/B (~\(splitAB.estimatedSeconds / 60) min)") {
+                    let (h, p) = probeTarget()
+                    splitAB.start(host: h, port: p, probe: cwndProbe)
+                }
+                .disabled(splitAB.running || pairedAB.running || synthAB.running
+                          || cwndProbe.running || flowAB.running)
+                if splitAB.running {
+                    Button("Stop the split A/B", role: .destructive) { splitAB.cancel() }
+                }
+                Text(splitAB.status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {

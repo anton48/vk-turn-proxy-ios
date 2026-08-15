@@ -495,6 +495,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: uplink-synth target = \(Double(raw) / 100) Mbit/s")
             wgSetUplinkSynthCentiMbit(Int32(raw))
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_uplink_split_n:") {
+            // Splits the connection pool between the synthetic and WireGuard, so
+            // the two streams stop sharing allocations. Live, because an arm
+            // applied through a reconnect costs a ~107 s thirty-connection ramp.
+            // No UI: the split A/B runner is the only caller. Go clamps.
+            let raw = Int(msg.dropFirst("set_uplink_split_n:".count)) ?? 0
+            logMsg("handleAppMessage: uplink split N = \(raw)")
+            wgSetUplinkSplitN(Int32(raw))
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("set_uplink_chunk_k:") {
             // The uplink chunk size, applied to the RUNNING tunnel. 🚨 There is
             // no picker for this and there must not be one — chunking is a

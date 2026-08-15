@@ -554,6 +554,31 @@ func (p *Proxy) pathHealthy(connIdx int) bool {
 // a receive on a nil channel never fires, and this is exactly the old
 // `case item := <-p.sendCh:` — byte-for-byte behaviour, one indirection.
 func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool) {
+	// THE SPLIT, and it comes FIRST because it is exclusive: a writer in the
+	// synthetic's group serves that queue and nothing else, so it must not fall
+	// through to the shared channel below. With the split off (the default) this
+	// is one atomic load and the loop underneath is untouched.
+	//
+	// 🚨 It also takes precedence over the flow-local path set, the same way
+	// chunking yields to it: a path queue would put WireGuard packets on a
+	// synthetic-group writer and undo the very disjointness being measured. The
+	// runner refuses to start with both armed, so this branch is belt and braces.
+	// → uplinksplit.go
+	if uplinkSplit() > UplinkSplitOff && connIdx >= 0 {
+		src := p.sendCh
+		if splitOwnsSynth(connIdx) {
+			src = p.synthCh
+		}
+		select {
+		case item := <-src:
+			item.via = viaShared
+			noteSplitDispatch(item.synth)
+			p.noteDispatch(item, connIdx, "shared")
+			return item, true
+		case <-done:
+			return sendItem{}, false
+		}
+	}
 	for {
 		// 🚨 RE-READ k ON EVERY ITERATION. Hoisting these two out of the loop was
 		// a real defect with a device signature, and it is worth the atomic load

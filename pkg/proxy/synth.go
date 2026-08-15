@@ -294,7 +294,7 @@ func (p *Proxy) runUplinkSynthLoop(ctx context.Context) {
 			// this generator now exists for.
 			binary.LittleEndian.PutUint64(buf[8:16], seq)
 			before := p.sendChBlockCount.Load()
-			if err := p.SendPacket(buf); err != nil {
+			if err := p.SendPacketSynth(buf); err != nil {
 				log.Printf("uplink-synth: STOPPED after %d packets in this arm: %v", armSent, err)
 				stopArm("send error")
 				synthTargetCentiMbit.Store(0)

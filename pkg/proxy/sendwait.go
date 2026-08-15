@@ -95,7 +95,14 @@ type sendItem struct {
 	// conn.Write". → flowpaths.go
 	flow uint64
 	buf  []byte
-	at   int64 // time.Now().UnixNano() at enqueue; 0 = unstamped, not measured
+
+	// synth marks a packet from the paced generator rather than from
+	// WireGuard. Carried on the packet because the routing decision is made at
+	// ENQUEUE and the group is chosen at DEQUEUE, and nothing else in between
+	// knows where a packet came from. Inert unless the pool is split.
+	// → uplinksplit.go
+	synth bool
+	at    int64 // time.Now().UnixNano() at enqueue; 0 = unstamped, not measured
 
 	// via records WHICH of the three dispatch routes handed this packet to a
 	// writer, so its residence can be filed against that route instead of into

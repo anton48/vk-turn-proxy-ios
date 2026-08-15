@@ -56,7 +56,11 @@ enum UplinkSynth {
     /// ~half the budget while real TCP takes the rest. Its guard refuses to
     /// start if its rate is not a sweep point, so this entry and that runner
     /// are one change: removing it does not break a build, it stops a run.
-    static let choices: [Double] = [0, 12, 19, 30, 37, 40, 55, 58, 59, 60, 80]
+    static let choices: [Double] = [0, 12, 15, 19, 30, 37, 40, 55, 58, 59, 60, 80]
+    // 🚨 15 exists for the SPLIT run and for nothing else: with the pool cut in
+    // half the synthetic rides 15 allocations, and 15 Mbit/s there is the same
+    // ~1 Mbit/s per allocation as 30 Mbit/s over 30. Holding the PER-ALLOCATION
+    // rate constant is what keeps that arm comparable with the shared one.
 
     /// The fraction of the allocation budget a rate represents at `conns`
     /// connections, for the picker's own label. Display only.

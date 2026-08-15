@@ -1121,6 +1121,26 @@ func wgSetFlowPathsK(k C.int32_t) {
 // with flowPathsK > 0 would silently run K=1. The runner refuses to start in
 // that case; do not remove that guard.
 //
+// Applies the uplink POOL SPLIT to this process without a reconnect: N
+// connections carry the paced synthetic and the rest carry WireGuard, so the two
+// streams share the relay and the phone but NOT an allocation. 0 = off.
+//
+// 🎯 It exists to settle the last fork in the uplink-loss question — whether the
+// collateral loss needs the two streams to share an ALLOCATION (a per-allocation
+// meter or buffer) or only a relay (its egress, or the leg after it). Splitting
+// across two relays would answer both at once and separate neither; this changes
+// one thing. ⚡ And a clean result also excludes the phone, since the radio, the
+// socket and the dispatcher stay shared however the allocations are cut.
+//
+// proxy.SetUplinkSplitN clamps to [0, 29] so neither group can be left without a
+// writer.
+//
+//export wgSetUplinkSplitN
+func wgSetUplinkSplitN(n C.int32_t) {
+	proxy.SetUplinkSplitN(int(n))
+	log.Printf("handleAppMessage: uplink split N = %d (0 = off; DIAGNOSTIC, no UI)", int(n))
+}
+
 //export wgSetUplinkChunkK
 func wgSetUplinkChunkK(k C.int32_t) {
 	proxy.SetUplinkChunkK(int(k))

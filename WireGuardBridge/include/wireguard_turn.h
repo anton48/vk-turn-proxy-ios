@@ -185,6 +185,11 @@ void wgSetFlowPathsK(int32_t k);
 void wgSetUplinkSynthCentiMbit(int32_t centiMbit);
 void wgSetFlowPathsCover(int32_t on);
 
+/// Uplink POOL SPLIT: N connections carry the paced synthetic and the rest carry
+/// WireGuard, so the two streams share the relay but not an allocation. 0 = off.
+/// 🚨 DIAGNOSTIC with no UI — driven only by the split A/B runner as an arm.
+void wgSetUplinkSplitN(int32_t n);
+
 /// Uplink chunk size K, applied live. 1 = off and is what production runs.
 /// 🚨 A RETIRED lever with no UI: K > 1 is only ever an arm of the paired A/B.
 /// It was removed entirely once, and the value the deleted picker had written

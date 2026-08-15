@@ -12,6 +12,7 @@
 		121CB1E4F13DAA593FF6B4D9 /* AppEntitlements.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0725E9EC1D6D9B4E406EB36B /* AppEntitlements.swift */; };
 		162CCBC282209653F9411135 /* UplinkSynth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E54813375C73B53E9094558 /* UplinkSynth.swift */; };
 		1AA83E1C9AC88278DFCDB156 /* UplinkFlowABRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE78EF117E4D7F36F2D0AA2D /* UplinkFlowABRunner.swift */; };
+		1B1B71E00EB385FF31D1FAAD /* UplinkSplitRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64245599B4A5E6E3B61CA180 /* UplinkSplitRunner.swift */; };
 		1B2231DF1954F65A65A76DF6 /* WireGuardTURN.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 99E2AC40D13D6F8DD598752A /* WireGuardTURN.xcframework */; };
 		2263C90DC75E56A0D637B2B4 /* CredCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = B72BF34DDA41B9171843CDA5 /* CredCache.swift */; };
 		23FB3FA154A0B74AE5DFB39C /* ConfigValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0ACB6146869BD6DC55039EC2 /* ConfigValidation.swift */; };
@@ -116,6 +117,7 @@
 		50685ED014984982ABF8CF0C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		58612E89BCBF7234C05D3831 /* VPNLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPNLiveActivity.swift; sourceTree = "<group>"; };
 		605ED1D89D0F1886A8414767 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
+		64245599B4A5E6E3B61CA180 /* UplinkSplitRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UplinkSplitRunner.swift; sourceTree = "<group>"; };
 		6D9ADA67065E63261009BBE2 /* KeyboardDismisser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardDismisser.swift; sourceTree = "<group>"; };
 		7342F754F29FF238732D4C8A /* VKTurnProxy.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VKTurnProxy.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		7D7F1740B04FA0B3E9B79C9B /* UplinkSynthRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UplinkSynthRunner.swift; sourceTree = "<group>"; };
@@ -245,6 +247,7 @@
 				430CB5E36FB44FB306235CC0 /* UplinkCwndProbe.swift */,
 				EE78EF117E4D7F36F2D0AA2D /* UplinkFlowABRunner.swift */,
 				A9660BF758CE7466613D9E38 /* UplinkPairedRunner.swift */,
+				64245599B4A5E6E3B61CA180 /* UplinkSplitRunner.swift */,
 				3E54813375C73B53E9094558 /* UplinkSynth.swift */,
 				7D7F1740B04FA0B3E9B79C9B /* UplinkSynthRunner.swift */,
 				B15C079F499D57B27E1635DE /* VKAuthWebView.swift */,
@@ -450,6 +453,7 @@
 				9B9D55BA5248F31E477EB387 /* UplinkCwndProbe.swift in Sources */,
 				1AA83E1C9AC88278DFCDB156 /* UplinkFlowABRunner.swift in Sources */,
 				F33D11BB7538B2F4830D3686 /* UplinkPairedRunner.swift in Sources */,
+				1B1B71E00EB385FF31D1FAAD /* UplinkSplitRunner.swift in Sources */,
 				162CCBC282209653F9411135 /* UplinkSynth.swift in Sources */,
 				2D8A9860293B3D35797E5D4B /* UplinkSynthRunner.swift in Sources */,
 				548E254EF4C178FACD9DCAF6 /* VKAuthWebView.swift in Sources */,
@@ -481,7 +485,7 @@
 		1551285F9714F8A1EA2F3F46 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 271;
+				CURRENT_PROJECT_VERSION = 272;
 				INFOPLIST_FILE = VKTurnProxyWidget/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -501,7 +505,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 271;
+				CURRENT_PROJECT_VERSION = 272;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -531,7 +535,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 271;
+				CURRENT_PROJECT_VERSION = 272;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -557,7 +561,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 271;
+				CURRENT_PROJECT_VERSION = 272;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -652,7 +656,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 271;
+				CURRENT_PROJECT_VERSION = 272;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -677,7 +681,7 @@
 		C9EC52049256F969AB0E71C8 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 271;
+				CURRENT_PROJECT_VERSION = 272;
 				INFOPLIST_FILE = VKTurnProxyWidget/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (

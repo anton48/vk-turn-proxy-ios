@@ -176,7 +176,13 @@ type Proxy struct {
 	// than a bare []byte so each packet's enqueue instant travels WITH it —
 	// see sendwait.go for why a parallel structure cannot pair them correctly.
 	sendCh chan sendItem
-	recvCh chan []byte
+
+	// synthCh carries the paced generator's packets when the pool is SPLIT, so
+	// the two streams can be put on disjoint allocations. nil-safe: with the
+	// split off nothing is ever enqueued here and no writer ever reads it.
+	// → uplinksplit.go
+	synthCh chan sendItem
+	recvCh  chan []byte
 
 	// ackGap: per-inner-flow gaps between inbound ACKs, fed by the patched
 	// wireguard-go through conn.FlowReceiver. The aggregate version of this
@@ -636,6 +642,7 @@ func NewProxy(cfg Config) *Proxy {
 		ctx:               ctx,
 		cancel:            cancel,
 		sendCh:            make(chan sendItem, 256),
+		synthCh:           make(chan sendItem, 256),
 		sockStats:         newSockStats(),
 		recvCh:            make(chan []byte, 256),
 		sessCtx:           sessCtx,
@@ -1787,12 +1794,28 @@ func (p *Proxy) SendPacket(data []byte) error {
 	return p.SendPacketFlow(data, 0)
 }
 
+// SendPacketSynth is the paced generator's entry. Identical to SendPacket
+// except that the packet is MARKED, which matters only when the pool is split:
+// the mark is what puts it on the synthetic's own allocations.
+// 🚨 The generator must not call SendPacket instead — an unmarked synthetic
+// packet would ride WireGuard's group and the arm would silently test nothing.
+// → uplinksplit.go
+func (p *Proxy) SendPacketSynth(data []byte) error {
+	return p.sendPacketMarked(data, 0, true)
+}
+
 // SendPacketFlow is SendPacket carrying the inner-flow key (a hash of the
 // 5-tuple, 0 = unknown/keepalive) computed in the patched WireGuard TUN-read
 // path. PR1 only ACCOUNTS the key (flowKeyNonZero, so an on-device run confirms
 // the plumbing) and still dispatches via the shared sendCh; PR2 pins a flow to
 // a stable subset of paths by it.
 func (p *Proxy) SendPacketFlow(data []byte, flowKey uint64) error {
+	return p.sendPacketMarked(data, flowKey, false)
+}
+
+// sendPacketMarked is the one enqueue path; `synth` only selects the queue
+// when the pool is split, and is ignored otherwise.
+func (p *Proxy) sendPacketMarked(data []byte, flowKey uint64, synth bool) error {
 	p.flowKeyTotal.Add(1)
 	if flowKey != 0 {
 		p.flowKeyNonZero.Add(1)
@@ -1812,7 +1835,13 @@ func (p *Proxy) SendPacketFlow(data []byte, flowKey uint64) error {
 	// over-statement is BOUNDED, per interval, by the `sendch-block` total
 	// printed beside it on the same memstats line. When that reads `0s/0`, every
 	// residence in the interval is exact.
-	item := sendItem{buf: buf, at: time.Now().UnixNano(), flow: flowKey}
+	item := sendItem{buf: buf, at: time.Now().UnixNano(), flow: flowKey, synth: synth}
+	// THE SPLIT, and it is one line because everything below is unchanged: with
+	// the split off `ch` IS p.sendCh and this is byte-for-byte the old path.
+	ch := p.sendCh
+	if uplinkSplit() > UplinkSplitOff && synth {
+		ch = p.synthCh
+	}
 	// Flow-local path set (PR2), inert unless flow_paths_k is set. A packet that
 	// lands on one of its flow's preferred paths is done here; everything else —
 	// k=0, a keepalive with no key, or a preferred set that is momentarily busy —
@@ -1831,8 +1860,8 @@ func (p *Proxy) SendPacketFlow(data []byte, flowKey uint64) error {
 	// was genuinely no room. That is what makes the blocked-time counter exact:
 	// it measures waiting, not the cost of measuring.
 	select {
-	case p.sendCh <- item:
-		notePeak(&p.sendChPeak, len(p.sendCh))
+	case ch <- item:
+		notePeak(&p.sendChPeak, len(ch))
 		p.txBytes.Add(int64(len(data)))
 		p.txPackets.Add(1)
 		return nil
@@ -1840,10 +1869,10 @@ func (p *Proxy) SendPacketFlow(data []byte, flowKey uint64) error {
 	}
 	start := time.Now()
 	select {
-	case p.sendCh <- item:
+	case ch <- item:
 		p.sendChBlockNs.Add(int64(time.Since(start)))
 		p.sendChBlockCount.Add(1)
-		notePeak(&p.sendChPeak, len(p.sendCh))
+		notePeak(&p.sendChPeak, len(ch))
 		p.txBytes.Add(int64(len(data)))
 		p.txPackets.Add(1)
 		return nil
@@ -4236,7 +4265,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s%s flowkey=%d/%d%s%s%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s%s flowkey=%d/%d%s%s%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4284,6 +4313,10 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// null: a configured K that never materialised (shallow queue)
 			// means the run tested nothing. See uplinkchunk.go.
 			p.chunkStats.summary(),
+			// Which group each packet went to when the pool is SPLIT. Empty unless
+			// split is armed. 🚨 A split with one side reading 0 tested nothing —
+			// read this before any conclusion from a split arm. See uplinksplit.go.
+			splitSummary(),
 			p.recvChPeak.Swap(0),
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
