@@ -648,6 +648,30 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 			default:
 			}
 		}
+		// 1b. LEFTOVERS. With the split off a synthetic packet is legal for ANY
+		//     writer, so whatever the last un-split left in `synthCh` is served
+		//     right here by the ordinary path — nothing is copied, nothing waits
+		//     on a timer and nothing can be dropped. Taken FIRST because those
+		//     packets are the OLDEST: leaving them behind newer ones is how a
+		//     leftover ends up outside the receiver's 8128-counter window and is
+		//     counted as loss that never recovers. The `len` check keeps this at
+		//     one load on the hot path, where the queue is empty. → uplinksplit.go
+		if len(p.synthCh) > 0 {
+			select {
+			case item := <-p.synthCh:
+				if !splitAdmits(connIdx, item) {
+					if p.requeueStale(item) {
+						continue
+					}
+					splitLeaked.Add(1)
+				}
+				splitLeftover.Add(1)
+				item.via = viaShared
+				p.noteDispatch(item, connIdx, "shared")
+				return item, true
+			default:
+			}
+		}
 		// 2. The shared channel — spilled packets, and every keepalive and
 		//    handshake, which carry no flow key by design.
 		select {
@@ -694,6 +718,20 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 				}
 				splitLeaked.Add(1)
 			}
+			item.via = viaShared
+			p.noteDispatch(item, connIdx, "shared")
+			return item, true
+		case item := <-p.synthCh:
+			// Same leftovers, for a writer that had nothing at all to do. With
+			// the split ON this case is unreachable for a group-B writer,
+			// because step 0 above returns before reaching here.
+			if !splitAdmits(connIdx, item) {
+				if p.requeueStale(item) {
+					continue
+				}
+				splitLeaked.Add(1)
+			}
+			splitLeftover.Add(1)
 			item.via = viaShared
 			p.noteDispatch(item, connIdx, "shared")
 			return item, true

@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 )
@@ -103,9 +102,6 @@ func SetUplinkSplitN(n int) {
 	next := &splitState{n: ClampUplinkSplitN(n), wake: make(chan struct{})}
 	splitCur.Store(next)
 	close(old.wake)
-	if next.n <= UplinkSplitOff {
-		drainSynthQueue()
-	}
 }
 
 // ClampUplinkSplitN keeps the split inside [0, 29]: at least one connection must
@@ -124,41 +120,31 @@ func ClampUplinkSplitN(n int) int {
 // size and never park — the summary line, and tests.
 func uplinkSplit() int { return splitNow().n }
 
-// synthDrainHook lets the Proxy register its queues so a split being turned OFF
-// can rescue whatever is still sitting in the synthetic's channel. Without it
-// those packets are stranded: no writer serves synthCh once the split is off,
-// and the gap in the synthetic's sequence would be counted downstream as LOSS —
-// an arm biased by our own switch.
-var synthDrainHook atomic.Value // func() (moved, left int)
+// synthDepthHook lets the summary READ the synthetic queue's depth. Read-only on
+// purpose: the transfer that used to live here is what destroyed packets, and
+// what is wanted now is only the observation.
+//
+// 🚨 WHY THE DEPTH IS PRINTED AT ALL. With the split off, a packet left in that
+// queue is served by the next writer to loop — the un-split closes the wake, so
+// every writer loops immediately, which is what makes the transition lossless.
+// If a non-zero depth were ever to SURVIVE an un-split, those packets would sit
+// while the other arm sends thousands of newer counters, and past the receiver's
+// 8128-counter window they arrive `stale` and the loss never recovers. That is
+// not a footnote for the end of the run — it invalidates the arm on the spot, so
+// it has to be on the line the run is read from.
+var synthDepthHook atomic.Value // func() int
 
-func drainSynthQueue() {
-	f, _ := synthDrainHook.Load().(func() (int, int))
+func synthQueueDepth() int {
+	f, _ := synthDepthHook.Load().(func() int)
 	if f == nil {
-		return
+		return 0
 	}
-	moved, left := f()
-	if moved == 0 && left == 0 {
-		return
-	}
-	warn := ""
-	if left > 0 {
-		// Not destroyed — still queued, and the next arm that arms the split will
-		// send them, late. But if the RUN ends with them queued they are a
-		// permanent hole in the synthetic's sequence, which reads downstream as
-		// network loss. So it has to be visible.
-		warn = " 🚨 STILL QUEUED — these fly only when the split is armed again; " +
-			"if the run ends here they become a gap the loss counter blames on the network"
-	}
-	log.Printf("uplink-split: rescued %d packet(s) from the synthetic queue on un-split, %d left%s",
-		moved, left, warn)
+	return f()
 }
 
-// splitOwnsSynth says whether this writer serves the synthetic's group.
-//
-// ⚠️ Connections are identified by their index in the pool, which is stable for
-// the life of a connection. A reconnect renumbers, and an arm that straddles one
-// has its groups redrawn — read `split=` on the memstats line, which prints how
-// many packets each group actually carried, rather than assuming.
+// splitOwnsSynth says whether this writer serves the synthetic's group under a
+// given split size. Takes the size as an argument rather than reading it, so the
+// caller's snapshot is the only source of truth.
 func splitOwnsSynth(connIdx, n int) bool { return connIdx >= 0 && connIdx < n }
 
 // splitAdmits reports whether this writer may SEND the packet it has just
@@ -201,7 +187,28 @@ func (p *Proxy) requeueStale(item sendItem) bool {
 	}
 }
 
+// splitLeftover counts packets taken out of the synthetic's queue by an ORDINARY
+// writer after the split was turned off.
+//
+// 🚨 WHY THERE IS NO DRAIN FUNCTION ANY MORE, and this is the important part.
+// The first version copied the leftovers into the shared queue with a timeout
+// and dropped them if it expired — and the comment claiming "room is guaranteed"
+// on the put-back was simply FALSE: the drain frees a slot in `synthCh` by taking
+// the packet, a blocked producer takes that slot, the copy times out, and the
+// put-back finds no room. The packet then vanished with no counter at all.
+// *(User-caught, 2026-08-16.)*
+//
+// ⚠️ And waiting was not harmless either: while a leftover sits unserved the
+// other arm sends thousands of NEWER sequence numbers, and once the receiver's
+// 8128-counter window has passed it, the packet arrives `stale` and the loss is
+// never recovered. So "it will fly when the split comes back" was not a rescue.
+//
+// ⇒ 🎯 THE FIX IS TO REMOVE THE TRANSFER, NOT TO PERFECT IT. With the split off,
+// a synthetic packet is legal for ANY writer, so the ordinary dispatch path
+// serves `synthCh` whenever it is non-empty. Nothing is copied, nothing is
+// dropped, nothing waits on a timer, and the packets keep their order.
 var (
+	splitLeftover atomic.Int64
 	splitRequeued atomic.Int64
 	splitLeaked   atomic.Int64
 	splitSynthToA atomic.Int64
@@ -237,10 +244,10 @@ func noteSplitDispatch(synth, toA bool) {
 // caller, because the first version cleared them here and read them afterwards —
 // so the field printed 0 no matter what happened. A reset that runs before the
 // read is the same silent zero this project has now shipped three times.
-func SplitStatsAndReset() (synthA, synthB, wgA, wgB, requeued, leaked int64, n int) {
+func SplitStatsAndReset() (synthA, synthB, wgA, wgB, requeued, leaked, leftover int64, n int) {
 	return splitSynthToA.Swap(0), splitSynthToB.Swap(0),
 		splitWGToA.Swap(0), splitWGToB.Swap(0),
-		splitRequeued.Swap(0), splitLeaked.Swap(0), uplinkSplit()
+		splitRequeued.Swap(0), splitLeaked.Swap(0), splitLeftover.Swap(0), uplinkSplit()
 }
 
 // splitSummary renders the engagement witness and CLEARS the interval. Empty
@@ -252,8 +259,21 @@ func SplitStatsAndReset() (synthA, synthB, wgA, wgB, requeued, leaked int64, n i
 // failure as a chunk size that is live but inert on a shallow queue, which cost
 // this project nine runs.
 func splitSummary() string {
-	synthA, synthB, wgA, wgB, requeued, leaked, n := SplitStatsAndReset()
+	synthA, synthB, wgA, wgB, requeued, leaked, leftover, n := SplitStatsAndReset()
 	if n <= UplinkSplitOff {
+		// 🚨 One exception to the silence: leftovers served by the ordinary path
+		// AFTER an un-split. They are not an error — that is the design — but a
+		// large number means the switch left a lot behind, and the reader should
+		// see it rather than infer it.
+		if depth := synthQueueDepth(); depth > 0 {
+			return fmt.Sprintf(" split=0 leftover-sent=%d 🚨 leftover-QUEUED=%d — the split is "+
+				"OFF and packets are still in the synthetic queue; they age past the receiver's "+
+				"8128-counter window and become loss that never recovers. THIS ARM IS VOID",
+				leftover, depth)
+		}
+		if leftover > 0 {
+			return fmt.Sprintf(" split=0 leftover-sent=%d", leftover)
+		}
 		return ""
 	}
 	// A leak is a packet that WAS sent under the superseded mode, so it counts as
@@ -266,6 +286,6 @@ func splitSummary() string {
 		// thing it was built to remove.
 		note = " 🚨 WRONG-GROUP — the split LEAKED and this arm is void"
 	}
-	return fmt.Sprintf(" split=%d synth→A=%d synth→B=%d wg→A=%d wg→B=%d requeued=%d leaked=%d wrong=%d%s",
-		n, synthA, synthB, wgA, wgB, requeued, leaked, wrong, note)
+	return fmt.Sprintf(" split=%d synth→A=%d synth→B=%d wg→A=%d wg→B=%d requeued=%d leaked=%d leftover=%d wrong=%d%s",
+		n, synthA, synthB, wgA, wgB, requeued, leaked, leftover, wrong, note)
 }

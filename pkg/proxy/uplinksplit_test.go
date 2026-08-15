@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -334,43 +335,6 @@ func TestBlockedProducerRePicksTheQueueWhenTheSplitChanges(t *testing.T) {
 	}
 }
 
-// 🚨 AND THE PACKETS ALREADY IN THE QUEUE. Turning the split off leaves synthCh
-// with no reader, so anything still in it is never sent — a gap in the
-// synthetic's own sequence, which the server's counter would blame on the
-// network. An arm biased by our own switch is worse than a missing arm.
-//
-// SABOTAGE SEEN TO FAIL: make SetUplinkSplitN skip drainSynthQueue when the new
-// size is 0. Compiles; the packet is then still sitting in synthCh.
-func TestUnSplittingRescuesWhatIsStillQueued(t *testing.T) {
-	resetSplit()
-	t.Cleanup(resetSplit)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 8), synthCh: make(chan sendItem, 8)}
-	registerSynthDrain(p)
-	t.Cleanup(func() { synthDrainHook.Store((func() (int, int))(nil)) })
-
-	SetUplinkSplitN(15)
-	_ = p.SendPacketSynth([]byte("queued before the flip"))
-	if len(p.synthCh) != 1 {
-		t.Fatalf("expected the packet in synthCh, got %d", len(p.synthCh))
-	}
-
-	SetUplinkSplitN(UplinkSplitOff)
-
-	if len(p.synthCh) != 0 {
-		t.Fatalf("synthCh must be drained on un-split, %d left stranded", len(p.synthCh))
-	}
-	select {
-	case item := <-p.sendCh:
-		if string(item.buf) != "queued before the flip" {
-			t.Fatalf("wrong packet rescued: %q", item.buf)
-		}
-	default:
-		t.Fatal("the queued packet was neither stranded nor rescued — it vanished")
-	}
-}
-
 // 🚨🚨 THE STRICT BOUNDARY, and Go's `select` is what breaks it: it picks
 // UNIFORMLY AT RANDOM among ready cases, so when the split is armed while a
 // writer is parked on the shared channel, a WireGuard packet and the closed wake
@@ -389,8 +353,6 @@ func TestAWriterWillNotSendAPacketOfTheSupersededMode(t *testing.T) {
 	t.Cleanup(resetSplit)
 	p, cancel := splitTestProxy()
 	defer cancel()
-	registerSynthDrain(p)
-	t.Cleanup(func() { synthDrainHook.Store((func() (int, int))(nil)) })
 
 	// A WireGuard packet queued while the pool is whole…
 	if err := p.SendPacketFlow([]byte("queued while shared"), 0); err != nil {
@@ -446,36 +408,127 @@ func TestAWriterReturnsAPacketThatIsNotItsGroups(t *testing.T) {
 	}
 }
 
-// 🚨 AND THE DRAIN MUST NOT INVENT LOSS. Taking a packet out of synthCh and
-// dropping it when sendCh is full is a DROP — and under real TCP a full sendCh is
-// ordinary. The generator has already numbered that packet, so losing it is a
-// permanent hole in the synthetic's own sequence that the server blames on the
-// network: the arm would report loss we caused ourselves.
+// 🚨🚨 THE LOSSLESS UN-SPLIT, and it is lossless because NOTHING IS TRANSFERRED.
 //
-// SABOTAGE SEEN TO FAIL: in the drain, replace the put-back with a counter
-// increment (the original destructive shape). Compiles; the packet then vanishes
-// from both queues.
-func TestTheDrainNeverDestroysAPacket(t *testing.T) {
+// The first design copied the leftovers into the shared queue with a timeout and
+// dropped them if it expired — and its put-back could fail too, because the drain
+// itself frees the slot a blocked producer immediately takes. A packet the
+// generator has already NUMBERED then vanished with no counter, which the server
+// reads as network loss.
+//
+// ⚠️ Waiting was no better: while a leftover sits, the other arm sends thousands
+// of newer sequence numbers, and past the receiver's 8128-counter window the
+// packet arrives `stale` and the loss never recovers.
+//
+// ⇒ With the split off a synthetic packet is legal for ANY writer, so the
+// ordinary path serves `synthCh` directly. This test states the conservation
+// that follows, WITH a concurrent producer competing for the same slots — the
+// case the old test never built.
+//
+// SABOTAGE SEEN TO FAIL: delete the `if len(p.synthCh) > 0` block from
+// nextSendItem's step 1b (and the `case item := <-p.synthCh:` from the blocking
+// select). Compiles; the leftover is then never delivered and this test times
+// out with it still queued.
+func TestLeftoversAreDeliveredByTheOrdinaryPathAfterAnUnSplit(t *testing.T) {
 	resetSplit()
 	t.Cleanup(resetSplit)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// A shared queue with NO room at all, which is the case that used to drop.
-	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 1), synthCh: make(chan sendItem, 4)}
-	registerSynthDrain(p)
-	t.Cleanup(func() { synthDrainHook.Store((func() (int, int))(nil)) })
+	// A deliberately tight shared queue, so a producer really does compete.
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 2), synthCh: make(chan sendItem, 8)}
 
 	SetUplinkSplitN(15)
-	_ = p.SendPacketSynth([]byte("a"))
-	_ = p.SendPacketSynth([]byte("b"))
-	p.sendCh <- sendItem{buf: []byte("occupies the only slot")} // sendCh is now full
+	for _, b := range []string{"leftover-1", "leftover-2", "leftover-3"} {
+		if err := p.SendPacketSynth([]byte(b)); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	// A producer hammering the shared queue across the switch — the interleave
+	// that made the old transfer lose packets.
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = p.SendPacketFlow([]byte("wg"), 0)
+			}
+		}
+	}()
 
-	SetUplinkSplitN(UplinkSplitOff) // triggers the drain against a full shared queue
+	SetUplinkSplitN(UplinkSplitOff)
 
-	// One packet fits (nothing does, here), the rest must remain QUEUED — never
-	// silently gone. Total conservation is the assertion.
-	if got := len(p.sendCh) + len(p.synthCh); got != 3 {
-		t.Fatalf("packets were destroyed: %d of 3 survive (sendCh=%d synthCh=%d)",
-			got, len(p.sendCh), len(p.synthCh))
+	got := map[string]bool{}
+	deadline := time.After(3 * time.Second)
+	for len(got) < 3 {
+		select {
+		case <-deadline:
+			close(stop)
+			t.Fatalf("only %d of 3 leftovers were delivered; %d still queued", len(got), len(p.synthCh))
+		default:
+		}
+		item, ok := p.nextSendItem(make(chan struct{}), 7)
+		if !ok {
+			continue
+		}
+		if s := string(item.buf); strings.HasPrefix(s, "leftover-") {
+			got[s] = true
+		}
+	}
+	close(stop)
+
+	if s := splitSummary(); !strings.Contains(s, "leftover-sent=3") {
+		t.Fatalf("the leftovers served by the ordinary path must be counted: %q", s)
+	}
+}
+
+// 🚨 A QUEUE THAT SURVIVES AN UN-SPLIT VOIDS THE ARM, and the line has to say so
+// where the run is read. The transition is lossless by construction — the
+// un-split wakes every writer and they serve `synthCh` on their next loop — but
+// if a packet ever DID survive, it would age past the receiver's 8128-counter
+// window while the other arm sends newer ones, and become loss that never
+// recovers. Silence there would be indistinguishable from success.
+//
+// SABOTAGE SEEN TO FAIL: drop the `if depth := synthQueueDepth(); depth > 0`
+// branch from splitSummary. Compiles; the queue then goes unreported.
+func TestASurvivingSyntheticQueueVoidsTheArmLoudly(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 4), synthCh: make(chan sendItem, 4)}
+	synthDepthHook.Store(func() int { return len(p.synthCh) })
+	t.Cleanup(func() { synthDepthHook.Store((func() int)(nil)) })
+
+	SetUplinkSplitN(15)
+	_ = p.SendPacketSynth([]byte("stuck"))
+	SetUplinkSplitN(UplinkSplitOff) // nobody is running a writer in this test
+
+	s := splitSummary()
+	if !strings.Contains(s, "leftover-QUEUED=1") || !strings.Contains(s, "VOID") {
+		t.Fatalf("a queue surviving the un-split must void the arm loudly, got %q", s)
+	}
+}
+
+// 🚨 THE OTHER HALF OF THE WIRING. The test above passes while registering the
+// probe itself — which is exactly the trap this project has already paid for
+// once: a guard on one half of a two-part hookup buys a green suite and an empty
+// log. The field can only appear on a device if NewProxy registers the probe, so
+// that is asserted separately.
+//
+// SABOTAGE SEEN TO FAIL: delete the `synthDepthHook.Store(...)` line from
+// NewProxy. Compiles; the summary then never reports a surviving queue on any
+// real run.
+func TestNewProxyRegistersTheSynthDepthProbe(t *testing.T) {
+	src, err := os.ReadFile("proxy.go")
+	if err != nil {
+		t.Fatalf("reading proxy.go: %v", err)
+	}
+	// The declaration lives in uplinksplit.go, so a hit here is a CALL — no
+	// risk of matching the symbol's own definition.
+	if !strings.Contains(string(src), "synthDepthHook.Store(") {
+		t.Fatal("NewProxy no longer registers the synthetic-queue depth probe — " +
+			"the summary would never report a queue surviving an un-split")
 	}
 }
