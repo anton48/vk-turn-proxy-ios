@@ -408,6 +408,17 @@ final class UplinkSplitRunner: ObservableObject {
                     DispatchQueue.main.async { probe.stop() }
                     return
                 }
+                // 🚨 EXACT COUNT, NOT "SOME". `connectAll` refuses only a pool of
+                // ZERO, so without this an arm can run on 1 of 8 flows and score
+                // as a full one — and the neighbour's intensity is the treatment.
+                // *(User-caught, 2026-08-16.)*
+                let c = probe.flowCensus()
+                guard c.connected == probeFlows else {
+                    abortRun("only \(c.connected) of \(probeFlows) flows connected for arm \(no) — "
+                        + "the load's INTENSITY is the treatment here, so a short pool is a "
+                        + "different arm and not a noisy one")
+                    return
+                }
                 probeRunning = true
                 log.log("\(runName) SETTLE sec=\(settleSec) — the probe just started; letting "
                     + "TCP leave slow start before the arm is declared")
@@ -432,7 +443,8 @@ final class UplinkSplitRunner: ObservableObject {
             let mode = "\(arm)"
             log.log("\(runName) ARM a=\(no)/\(arms.count) mode=\(mode) splitN=\(splitN) "
                 + "routing=\(arm == .colocated ? "colocated" : (splitN > 0 ? "disjoint" : "whole-pool")) "
-                + "synth=\(Int(mbit))Mbit/s flows=\(wantsLoad ? probeFlows : 0) sec=\(armSec)")
+                + "synth=\(Int(mbit))Mbit/s flows=\(wantsLoad ? probe.flowCensus().live : 0)"
+                + "/\(wantsLoad ? probeFlows : 0) sec=\(armSec)")
             publish("arm \(no)/\(arms.count) · \(mode) · \(armSec)s")
             // 🎯 THE LOAD WITNESS: BYTES, AND WHETHER THEY WERE STILL MOVING AT
             // THE END. Sampled across the arm's own span, so a load that dies
@@ -451,6 +463,7 @@ final class UplinkSplitRunner: ObservableObject {
             let after = probe.loadProgress()
             var stillUp = false
             DispatchQueue.main.sync { stillUp = probe.running }
+            let census = probe.flowCensus()
             let moved = after.bytes &- before.bytes
             let idleMs = after.idleMs
             let worstGapMs = after.worstGapMs
@@ -460,9 +473,11 @@ final class UplinkSplitRunner: ObservableObject {
                 // fails, because the threshold below is the one number here that
                 // was chosen rather than measured. The first run's own idle
                 // figures are what should set it. → feedback_measuring_on_this_line
-                loadNote = " load=+\(moved / (1 << 20))MiB idle=\(idleMs)ms gapmax=\(worstGapMs)ms"
+                loadNote = " load=+\(moved / (1 << 20))MiB idle=\(idleMs)ms gapmax=\(worstGapMs)ms "
+                    + "flows=\(census.live)/\(probeFlows)"
                 let verdict = LoadWitness.judge(movedBytes: moved, worstGapMs: worstGapMs,
                                                 probeStillRunning: stillUp,
+                                                liveFlows: census.live, wantFlows: probeFlows,
                                                 staleMs: staleLoadMs)
                 if verdict != .ok {
                     // The neighbour IS the treatment. An arm without it is a solo

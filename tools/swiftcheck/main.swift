@@ -186,8 +186,10 @@ do {
 //    for one second and idles for the other 119.
 do {
     let stale = 2000
-    func judge(_ moved: UInt64, _ worstGap: Int, _ up: Bool) -> LoadWitness.Verdict {
-        LoadWitness.judge(movedBytes: moved, worstGapMs: worstGap, probeStillRunning: up, staleMs: stale)
+    func judge(_ moved: UInt64, _ worstGap: Int, _ up: Bool,
+               _ live: Int = 8, _ want: Int = 8) -> LoadWitness.Verdict {
+        LoadWitness.judge(movedBytes: moved, worstGapMs: worstGap, probeStillRunning: up,
+                          liveFlows: live, wantFlows: want, staleMs: stale)
     }
 
     check(judge(1 << 20, 100, true) == .ok, "moving, fresh, alive => ok")
@@ -204,9 +206,24 @@ do {
           "noBytes outranks ended - what it failed to do beats when it stopped")
     check(judge(1 << 20, 100, false) == .ended, "fresh bytes but the probe is gone => ended")
 
+    // 🚨 THE POPULATION, WHICH EVERY AGGREGATE ABOVE IS BLIND TO. `connectAll`
+    // rejected only a pool of ZERO and a sender dying on a socket error just
+    // broke out of its loop, so 7 of 8 flows could be gone while bytes, gaps and
+    // lifecycle all read perfectly on the strength of the last one — and the
+    // neighbour's INTENSITY is the treatment (0/8/16 flows gave 0.001/1.08/2.4%
+    // collateral loss), so that is a DIFFERENT ARM.
+    check(judge(64 << 20, 100, true, 7, 8) == .shortPool(live: 7, want: 8),
+          "one flow short is a different arm, however healthy the bytes look")
+    check(judge(64 << 20, 100, true, 8, 8) == .ok, "a full pool with healthy bytes is ok")
+
+    // It outranks the others BECAUSE IT EXPLAINS THEM — reporting a downstream
+    // symptom sends the reader to the wrong place.
+    check(judge(0, 999_999, false, 0, 8) == .shortPool(live: 0, want: 8),
+          "an empty pool is reported as such, not as noBytes/ended/stalled")
+
     // Every verdict must be able to SAY itself, or a void arm reaches the log
     // with no reason attached.
-    for v: LoadWitness.Verdict in [.noBytes, .ended, .stalled(ms: 5), .ok] {
+    for v: LoadWitness.Verdict in [.noBytes, .ended, .stalled(ms: 5), .shortPool(live: 3, want: 8), .ok] {
         check(!LoadWitness.reason(v).isEmpty, "the verdict has a reason string")
     }
 }
@@ -242,7 +259,8 @@ do {
     check(a.idleMs == 0, "the last byte is fresh — which is exactly why idle cannot decide")
     check(a.worstGapMs == 117_000, "the 117 s hole is what the arm actually suffered (got \(a.worstGapMs))")
     check(LoadWitness.judge(movedBytes: a.bytes, worstGapMs: a.worstGapMs,
-                            probeStillRunning: true, staleMs: 2000) == .stalled(ms: 117_000),
+                            probeStillRunning: true, liveFlows: 8, wantFlows: 8,
+                            staleMs: 2000) == .stalled(ms: 117_000),
           "…and the verdict is stalled, where freshness said ok")
 
     // A NEW ARM MUST NOT INHERIT IT, or one bad arm condemns the rest of the run.

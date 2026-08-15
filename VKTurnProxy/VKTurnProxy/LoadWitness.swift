@@ -15,6 +15,12 @@
 //  • the load never moved at all — the first version caught only this;
 //  • it moved and then DIED, leaving a positive byte delta across the arm while
 //    the arm was 99% idle. "Some bytes moved" is not "the load was running";
+//  • it ran with FEWER FLOWS than the arm asked for — `connectAll` rejected only
+//    ZERO, and a sender dying on a socket error just broke out of its loop, so
+//    7 of 8 could be gone while every aggregate stayed healthy on the strength
+//    of the last one. This project has measured the neighbour's INTENSITY as a
+//    dose (0/8/16 flows → 0.001/1.08/2.4-2.7% collateral loss), so a short pool
+//    is A DIFFERENT ARM, not a noisier version of the same one;
 //  • it moved, STOPPED FOR MOST OF THE ARM, and resumed just before the end —
 //    which has a positive delta, a live probe AND a fresh last byte. 🎯 The only
 //    quantity that means "throughout" is the WORST GAP inside the arm, so that
@@ -37,6 +43,8 @@ enum LoadWitness {
         case stalled(ms: Int)
         /// The probe was no longer running when the arm closed.
         case ended
+        /// Fewer flows were carrying the load than the arm asked for.
+        case shortPool(live: Int, want: Int)
     }
 
     /// 🚨 ORDER MATTERS, and it is by how much each says. `noBytes` outranks
@@ -47,7 +55,15 @@ enum LoadWitness {
     static func judge(movedBytes: UInt64,
                       worstGapMs: Int,
                       probeStillRunning: Bool,
+                      liveFlows: Int,
+                      wantFlows: Int,
                       staleMs: Int) -> Verdict {
+        // 🚨 THE POPULATION COMES FIRST BECAUSE IT EXPLAINS THE REST. If flows
+        // are missing, every other symptom is downstream of that, and reporting
+        // the downstream one sends the reader to the wrong place. It is also the
+        // only failure the aggregates CANNOT see: bytes, gaps and lifecycle are
+        // all satisfied by one surviving flow.
+        if liveFlows != wantFlows { return .shortPool(live: liveFlows, want: wantFlows) }
         if movedBytes == 0 { return .noBytes }
         if !probeStillRunning { return .ended }
         if worstGapMs > staleMs { return .stalled(ms: worstGapMs) }
@@ -62,6 +78,9 @@ enum LoadWitness {
         case .noBytes:       return "NO BYTES MOVED at all"
         case .ended:         return "the probe had already ended"
         case .stalled(let m): return "the load stood still for \(m)ms inside this arm"
+        case .shortPool(let live, let want):
+            return "only \(live) of \(want) flows were carrying the load — the neighbour's "
+                 + "INTENSITY is the treatment, so this is a different arm and not a noisy one"
         }
     }
 }

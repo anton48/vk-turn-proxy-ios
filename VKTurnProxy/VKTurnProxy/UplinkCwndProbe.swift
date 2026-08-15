@@ -76,6 +76,20 @@ final class UplinkCwndProbe: ObservableObject {
     ///
     /// Taken from `TCP_CONNECTION_INFO`'s own `txbytes` rather than from our
     /// `send()` returns, so it is the kernel's statement rather than ours.
+    /// How many flows were ASKED FOR, how many actually connected, and how many
+    /// are still sending.
+    ///
+    /// 🚨 THE POPULATION IS PART OF THE TREATMENT, NOT A DETAIL. This project has
+    /// measured the neighbour's INTENSITY as a dose — 0 / 8 / 16 real flows gave
+    /// 0.001 / 1.08 / 2.4-2.7% of collateral loss — so an arm that ran with 1 of
+    /// 8 flows is not a noisy version of the same arm, it is a DIFFERENT ARM.
+    /// And every other witness passes it: `connectAll` rejected only ZERO, a
+    /// sender that dies on a socket error just breaks out of its loop, and the
+    /// aggregate byte counter keeps advancing as long as ONE flow is alive.
+    /// *(User-caught, 2026-08-16.)*
+    private let census = FlowCensus()
+    func flowCensus() -> (requested: Int, connected: Int, live: Int) { census.snapshot() }
+
     private let progress = LoadProgress()
     func loadProgress() -> (bytes: UInt64, idleMs: Int, worstGapMs: Int) { progress.snapshot() }
     /// Open a new scoring window. A runner calls this at each arm's start so the
@@ -344,6 +358,12 @@ final class UplinkCwndProbe: ObservableObject {
         var eff: Int32 = 0
         var el = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &eff, &el)
+        census.opened(requested: flows, connected: fds.count)
+        if fds.count != flows {
+            log.log("cwndprobe 🚨 PARTIAL POOL — only \(fds.count) of \(flows) flows connected. The "
+                + "load's INTENSITY is the treatment here, so this is a different arm, not a noisy "
+                + "one. A runner must refuse it; a hand-driven run should be re-taken.")
+        }
         log.log("cwndprobe START host=\(host):\(port) flows=\(fds.count)/\(flows) dur=\(durationSec)s effSndBuf=\(eff)")
         log.log("cwndprobe CSV t_ms,flow,cwnd,ssthresh,sndwnd,sbbytes,srtt_ms,rttcur_ms,loss,reord,mss,txbytes,rxrtx_pkts,deliv_mbit,winuse,txrtx_bytes")
         publish("running: \(fds.count) flows for \(durationSec)s")
@@ -360,14 +380,25 @@ final class UplinkCwndProbe: ObservableObject {
         // One blocking sender per flow. A blocked send() IS the measurement —
         // it means the flow is cwnd/sndbuf-limited, which is what we want.
         var senders: [Thread] = []
-        for fd in fds {
+        for (idx, fd) in fds.enumerated() {
             let t = Thread {
+                var failure: Int32 = 0
                 while Date() < deadline && !self.stopped.get() {
                     let n = send(fd, bufPtr, bufSize, 0)
                     if n <= 0 {
                         if n < 0 && errno == EINTR { continue }
+                        failure = n < 0 ? errno : 0
                         break
                     }
+                }
+                // 🚨 A SENDER THAT DIES IS INVISIBLE TO EVERY OTHER INSTRUMENT.
+                // The aggregate byte counter keeps advancing while ONE flow
+                // lives, so seven of eight can be gone with nothing to show it.
+                let live = self.census.senderFinished()
+                if Date() < deadline && !self.stopped.get() {
+                    log.log("cwndprobe 🚨 FLOW \(idx) ENDED EARLY (errno=\(failure)) — \(live) of "
+                        + "\(fds.count) senders left. The load's intensity is the treatment; an arm "
+                        + "that continues past this ran at a level nobody asked for.")
                 }
             }
             t.stackSize = 512 << 10
@@ -438,6 +469,34 @@ final class UplinkCwndProbe: ObservableObject {
     }
 }
 
+
+/// Who is actually carrying the load: asked for, connected, still alive.
+///
+/// 🎯 IT EXISTS BECAUSE EVERY AGGREGATE HIDES IT. Bytes, gaps and lifecycle
+/// flags are all satisfied by a single surviving flow, so the only way to know
+/// the arm ran at the level it claims is to count the population itself.
+final class FlowCensus {
+    private let lock = NSLock()
+    private var requestedN = 0
+    private var connectedN = 0
+    private var liveN = 0
+
+    func opened(requested: Int, connected: Int) {
+        lock.lock(); defer { lock.unlock() }
+        requestedN = requested; connectedN = connected; liveN = connected
+    }
+    /// Called by a sender on its way out, whatever the reason. Returns how many
+    /// are left, so the caller can name it in one line.
+    @discardableResult func senderFinished() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        if liveN > 0 { liveN -= 1 }
+        return liveN
+    }
+    func snapshot() -> (requested: Int, connected: Int, live: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (requestedN, connectedN, liveN)
+    }
+}
 
 /// A boolean shared between the UI thread and the probe's worker threads. Small
 /// enough to hand-roll, and a plain Bool here would be a data race — the kind
