@@ -238,8 +238,34 @@ final class UplinkSplitRunner: ObservableObject {
             return
         }
 
+        // 🚨 THE PROBE MUST BE ABLE TO OUTLIVE THE PLAN, AND WE ASK IT RATHER THAN
+        // ASSUMING IT. The probe bounds its own duration; if that bound is below
+        // what this plan needs, the load dies mid-run and every arm after it is a
+        // solo arm wearing the wrong label — `colocated ≈ split ≈ solo`, which the
+        // reading table calls "the treatment did not engage". A null manufactured
+        // by the instrument.
+        //
+        // 🎯 It is checked against the ACTUAL request, not against a copy of the
+        // plan's length written down somewhere else: the runner is the only thing
+        // that knows how long it runs, so it is the only thing that can ask.
+        // *(User-caught, 2026-08-16 — my first fix duplicated the number instead.)*
+        let probeRequestSec = estimatedSeconds + 120
+        guard !ProbeDuration.clamps(probeRequestSec) else {
+            log.log("\(runName) REFUSED — this plan needs the load for \(probeRequestSec)s and the "
+                + "probe would clamp that to \(ProbeDuration.clamp(probeRequestSec))s "
+                + "(bounds \(ProbeDuration.minSec)-\(ProbeDuration.maxSec)s). The real load would "
+                + "end mid-run and every arm after it would be SOLO while still being labelled "
+                + "loaded. Raise ProbeDuration.maxSec or shorten the plan.")
+            publish("not started — the probe cannot run for the whole plan", running: false)
+            return
+        }
+
         let n = conns / 2
         var probeRunning = false
+        // 🚨 Set when a LOADED arm ended having moved zero bytes: the probe is
+        // alive by its own lifecycle flags and is not actually sending, so the
+        // next boundary tears it down and starts a fresh one.
+        var lastArmStalled = false
         log.log("\(runName) TARGET \(host):\(port) — 🚨 this must be server1's INNER (tunnel) "
             + "address with `cwndsink` listening, or the real load never reaches server1.")
         log.log("\(runName) \(knobs)")
@@ -307,28 +333,30 @@ final class UplinkSplitRunner: ObservableObject {
             // continuous. Five transitions in all; `loadTransitions` counts them.
             // 🚨 ASK THE PROBE, DO NOT TRUST OUR OWN FLAG. `probeRunning` records
             // what this runner INTENDED; the probe can end on its own — it used to
-            // do exactly that, at a hard 120 s, which is three of these arms. A
-            // flag that says "running" while nothing is sending turns arms 4-6
-            // into solo arms wearing the wrong label, and the log would carry no
-            // sign of it. So the state is READ from the probe at every boundary,
-            // the same fix as deriving `loadTransitions` from `arms`: do not keep
-            // a second copy of something that already has an owner.
-            // *(User-caught, 2026-08-16.)*
+            // do exactly that, at a hard 120 s, which is three of these arms.
+            //
+            // ⚠️ BUT `running`/`sending` ARE LIFECYCLE, NOT LOAD. `sending` is set
+            // once when the flows come up and cleared once when the run ends: if
+            // every sender thread breaks out on a socket error it stays TRUE for
+            // the rest of the deadline, so a pool of dead flows reads as a healthy
+            // one. The real witness is BYTES MOVING, and it is checked at the end
+            // of each arm below. This boundary check only decides whether a probe
+            // has to be (re)started. *(User-caught, 2026-08-16.)*
             let wantsLoad = arm != .solo
-            var loadAlive = false
-            DispatchQueue.main.sync { loadAlive = probe.running && probe.sending }
-            if probeRunning && !loadAlive {
-                // 🚨 It died without being asked. Whatever arm just ended was
-                // partly or wholly unloaded, and no counter on the server side can
-                // tell that apart from "the neighbour stopped mattering".
-                log.log("\(runName) 🚨 PROBE DIED ON ITS OWN before arm \(no) — the real load "
-                    + "ended without this runner stopping it, so arm \(no - 1) ran wholly or "
-                    + "partly SOLO while being labelled loaded. THAT ARM IS VOID, and so is any "
-                    + "earlier arm that shares its probe. Restarting the load for the arms that "
-                    + "remain; score nothing across this line.")
+            var lifecycleAlive = false
+            DispatchQueue.main.sync { lifecycleAlive = probe.running }
+            if probeRunning && (!lifecycleAlive || lastArmStalled) {
+                let why = lifecycleAlive
+                    ? "it is alive but moved NO BYTES through the whole of arm \(no - 1)"
+                    : "it ended without this runner stopping it"
+                log.log("\(runName) 🚨 THE REAL LOAD FAILED before arm \(no) — \(why), so arm "
+                    + "\(no - 1) ran wholly or partly SOLO while being labelled loaded. THAT ARM "
+                    + "IS VOID. Restarting the load for the arms that remain; score nothing "
+                    + "across this line.")
                 DispatchQueue.main.async { probe.stop() }
                 probeRunning = false
             }
+            lastArmStalled = false
             if wantsLoad && !probeRunning {
                 DispatchQueue.main.async {
                     probe.start(host: host, port: port, flows: self.probeFlows,
@@ -369,8 +397,25 @@ final class UplinkSplitRunner: ObservableObject {
                 + "routing=\(arm == .colocated ? "colocated" : (splitN > 0 ? "disjoint" : "whole-pool")) "
                 + "synth=\(Int(mbit))Mbit/s flows=\(wantsLoad ? probeFlows : 0) sec=\(armSec)")
             publish("arm \(no)/\(arms.count) · \(mode) · \(armSec)s")
+            // 🎯 THE LOAD WITNESS, AND IT IS BYTES RATHER THAN A FLAG. Sampled
+            // across the arm's own span, so a load that dies INSIDE an arm — the
+            // last one included — is caught by that arm and named by it, instead
+            // of being noticed at the next boundary or, for the final arm, never.
+            let txBefore = probe.bytesSent()
             sleep(seconds: armSec)
-            log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)")
+            let moved = probe.bytesSent() &- txBefore
+            var loadNote = ""
+            if wantsLoad {
+                loadNote = " load=+\(moved / (1 << 20))MiB"
+                if moved == 0 {
+                    // The neighbour is the treatment. An arm without it is a solo
+                    // arm, and it would score as one — quietly.
+                    loadNote += " 🚨 NO BYTES MOVED — the real load was dead for this whole arm, "
+                        + "so it is a SOLO arm wearing the '\(mode)' label. THIS ARM IS VOID."
+                    lastArmStalled = true
+                }
+            }
+            log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)\(loadNote)")
         }
 
         setLevel(0)

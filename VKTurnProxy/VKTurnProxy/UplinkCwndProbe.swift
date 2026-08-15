@@ -57,6 +57,22 @@ final class UplinkCwndProbe: ObservableObject {
     // struct, validated on Darwin against a loopback transfer (M1 gate).
     private let optTCPConnectionInfo: Int32 = 0x106
 
+    /// The kernel's own byte count, summed across the flows and refreshed by the
+    /// sampler every ~100 ms.
+    ///
+    /// 🚨 THIS — NOT `running` OR `sending` — IS WHAT PROVES THE LOAD IS MOVING.
+    /// Those two are LIFECYCLE: `sending` is set once when the flows come up and
+    /// cleared once when the run ends, so if every sender thread breaks out of
+    /// its loop on a socket error it stays TRUE for the rest of the deadline and
+    /// a pool of dead flows reads as a healthy one. A runner that schedules
+    /// against them can label an unloaded arm "paired" and nothing contradicts
+    /// it. *(User-caught, 2026-08-16.)*
+    ///
+    /// Taken from `TCP_CONNECTION_INFO`'s own `txbytes` rather than from our
+    /// `send()` returns, so it is the kernel's statement rather than ours.
+    private let txTotal = AtomicU64()
+    func bytesSent() -> UInt64 { txTotal.get() }
+
     /// Ask the run to end early. Safe from any thread; the loop notices within a
     /// tick and tears the flows down through its normal path.
     func stop() { stopped.set(true) }
@@ -356,14 +372,19 @@ final class UplinkCwndProbe: ObservableObject {
         // its own window the flow actually uses. winuse ≪ 100 = paced /
         // ACK-clock-limited (window slack); ≈ 100 = at the window edge.
         let start = Date()
+        txTotal.reset()
         var lossTicks = 0, reordTicks = 0, totalTicks = 0
         let sampleInterval = 0.1
         var prevTx = [UInt64](repeating: 0, count: fds.count)
         var prevMs = [Int](repeating: 0, count: fds.count)
         while Date() < deadline && !stopped.get() {
             let tms = Int(Date().timeIntervalSince(start) * 1000)
+            // Summed across flows for the liveness witness below. Each socket's
+            // txbytes is monotonic, so the sum is too.
+            var tickTx: UInt64 = 0
             for (i, fd) in fds.enumerated() {
                 guard let s = sample(fd) else { continue }
+                tickTx &+= s.txbytes
                 let loss = (s.flags & 0x1) != 0 ? 1 : 0
                 let reord = (s.flags & 0x2) != 0 ? 1 : 0
                 if i == 0 {
@@ -379,6 +400,10 @@ final class UplinkCwndProbe: ObservableObject {
                 prevTx[i] = s.txbytes; prevMs[i] = tms
                 log.log("cwndprobe \(tms),\(i),\(s.cwnd),\(s.ssthresh),\(s.sndwnd),\(s.sbbytes),\(s.srttMs),\(s.rttcurMs),\(loss),\(reord),\(s.mss),\(s.txbytes),\(s.rxRtxPkts),\(String(format: "%.2f", deliv)),\(winuse),\(s.txRtxBytes)")
             }
+            // `raise` rather than `set`: a flow whose getsockopt momentarily
+            // fails drops out of this tick's sum, and the witness must not read
+            // that as the load running backwards.
+            txTotal.raise(to: tickTx)
             Thread.sleep(forTimeInterval: sampleInterval)
         }
 
@@ -410,4 +435,17 @@ final class AtomicFlag {
     private var value = false
     func set(_ v: Bool) { lock.lock(); value = v; lock.unlock() }
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+/// A monotonic counter shared between the sampler and whoever is watching the
+/// run. Same hand-rolled shape as `AtomicFlag`, and monotonic ON PURPOSE: the
+/// reader's whole question is "did this advance", so a momentary dip — one
+/// flow's getsockopt failing and dropping out of the sum — must not be able to
+/// answer it.
+final class AtomicU64 {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+    func raise(to v: UInt64) { lock.lock(); if v > value { value = v }; lock.unlock() }
+    func reset() { lock.lock(); value = 0; lock.unlock() }
+    func get() -> UInt64 { lock.lock(); defer { lock.unlock() }; return value }
 }

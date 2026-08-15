@@ -1,0 +1,14 @@
+# Everything under tools/ is a local scratch harness and stays out of the repo.
+*
+
+# …EXCEPT the swiftcheck harness, which is not a scratch tool but a TEST: it
+# asserts invariants of the SHIPPED app (the stale-K migration, the diagnostic
+# run lock, the probe's duration bound) by compiling the real sources
+# standalone, because the app has no test target.
+#
+# 🚨 It was written, run, and CLAIMED BY A COMMIT MESSAGE while `git ls-files`
+# could not see it — a fresh clone had the claim and not the test. A blanket
+# ignore hides a test exactly as well as it hides a binary. (2026-08-16)
+!.gitignore
+!swiftcheck/
+!swiftcheck/*.swift
