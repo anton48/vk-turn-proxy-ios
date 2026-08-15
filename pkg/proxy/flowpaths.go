@@ -564,22 +564,31 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 	// synthetic-group writer and undo the very disjointness being measured. The
 	// runner refuses to start with both armed, so this branch is belt and braces.
 	// → uplinksplit.go
-	if uplinkSplit() > UplinkSplitOff && connIdx >= 0 {
-		src := p.sendCh
-		if splitOwnsSynth(connIdx) {
-			src = p.synthCh
-		}
-		select {
-		case item := <-src:
-			item.via = viaShared
-			noteSplitDispatch(item.synth, splitOwnsSynth(connIdx))
-			p.noteDispatch(item, connIdx, "shared")
-			return item, true
-		case <-done:
-			return sendItem{}, false
-		}
-	}
 	for {
+		// 0. THE SPLIT, re-checked on EVERY iteration for the same reason k is:
+		//    a writer parked here when the mode changes must not go on serving
+		//    the old grouping. It also parks on `splitWakeCh()`, because
+		//    re-checking is worthless to a goroutine that is already blocked —
+		//    the check happens after the wake, never before it.
+		if uplinkSplit() > UplinkSplitOff && connIdx >= 0 {
+			src := p.sendCh
+			if splitOwnsSynth(connIdx) {
+				src = p.synthCh
+			}
+			select {
+			case item := <-src:
+				item.via = viaShared
+				noteSplitDispatch(item.synth, splitOwnsSynth(connIdx))
+				p.noteDispatch(item, connIdx, "shared")
+				return item, true
+			case <-splitWakeCh():
+				// The split changed while we were parked. Round again and read
+				// the new grouping.
+				continue
+			case <-done:
+				return sendItem{}, false
+			}
+		}
 		// 🚨 RE-READ k ON EVERY ITERATION. Hoisting these two out of the loop was
 		// a real defect with a device signature, and it is worth the atomic load
 		// to keep them here.
@@ -655,6 +664,12 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 			// Something was queued to SOME path while we had nothing to do. Loop
 			// round to the sweep above rather than stealing here, so the owner
 			// still gets first refusal on its own packet.
+			continue
+		case <-splitWakeCh():
+			// The pool was just split (or un-split) while we were parked on the
+			// shared channel. Round again: step 0 above will put us on the right
+			// queue. Without this a writer that went to sleep before the arm
+			// switched would serve the WRONG group for the whole arm.
 			continue
 		case <-done:
 			return sendItem{}, false

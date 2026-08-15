@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"sync"
 	"sync/atomic"
 )
 
@@ -60,7 +61,48 @@ var uplinkSplitN atomic.Int64
 // SetUplinkSplitN applies the split to THIS process without a reconnect, so an
 // arm costs no 107-second thirty-connection ramp. Clamped: a value that would
 // leave either side without a writer is meaningless, and 0 is off.
-func SetUplinkSplitN(n int) { uplinkSplitN.Store(int64(ClampUplinkSplitN(n))) }
+func SetUplinkSplitN(n int) {
+	uplinkSplitN.Store(int64(ClampUplinkSplitN(n)))
+	wakeSplitWaiters()
+}
+
+// THE WAKE-UP, AND IT IS NOT OPTIONAL.
+//
+// 🚨 THE DEFECT IT FIXES, caught by the user before the first run and already on
+// record in this very file's neighbour: a writer that is PARKED on a channel does
+// not re-read the mode. With the split armed, group-A writers block on `synthCh`;
+// flip the split off and they are still blocked there, on a queue nothing will
+// ever fill again — so the arm runs with HALF THE POOL and nothing says so. The
+// 8-second gap between arms guarantees they are parked at exactly the moment the
+// mode changes, because the load is set to 0 for the whole gap.
+//
+// ⚠️ `stealHint` cannot serve: it has capacity 1 and wakes ONE writer, which is
+// right for "a packet appeared" and useless for "the world changed". A mode
+// change must reach ALL of them, so this is the generation-channel idiom —
+// CLOSE the current channel (every receiver fires at once) and install a fresh
+// one for the next change.
+//
+// This is the same lesson as build 254's parked-writer stall, which is why the
+// re-check now lives INSIDE `nextSendItem`'s loop rather than above it.
+var (
+	splitWakeMu sync.Mutex
+	splitWakeV  atomic.Value // chan struct{}, closed on every change
+)
+
+func init() { splitWakeV.Store(make(chan struct{})) }
+
+// splitWakeCh is the current generation. Take it INSIDE the select statement
+// that parks: a channel captured earlier is a channel that may already be the
+// previous generation.
+func splitWakeCh() <-chan struct{} { return splitWakeV.Load().(chan struct{}) }
+
+func wakeSplitWaiters() {
+	splitWakeMu.Lock()
+	defer splitWakeMu.Unlock()
+	old := splitWakeV.Load().(chan struct{})
+	splitWakeV.Store(make(chan struct{}))
+	close(old)
+}
 
 // ClampUplinkSplitN keeps the split inside [0, 29]: at least one connection must
 // remain on each side, and 0 means off.

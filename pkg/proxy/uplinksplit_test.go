@@ -175,3 +175,82 @@ func TestClampUplinkSplitN(t *testing.T) {
 		}
 	}
 }
+
+// 🚨🚨 THE DEFECT THE USER CAUGHT BEFORE THE FIRST RUN, and it would have been
+// silent. A writer PARKED on a channel does not re-read the mode. With the split
+// armed, group-A writers block on `synthCh`; if the split is then turned off
+// they are still blocked there, on a queue nothing will ever fill again — so the
+// arm runs with HALF THE POOL and no counter says so. The 8-second gap between
+// arms guarantees they are parked at exactly the moment the mode changes,
+// because the load is zero for the whole gap.
+//
+// SABOTAGE SEEN TO FAIL: remove the `case <-splitWakeCh(): continue` from the
+// split branch in nextSendItem. Compiles; the parked writer then never wakes and
+// this test times out at `done`.
+func TestParkedWriterWakesWhenTheSplitIsTurnedOff(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	SetUplinkSplitN(15)
+	p, cancel := splitTestProxy()
+	defer cancel()
+
+	done := make(chan struct{})
+	got := make(chan sendItem, 1)
+	go func() {
+		// Parks on synthCh, which stays empty for the whole test.
+		if item, ok := p.nextSendItem(done, 0); ok {
+			got <- item
+		}
+	}()
+	time.Sleep(50 * time.Millisecond) // let it park
+
+	SetUplinkSplitN(UplinkSplitOff)
+	_ = p.SendPacketFlow([]byte("after the flip"), 0)
+
+	select {
+	case item := <-got:
+		if string(item.buf) != "after the flip" {
+			t.Fatalf("woke with the wrong packet: %q", item.buf)
+		}
+	case <-time.After(2 * time.Second):
+		close(done)
+		t.Fatal("a writer parked on synthCh never woke after the split was turned off — " +
+			"that arm would have run with half the pool")
+	}
+}
+
+// The mirror: parked with the split OFF, on the shared channel, when the split is
+// turned ON. Without a wake it would go on taking WireGuard packets from the
+// shared queue — landing them on the synthetic's own allocations, which is the
+// exact contamination the split exists to remove.
+//
+// SABOTAGE SEEN TO FAIL: remove the `case <-splitWakeCh(): continue` from the
+// legacy blocking select. Compiles; this test then times out.
+func TestParkedWriterWakesWhenTheSplitIsTurnedOn(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	p, cancel := splitTestProxy()
+	defer cancel()
+
+	done := make(chan struct{})
+	got := make(chan sendItem, 1)
+	go func() {
+		if item, ok := p.nextSendItem(done, 0); ok {
+			got <- item
+		}
+	}()
+	time.Sleep(50 * time.Millisecond) // parks on the shared channel
+
+	SetUplinkSplitN(15)
+	_ = p.SendPacketSynth([]byte("synthetic after the flip"))
+
+	select {
+	case item := <-got:
+		if string(item.buf) != "synthetic after the flip" {
+			t.Fatalf("woke with the wrong packet: %q", item.buf)
+		}
+	case <-time.After(2 * time.Second):
+		close(done)
+		t.Fatal("a writer parked on the shared channel never learned the pool had been split")
+	}
+}
