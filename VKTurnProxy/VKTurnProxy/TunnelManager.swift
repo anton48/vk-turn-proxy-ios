@@ -1019,6 +1019,23 @@ class TunnelManager: ObservableObject {
         try? session.sendProviderMessage(msg) { _ in }
     }
 
+    /// Applies the uplink chunk size to the RUNNING tunnel.
+    ///
+    /// 🚨 THERE IS NO SETTING BEHIND THIS, and that is deliberate. Chunking is a
+    /// retired lever: the only caller is `UplinkPairedRunner`, which uses K as an
+    /// experiment ARM and needs it applied without a reconnect. It takes the
+    /// value as an argument rather than reading UserDefaults, so an arm can
+    /// never be silently overridden by a stale stored value — which is exactly
+    /// the failure this whole change exists to undo.
+    ///
+    /// No-op when the tunnel is down.
+    func applyUplinkChunkK(_ k: Int) {
+        let clamped = UplinkChunk.clamp(k)
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_uplink_chunk_k:\(clamped)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
     /// Applies the assignment mode live, for the same reason k applies live.
     ///
     /// ⚠️ A flow keeps the set it was given until its next lookup finds the mode

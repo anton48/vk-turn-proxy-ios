@@ -68,7 +68,53 @@ enum UplinkChunk {
     /// declares this key, and nothing near ContentView may ever observe it (a
     /// write there pops whatever is pushed). See the SwiftUI pop rule.
     static func stored(in defaults: UserDefaults = .standard) -> Int {
-        let raw = defaults.integer(forKey: "uplinkChunkK")
+        let raw = defaults.integer(forKey: key)
         return raw == 0 ? off : clamp(raw)
+    }
+
+    static let key = "uplinkChunkK"
+
+    /// The marker that makes the reset below happen exactly ONCE. Without it a
+    /// deliberate re-arm through the backup field would be undone at the next
+    /// launch, and the documented way to re-drive this machinery would be dead.
+    static let clearedKey = "uplinkChunkKStaleCleared"
+
+    /// 🚨 REMOVING A UI DOES NOT REMOVE THE STATE IT WROTE, and this is the fix
+    /// for a case that cost three days of measurements.
+    ///
+    /// The Advanced picker was deleted when the sweep closed on 2026-08-12, on
+    /// the assumption — written into the header of this file — that "default is
+    /// off, and off is byte-for-byte the behaviour the tunnel has always had".
+    /// That is true of a fresh install and false of any device that had ever
+    /// touched the picker: the value it wrote stayed in UserDefaults, `stored()`
+    /// kept returning it, and the tunnel ran K=64 for three days with no screen
+    /// showing it and no way to change it.
+    ///
+    /// 🚨 WHAT MADE IT INVISIBLE rather than merely wrong: K is INERT while the
+    /// send queue is shallow. Every synthetic-only run measured mean chunk 1.000
+    /// — the lever asleep — while every run with real inner traffic woke it
+    /// (mean 1.02-1.17, max 64, up to 14.8% of packets riding as extra positions
+    /// in a chunk). So it was silent in exactly the runs used as controls and
+    /// alive in exactly the runs used as measurements.
+    ///
+    /// Runs once, shouts when it fires, and leaves the backup field as the
+    /// deliberate way back in.
+    @discardableResult
+    static func clearStaleValueOnce(in defaults: UserDefaults = .standard,
+                                    log: ((String) -> Void)? = nil) -> Bool {
+        guard !defaults.bool(forKey: clearedKey) else { return false }
+        defaults.set(true, forKey: clearedKey)
+
+        let raw = defaults.integer(forKey: key)
+        guard raw != 0, clamp(raw) != off else { return false }
+
+        defaults.removeObject(forKey: key)
+        log?("uplink-chunk: 🚨 CLEARED a stale K=\(clamp(raw)) left in UserDefaults by the "
+            + "Advanced picker that was removed on 2026-08-12. The tunnel has been running "
+            + "that value ever since — it is INERT while the send queue is shallow and wakes "
+            + "up under real traffic, so it was invisible in every synthetic-only run. "
+            + "K is now \(off), which is production behaviour. Re-arm deliberately via the "
+            + "`uplinkChunkK` backup field if an experiment needs it.")
+        return true
     }
 }

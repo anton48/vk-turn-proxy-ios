@@ -28,6 +28,13 @@ struct VKTurnProxyApp: App {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         SharedLogger.shared.log("[App] VKTurnProxy launched (build \(build))")
 
+        // 🚨 One-time cleanup of a retired experiment's leftover state. The
+        // uplink-chunking picker was deleted in August 2026 and the value it had
+        // written kept driving the tunnel — see UplinkChunk.clearStaleValueOnce.
+        // Safe here: no view declares that key, so this write cannot re-render a
+        // NavigationView host and pop a pushed screen (the standing SwiftUI rule).
+        UplinkChunk.clearStaleValueOnce(log: { SharedLogger.shared.log("[App] \($0)") })
+
         // Instantiate the named-server store: first-launch migration captures the
         // user's existing single config as "Server1", and the store projects the
         // active server onto the flat @AppStorage keys that ContentView /

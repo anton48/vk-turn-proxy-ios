@@ -495,6 +495,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: uplink-synth target = \(Double(raw) / 100) Mbit/s")
             wgSetUplinkSynthCentiMbit(Int32(raw))
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_uplink_chunk_k:") {
+            // The uplink chunk size, applied to the RUNNING tunnel. 🚨 There is
+            // no picker for this and there must not be one — chunking is a
+            // retired lever, and K > 1 is only ever an arm of the paired A/B,
+            // which needs it live because a reconnect between arms inserts a
+            // ~107 s thirty-connection ramp. Go clamps at the sink.
+            let raw = Int(msg.dropFirst("set_uplink_chunk_k:".count)) ?? 0
+            logMsg("handleAppMessage: uplink chunk K = \(raw)")
+            wgSetUplinkChunkK(Int32(raw))
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("set_flow_paths_cover:") {
             // The SECOND arm of the flow-path experiment: it changes what a given
             // k means, so the Go side logs the mode and the memstats line carries

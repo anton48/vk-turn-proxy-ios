@@ -1099,6 +1099,35 @@ func wgSetFlowPathsK(k C.int32_t) {
 	proxy.SetFlowPathsK(int(k))
 }
 
+// Applies the uplink chunk size K to THIS process without a reconnect.
+//
+// 🚨 THIS CHANNEL WAS DELETED ONCE AND HAD TO COME BACK, and the reason is worth
+// keeping. When the chunking sweep closed on 2026-08-12 the picker, this export
+// and its provider message were all removed — but the VALUE the picker had
+// written stayed in UserDefaults, so the tunnel kept running K=64 for three days
+// with no way to see it and no way to change it. Removing a UI does not remove
+// the state it wrote. Worse, K=64 is INERT while the send queue is shallow and
+// wakes up exactly when real traffic fills it, so it was silent in every
+// synthetic-only run and alive in every run with real traffic — which is the set
+// of runs the whole uplink-loss question is built on. (Found 2026-08-15.)
+//
+// So the lever stays retired — no picker, no Advanced row — and this export
+// exists for ONE purpose: the paired A/B needs K as an ARM, and an arm applied
+// through a reconnect puts a ~107 s thirty-connection ramp between arms on a
+// line that moves 75 → 363 Mbit/s inside 70 minutes.
+//
+// ⚠️ proxy.SetUplinkChunkK clamps at the sink, and `writeChunk` force-disables
+// chunking whenever a flow-local path set is armed — so an arm that sets K=64
+// with flowPathsK > 0 would silently run K=1. The runner refuses to start in
+// that case; do not remove that guard.
+//
+//export wgSetUplinkChunkK
+func wgSetUplinkChunkK(k C.int32_t) {
+	proxy.SetUplinkChunkK(int(k))
+	log.Printf("handleAppMessage: uplink chunk K = %d (chunking is a RETIRED lever; "+
+		"K > 1 is only ever an experiment arm)", int(k))
+}
+
 // Sets the paced synthetic uplink's target rate on THIS process without a
 // reconnect, in hundredths of a Mbit/s. 0 stops it.
 //

@@ -210,6 +210,16 @@ final class UplinkSynthRunner: ObservableObject {
         }
         let totalArms = passes * levels.count
 
+        // 🚨 EVERY KNOB, BEFORE THE PLAN. The ramp runs of 2026-08-15 were all
+        // taken with `uplinkChunkK=64` in effect; it happened to be INERT there
+        // (mean chunk 1.001, because a synthetic-only queue is shallow) and that
+        // was luck, not design. A knob that could change what a run measures
+        // belongs on the run's own plan line, not only in the connect-time dump.
+        var knobs = ""
+        DispatchQueue.main.sync {
+            knobs = ExperimentKnobs.summary(server: ServerStore.shared.activeServer)
+        }
+        log.log("synthab \(knobs)")
         log.log("synthab PLAN pool=\(gate.why) levels=\(levels.map { String(format: "%.0f", $0) }.joined(separator: ",")) Mbit/s "
             + "armSec=\(armSec) passes=\(passes) gapSec=\(gapSec) warmupSec=\(warmupSec) "
             + "arms=\(totalArms) estimated=\(estimatedSeconds)s — RAMP UP AND BACK DOWN, "

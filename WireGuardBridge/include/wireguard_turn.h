@@ -185,6 +185,12 @@ void wgSetFlowPathsK(int32_t k);
 void wgSetUplinkSynthCentiMbit(int32_t centiMbit);
 void wgSetFlowPathsCover(int32_t on);
 
+/// Uplink chunk size K, applied live. 1 = off and is what production runs.
+/// 🚨 A RETIRED lever with no UI: K > 1 is only ever an arm of the paired A/B.
+/// It was removed entirely once, and the value the deleted picker had written
+/// went on driving the tunnel for three days — see bridge.go.
+void wgSetUplinkChunkK(int32_t k);
+
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
 /// The extension polls this after bootstrap (cookie mode only) — a non-empty
 /// value means the saved cookie was rejected/expired in the background, so the
