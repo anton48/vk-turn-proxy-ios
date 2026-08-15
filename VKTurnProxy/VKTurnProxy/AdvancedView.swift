@@ -74,6 +74,7 @@ struct AdvancedView: View {
     /// @StateObject so it survives this pushed view's re-renders while running.
     @StateObject private var cwndProbe = UplinkCwndProbe()
     @StateObject private var flowAB = UplinkFlowABRunner()
+    @StateObject private var synthAB = UplinkSynthRunner()
     @State private var probeHost = "192.168.102.1:5202"
     @State private var probeFlows = 8
     @State private var probeDuration = 20
@@ -226,10 +227,33 @@ struct AdvancedView: View {
                 .onChange(of: uplinkSynthMbit) { _ in
                     TunnelManager.shared.applyUplinkSynthMbit()
                 }
+                .disabled(synthAB.running)
+
+                // The scripted dose-response. Same section and footer as the
+                // picker it drives, for the same reason the flow A/B sits with
+                // the probe: it is that setting on a schedule, not a second
+                // unrelated switch.
+                //
+                // 🚨 A RUNNER RATHER THAN A STOPWATCH, and the reason is on
+                // record: hand-timed arms are how build 247 lost two runs of
+                // six. Here the arm length, the gaps and the level order are
+                // constants, and every boundary lands in the log as a marker.
+                Button(synthAB.running
+                        ? "Running the sweep…"
+                        : "Run the load sweep (~\(synthAB.estimatedSeconds / 60) min)") {
+                    synthAB.start()
+                }
+                .disabled(synthAB.running || cwndProbe.running || flowAB.running)
+                if synthAB.running {
+                    Button("Stop the sweep", role: .destructive) { synthAB.cancel() }
+                }
+                Text(synthAB.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text("Uplink experiment")
             } footer: {
-                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.\n\nLeast-used paths first changes HOW those few paths are picked: each new connection takes the ones carrying the fewest others, so the small sets still add up to all of them. It does nothing while the setting above is Off, and it changes what that setting measures — so turn it on before a measurement, not during one.\n\nSynthetic uplink load sends paced filler traffic through the tunnel at a fixed rate, to hold the connections at a chosen share of what each one is allowed to carry. It applies to a tunnel that is already connected, it ADDS to whatever else the phone is sending, and it stops itself after ten minutes so a level left on cannot keep the radio busy. Off is the normal setting; the answer is read on the server, not here.")
+                Text("Sends each connection's traffic over a few of the tunnel's paths instead of all of them, while still using every path when those few are busy. Takes effect immediately, on a tunnel that is already connected.\n\nOff is the normal behaviour. This is a measurement, not a speed setting — leave it Off unless you are running one.\n\nLeast-used paths first changes HOW those few paths are picked: each new connection takes the ones carrying the fewest others, so the small sets still add up to all of them. It does nothing while the setting above is Off, and it changes what that setting measures — so turn it on before a measurement, not during one.\n\nSynthetic uplink load sends paced filler traffic through the tunnel at a fixed rate, to hold the connections at a chosen share of what each one is allowed to carry. It applies to a tunnel that is already connected, it ADDS to whatever else the phone is sending, and it stops itself after ten minutes so a level left on cannot keep the radio busy. Off is the normal setting; the answer is read on the server, not here.\n\nThe sweep button runs the pre-registered comparison by itself: three load levels, two minutes each, twice through with the order reversed, with short gaps so the numbers for one level stay its own. It writes marker lines so the levels can be cut out of the log exactly, it refuses to start unless the connections are up, and it returns the load to Off when it finishes or is stopped. Keep this screen in the foreground, and take a VPN-off control before and after.")
             }
 
             // 🚨 Its own section (see the note above the Logging one). Diagnostic

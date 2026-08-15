@@ -15,6 +15,7 @@
 		1B2231DF1954F65A65A76DF6 /* WireGuardTURN.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 99E2AC40D13D6F8DD598752A /* WireGuardTURN.xcframework */; };
 		2263C90DC75E56A0D637B2B4 /* CredCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = B72BF34DDA41B9171843CDA5 /* CredCache.swift */; };
 		23FB3FA154A0B74AE5DFB39C /* ConfigValidation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0ACB6146869BD6DC55039EC2 /* ConfigValidation.swift */; };
+		2D8A9860293B3D35797E5D4B /* UplinkSynthRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D7F1740B04FA0B3E9B79C9B /* UplinkSynthRunner.swift */; };
 		302CCA96A99CD22B03E23267 /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 41F2E4485000AF848A0CFE03 /* AppIntents.framework */; };
 		34A869BAE79B9DB63568AC30 /* ServerEditView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16894D17BB018EECDC8F01FF /* ServerEditView.swift */; };
 		3A39EA7CCA17B5386327D0EA /* VKTurnProxyWidgetBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9126F72D30AE6D3503CC167 /* VKTurnProxyWidgetBundle.swift */; };
@@ -114,6 +115,7 @@
 		605ED1D89D0F1886A8414767 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		6D9ADA67065E63261009BBE2 /* KeyboardDismisser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardDismisser.swift; sourceTree = "<group>"; };
 		7342F754F29FF238732D4C8A /* VKTurnProxy.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VKTurnProxy.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		7D7F1740B04FA0B3E9B79C9B /* UplinkSynthRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UplinkSynthRunner.swift; sourceTree = "<group>"; };
 		833BDC3A0FA5D02DCB09DB59 /* ServerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProfile.swift; sourceTree = "<group>"; };
 		8B1A512B35CE1D505CB1A3CD /* LiveActivityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityController.swift; sourceTree = "<group>"; };
 		99E2AC40D13D6F8DD598752A /* WireGuardTURN.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = WireGuardTURN.xcframework; path = ../WireGuardBridge/build/WireGuardTURN.xcframework; sourceTree = "<group>"; };
@@ -235,6 +237,7 @@
 				430CB5E36FB44FB306235CC0 /* UplinkCwndProbe.swift */,
 				EE78EF117E4D7F36F2D0AA2D /* UplinkFlowABRunner.swift */,
 				3E54813375C73B53E9094558 /* UplinkSynth.swift */,
+				7D7F1740B04FA0B3E9B79C9B /* UplinkSynthRunner.swift */,
 				B15C079F499D57B27E1635DE /* VKAuthWebView.swift */,
 				EB18A0573ABD15BB23B9E7D7 /* VKCallsAPI.swift */,
 				D5927A5725339CB3E0F08E4B /* VKCookieStore.swift */,
@@ -436,6 +439,7 @@
 				9B9D55BA5248F31E477EB387 /* UplinkCwndProbe.swift in Sources */,
 				1AA83E1C9AC88278DFCDB156 /* UplinkFlowABRunner.swift in Sources */,
 				162CCBC282209653F9411135 /* UplinkSynth.swift in Sources */,
+				2D8A9860293B3D35797E5D4B /* UplinkSynthRunner.swift in Sources */,
 				548E254EF4C178FACD9DCAF6 /* VKAuthWebView.swift in Sources */,
 				F0801AAE2F21FAF8BBED6622 /* VKCallsAPI.swift in Sources */,
 				AE025DA7D5CF543AFACF6F20 /* VKCookieStore.swift in Sources */,
