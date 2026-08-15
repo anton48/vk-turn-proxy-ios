@@ -61,15 +61,29 @@ final class UplinkCwndProbe: ObservableObject {
     /// tick and tears the flows down through its normal path.
     func stop() { stopped.set(true) }
 
+    /// 🚨 THE DURATION BOUND IS NOT A DETAIL — see `ProbeDuration.swift`. It used
+    /// to be an inline `min(durationSec, 120)`, which silently cut every runner's
+    /// request to two minutes; the split runner keeps ONE probe across four arms
+    /// and three of them would have carried no load at all while the runner still
+    /// believed it was running. The bound is now well above every caller AND it
+    /// SHOUTS when it bites, because a shortened run reads exactly like a
+    /// completed one.
     func start(host: String, port: UInt16, flows: Int, durationSec: Int) {
         guard !running else { return }
+        let dur = ProbeDuration.clamp(durationSec)
+        if ProbeDuration.clamps(durationSec) {
+            SharedLogger.shared.log("cwndprobe 🚨 DURATION CLAMPED \(durationSec)s → \(dur)s "
+                + "(bounds \(ProbeDuration.minSec)-\(ProbeDuration.maxSec)s). If a RUNNER asked "
+                + "for this, its arms will outlive the load and every arm after the probe dies "
+                + "is a solo arm in disguise — read the plan's own length before scoring.")
+        }
         stopped.set(false)
         running = true
         status = "connecting…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.run(host: host, port: port,
                       flows: max(1, min(flows, 64)),
-                      durationSec: max(1, min(durationSec, 120)))
+                      durationSec: dur)
         }
     }
 

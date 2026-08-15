@@ -305,7 +305,30 @@ final class UplinkSplitRunner: ObservableObject {
             // nothing, which is why the plan keeps arms 3-6 — colocated · split ·
             // split · colocated, the three SCORED conditions and their repeat —
             // continuous. Five transitions in all; `loadTransitions` counts them.
+            // 🚨 ASK THE PROBE, DO NOT TRUST OUR OWN FLAG. `probeRunning` records
+            // what this runner INTENDED; the probe can end on its own — it used to
+            // do exactly that, at a hard 120 s, which is three of these arms. A
+            // flag that says "running" while nothing is sending turns arms 4-6
+            // into solo arms wearing the wrong label, and the log would carry no
+            // sign of it. So the state is READ from the probe at every boundary,
+            // the same fix as deriving `loadTransitions` from `arms`: do not keep
+            // a second copy of something that already has an owner.
+            // *(User-caught, 2026-08-16.)*
             let wantsLoad = arm != .solo
+            var loadAlive = false
+            DispatchQueue.main.sync { loadAlive = probe.running && probe.sending }
+            if probeRunning && !loadAlive {
+                // 🚨 It died without being asked. Whatever arm just ended was
+                // partly or wholly unloaded, and no counter on the server side can
+                // tell that apart from "the neighbour stopped mattering".
+                log.log("\(runName) 🚨 PROBE DIED ON ITS OWN before arm \(no) — the real load "
+                    + "ended without this runner stopping it, so arm \(no - 1) ran wholly or "
+                    + "partly SOLO while being labelled loaded. THAT ARM IS VOID, and so is any "
+                    + "earlier arm that shares its probe. Restarting the load for the arms that "
+                    + "remain; score nothing across this line.")
+                DispatchQueue.main.async { probe.stop() }
+                probeRunning = false
+            }
             if wantsLoad && !probeRunning {
                 DispatchQueue.main.async {
                     probe.start(host: host, port: port, flows: self.probeFlows,
