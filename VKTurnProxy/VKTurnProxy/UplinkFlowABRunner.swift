@@ -41,6 +41,14 @@ import Foundation
 /// The runner writes `flowab` markers to the same log as the probe, so the
 /// parser aligns arms on the log's own timestamps instead of a stopwatch.
 final class UplinkFlowABRunner: ObservableObject {
+    /// 🚨 SHARED — see DiagnosticRunLock. A runner must outlive the view that
+    /// started it, or a re-created view hands the next tap a fresh, idle object
+    /// and a second concurrent run begins.
+    static let shared = UplinkFlowABRunner()
+
+    /// The name this run takes in `DiagnosticRunLock` and in its log lines.
+    private let runName = "flowab"
+
     @Published var running = false
     @Published var status = "idle"
 
@@ -105,6 +113,15 @@ final class UplinkFlowABRunner: ObservableObject {
 
     func start(host: String, port: UInt16, probe: UplinkCwndProbe) {
         guard !running else { return }
+        // Process-wide, taken before anything is dispatched: two diagnostic
+        // runs on one tunnel means two probes and overlapping arms.
+        guard DiagnosticRunLock.acquire(runName) else {
+            let who = DiagnosticRunLock.current ?? "another run"
+            SharedLogger.shared.log("\(runName) REFUSED — `\(who)` is already running "
+                + "on this tunnel. Stop the other one first.")
+            status = "not started — \(who) is already running"
+            return
+        }
         running = true
         cancelledFlag.set(false)
         self.probe = probe
@@ -124,6 +141,7 @@ final class UplinkFlowABRunner: ObservableObject {
     private weak var probe: UplinkCwndProbe?
 
     private func run(host: String, port: UInt16, probe: UplinkCwndProbe) {
+        defer { DiagnosticRunLock.release(runName) }
         let log = SharedLogger.shared
         let runSec = armSec * armsPerRun
         var runIdx = 0

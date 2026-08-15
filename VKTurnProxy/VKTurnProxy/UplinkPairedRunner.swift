@@ -46,8 +46,20 @@ import Foundation
 /// about half the 30 × 2.07 ≈ 62 budget, leaving room for the probe without
 /// pushing the pool into the region where loss appears at all.
 final class UplinkPairedRunner: ObservableObject {
+    /// 🚨 SHARED, because a runner must outlive the view that started it. On
+    /// 2026-08-15 a second tap landed on a freshly-created runner object — the
+    /// view had been re-created, its `@StateObject` was idle again — and started
+    /// a SECOND concurrent run 38 s behind the first. With one instance the
+    /// screen shows the true state after any re-render, and `running` means what
+    /// it says. The process-wide lock below is the second line of defence, for
+    /// the case where the competing run is a DIFFERENT runner.
+    static let shared = UplinkPairedRunner()
+
     @Published var running = false
     @Published var status = "idle"
+
+    /// The name this run takes in `DiagnosticRunLock` and in its log lines.
+    private let runName = "pairedab"
 
     private let cancelledFlag = AtomicFlag()
     private var cancelled: Bool { cancelledFlag.get() }
@@ -88,6 +100,18 @@ final class UplinkPairedRunner: ObservableObject {
 
     func start(host: String, port: UInt16, probe: UplinkCwndProbe) {
         guard !running else { return }
+        // 🚨 THE GUARD THAT THE PER-OBJECT ONE ABOVE CANNOT BE: taken on the
+        // caller's thread, before anything is dispatched, and scoped to the
+        // PROCESS — because the resource being protected is the tunnel, not this
+        // object. See DiagnosticRunLock for the run this cost.
+        guard DiagnosticRunLock.acquire(runName) else {
+            let who = DiagnosticRunLock.current ?? "another run"
+            SharedLogger.shared.log("\(runName) REFUSED — `\(who)` is already running on this "
+                + "tunnel. Two diagnostic runs at once means two probes, double the real load "
+                + "and overlapping arms, which no re-analysis can undo. Stop the other one first.")
+            status = "not started — \(who) is already running"
+            return
+        }
         running = true
         cancelledFlag.set(false)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -102,6 +126,10 @@ final class UplinkPairedRunner: ObservableObject {
     }
 
     private func run(host: String, port: UInt16, probe: UplinkCwndProbe) {
+        // One release for every exit path, including the refusals below and the
+        // mid-run abort — a lock that leaks on an early return would make the
+        // next honest attempt refuse forever.
+        defer { DiagnosticRunLock.release(runName) }
         let log = SharedLogger.shared
         let plan = arms
 

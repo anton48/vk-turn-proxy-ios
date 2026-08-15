@@ -33,6 +33,12 @@ import Combine
 import Darwin
 
 final class UplinkCwndProbe: ObservableObject {
+    /// 🚨 SHARED for the same reason as the runners: the runners hand THIS object
+    /// to their arms, and a view re-creation used to produce a second probe — so
+    /// two runs opened 8 flows each and the paired arms carried 16. One instance
+    /// makes that impossible, and its own `guard !running` then actually bites.
+    static let shared = UplinkCwndProbe()
+
     @Published var running = false
     /// Set by stop(); the send loop checks it every tick. Without this the A/B
     /// runner could stop ITSELF but not the traffic it started, so pressing Stop

@@ -41,6 +41,14 @@ import Foundation
 /// all. The gap between arms exists for the other half of the same problem: it
 /// lets the packets in flight at the boundary land before the next reading.
 final class UplinkSynthRunner: ObservableObject {
+    /// 🚨 SHARED — see DiagnosticRunLock. A runner must outlive the view that
+    /// started it, or a re-created view hands the next tap a fresh, idle object
+    /// and a second concurrent run begins.
+    static let shared = UplinkSynthRunner()
+
+    /// The name this run takes in `DiagnosticRunLock` and in its log lines.
+    private let runName = "synthab"
+
     @Published var running = false
     @Published var status = "idle"
 
@@ -116,6 +124,15 @@ final class UplinkSynthRunner: ObservableObject {
 
     func start() {
         guard !running else { return }
+        // Process-wide, taken before anything is dispatched: two diagnostic
+        // runs on one tunnel means two probes and overlapping arms.
+        guard DiagnosticRunLock.acquire(runName) else {
+            let who = DiagnosticRunLock.current ?? "another run"
+            SharedLogger.shared.log("\(runName) REFUSED — `\(who)` is already running "
+                + "on this tunnel. Stop the other one first.")
+            status = "not started — \(who) is already running"
+            return
+        }
         running = true
         cancelledFlag.set(false)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -189,6 +206,7 @@ final class UplinkSynthRunner: ObservableObject {
     }
 
     private func run() {
+        defer { DiagnosticRunLock.release(runName) }
         let log = SharedLogger.shared
 
         let planOK = levelsAreSupported()

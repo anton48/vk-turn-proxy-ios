@@ -69,13 +69,23 @@ struct AdvancedView: View {
     // ContentView.swift` = 0.
     @AppStorage(UplinkSynth.key) private var uplinkSynthMbit = UplinkSynth.off
 
-    /// Diagnostic uplink cwnd probe (build 241). Ephemeral @State, not backed
-    /// up: it is a one-sitting measurement, not a preference. The runner is a
-    /// @StateObject so it survives this pushed view's re-renders while running.
-    @StateObject private var cwndProbe = UplinkCwndProbe()
-    @StateObject private var pairedAB = UplinkPairedRunner()
-    @StateObject private var flowAB = UplinkFlowABRunner()
-    @StateObject private var synthAB = UplinkSynthRunner()
+    /// Diagnostic uplink cwnd probe (build 241). Ephemeral, not backed up: it is
+    /// a one-sitting measurement, not a preference.
+    ///
+    /// 🚨 SHARED INSTANCES, `@ObservedObject`, NOT `@StateObject` — and this is a
+    /// correctness fix, not a style choice. `@StateObject` ties the object's life
+    /// to the VIEW's: when this pushed screen is re-created for any reason, the
+    /// old runner's background thread keeps driving the tunnel while the new view
+    /// gets a fresh, idle one. On 2026-08-15 that is exactly what happened — the
+    /// screen showed "idle" during a run, the next tap started a SECOND eight-arm
+    /// run 38 s behind the first, and the paired arms carried 16 real flows
+    /// instead of 8. With one shared instance the screen shows the true state
+    /// after any re-render, and `running` means what it says.
+    /// See [[DiagnosticRunLock]] for the second line of defence.
+    @ObservedObject private var cwndProbe = UplinkCwndProbe.shared
+    @ObservedObject private var pairedAB = UplinkPairedRunner.shared
+    @ObservedObject private var flowAB = UplinkFlowABRunner.shared
+    @ObservedObject private var synthAB = UplinkSynthRunner.shared
     @State private var probeHost = "192.168.102.1:5202"
 
     /// The sink address, parsed once. It used to be split inline at every call
