@@ -34,15 +34,25 @@ enum UplinkSynth {
     /// payload figure at a 1200-byte packet.
     static let perAllocationMbit = 2.07
 
-    /// The sweep points, in Mbit/s. Chosen so that at the shipped NumConns = 30
-    /// they land at roughly 20 / 30 / 60 / 95% of the 30 × 2.07 ≈ 62 Mbit/s
-    /// allocation budget, with one point above it to show the meter engaging.
+    /// The sweep points, in Mbit/s, against the 30 × 2.07 ≈ 62 Mbit/s allocation
+    /// budget: a coarse low end (12/19/37) kept from the first dose-response,
+    /// then **40 / 55 / 58 / 59 / 60 packed against the knee** for the ramp that
+    /// probes hysteresis, and 80 above it to show the meter engaging.
+    ///
+    /// 🚨 **EVERY LEVEL `UplinkSynthRunner` USES MUST BE IN THIS LIST.** `clamp`
+    /// snaps to the NEAREST point, so a level missing here is not rejected — it
+    /// is silently replaced by its neighbour, and the run measures a plan nobody
+    /// wrote. Adding 40/55/58/60 to the runner without adding them here would
+    /// have run 37/59/59/59 instead, and the log would have looked correct
+    /// because the generator honestly reports the rate it was given. The runner
+    /// now REFUSES to start if any of its levels does not survive `clamp`
+    /// unchanged; this comment is the other half of that guard.
     ///
     /// ⚠️ They are ABSOLUTE, so at a different connection count they mean a
     /// different fraction — recompute rather than assuming. The Go side logs
     /// the rate it actually ran, and the SERVER's 2-second per-conn dump is
     /// what says which fraction was really reached.
-    static let choices: [Double] = [0, 12, 19, 37, 59, 80]
+    static let choices: [Double] = [0, 12, 19, 37, 40, 55, 58, 59, 60, 80]
 
     /// The fraction of the allocation budget a rate represents at `conns`
     /// connections, for the picker's own label. Display only.

@@ -47,24 +47,52 @@ final class UplinkSynthRunner: ObservableObject {
     private let cancelledFlag = AtomicFlag()
     private var cancelled: Bool { cancelledFlag.get() }
 
-    /// 🚨 THE PLAN IS PRE-REGISTERED AND IS NOT A KNOB. Three levels, chosen as
-    /// roughly 30 / 60 / 95% of the 30 × 2.07 ≈ 62 Mbit/s allocation budget, so
-    /// the sweep straddles the knee rather than surrounding it — the bucket
-    /// lesson of the ACK-gap counter, where 250 and 500 ms differed 39× in
-    /// frequency and the deciding value sat between them.
+    /// 🚨 THE PLAN IS PRE-REGISTERED AND IS NOT A KNOB.
     ///
-    /// ⚠️ The percentages assume the shipped NumConns = 30. At another count the
-    /// same rates mean another fraction, and the SERVER's 2-second per-conn dump
-    /// is what says which fraction was really reached — never this list.
-    private let levels: [Double] = [19, 37, 59]
+    /// With `passes = 2` and the order reversed on the second pass, this list
+    /// produces **40 · 55 · 58 · 59 · 60 · 60 · 59 · 58 · 55 · 40** — a RAMP UP
+    /// AND BACK DOWN, which is a different experiment from the first sweep and a
+    /// better one for the question that survived it.
+    ///
+    /// 🎯 **WHY A RAMP: IT IS A HYSTERESIS PROBE.** The 08-15 runs left exactly
+    /// one form of VK's meter alive — a token bucket — and the signature that
+    /// separates a bucket from a plain rate limit is **memory**: a bucket
+    /// emptied at 60 is still empty when the load comes back down to 59 and 58,
+    /// so the DOWN arm at a level must lose more than the UP arm at the same
+    /// level. A rate limit has no memory and the two arms must match. **The
+    /// paired comparison is arm 4 vs arm 7 (59), arm 3 vs arm 8 (58), arm 2 vs
+    /// arm 9 (55), arm 1 vs arm 10 (40)** — score those pairs, not the levels
+    /// in isolation.
+    ///
+    /// 🚨 **WHAT THE RAMP GIVES UP, stated because it is a real cost.** The
+    /// reversal used to be drift control: each level appeared once early and
+    /// once late, so a session that got worse over time loaded on no level in
+    /// particular. In a palindrome the SEPARATION IS UNEQUAL — 40 is measured
+    /// first and last, while the two 60 arms are ADJACENT. So the top level, the
+    /// one we care most about, has the worst protection against drift, and the
+    /// naked controls at both ends are the only guard on it. Take them.
+    ///
+    /// ⚠️ **And the levels are packed where the resolution is worst.** 58/59/60
+    /// are 3% apart in offered rate while the per-arm loss at that level varied
+    /// **10× between two arms of the same level** on 08-15 (961 against 87). So
+    /// this plan can show a MONOTONE TREND across 40 → 60 and a hysteresis gap
+    /// between up and down; it cannot resolve 58 from 59 from 60 on one session.
+    /// Do not read a difference between adjacent top levels as a finding.
+    ///
+    /// ⚠️ The percentages assume the shipped NumConns = 30: 40/55/58/59/60
+    /// Mbit/s are roughly **66 / 90 / 95 / 97 / 98%** of the knee in WIRE bytes.
+    /// The SERVER's per-conn dump is what says which fraction was really
+    /// reached — never this list.
+    private let levels: [Double] = [40, 55, 58, 59, 60]
 
     /// 120 s per arm. Long enough that a ~1% loss made of bursts (67% of it
     /// arrived in 4 of 36 ticks on the run that motivated this) has many bursts
     /// to average over: at 19 Mbit/s that is ~216 000 packets per arm.
     private let armSec = 120
 
-    /// Two passes with the level order REVERSED, so a drift across the session
-    /// loads onto neither end of the sweep.
+    /// Two passes with the level order REVERSED. With the ramp above this is
+    /// what makes the sequence a palindrome — the second pass IS the way back
+    /// down, and each level's up-arm and down-arm are the pair to compare.
     private let passes = 2
 
     /// Between arms: long enough for the packets in flight at the boundary to
@@ -139,8 +167,36 @@ final class UplinkSynthRunner: ObservableObject {
         return (true, "\(active)/\(total) connections")
     }
 
+    /// 🚨 STEP 0b — REFUSE RATHER THAN RUN A PLAN NOBODY WROTE.
+    ///
+    /// `UplinkSynth.clamp` snaps to the NEAREST sweep point, so a level this
+    /// runner asks for that is missing from `UplinkSynth.choices` is not
+    /// rejected — it is silently replaced by its neighbour. Adding 40/55/58/60
+    /// here without adding them there would have run 37/59/59/59, and nothing
+    /// in the log would have looked wrong, because the generator faithfully
+    /// reports the rate it was handed. This is the same defect class as the
+    /// cover toggle the A/B runner never touched, and the same fix: make the
+    /// silent substitution loud.
+    private func levelsAreSupported() -> (ok: Bool, why: String) {
+        let bad = levels.filter { UplinkSynth.clamp($0) != $0 }
+        guard bad.isEmpty else {
+            let list = bad.map { String(format: "%.0f→%.0f", $0, UplinkSynth.clamp($0)) }
+            return (false, "these levels are not sweep points and would be SILENTLY "
+                + "SNAPPED to their neighbours: \(list.joined(separator: ", ")). "
+                + "Add them to UplinkSynth.choices.")
+        }
+        return (true, "")
+    }
+
     private func run() {
         let log = SharedLogger.shared
+
+        let planOK = levelsAreSupported()
+        guard planOK.ok else {
+            log.log("synthab REFUSED — \(planOK.why) Nothing was sent.")
+            publish("not started — the plan's levels are not sweep points", running: false)
+            return
+        }
 
         let gate = poolReady()
         guard gate.ok else {
@@ -156,11 +212,16 @@ final class UplinkSynthRunner: ObservableObject {
 
         log.log("synthab PLAN pool=\(gate.why) levels=\(levels.map { String(format: "%.0f", $0) }.joined(separator: ",")) Mbit/s "
             + "armSec=\(armSec) passes=\(passes) gapSec=\(gapSec) warmupSec=\(warmupSec) "
-            + "arms=\(totalArms) estimated=\(estimatedSeconds)s — "
-            + "score each arm as the DELTA of cum-lost across its boundaries, per receiver index "
-            + "(the synthetic is 5d170000); the per-interval `lost` is deferred by one 8128-counter "
-            + "window and would smear each level into the next. Verify the LEVEL from the server's "
-            + "2s per-conn dump, not from these numbers.")
+            + "arms=\(totalArms) estimated=\(estimatedSeconds)s — RAMP UP AND BACK DOWN, "
+            + "so this is a HYSTERESIS probe: pair each level's dir=up arm with its dir=down arm "
+            + "(a token bucket emptied at the top is still empty on the way down and must lose MORE "
+            + "there; a plain rate limit has no memory and the two must match). "
+            + "Score each arm as the DELTA of cum-lost across its boundaries, per receiver index "
+            + "(the synthetic is 5d170000) — cum-lost is a DEFICIT SNAPSHOT, not an accumulator, so "
+            + "it falls when late packets land and only the level it settles at is loss; the "
+            + "per-interval `lost` is deferred by one 8128-counter window and would smear each level "
+            + "into the next. Verify the LEVEL from the server's 2s per-conn dump and its 100ms "
+            + "conn-rate line, never from these numbers.")
 
         // Warm-up: the generator waits for the pool on its first arm, and that
         // wait must not land inside a scored one.
@@ -187,8 +248,13 @@ final class UplinkSynthRunner: ObservableObject {
 
                 setLevel(level)
                 let started = Date()
-                log.log(String(format: "synthab ARM a=%d/%d pass=%d mbit=%.0f sec=%d",
-                               armIdx, totalArms, p + 1, level, armSec))
+                // `dir` is what makes the hysteresis pairing greppable: the UP
+                // arm and the DOWN arm at the same `mbit` are the comparison,
+                // and an arm boundary that lives only in the operator's head is
+                // an arm boundary that cannot be recovered from the log.
+                let dir = p % 2 == 0 ? "up" : "down"
+                log.log(String(format: "synthab ARM a=%d/%d pass=%d dir=%@ mbit=%.0f sec=%d",
+                               armIdx, totalArms, p + 1, dir, level, armSec))
                 publish(String(format: "arm %d/%d · pass %d · %.0f Mbit/s · %ds",
                                armIdx, totalArms, p + 1, level, armSec))
                 sleep(seconds: armSec)
