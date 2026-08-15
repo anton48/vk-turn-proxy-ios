@@ -72,11 +72,50 @@ final class UplinkSplitRunner: ObservableObject {
     private let gapSec = 8
     private let warmupSec = 25
 
-    /// shared · split · split · shared — a palindrome, so a drift across the
-    /// session cannot load onto either condition.
-    private let arms = [false, true, true, false]
+    /// After the real load is switched on or off, before the arm is declared:
+    /// long enough for 8 TCP flows to leave slow start, and for the pool to
+    /// drain when it goes the other way.
+    private let settleSec = 12
 
-    var estimatedSeconds: Int { warmupSec + arms.count * (armSec + gapSec) }
+    /// 🎯 THE SEQUENCE, and it is the user's (2026-08-16). Six arms, a palindrome
+    /// in every condition, so a drift across the session cannot load onto any of
+    /// them:
+    ///
+    ///     solo · shared · split · split · shared · solo
+    ///
+    /// The two SOLO arms are what make the reading unambiguous, and they are the
+    /// part my first plan got wrong: it leaned on the ramp's 0.02-0.03% from
+    /// ANOTHER SESSION as the "alone" reference, on a line that moves 75 → 363
+    /// Mbit/s inside 70 minutes. The control belongs in the same minutes.
+    ///
+    ///	  shared loses, split ≈ solo   ⇒ the competition is ALLOCATION-LOCAL:
+    ///	                                 a shared meter or buffer per allocation.
+    ///	  shared > split > solo        ⇒ allocation-local AND something wider —
+    ///	                                 the relay, or the leg before it.
+    ///	  shared ≈ split > solo        ⇒ the mechanism is NOT the shared
+    ///	                                 allocation; it is the relay or beyond.
+    ///	  all three equal              ⇒ either the effect needs a different load,
+    ///	                                 or the treatment did not engage — read
+    ///	                                 `split=` before concluding anything.
+    ///
+    /// 🚨 SOLO AND SPLIT ARE GEOMETRY-MATCHED, which is the other half of making
+    /// the table unambiguous: in BOTH the synthetic rides the same 15
+    /// allocations at the same 15 Mbit/s, and the ONLY difference is whether real
+    /// TCP is running on the other 15. Without that, "split ≈ solo" could be a
+    /// coincidence of fan-out (15 paths against 30) rather than a statement about
+    /// the neighbour.
+    ///
+    /// ⚠️ SHARED IS DELIBERATELY *NOT* GEOMETRY-MATCHED — it is the historical
+    /// condition (synthetic over all 30 at 30 Mbit/s, real TCP over all 30), kept
+    /// exactly as the runs that produced 0.5-2.7% so this session can show the
+    /// effect is present at all. Read shared↔split as a positive control, and
+    /// solo↔split as the measurement.
+    private enum Arm { case solo, shared, split }
+    private let arms: [Arm] = [.solo, .shared, .split, .split, .shared, .solo]
+
+    /// Two transitions of the real load (on before arm 2, off before arm 6)
+    /// each cost a settle.
+    var estimatedSeconds: Int { warmupSec + arms.count * (armSec + gapSec) + 2 * settleSec }
 
     func start(host: String, port: UInt16, probe: UplinkCwndProbe) {
         guard !running else { return }
@@ -117,6 +156,7 @@ final class UplinkSplitRunner: ObservableObject {
         var knobs = ""
         var flowK = 0
         var conns = 0
+        var isTCP = false
         DispatchQueue.main.sync {
             let live = TunnelManager.shared.live
             received = live.statsReceivedOnce
@@ -126,6 +166,7 @@ final class UplinkSplitRunner: ObservableObject {
             knobs = ExperimentKnobs.summary(server: server)
             flowK = FlowPaths.stored(in: UserDefaults.standard)
             conns = server.numConnections
+            isTCP = !server.useUDP
         }
         guard received, total > 0, Double(active) >= 0.9 * Double(total) else {
             log.log("\(runName) REFUSED — the pool is not up (\(active)/\(total), "
@@ -141,6 +182,19 @@ final class UplinkSplitRunner: ObservableObject {
             publish("not started — NumConns must be even and ≥4", running: false)
             return
         }
+        // 🚨 OUTER TRANSPORT IS FIXED TO TCP, and this is a refusal rather than a
+        // note. TURN over TCP is terminated at the relay, so the phone → relay
+        // hop is protected by retransmission and every gap the server counts is
+        // made AT OR AFTER the relay — which is precisely the region this run is
+        // trying to divide. On UDP both hops are exposed and the arms would carry
+        // an extra term that has nothing to do with the split.
+        guard isTCP else {
+            log.log("\(runName) REFUSED — the active server is on UDP transport. This run fixes "
+                + "the outer transport to TCP so the first hop is retransmission-protected and "
+                + "every counted gap is at or after the relay. Switch the server to TCP.")
+            publish("not started — switch the server to TCP transport", running: false)
+            return
+        }
         // Same guard as the paired runner's, for the same reason: a flow-local
         // path set would put WireGuard packets on the synthetic's writers and
         // undo the disjointness this run exists to create.
@@ -152,40 +206,36 @@ final class UplinkSplitRunner: ObservableObject {
         }
 
         let n = conns / 2
+        var probeRunning = false
         log.log("\(runName) TARGET \(host):\(port) — 🚨 this must be server1's INNER (tunnel) "
             + "address with `cwndsink` listening, or the real load never reaches server1.")
         log.log("\(runName) \(knobs)")
         log.log("\(runName) PLAN pool=\(active)/\(total) split=\(n)+\(conns - n) "
-            + "synth=\(Int(sharedMbit))Mbit/s(shared) vs \(Int(splitMbit))Mbit/s(split) "
-            + "flows=\(probeFlows) armSec=\(armSec) arms=\(arms.count) "
-            + "estimated=\(estimatedSeconds)s — arms are shared·split·split·shared, a PALINDROME. "
-            + "The synthetic's rate is HALVED in the split arms so its PER-ALLOCATION load is the "
-            + "same in all four (~1 Mbit/s); what changes is only whether real TCP is on its "
-            + "allocations. Score the SYNTHETIC's own cum-lost (index 5d170000). "
-            + "🚨 Read `split=N synth-pkts=… wg-pkts=…` on the memstats line FIRST — a split arm "
-            + "with either count at 0 tested nothing. "
-            + "🎯 The reference is the ramp's 0.02-0.03% for a smooth stream ALONE at this "
-            + "per-allocation level: a split arm near it means the loss needs a SHARED "
-            + "ALLOCATION; a split arm near 0.5% means it does not, and the resource is above "
-            + "the allocation — the relay or the leg after it.")
+            + "synth=\(Int(splitMbit))Mbit/s(solo,split) vs \(Int(sharedMbit))Mbit/s(shared) "
+            + "flows=\(probeFlows) armSec=\(armSec) arms=\(arms.count) transport=TCP k=1 "
+            + "estimated=\(estimatedSeconds)s — arms are solo·shared·split·split·shared·solo, a "
+            + "PALINDROME in every condition. "
+            + "🚨 SOLO AND SPLIT ARE GEOMETRY-MATCHED: in both, the synthetic rides the SAME 15 "
+            + "allocations at the SAME 15 Mbit/s, and the only difference is whether real TCP is "
+            + "on the other 15 — so solo↔split is the MEASUREMENT. SHARED is the historical "
+            + "condition (synthetic over all 30 at 30, real over all 30) and is the POSITIVE "
+            + "CONTROL that the effect is present in this session at all; it is not "
+            + "geometry-matched, so read shared↔split with that in mind. "
+            + "READING: shared loses while split ≈ solo ⇒ allocation-local; shared > split > solo "
+            + "⇒ allocation-local AND something wider; shared ≈ split > solo ⇒ not the shared "
+            + "allocation at all; all three equal ⇒ the effect needs another load, or the "
+            + "treatment did not engage. "
+            + "🚨 Read `split=N synth→A=… synth→B=… wg→A=… wg→B=… wrong=…` on the memstats line "
+            + "FIRST: wrong>0 VOIDS the arm, and either group at 0 means nothing was tested. "
+            + "🎯 SCORE THE SYNTHETIC ALONE — its own cum-lost (index 5d170000), and in the pcap "
+            + "only the SSRCs of group A, never the aggregate of both groups. Group A is conns "
+            + "0-\(n - 1): map them to relay ports with the client's own `[conn N] TURN relay "
+            + "allocated:` lines and select those source ports.")
 
-        // 🚨 THE REAL LOAD RUNS FOR THE WHOLE SESSION, not per arm. It is on in
-        // all four arms by design, and restarting it at every boundary would
-        // make each arm begin with TCP in slow start — a difference between arms
-        // that has nothing to do with the split.
-        DispatchQueue.main.async {
-            probe.start(host: host, port: port, flows: self.probeFlows,
-                        durationSec: self.estimatedSeconds + 120)
-        }
-        guard waitForRealLoad(probe, upTo: 45) else {
-            log.log("\(runName) ABORTED — the cwnd probe never started sending. 🚨 `cwndsink` "
-                + "must be LISTENING on \(host):\(port); without it every arm is solo and the "
-                + "whole comparison is void.")
-            publish("aborted — no real load; is cwndsink running?", running: false)
-            setLevel(0); setSplit(0)
-            DispatchQueue.main.async { probe.stop() }
-            return
-        }
+        // 🚨 K IS PINNED, not assumed. Chunking is retired and its stored value
+        // was found driving the tunnel for three days after its UI was deleted;
+        // an experiment that cares about burst structure states its own K.
+        DispatchQueue.main.async { TunnelManager.shared.applyUplinkChunkK(UplinkChunk.off) }
 
         publish("warm-up \(warmupSec)s")
         log.log("\(runName) WARMUP sec=\(warmupSec) — NOT SCORED")
@@ -193,24 +243,64 @@ final class UplinkSplitRunner: ObservableObject {
         setLevel(sharedMbit)
         sleep(seconds: warmupSec)
 
-        for (i, split) in arms.enumerated() {
+        for (i, arm) in arms.enumerated() {
             if cancelled { break }
-            let arm = i + 1
+            let no = i + 1
             setLevel(0)
-            log.log("\(runName) GAP a=\(arm)/\(arms.count) sec=\(gapSec)")
-            publish("gap \(gapSec)s before arm \(arm)/\(arms.count)")
+            log.log("\(runName) GAP a=\(no)/\(arms.count) sec=\(gapSec)")
+            publish("gap \(no == 1 ? 1 : gapSec)s before arm \(no)/\(arms.count)")
             sleep(seconds: gapSec)
             if cancelled { break }
 
-            // Both applied in the GAP, so no arm straddles a switch.
-            setSplit(split ? n : 0)
-            setLevel(split ? splitMbit : sharedMbit)
-            let mode = split ? "split" : "shared"
-            log.log("\(runName) ARM a=\(arm)/\(arms.count) mode=\(mode) splitN=\(split ? n : 0) "
-                + "synth=\(Int(split ? splitMbit : sharedMbit))Mbit/s flows=\(probeFlows) sec=\(armSec)")
-            publish("arm \(arm)/\(arms.count) · \(mode) · \(armSec)s")
+            // The real load is only ON where the arm calls for it, and every
+            // transition happens inside the GAP so no arm straddles one.
+            //
+            // ⚠️ TCP RESTARTS IN SLOW START. An arm that begins the instant the
+            // probe does would spend its first seconds measuring a ramp, so a
+            // arm that turns the load ON waits for bytes AND then settles before
+            // it is declared. The arms that inherit an already-running probe pay
+            // nothing, which is why the plan keeps arms 2-5 continuous.
+            let wantsLoad = arm != .solo
+            if wantsLoad && !probeRunning {
+                DispatchQueue.main.async {
+                    probe.start(host: host, port: port, flows: self.probeFlows,
+                                durationSec: self.estimatedSeconds + 120)
+                }
+                guard waitForRealLoad(probe, upTo: 45) else {
+                    log.log("\(runName) ABORTED at arm \(no) — the cwnd probe never started "
+                        + "sending. 🚨 `cwndsink` must be LISTENING on \(host):\(port); without "
+                        + "it every arm is solo and the comparison is void.")
+                    publish("aborted — no real load; is cwndsink running?", running: false)
+                    setLevel(0); setSplit(0)
+                    DispatchQueue.main.async { probe.stop() }
+                    return
+                }
+                probeRunning = true
+                log.log("\(runName) SETTLE sec=\(settleSec) — the probe just started; letting "
+                    + "TCP leave slow start before the arm is declared")
+                sleep(seconds: settleSec)
+                if cancelled { break }
+            } else if !wantsLoad && probeRunning {
+                DispatchQueue.main.async { probe.stop() }
+                probeRunning = false
+                log.log("\(runName) SETTLE sec=\(settleSec) — the probe was stopped; letting the "
+                    + "pool drain before the solo arm is declared")
+                sleep(seconds: settleSec)
+                if cancelled { break }
+            }
+
+            // Geometry: solo and split are IDENTICAL for the synthetic (same 15
+            // allocations, same 15 Mbit/s); only shared puts it back on all 30.
+            let splitN = (arm == .shared) ? 0 : n
+            let mbit = (arm == .shared) ? sharedMbit : splitMbit
+            setSplit(splitN)
+            setLevel(mbit)
+            let mode = "\(arm)"
+            log.log("\(runName) ARM a=\(no)/\(arms.count) mode=\(mode) splitN=\(splitN) "
+                + "synth=\(Int(mbit))Mbit/s flows=\(wantsLoad ? probeFlows : 0) sec=\(armSec)")
+            publish("arm \(no)/\(arms.count) · \(mode) · \(armSec)s")
             sleep(seconds: armSec)
-            log.log("\(runName) ARMEND a=\(arm)/\(arms.count) mode=\(mode)")
+            log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)")
         }
 
         setLevel(0)

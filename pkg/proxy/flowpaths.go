@@ -572,7 +572,7 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		select {
 		case item := <-src:
 			item.via = viaShared
-			noteSplitDispatch(item.synth)
+			noteSplitDispatch(item.synth, splitOwnsSynth(connIdx))
 			p.noteDispatch(item, connIdx, "shared")
 			return item, true
 		case <-done:

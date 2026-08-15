@@ -86,25 +86,36 @@ func uplinkSplit() int { return int(uplinkSplitN.Load()) }
 func splitOwnsSynth(connIdx int) bool { return connIdx >= 0 && connIdx < uplinkSplit() }
 
 var (
-	splitSynthPkts atomic.Int64
-	splitWGPkts    atomic.Int64
+	splitSynthToA atomic.Int64
+	splitSynthToB atomic.Int64
+	splitWGToA    atomic.Int64
+	splitWGToB    atomic.Int64
 )
 
-// noteSplitDispatch counts what each group carried, which is the engagement
-// witness for this lever: a split that is armed while one group carries nothing
-// tested nothing, and that has happened before with a knob whose value was live
-// but inert.
-func noteSplitDispatch(synth bool) {
-	if synth {
-		splitSynthPkts.Add(1)
-		return
+// noteSplitDispatch counts, for every dispatched packet, WHICH KIND went to
+// WHICH GROUP — not just how many of each kind there were.
+//
+// 🚨 THE CROSS TERMS ARE THE POINT. `synth→B` and `wg→A` must both be ZERO while
+// the split is armed, and printing them is what turns "the code cannot do that"
+// into "it did not do that on this run". A design guarantee that is never
+// observed is exactly how a lever gets believed for nine runs while inert.
+func noteSplitDispatch(synth, toA bool) {
+	switch {
+	case synth && toA:
+		splitSynthToA.Add(1)
+	case synth:
+		splitSynthToB.Add(1)
+	case toA:
+		splitWGToA.Add(1)
+	default:
+		splitWGToB.Add(1)
 	}
-	splitWGPkts.Add(1)
 }
 
-// SplitStatsAndReset reports the per-group packet counts and clears them.
-func SplitStatsAndReset() (synth, wg int64, n int) {
-	return splitSynthPkts.Swap(0), splitWGPkts.Swap(0), uplinkSplit()
+// SplitStatsAndReset reports the four (kind × group) counts and clears them.
+func SplitStatsAndReset() (synthA, synthB, wgA, wgB int64, n int) {
+	return splitSynthToA.Swap(0), splitSynthToB.Swap(0),
+		splitWGToA.Swap(0), splitWGToB.Swap(0), uplinkSplit()
 }
 
 // splitSummary renders the engagement witness and CLEARS the interval. Empty
@@ -116,9 +127,18 @@ func SplitStatsAndReset() (synth, wg int64, n int) {
 // failure as a chunk size that is live but inert on a shallow queue, which cost
 // this project nine runs.
 func splitSummary() string {
-	synth, wg, n := SplitStatsAndReset()
+	synthA, synthB, wgA, wgB, n := SplitStatsAndReset()
 	if n <= UplinkSplitOff {
 		return ""
 	}
-	return fmt.Sprintf(" split=%d synth-pkts=%d wg-pkts=%d", n, synth, wg)
+	wrong := synthB + wgA
+	note := ""
+	if wrong > 0 {
+		// 🚨 Not a statistic — a broken run. If a packet crossed groups the two
+		// streams shared allocations after all, and the arm measured the very
+		// thing it was built to remove.
+		note = " 🚨 WRONG-GROUP — the split LEAKED and this arm is void"
+	}
+	return fmt.Sprintf(" split=%d synth→A=%d synth→B=%d wg→A=%d wg→B=%d wrong=%d%s",
+		n, synthA, synthB, wgA, wgB, wrong, note)
 }

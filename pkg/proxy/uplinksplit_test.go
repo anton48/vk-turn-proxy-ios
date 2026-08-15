@@ -129,12 +129,36 @@ func TestSplitSummaryCountsBothGroupsAndIsSilentWhenOff(t *testing.T) {
 	_, _ = p.nextSendItem(make(chan struct{}), 20)
 
 	s := splitSummary()
-	if !strings.Contains(s, "split=15") || !strings.Contains(s, "synth-pkts=1") ||
-		!strings.Contains(s, "wg-pkts=1") {
-		t.Fatalf("both groups must be reported, got %q", s)
+	// 🚨 The cross terms are the point: synth→B and wg→A must be ZERO and must be
+	// PRINTED, so the disjointness is observed on every run rather than merely
+	// guaranteed by the code.
+	for _, want := range []string{"split=15", "synth→A=1", "synth→B=0", "wg→A=0", "wg→B=1", "wrong=0"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("expected %q in %q", want, s)
+		}
 	}
-	if again := splitSummary(); !strings.Contains(again, "synth-pkts=0 wg-pkts=0") {
+	if strings.Contains(s, "WRONG-GROUP") {
+		t.Fatalf("nothing crossed groups; the alarm must be silent: %q", s)
+	}
+	if again := splitSummary(); !strings.Contains(again, "synth→A=0") {
 		t.Fatalf("the counters must read and reset, got %q", again)
+	}
+}
+
+// 🚨 AND THE ALARM MUST FIRE. A packet that crossed groups means the two streams
+// shared allocations after all and the arm measured the thing it was built to
+// remove — that has to shout, not appear as a small number among others.
+//
+// SABOTAGE SEEN TO FAIL: drop the `if wrong > 0` note from splitSummary and
+// leave `_ = wrong`. Compiles; this test then finds no warning.
+func TestSplitShoutsWhenAPacketCrossedGroups(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	SetUplinkSplitN(15)
+	noteSplitDispatch(true, false) // a synthetic packet served by group B
+	s := splitSummary()
+	if !strings.Contains(s, "wrong=1") || !strings.Contains(s, "WRONG-GROUP") {
+		t.Fatalf("a cross-group dispatch must void the arm loudly, got %q", s)
 	}
 }
 
