@@ -221,6 +221,19 @@ do {
     check(judge(0, 999_999, false, 0, 8) == .shortPool(live: 0, want: 8),
           "an empty pool is reported as such, not as noBytes/ended/stalled")
 
+    // 🚨 AND WHAT THE ARM ACTUALLY WAS MUST TRACK THE VERDICT, not be a fixed
+    // suffix. "A SOLO arm in disguise" is true of an arm that carried nothing
+    // and FALSE of one that carried 7 of 8 flows — that one is a different
+    // INTENSITY, which in this experiment is a different arm.
+    //
+    // SABOTAGE SEEN TO FAIL: return "a SOLO arm in disguise" for every case.
+    // Compiles, and the 7-of-8 check goes red.
+    check(!LoadWitness.mislabel(.shortPool(live: 7, want: 8)).contains("SOLO"),
+          "7 of 8 flows is a different INTENSITY, not a solo arm")
+    check(LoadWitness.mislabel(.shortPool(live: 0, want: 8)).contains("SOLO"),
+          "…but a pool of zero really is solo")
+    check(LoadWitness.mislabel(.noBytes).contains("SOLO"), "nothing moved is solo")
+
     // Every verdict must be able to SAY itself, or a void arm reaches the log
     // with no reason attached.
     for v: LoadWitness.Verdict in [.noBytes, .ended, .stalled(ms: 5), .shortPool(live: 3, want: 8), .ok] {

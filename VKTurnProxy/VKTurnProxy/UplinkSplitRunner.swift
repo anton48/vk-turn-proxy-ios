@@ -485,9 +485,9 @@ final class UplinkSplitRunner: ObservableObject {
                     let why = LoadWitness.reason(verdict)
                     loadNote += " 🚨 \(why)"
                     log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)\(loadNote)")
-                    abortRun("arm \(no) was labelled '\(mode)' but \(why) — it is a SOLO arm in "
-                        + "disguise. THIS ARM IS VOID, the palindrome is broken, and nothing after "
-                        + "it would be comparable with what came before")
+                    abortRun("arm \(no) was labelled '\(mode)' but \(why) — it is "
+                        + "\(LoadWitness.mislabel(verdict)). THIS ARM IS VOID, the palindrome is "
+                        + "broken, and nothing after it would be comparable with what came before")
                     return
                 }
             }

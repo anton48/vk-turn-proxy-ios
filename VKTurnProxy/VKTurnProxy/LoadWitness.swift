@@ -70,6 +70,29 @@ enum LoadWitness {
         return .ok
     }
 
+    /// What the arm ACTUALLY was, as against the label it was running under.
+    ///
+    /// 🚨 IT LIVES HERE FOR THE SAME REASON `reason` DOES: it was a fixed suffix
+    /// on the runner's abort line — *"it is a SOLO arm in disguise"* — which is
+    /// true of an arm that carried nothing and FALSE of one that carried 7 of 8
+    /// flows. That arm is not solo; it is a different INTENSITY, which is a
+    /// different arm in an experiment where intensity is the dose. A phrase that
+    /// cannot see the verdict will eventually contradict it.
+    /// *(User-caught, 2026-08-16.)*
+    static func mislabel(_ v: Verdict) -> String {
+        switch v {
+        case .ok:
+            return "the arm it was labelled"
+        case .noBytes, .ended:
+            return "a SOLO arm in disguise"
+        case .shortPool(let live, _):
+            return live == 0 ? "a SOLO arm in disguise"
+                             : "an arm at an INTENSITY nobody asked for"
+        case .stalled:
+            return "an arm that spent part of itself unloaded"
+        }
+    }
+
     /// What the log says when an arm is void. Kept beside the verdict so the two
     /// cannot drift apart.
     static func reason(_ v: Verdict) -> String {
