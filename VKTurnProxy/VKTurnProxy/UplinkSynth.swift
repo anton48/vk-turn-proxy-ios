@@ -52,7 +52,11 @@ enum UplinkSynth {
     /// different fraction — recompute rather than assuming. The Go side logs
     /// the rate it actually ran, and the SERVER's 2-second per-conn dump is
     /// what says which fraction was really reached.
-    static let choices: [Double] = [0, 12, 19, 37, 40, 55, 58, 59, 60, 80]
+    /// 🚨 **30 is here for `UplinkPairedRunner`**, which holds the synthetic at
+    /// ~half the budget while real TCP takes the rest. Its guard refuses to
+    /// start if its rate is not a sweep point, so this entry and that runner
+    /// are one change: removing it does not break a build, it stops a run.
+    static let choices: [Double] = [0, 12, 19, 30, 37, 40, 55, 58, 59, 60, 80]
 
     /// The fraction of the allocation budget a rate represents at `conns`
     /// connections, for the picker's own label. Display only.

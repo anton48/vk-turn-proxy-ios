@@ -73,9 +73,21 @@ struct AdvancedView: View {
     /// up: it is a one-sitting measurement, not a preference. The runner is a
     /// @StateObject so it survives this pushed view's re-renders while running.
     @StateObject private var cwndProbe = UplinkCwndProbe()
+    @StateObject private var pairedAB = UplinkPairedRunner()
     @StateObject private var flowAB = UplinkFlowABRunner()
     @StateObject private var synthAB = UplinkSynthRunner()
     @State private var probeHost = "192.168.102.1:5202"
+
+    /// The sink address, parsed once. It used to be split inline at every call
+    /// site; a fourth copy is how the runners quietly end up pointing at
+    /// different hosts.
+    private func probeTarget() -> (String, UInt16) {
+        let parts = probeHost.split(separator: ":", maxSplits: 1)
+        let h = parts.first.map(String.init) ?? "192.168.102.1"
+        let p: UInt16 = parts.count > 1 ? (UInt16(parts[1]) ?? 5202) : 5202
+        return (h, p)
+    }
+
     @State private var probeFlows = 8
     @State private var probeDuration = 20
 
@@ -248,6 +260,7 @@ struct AdvancedView: View {
                     Button("Stop the sweep", role: .destructive) { synthAB.cancel() }
                 }
                 Text(synthAB.status)
+
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {
@@ -270,9 +283,7 @@ struct AdvancedView: View {
                 Stepper("Flows: \(probeFlows)", value: $probeFlows, in: 1...64)
                 Stepper("Duration: \(probeDuration) s", value: $probeDuration, in: 5...60, step: 5)
                 Button(cwndProbe.running ? "Running…" : "Run uplink cwnd probe") {
-                    let parts = probeHost.split(separator: ":", maxSplits: 1)
-                    let h = parts.first.map(String.init) ?? "192.168.102.1"
-                    let p: UInt16 = parts.count > 1 ? (UInt16(parts[1]) ?? 5202) : 5202
+                    let (h, p) = probeTarget()
                     cwndProbe.start(host: h, port: p, flows: probeFlows, durationSec: probeDuration)
                 }
                 .disabled(cwndProbe.running || flowAB.running)
@@ -284,9 +295,7 @@ struct AdvancedView: View {
                 // it drives the probe above rather than being a second unrelated
                 // switch (which is what the one-footer-one-switch rule forbids).
                 Button(flowAB.running ? "Running the A/B…" : "Run flow-path A/B (~\(flowAB.estimatedSeconds / 60) min)") {
-                    let parts = probeHost.split(separator: ":", maxSplits: 1)
-                    let h = parts.first.map(String.init) ?? "192.168.102.1"
-                    let p: UInt16 = parts.count > 1 ? (UInt16(parts[1]) ?? 5202) : 5202
+                    let (h, p) = probeTarget()
                     flowAB.start(host: h, port: p, probe: cwndProbe)
                 }
                 .disabled(cwndProbe.running || flowAB.running)
@@ -294,6 +303,21 @@ struct AdvancedView: View {
                     Button("Stop the A/B", role: .destructive) { flowAB.cancel() }
                 }
                 Text(flowAB.status)
+                // The synthetic alone vs the synthetic next to real inner TCP,
+                // at the SAME synthetic rate — the one thing the sweep cannot
+                // see, because WireGuard discards the synthetic at the index
+                // lookup and so is never loaded by it.
+                Button(pairedAB.running
+                        ? "Running the paired A/B…"
+                        : "Run synth-vs-real A/B (~\(pairedAB.estimatedSeconds / 60) min)") {
+                    let (h, p) = probeTarget()
+                    pairedAB.start(host: h, port: p, probe: cwndProbe)
+                }
+                .disabled(pairedAB.running || synthAB.running || cwndProbe.running || flowAB.running)
+                if pairedAB.running {
+                    Button("Stop the paired A/B", role: .destructive) { pairedAB.cancel() }
+                }
+                Text(pairedAB.status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {
