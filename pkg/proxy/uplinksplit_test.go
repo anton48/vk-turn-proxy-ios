@@ -254,3 +254,119 @@ func TestParkedWriterWakesWhenTheSplitIsTurnedOn(t *testing.T) {
 		t.Fatal("a writer parked on the shared channel never learned the pool had been split")
 	}
 }
+
+// 🚨🚨 THE LOST WAKE-UP THE USER FOUND, and the reason the state and the wake
+// live in ONE struct. The failing interleave the previous design allowed:
+//
+//  1. a writer reads n=15 and picks synthCh;
+//  2. SetUplinkSplitN(0) stores the new size, installs a fresh wake and closes
+//     the old one;
+//  3. only NOW does the writer evaluate the wake channel — and gets the NEW,
+//     still-open one;
+//  4. it parks on {old synthCh, new wake} and sleeps through the whole arm.
+//
+// This test states the invariant that makes that impossible, and states it
+// DETERMINISTICALLY rather than by racing: whatever snapshot a reader holds, the
+// change that supersedes it closes THAT snapshot's channel.
+//
+// SABOTAGE SEEN TO FAIL: in SetUplinkSplitN close `next.wake` instead of
+// `old.wake`. Compiles; the snapshot a reader is holding then never closes.
+func TestTheSnapshotYouHoldIsTheOneTheNextChangeCloses(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	SetUplinkSplitN(15)
+
+	// A writer would load this and THEN decide — the whole race window.
+	st := splitNow()
+	if st.n != 15 {
+		t.Fatalf("snapshot should read 15, got %d", st.n)
+	}
+
+	SetUplinkSplitN(UplinkSplitOff) // the change that happens "in between"
+
+	select {
+	case <-st.wake: // closed ⇒ a reader holding this snapshot cannot miss it
+	default:
+		t.Fatal("the superseded snapshot's wake was not closed — a writer holding it " +
+			"would park on the old queue and sleep through the arm")
+	}
+	// And the fresh snapshot must NOT be closed, or every park would spin.
+	select {
+	case <-splitNow().wake:
+		t.Fatal("the current snapshot's wake must stay open")
+	default:
+	}
+}
+
+// The producer half of the same race: `sendPacketMarked` picks its queue by the
+// mode too, and if the split is turned OFF while it is blocked on a full
+// synthCh, nothing will ever drain that queue again — the paced generator would
+// freeze for the rest of the run.
+//
+// SABOTAGE SEEN TO FAIL: drop the `case <-st.wake:` from the blocking select in
+// sendPacketMarked. Compiles; this test then times out.
+func TestBlockedProducerRePicksTheQueueWhenTheSplitChanges(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	SetUplinkSplitN(15)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 4), synthCh: make(chan sendItem, 1)}
+
+	// Fill the synthetic queue so the next send must block.
+	if err := p.SendPacketSynth([]byte("first")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	sent := make(chan error, 1)
+	go func() { sent <- p.SendPacketSynth([]byte("blocked")) }()
+	time.Sleep(50 * time.Millisecond) // it is now parked on a full synthCh
+
+	SetUplinkSplitN(UplinkSplitOff) // no reader will ever serve synthCh again
+
+	select {
+	case err := <-sent:
+		if err != nil {
+			t.Fatalf("the producer should have re-picked the shared queue, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the producer stayed blocked on a queue nothing will drain — " +
+			"the generator would have frozen for the rest of the run")
+	}
+}
+
+// 🚨 AND THE PACKETS ALREADY IN THE QUEUE. Turning the split off leaves synthCh
+// with no reader, so anything still in it is never sent — a gap in the
+// synthetic's own sequence, which the server's counter would blame on the
+// network. An arm biased by our own switch is worse than a missing arm.
+//
+// SABOTAGE SEEN TO FAIL: make SetUplinkSplitN skip drainSynthQueue when the new
+// size is 0. Compiles; the packet is then still sitting in synthCh.
+func TestUnSplittingRescuesWhatIsStillQueued(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 8), synthCh: make(chan sendItem, 8)}
+	registerSynthDrain(p)
+	t.Cleanup(func() { synthDrainHook.Store((func() (int, int))(nil)) })
+
+	SetUplinkSplitN(15)
+	_ = p.SendPacketSynth([]byte("queued before the flip"))
+	if len(p.synthCh) != 1 {
+		t.Fatalf("expected the packet in synthCh, got %d", len(p.synthCh))
+	}
+
+	SetUplinkSplitN(UplinkSplitOff)
+
+	if len(p.synthCh) != 0 {
+		t.Fatalf("synthCh must be drained on un-split, %d left stranded", len(p.synthCh))
+	}
+	select {
+	case item := <-p.sendCh:
+		if string(item.buf) != "queued before the flip" {
+			t.Fatalf("wrong packet rescued: %q", item.buf)
+		}
+	default:
+		t.Fatal("the queued packet was neither stranded nor rescued — it vanished")
+	}
+}

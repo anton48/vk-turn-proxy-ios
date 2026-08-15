@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 )
@@ -51,57 +52,60 @@ import (
 // UplinkSplitOff is the default: one shared queue, every writer serving it.
 const UplinkSplitOff = 0
 
-// uplinkSplitN is the number of connections reserved for the SYNTHETIC. Writers
-// with index < N serve the synthetic queue and nothing else; writers with index
-// >= N serve WireGuard and nothing else. Process-global for the same reason the
-// chunk size is: the extension runs exactly one Proxy and the bridge holds no
-// handle on it.
-var uplinkSplitN atomic.Int64
+// splitState binds the mode to the channel that will announce its END.
+//
+// 🚨🚨 WHY ONE STRUCT AND NOT TWO VARIABLES — this is a LOST WAKE-UP, and the
+// first version of this file had it. With the size in one atomic and the wake
+// channel in another, a writer can interleave like this:
+//
+//  1. reads n = 15 and picks synthCh;
+//  2. SetUplinkSplitN(0) stores the new size, installs a fresh channel and
+//     closes the old one;
+//  3. only NOW does the writer evaluate the wake channel — and gets the NEW,
+//     still-open one;
+//  4. it parks on {old synthCh, new wake} and misses the close that was meant
+//     for it. synthCh will never be filled again and the new channel only closes
+//     on the NEXT change, so it sleeps through the whole arm.
+//
+// The invariant that fixes it: **the state you read is bound to the wake that
+// supersedes it.** One snapshot, loaded once, used for both the decision and the
+// parking — so whichever side of the swap a reader lands on, the channel it
+// holds is the one the NEXT change closes. *(User-caught, 2026-08-16, after the
+// first fix closed only the half where the writer parks BEFORE the flip.)*
+type splitState struct {
+	n    int
+	wake chan struct{}
+}
+
+var (
+	splitCur   atomic.Pointer[splitState]
+	splitSetMu sync.Mutex
+)
+
+func init() { splitCur.Store(&splitState{n: UplinkSplitOff, wake: make(chan struct{})}) }
+
+// splitNow returns the current snapshot. Load it ONCE per decision and use both
+// fields from that one value; re-reading either separately re-opens the race
+// this type exists to close.
+func splitNow() *splitState { return splitCur.Load() }
 
 // SetUplinkSplitN applies the split to THIS process without a reconnect, so an
 // arm costs no 107-second thirty-connection ramp. Clamped: a value that would
 // leave either side without a writer is meaningless, and 0 is off.
+//
+// Swap FIRST, then close the superseded channel: every reader that lands after
+// the swap gets the new mode, and every reader that landed before it holds a
+// channel that is about to close.
 func SetUplinkSplitN(n int) {
-	uplinkSplitN.Store(int64(ClampUplinkSplitN(n)))
-	wakeSplitWaiters()
-}
-
-// THE WAKE-UP, AND IT IS NOT OPTIONAL.
-//
-// 🚨 THE DEFECT IT FIXES, caught by the user before the first run and already on
-// record in this very file's neighbour: a writer that is PARKED on a channel does
-// not re-read the mode. With the split armed, group-A writers block on `synthCh`;
-// flip the split off and they are still blocked there, on a queue nothing will
-// ever fill again — so the arm runs with HALF THE POOL and nothing says so. The
-// 8-second gap between arms guarantees they are parked at exactly the moment the
-// mode changes, because the load is set to 0 for the whole gap.
-//
-// ⚠️ `stealHint` cannot serve: it has capacity 1 and wakes ONE writer, which is
-// right for "a packet appeared" and useless for "the world changed". A mode
-// change must reach ALL of them, so this is the generation-channel idiom —
-// CLOSE the current channel (every receiver fires at once) and install a fresh
-// one for the next change.
-//
-// This is the same lesson as build 254's parked-writer stall, which is why the
-// re-check now lives INSIDE `nextSendItem`'s loop rather than above it.
-var (
-	splitWakeMu sync.Mutex
-	splitWakeV  atomic.Value // chan struct{}, closed on every change
-)
-
-func init() { splitWakeV.Store(make(chan struct{})) }
-
-// splitWakeCh is the current generation. Take it INSIDE the select statement
-// that parks: a channel captured earlier is a channel that may already be the
-// previous generation.
-func splitWakeCh() <-chan struct{} { return splitWakeV.Load().(chan struct{}) }
-
-func wakeSplitWaiters() {
-	splitWakeMu.Lock()
-	defer splitWakeMu.Unlock()
-	old := splitWakeV.Load().(chan struct{})
-	splitWakeV.Store(make(chan struct{}))
-	close(old)
+	splitSetMu.Lock()
+	defer splitSetMu.Unlock()
+	old := splitCur.Load()
+	next := &splitState{n: ClampUplinkSplitN(n), wake: make(chan struct{})}
+	splitCur.Store(next)
+	close(old.wake)
+	if next.n <= UplinkSplitOff {
+		drainSynthQueue()
+	}
 }
 
 // ClampUplinkSplitN keeps the split inside [0, 29]: at least one connection must
@@ -116,8 +120,28 @@ func ClampUplinkSplitN(n int) int {
 	return n
 }
 
-// uplinkSplit reports the split size, 0 when off.
-func uplinkSplit() int { return int(uplinkSplitN.Load()) }
+// uplinkSplit reports the split size, 0 when off. For callers that need only the
+// size and never park — the summary line, and tests.
+func uplinkSplit() int { return splitNow().n }
+
+// synthDrainHook lets the Proxy register its queues so a split being turned OFF
+// can rescue whatever is still sitting in the synthetic's channel. Without it
+// those packets are stranded: no writer serves synthCh once the split is off,
+// and the gap in the synthetic's sequence would be counted downstream as LOSS —
+// an arm biased by our own switch.
+var synthDrainHook atomic.Value // func() (moved, stranded int)
+
+func drainSynthQueue() {
+	f, _ := synthDrainHook.Load().(func() (int, int))
+	if f == nil {
+		return
+	}
+	if moved, stranded := f(); moved > 0 || stranded > 0 {
+		log.Printf("uplink-split: drained %d packet(s) out of the synthetic queue on un-split"+
+			", %d stranded — a stranded packet is a gap the loss counter would blame on the network",
+			moved, stranded)
+	}
+}
 
 // splitOwnsSynth says whether this writer serves the synthetic's group.
 //
@@ -125,7 +149,7 @@ func uplinkSplit() int { return int(uplinkSplitN.Load()) }
 // the life of a connection. A reconnect renumbers, and an arm that straddles one
 // has its groups redrawn — read `split=` on the memstats line, which prints how
 // many packets each group actually carried, rather than assuming.
-func splitOwnsSynth(connIdx int) bool { return connIdx >= 0 && connIdx < uplinkSplit() }
+func splitOwnsSynth(connIdx, n int) bool { return connIdx >= 0 && connIdx < n }
 
 var (
 	splitSynthToA atomic.Int64

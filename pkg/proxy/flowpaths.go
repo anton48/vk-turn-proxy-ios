@@ -567,21 +567,28 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 	for {
 		// 0. THE SPLIT, re-checked on EVERY iteration for the same reason k is:
 		//    a writer parked here when the mode changes must not go on serving
-		//    the old grouping. It also parks on `splitWakeCh()`, because
-		//    re-checking is worthless to a goroutine that is already blocked —
-		//    the check happens after the wake, never before it.
-		if uplinkSplit() > UplinkSplitOff && connIdx >= 0 {
+		//    the old grouping. It parks on the snapshot's OWN wake channel,
+		//    because re-checking is worthless to a goroutine that is already
+		//    blocked — the check happens after the wake, never before it.
+		//
+		// 🚨 ONE LOAD, BOTH FIELDS. Reading the size here and the wake channel
+		//    inside the select is a LOST WAKE-UP: the mode can change in between,
+		//    and the writer then parks on the old queue holding the NEW channel,
+		//    missing the close that was meant for it. → uplinksplit.go
+		st := splitNow()
+		if st.n > UplinkSplitOff && connIdx >= 0 {
+			toA := splitOwnsSynth(connIdx, st.n)
 			src := p.sendCh
-			if splitOwnsSynth(connIdx) {
+			if toA {
 				src = p.synthCh
 			}
 			select {
 			case item := <-src:
 				item.via = viaShared
-				noteSplitDispatch(item.synth, splitOwnsSynth(connIdx))
+				noteSplitDispatch(item.synth, toA)
 				p.noteDispatch(item, connIdx, "shared")
 				return item, true
-			case <-splitWakeCh():
+			case <-st.wake:
 				// The split changed while we were parked. Round again and read
 				// the new grouping.
 				continue
@@ -665,11 +672,13 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 			// round to the sweep above rather than stealing here, so the owner
 			// still gets first refusal on its own packet.
 			continue
-		case <-splitWakeCh():
+		case <-st.wake:
 			// The pool was just split (or un-split) while we were parked on the
 			// shared channel. Round again: step 0 above will put us on the right
 			// queue. Without this a writer that went to sleep before the arm
-			// switched would serve the WRONG group for the whole arm.
+			// switched would serve the WRONG group for the whole arm. `st` is the
+			// snapshot loaded at the top of THIS iteration, so it is the channel
+			// that the change which supersedes it will close.
 			continue
 		case <-done:
 			return sendItem{}, false

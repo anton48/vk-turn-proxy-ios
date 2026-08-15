@@ -718,7 +718,35 @@ func NewProxy(cfg Config) *Proxy {
 		}
 	}
 
+	// When the split is turned OFF, whatever is still in synthCh has no reader
+	// left — no writer serves that queue once the split is off. Those packets
+	// would be a gap in the synthetic's sequence that the loss counter blames on
+	// the network, i.e. an arm biased by our own switch. Hand the rescue to the
+	// setter. → uplinksplit.go
+	registerSynthDrain(p)
+
 	return p
+}
+
+// registerSynthDrain installs the rescue used when the split is turned off. It
+// is a named function so the test drives the SAME code the tunnel does, rather
+// than a parallel copy that could drift from it.
+func registerSynthDrain(p *Proxy) {
+	synthDrainHook.Store(func() (moved, stranded int) {
+		for {
+			select {
+			case item := <-p.synthCh:
+				select {
+				case p.sendCh <- item:
+					moved++
+				default:
+					stranded++
+				}
+			default:
+				return moved, stranded
+			}
+		}
+	})
 }
 
 // signalBootstrapDone fires the bootstrap-ready channel exactly once per
@@ -1836,10 +1864,17 @@ func (p *Proxy) sendPacketMarked(data []byte, flowKey uint64, synth bool) error 
 	// printed beside it on the same memstats line. When that reads `0s/0`, every
 	// residence in the interval is exact.
 	item := sendItem{buf: buf, at: time.Now().UnixNano(), flow: flowKey, synth: synth}
-	// THE SPLIT, and it is one line because everything below is unchanged: with
-	// the split off `ch` IS p.sendCh and this is byte-for-byte the old path.
+	// THE SPLIT. With it off `ch` IS p.sendCh and everything below is
+	// byte-for-byte the old path.
+	//
+	// 🚨 ONE SNAPSHOT, for the producer too. If the split is turned OFF while
+	// this goroutine is blocked on a full synthCh, nobody will ever drain that
+	// queue again — no writer serves it once the split is off — and the paced
+	// generator would freeze for the rest of the run. So it parks on the same
+	// snapshot's wake and re-picks the queue. → uplinksplit.go
+	st := splitNow()
 	ch := p.sendCh
-	if uplinkSplit() > UplinkSplitOff && synth {
+	if st.n > UplinkSplitOff && synth {
 		ch = p.synthCh
 	}
 	// Flow-local path set (PR2), inert unless flow_paths_k is set. A packet that
@@ -1868,16 +1903,26 @@ func (p *Proxy) sendPacketMarked(data []byte, flowKey uint64, synth bool) error 
 	default:
 	}
 	start := time.Now()
-	select {
-	case ch <- item:
-		p.sendChBlockNs.Add(int64(time.Since(start)))
-		p.sendChBlockCount.Add(1)
-		notePeak(&p.sendChPeak, len(ch))
-		p.txBytes.Add(int64(len(data)))
-		p.txPackets.Add(1)
-		return nil
-	case <-p.ctx.Done():
-		return p.ctx.Err()
+	for {
+		select {
+		case ch <- item:
+			p.sendChBlockNs.Add(int64(time.Since(start)))
+			p.sendChBlockCount.Add(1)
+			notePeak(&p.sendChPeak, len(ch))
+			p.txBytes.Add(int64(len(data)))
+			p.txPackets.Add(1)
+			return nil
+		case <-st.wake:
+			// The split changed while we waited for room. Re-pick the queue: the
+			// one we were holding may now have no reader at all.
+			st = splitNow()
+			ch = p.sendCh
+			if st.n > UplinkSplitOff && synth {
+				ch = p.synthCh
+			}
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		}
 	}
 }
 
