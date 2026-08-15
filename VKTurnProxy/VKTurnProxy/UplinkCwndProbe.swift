@@ -57,8 +57,7 @@ final class UplinkCwndProbe: ObservableObject {
     // struct, validated on Darwin against a loopback transfer (M1 gate).
     private let optTCPConnectionInfo: Int32 = 0x106
 
-    /// The kernel's own byte count, summed across the flows and refreshed by the
-    /// sampler every ~100 ms.
+    /// Bytes moved, and WHEN THEY LAST MOVED.
     ///
     /// 🚨 THIS — NOT `running` OR `sending` — IS WHAT PROVES THE LOAD IS MOVING.
     /// Those two are LIFECYCLE: `sending` is set once when the flows come up and
@@ -68,10 +67,17 @@ final class UplinkCwndProbe: ObservableObject {
     /// against them can label an unloaded arm "paired" and nothing contradicts
     /// it. *(User-caught, 2026-08-16.)*
     ///
+    /// 🚨 AND A TOTAL ALONE IS NOT ENOUGH EITHER — that was the first version's
+    /// defect. A probe that sends for one second and then dies for the remaining
+    /// 119 leaves a POSITIVE delta across the arm, so "bytes moved" passes while
+    /// the arm was 99% unloaded. The timestamp is what turns the witness from
+    /// "did anything happen" into "was it still happening at the end".
+    /// *(User-caught, 2026-08-16, on the fix for the previous one.)*
+    ///
     /// Taken from `TCP_CONNECTION_INFO`'s own `txbytes` rather than from our
     /// `send()` returns, so it is the kernel's statement rather than ours.
-    private let txTotal = AtomicU64()
-    func bytesSent() -> UInt64 { txTotal.get() }
+    private let progress = LoadProgress()
+    func loadProgress() -> (bytes: UInt64, lastAdvance: Date) { progress.snapshot() }
 
     /// Ask the run to end early. Safe from any thread; the loop notices within a
     /// tick and tears the flows down through its normal path.
@@ -372,19 +378,24 @@ final class UplinkCwndProbe: ObservableObject {
         // its own window the flow actually uses. winuse ≪ 100 = paced /
         // ACK-clock-limited (window slack); ≈ 100 = at the window edge.
         let start = Date()
-        txTotal.reset()
+        progress.reset()
         var lossTicks = 0, reordTicks = 0, totalTicks = 0
         let sampleInterval = 0.1
         var prevTx = [UInt64](repeating: 0, count: fds.count)
         var prevMs = [Int](repeating: 0, count: fds.count)
         while Date() < deadline && !stopped.get() {
             let tms = Int(Date().timeIntervalSince(start) * 1000)
-            // Summed across flows for the liveness witness below. Each socket's
-            // txbytes is monotonic, so the sum is too.
-            var tickTx: UInt64 = 0
+            // 🚨 SUM THE PER-FLOW DELTAS, NOT THE PER-FLOW TOTALS. Re-summing
+            // `txbytes` every tick and keeping the maximum looks equivalent and
+            // is not: if one socket stops being sampled its whole accumulated
+            // count vanishes from the sum, and the monotonic guard then freezes
+            // the witness until the OTHER flows have made up that entire amount —
+            // hundreds of MB into a run, that is a false stall lasting minutes.
+            // A missed sample must cost a zero delta, nothing more.
+            // *(User-caught, 2026-08-16.)*
+            var tickDelta: UInt64 = 0
             for (i, fd) in fds.enumerated() {
                 guard let s = sample(fd) else { continue }
-                tickTx &+= s.txbytes
                 let loss = (s.flags & 0x1) != 0 ? 1 : 0
                 let reord = (s.flags & 0x2) != 0 ? 1 : 0
                 if i == 0 {
@@ -394,16 +405,14 @@ final class UplinkCwndProbe: ObservableObject {
                 }
                 let dms = tms - prevMs[i]
                 let dtx = s.txbytes >= prevTx[i] ? s.txbytes - prevTx[i] : 0
+                tickDelta &+= dtx
                 let deliv = dms > 0 ? Double(dtx) * 8 / (Double(dms) / 1000.0) / 1e6 : 0        // Mbit/s
                 let winRate = s.srttMs > 0 ? Double(s.cwnd) * 8 / (Double(s.srttMs) / 1000.0) / 1e6 : 0
                 let winuse = winRate > 0 ? Int((100.0 * deliv / winRate).rounded()) : 0
                 prevTx[i] = s.txbytes; prevMs[i] = tms
                 log.log("cwndprobe \(tms),\(i),\(s.cwnd),\(s.ssthresh),\(s.sndwnd),\(s.sbbytes),\(s.srttMs),\(s.rttcurMs),\(loss),\(reord),\(s.mss),\(s.txbytes),\(s.rxRtxPkts),\(String(format: "%.2f", deliv)),\(winuse),\(s.txRtxBytes)")
             }
-            // `raise` rather than `set`: a flow whose getsockopt momentarily
-            // fails drops out of this tick's sum, and the witness must not read
-            // that as the load running backwards.
-            txTotal.raise(to: tickTx)
+            progress.advance(by: tickDelta)
             Thread.sleep(forTimeInterval: sampleInterval)
         }
 
@@ -437,15 +446,26 @@ final class AtomicFlag {
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
 
-/// A monotonic counter shared between the sampler and whoever is watching the
-/// run. Same hand-rolled shape as `AtomicFlag`, and monotonic ON PURPOSE: the
-/// reader's whole question is "did this advance", so a momentary dip — one
-/// flow's getsockopt failing and dropping out of the sum — must not be able to
-/// answer it.
-final class AtomicU64 {
+/// How much has moved, and when it last did. Same hand-rolled shape as
+/// `AtomicFlag`.
+///
+/// 🎯 IT CARRIES A TIMESTAMP BECAUSE A TOTAL CANNOT ANSWER THE QUESTION. A
+/// reader asking "was the load alive during this arm" gets "yes" from a single
+/// byte sent in the arm's first second, and an arm that was 99% idle scores as a
+/// loaded one. Only "when did it last advance" distinguishes them, and the
+/// reader gets both so it can also print how stale the answer is.
+///
+/// Fed by POSITIVE DELTAS so a skipped sample costs nothing: see the sampler.
+final class LoadProgress {
     private let lock = NSLock()
-    private var value: UInt64 = 0
-    func raise(to v: UInt64) { lock.lock(); if v > value { value = v }; lock.unlock() }
-    func reset() { lock.lock(); value = 0; lock.unlock() }
-    func get() -> UInt64 { lock.lock(); defer { lock.unlock() }; return value }
+    private var total: UInt64 = 0
+    private var last = Date.distantPast
+    func advance(by delta: UInt64) {
+        guard delta > 0 else { return }
+        lock.lock(); total &+= delta; last = Date(); lock.unlock()
+    }
+    func reset() { lock.lock(); total = 0; last = Date.distantPast; lock.unlock() }
+    func snapshot() -> (bytes: UInt64, lastAdvance: Date) {
+        lock.lock(); defer { lock.unlock() }; return (total, last)
+    }
 }

@@ -3,6 +3,7 @@
 //
 //   swiftc VKTurnProxy/VKTurnProxy/UplinkChunk.swift \
 //          VKTurnProxy/VKTurnProxy/ProbeDuration.swift \
+//          VKTurnProxy/VKTurnProxy/LoadWitness.swift \
 //          VKTurnProxy/VKTurnProxy/DiagnosticRunLock.swift \
 //          tools/swiftcheck/main.swift -o /tmp/chunkcheck && /tmp/chunkcheck
 //
@@ -171,6 +172,41 @@ do {
     for sec in [ProbeDuration.minSec, 60, 1229, ProbeDuration.maxSec] {
         check(ProbeDuration.clamps(sec) == (ProbeDuration.clamp(sec) != sec),
               "clamps(\(sec)) agrees with clamp(\(sec))")
+    }
+}
+
+// 8. 🚨 THE LOAD WITNESS. The arm's neighbour IS the treatment, so an arm that
+//    ran without one is a solo arm wearing a loaded label — and it scores as a
+//    loaded one, quietly. Three ways to be unloaded, each a separate shipped
+//    defect.
+//
+//    SABOTAGE SEEN TO FAIL: delete the `idleMs > staleMs` case. Compiles, and
+//    the "moved then died" checks go red — which is exactly the arm that sends
+//    for one second and idles for the other 119.
+do {
+    let stale = 2000
+    func judge(_ moved: UInt64, _ idle: Int, _ up: Bool) -> LoadWitness.Verdict {
+        LoadWitness.judge(movedBytes: moved, idleMs: idle, probeStillRunning: up, staleMs: stale)
+    }
+
+    check(judge(1 << 20, 100, true) == .ok, "moving, fresh, alive => ok")
+
+    // 🚨 THE CASE "SOME BYTES MOVED" LET THROUGH: a probe that sent for a second
+    // and then died leaves a big positive delta across the whole arm.
+    check(judge(64 << 20, 118_000, true) == .stalled(ms: 118_000),
+          "a big delta does NOT excuse a load that stopped 118 s ago")
+    check(judge(1, stale + 1, true) == .stalled(ms: stale + 1), "one ms past the bound is stale")
+    check(judge(1 << 20, stale, true) == .ok, "the bound itself is not stale")
+
+    check(judge(0, 0, true) == .noBytes, "nothing moved => noBytes, whatever the clock says")
+    check(judge(0, 100, false) == .noBytes,
+          "noBytes outranks ended - what it failed to do beats when it stopped")
+    check(judge(1 << 20, 100, false) == .ended, "fresh bytes but the probe is gone => ended")
+
+    // Every verdict must be able to SAY itself, or a void arm reaches the log
+    // with no reason attached.
+    for v: LoadWitness.Verdict in [.noBytes, .ended, .stalled(ms: 5), .ok] {
+        check(!LoadWitness.reason(v).isEmpty, "the verdict has a reason string")
     }
 }
 

@@ -77,6 +77,20 @@ final class UplinkSplitRunner: ObservableObject {
     /// drain when it goes the other way.
     private let settleSec = 12
 
+    /// How stale the load's last byte may be at an arm's end before the arm is
+    /// called unloaded. The sampler advances every ~100 ms under load, so this is
+    /// 20 sample intervals.
+    ///
+    /// ⚠️ IT IS CHOSEN, NOT MEASURED, AND THAT IS THE ONE THING TO CHECK IF IT
+    /// EVER FIRES ON A HEALTHY RUN. The deepest aggregate silence on record here
+    /// is 300-400 ms (all inner flows collapsing together, `tun-stall` 190-352 ms
+    /// in the same ticks), so 2 s is ~5× the worst observed — but a single flow's
+    /// RTO backoff has reached 6.6 s, and eight flows stalling together for
+    /// longer than this is not excluded by anything measured. `idle=` is
+    /// therefore printed on EVERY loaded arm, so the first run's own distribution
+    /// can replace this guess. → feedback_measuring_on_this_line, rule 8.
+    private let staleLoadMs = 2000
+
     /// 🎯 THE SEQUENCE, and it is the user's (2026-08-16). EIGHT arms, a nested
     /// palindrome, so a drift across the session cannot load onto any of them:
     ///
@@ -262,10 +276,6 @@ final class UplinkSplitRunner: ObservableObject {
 
         let n = conns / 2
         var probeRunning = false
-        // 🚨 Set when a LOADED arm ended having moved zero bytes: the probe is
-        // alive by its own lifecycle flags and is not actually sending, so the
-        // next boundary tears it down and starts a fresh one.
-        var lastArmStalled = false
         log.log("\(runName) TARGET \(host):\(port) — 🚨 this must be server1's INNER (tunnel) "
             + "address with `cwndsink` listening, or the real load never reaches server1.")
         log.log("\(runName) \(knobs)")
@@ -312,6 +322,30 @@ final class UplinkSplitRunner: ObservableObject {
         setLevel(sharedMbit)
         sleep(seconds: warmupSec)
 
+        // 🚨 A FAILED LOADED ARM ENDS THE RUN. It does NOT restart the load and
+        // carry on, and the reason is twofold.
+        //
+        // Scientifically: the palindrome is already broken. Its whole purpose is
+        // that a drift across the session loads on no arm, and an arm that ran
+        // unloaded — plus a fresh probe with a fresh slow start after it —
+        // destroys that symmetry. Nothing after the break is comparable with what
+        // came before, so continuing produces numbers that invite scoring.
+        //
+        // Mechanically, the restart could not have worked anyway, and it would
+        // have reported success: `probe.stop()` only sets a flag, the probe's
+        // teardown runs on its own thread, and `running` is cleared through
+        // `DispatchQueue.main.async` — so an immediate `start()` hits
+        // `guard !running` and returns SILENTLY, after which `waitForRealLoad`
+        // sees the OLD run's `sending == true` and declares the load up.
+        // *(User-caught, 2026-08-16.)*
+        func abortRun(_ why: String) {
+            log.log("\(runName) ABORTED — \(why). The palindrome is broken; score nothing from "
+                + "this session. Load restored to 0 and the pool un-split.")
+            setLevel(0); setSplit(0)
+            DispatchQueue.main.async { probe.stop() }
+            publish("aborted — the real load failed mid-run", running: false)
+        }
+
         for (i, arm) in arms.enumerated() {
             if cancelled { break }
             let no = i + 1
@@ -345,18 +379,11 @@ final class UplinkSplitRunner: ObservableObject {
             let wantsLoad = arm != .solo
             var lifecycleAlive = false
             DispatchQueue.main.sync { lifecycleAlive = probe.running }
-            if probeRunning && (!lifecycleAlive || lastArmStalled) {
-                let why = lifecycleAlive
-                    ? "it is alive but moved NO BYTES through the whole of arm \(no - 1)"
-                    : "it ended without this runner stopping it"
-                log.log("\(runName) 🚨 THE REAL LOAD FAILED before arm \(no) — \(why), so arm "
-                    + "\(no - 1) ran wholly or partly SOLO while being labelled loaded. THAT ARM "
-                    + "IS VOID. Restarting the load for the arms that remain; score nothing "
-                    + "across this line.")
-                DispatchQueue.main.async { probe.stop() }
-                probeRunning = false
+            if probeRunning && !lifecycleAlive {
+                abortRun("the real load ended before arm \(no) without this runner stopping it, "
+                    + "so arm \(no - 1) ran wholly or partly SOLO while being labelled loaded")
+                return
             }
-            lastArmStalled = false
             if wantsLoad && !probeRunning {
                 DispatchQueue.main.async {
                     probe.start(host: host, port: port, flows: self.probeFlows,
@@ -397,22 +424,44 @@ final class UplinkSplitRunner: ObservableObject {
                 + "routing=\(arm == .colocated ? "colocated" : (splitN > 0 ? "disjoint" : "whole-pool")) "
                 + "synth=\(Int(mbit))Mbit/s flows=\(wantsLoad ? probeFlows : 0) sec=\(armSec)")
             publish("arm \(no)/\(arms.count) · \(mode) · \(armSec)s")
-            // 🎯 THE LOAD WITNESS, AND IT IS BYTES RATHER THAN A FLAG. Sampled
-            // across the arm's own span, so a load that dies INSIDE an arm — the
-            // last one included — is caught by that arm and named by it, instead
-            // of being noticed at the next boundary or, for the final arm, never.
-            let txBefore = probe.bytesSent()
+            // 🎯 THE LOAD WITNESS: BYTES, AND WHETHER THEY WERE STILL MOVING AT
+            // THE END. Sampled across the arm's own span, so a load that dies
+            // INSIDE an arm — the last one included — is caught by that arm and
+            // named by it rather than at a boundary that, for the final arm,
+            // never comes.
+            //
+            // 🚨 "SOME BYTES MOVED" IS NOT ENOUGH, and that was this witness's
+            // own first defect: a probe that sends for one second and dies for
+            // the remaining 119 leaves a POSITIVE delta, so the arm passes while
+            // having been 99% unloaded. What the arm needs is that the load was
+            // alive AT ITS END. *(User-caught, 2026-08-16.)*
+            let before = probe.loadProgress()
             sleep(seconds: armSec)
-            let moved = probe.bytesSent() &- txBefore
+            let after = probe.loadProgress()
+            var stillUp = false
+            DispatchQueue.main.sync { stillUp = probe.running }
+            let moved = after.bytes &- before.bytes
+            let idleMs = Int(Date().timeIntervalSince(after.lastAdvance) * 1000)
             var loadNote = ""
             if wantsLoad {
-                loadNote = " load=+\(moved / (1 << 20))MiB"
-                if moved == 0 {
-                    // The neighbour is the treatment. An arm without it is a solo
+                // ⚠️ `idle` is PRINTED ON EVERY LOADED ARM, not only when it
+                // fails, because the threshold below is the one number here that
+                // was chosen rather than measured. The first run's own idle
+                // figures are what should set it. → feedback_measuring_on_this_line
+                loadNote = " load=+\(moved / (1 << 20))MiB idle=\(idleMs)ms"
+                let verdict = LoadWitness.judge(movedBytes: moved, idleMs: idleMs,
+                                                probeStillRunning: stillUp,
+                                                staleMs: staleLoadMs)
+                if verdict != .ok {
+                    // The neighbour IS the treatment. An arm without it is a solo
                     // arm, and it would score as one — quietly.
-                    loadNote += " 🚨 NO BYTES MOVED — the real load was dead for this whole arm, "
-                        + "so it is a SOLO arm wearing the '\(mode)' label. THIS ARM IS VOID."
-                    lastArmStalled = true
+                    let why = LoadWitness.reason(verdict)
+                    loadNote += " 🚨 \(why)"
+                    log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)\(loadNote)")
+                    abortRun("arm \(no) was labelled '\(mode)' but \(why) — it is a SOLO arm in "
+                        + "disguise. THIS ARM IS VOID, the palindrome is broken, and nothing after "
+                        + "it would be comparable with what came before")
+                    return
                 }
             }
             log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)\(loadNote)")
