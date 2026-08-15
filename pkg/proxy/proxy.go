@@ -732,21 +732,62 @@ func NewProxy(cfg Config) *Proxy {
 // is a named function so the test drives the SAME code the tunnel does, rather
 // than a parallel copy that could drift from it.
 func registerSynthDrain(p *Proxy) {
-	synthDrainHook.Store(func() (moved, stranded int) {
+	synthDrainHook.Store(func() (moved, left int) {
+		// 🚨 NEVER DESTROY A PACKET HERE. The first version took the packet out of
+		// synthCh and, if sendCh was full, merely counted it — which is a DROP,
+		// and under real TCP a full sendCh is ordinary. A packet the generator
+		// has already numbered and then loses is a permanent hole in the
+		// synthetic's own sequence, and the server's counter blames it on the
+		// network: the arm would report loss we caused ourselves.
+		// *(User-caught, 2026-08-16.)*
+		//
+		// So: try to place it, wait briefly for room, and if that fails PUT IT
+		// BACK. A packet still queued is recoverable — the next arm that arms the
+		// split will send it, late rather than never — while a dropped one is
+		// indistinguishable from network loss forever.
+		deadline := time.Now().Add(100 * time.Millisecond)
 		for {
 			select {
 			case item := <-p.synthCh:
-				select {
-				case p.sendCh <- item:
+				if p.placeOnShared(item, deadline) {
 					moved++
-				default:
-					stranded++
+					continue
 				}
+				select {
+				case p.synthCh <- item: // back where it came from; room is guaranteed
+				default:
+				}
+				return moved, len(p.synthCh)
 			default:
-				return moved, stranded
+				return moved, len(p.synthCh)
 			}
 		}
 	})
+}
+
+// placeOnShared moves one rescued packet to the shared queue, waiting for room
+// until `deadline` rather than giving up on the first full moment. Called only
+// from the split setter, never from the data path.
+func (p *Proxy) placeOnShared(item sendItem, deadline time.Time) bool {
+	select {
+	case p.sendCh <- item:
+		return true
+	default:
+	}
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		return false
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case p.sendCh <- item:
+		return true
+	case <-t.C:
+		return false
+	case <-p.ctx.Done():
+		return false
+	}
 }
 
 // signalBootstrapDone fires the bootstrap-ready channel exactly once per

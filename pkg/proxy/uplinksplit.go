@@ -129,18 +129,28 @@ func uplinkSplit() int { return splitNow().n }
 // those packets are stranded: no writer serves synthCh once the split is off,
 // and the gap in the synthetic's sequence would be counted downstream as LOSS —
 // an arm biased by our own switch.
-var synthDrainHook atomic.Value // func() (moved, stranded int)
+var synthDrainHook atomic.Value // func() (moved, left int)
 
 func drainSynthQueue() {
 	f, _ := synthDrainHook.Load().(func() (int, int))
 	if f == nil {
 		return
 	}
-	if moved, stranded := f(); moved > 0 || stranded > 0 {
-		log.Printf("uplink-split: drained %d packet(s) out of the synthetic queue on un-split"+
-			", %d stranded — a stranded packet is a gap the loss counter would blame on the network",
-			moved, stranded)
+	moved, left := f()
+	if moved == 0 && left == 0 {
+		return
 	}
+	warn := ""
+	if left > 0 {
+		// Not destroyed — still queued, and the next arm that arms the split will
+		// send them, late. But if the RUN ends with them queued they are a
+		// permanent hole in the synthetic's sequence, which reads downstream as
+		// network loss. So it has to be visible.
+		warn = " 🚨 STILL QUEUED — these fly only when the split is armed again; " +
+			"if the run ends here they become a gap the loss counter blames on the network"
+	}
+	log.Printf("uplink-split: rescued %d packet(s) from the synthetic queue on un-split, %d left%s",
+		moved, left, warn)
 }
 
 // splitOwnsSynth says whether this writer serves the synthetic's group.
@@ -151,7 +161,49 @@ func drainSynthQueue() {
 // many packets each group actually carried, rather than assuming.
 func splitOwnsSynth(connIdx, n int) bool { return connIdx >= 0 && connIdx < n }
 
+// splitAdmits reports whether this writer may SEND the packet it has just
+// dequeued, under the mode in force RIGHT NOW.
+//
+// 🚨 WHY A CHECK AFTER THE DEQUEUE AND NOT ONLY BEFORE IT. Go's `select` picks
+// UNIFORMLY AT RANDOM among ready cases. When the split is armed while a writer
+// is parked on the shared channel, the closed wake and a WireGuard packet can be
+// ready at the same instant — and half the time the writer takes the packet and
+// sends it under the OLD mode, onto an allocation that now belongs to the
+// synthetic. It is a handful of packets per transition, but it is a hole in the
+// guarantee AND it was invisible: the legacy branch never called the counter, so
+// `wrong=` could not see it. *(User-caught, 2026-08-16.)*
+//
+// The epoch is therefore checked where it can be checked exactly — on the packet,
+// after it is in hand.
+func splitAdmits(connIdx int, item sendItem) bool {
+	st := splitNow()
+	if st.n <= UplinkSplitOff {
+		return true
+	}
+	return splitOwnsSynth(connIdx, st.n) == item.synth
+}
+
+// requeueStale puts a packet that no longer belongs to this writer back on the
+// queue its group now reads, WITHOUT blocking. Returns false when that queue is
+// full — the caller then sends it anyway and counts a leak, because dropping it
+// would be loss, and a visible leak beats an invented gap.
+func (p *Proxy) requeueStale(item sendItem) bool {
+	dst := p.sendCh
+	if item.synth && uplinkSplit() > UplinkSplitOff {
+		dst = p.synthCh
+	}
+	select {
+	case dst <- item:
+		splitRequeued.Add(1)
+		return true
+	default:
+		return false
+	}
+}
+
 var (
+	splitRequeued atomic.Int64
+	splitLeaked   atomic.Int64
 	splitSynthToA atomic.Int64
 	splitSynthToB atomic.Int64
 	splitWGToA    atomic.Int64
@@ -178,10 +230,17 @@ func noteSplitDispatch(synth, toA bool) {
 	}
 }
 
-// SplitStatsAndReset reports the four (kind × group) counts and clears them.
-func SplitStatsAndReset() (synthA, synthB, wgA, wgB int64, n int) {
+// SplitStatsAndReset reports every split counter and clears them ALL in one
+// call.
+//
+// 🚨 It returns the requeue and leak counts rather than leaving them to the
+// caller, because the first version cleared them here and read them afterwards —
+// so the field printed 0 no matter what happened. A reset that runs before the
+// read is the same silent zero this project has now shipped three times.
+func SplitStatsAndReset() (synthA, synthB, wgA, wgB, requeued, leaked int64, n int) {
 	return splitSynthToA.Swap(0), splitSynthToB.Swap(0),
-		splitWGToA.Swap(0), splitWGToB.Swap(0), uplinkSplit()
+		splitWGToA.Swap(0), splitWGToB.Swap(0),
+		splitRequeued.Swap(0), splitLeaked.Swap(0), uplinkSplit()
 }
 
 // splitSummary renders the engagement witness and CLEARS the interval. Empty
@@ -193,11 +252,13 @@ func SplitStatsAndReset() (synthA, synthB, wgA, wgB int64, n int) {
 // failure as a chunk size that is live but inert on a shallow queue, which cost
 // this project nine runs.
 func splitSummary() string {
-	synthA, synthB, wgA, wgB, n := SplitStatsAndReset()
+	synthA, synthB, wgA, wgB, requeued, leaked, n := SplitStatsAndReset()
 	if n <= UplinkSplitOff {
 		return ""
 	}
-	wrong := synthB + wgA
+	// A leak is a packet that WAS sent under the superseded mode, so it counts as
+	// wrong; a requeue is the same event caught in time and costs nothing.
+	wrong := synthB + wgA + leaked
 	note := ""
 	if wrong > 0 {
 		// 🚨 Not a statistic — a broken run. If a packet crossed groups the two
@@ -205,6 +266,6 @@ func splitSummary() string {
 		// thing it was built to remove.
 		note = " 🚨 WRONG-GROUP — the split LEAKED and this arm is void"
 	}
-	return fmt.Sprintf(" split=%d synth→A=%d synth→B=%d wg→A=%d wg→B=%d wrong=%d%s",
-		n, synthA, synthB, wgA, wgB, wrong, note)
+	return fmt.Sprintf(" split=%d synth→A=%d synth→B=%d wg→A=%d wg→B=%d requeued=%d leaked=%d wrong=%d%s",
+		n, synthA, synthB, wgA, wgB, requeued, leaked, wrong, note)
 }

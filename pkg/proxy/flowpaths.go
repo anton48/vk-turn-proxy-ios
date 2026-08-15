@@ -576,6 +576,15 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		//    and the writer then parks on the old queue holding the NEW channel,
 		//    missing the close that was meant for it. → uplinksplit.go
 		st := splitNow()
+		// 🚨 If the snapshot we just loaded is ALREADY superseded, do not dequeue
+		// under it at all. Go's select picks uniformly among ready cases, so
+		// without this a writer takes one more packet under the old mode about
+		// half the time — see splitAdmits.
+		select {
+		case <-st.wake:
+			continue
+		default:
+		}
 		if st.n > UplinkSplitOff && connIdx >= 0 {
 			toA := splitOwnsSynth(connIdx, st.n)
 			src := p.sendCh
@@ -584,6 +593,12 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 			}
 			select {
 			case item := <-src:
+				if !splitAdmits(connIdx, item) {
+					if p.requeueStale(item) {
+						continue
+					}
+					splitLeaked.Add(1)
+				}
 				item.via = viaShared
 				noteSplitDispatch(item.synth, toA)
 				p.noteDispatch(item, connIdx, "shared")
@@ -637,6 +652,15 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 		//    handshake, which carry no flow key by design.
 		select {
 		case item := <-p.sendCh:
+			// The mode can change between the snapshot above and this dequeue;
+			// a packet that now belongs to the other group must not be sent by
+			// this writer. → splitAdmits
+			if !splitAdmits(connIdx, item) {
+				if p.requeueStale(item) {
+					continue
+				}
+				splitLeaked.Add(1)
+			}
 			item.via = viaShared
 			p.noteDispatch(item, connIdx, "shared")
 			return item, true
@@ -664,6 +688,12 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 			p.noteDispatch(item, connIdx, "own")
 			return item, true
 		case item := <-p.sendCh:
+			if !splitAdmits(connIdx, item) {
+				if p.requeueStale(item) {
+					continue
+				}
+				splitLeaked.Add(1)
+			}
 			item.via = viaShared
 			p.noteDispatch(item, connIdx, "shared")
 			return item, true

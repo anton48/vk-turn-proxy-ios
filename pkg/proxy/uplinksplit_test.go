@@ -370,3 +370,112 @@ func TestUnSplittingRescuesWhatIsStillQueued(t *testing.T) {
 		t.Fatal("the queued packet was neither stranded nor rescued — it vanished")
 	}
 }
+
+// 🚨🚨 THE STRICT BOUNDARY, and Go's `select` is what breaks it: it picks
+// UNIFORMLY AT RANDOM among ready cases, so when the split is armed while a
+// writer is parked on the shared channel, a WireGuard packet and the closed wake
+// can be ready together — and about half the time the writer takes the packet
+// and sends it under the SUPERSEDED mode, onto an allocation that now belongs to
+// the synthetic. Real for arms 2-5, where the synthetic is silent in the gap
+// while TCP keeps filling the shared queue.
+//
+// The check therefore happens on the packet, AFTER the dequeue.
+//
+// SABOTAGE SEEN TO FAIL: delete the `if !splitAdmits(...)` block from the
+// non-blocking shared-channel case in nextSendItem. Compiles; writer 0 then
+// returns the WireGuard packet it must not send.
+func TestAWriterWillNotSendAPacketOfTheSupersededMode(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	p, cancel := splitTestProxy()
+	defer cancel()
+	registerSynthDrain(p)
+	t.Cleanup(func() { synthDrainHook.Store((func() (int, int))(nil)) })
+
+	// A WireGuard packet queued while the pool is whole…
+	if err := p.SendPacketFlow([]byte("queued while shared"), 0); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	// …and the split armed before any writer picked it up.
+	SetUplinkSplitN(15)
+
+	// Writer 0 is now group A. It must NOT hand back that packet, however the
+	// runtime happens to schedule it.
+	done := make(chan struct{})
+	go func() { time.Sleep(300 * time.Millisecond); close(done) }()
+	if item, ok := p.nextSendItem(done, 0); ok {
+		t.Fatalf("a synthetic-group writer sent a WireGuard packet from the old mode: %q", item.buf)
+	}
+	// The packet is not lost: a group-B writer still gets it.
+	if item, ok := p.nextSendItem(make(chan struct{}), 20); !ok || string(item.buf) != "queued while shared" {
+		t.Fatalf("the packet must still be deliverable by group B (ok=%v)", ok)
+	}
+}
+
+// The post-dequeue half of the same guarantee, made DETERMINISTIC. The race
+// itself — the mode flipping between a writer's snapshot and its dequeue —
+// cannot be produced on demand, but its CONSEQUENCE can: a packet of the wrong
+// kind sitting in the queue a writer serves, which is exactly what a flip
+// leaves behind. The writer must return it rather than send it.
+//
+// SABOTAGE SEEN TO FAIL: delete the `if !splitAdmits(...)` block from the split
+// branch's dequeue in nextSendItem. Compiles; writer 20 then sends a synthetic
+// packet off the shared queue, onto a WireGuard-group allocation.
+func TestAWriterReturnsAPacketThatIsNotItsGroups(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	p, cancel := splitTestProxy()
+	defer cancel()
+	SetUplinkSplitN(15)
+
+	// A SYNTHETIC packet on the SHARED queue — the leftover shape a mode change
+	// produces. Writer 20 serves the shared queue and must not send it.
+	p.sendCh <- sendItem{buf: []byte("synthetic on the shared queue"), synth: true}
+
+	done := make(chan struct{})
+	go func() { time.Sleep(300 * time.Millisecond); close(done) }()
+	if item, ok := p.nextSendItem(done, 20); ok {
+		t.Fatalf("a WireGuard-group writer sent a synthetic packet: %q", item.buf)
+	}
+	// It was moved to the queue its group actually reads, not dropped.
+	if got := len(p.synthCh); got != 1 {
+		t.Fatalf("the packet should have been requeued to synthCh, found %d there", got)
+	}
+	if s := splitSummary(); !strings.Contains(s, "requeued=1") || !strings.Contains(s, "leaked=0") {
+		t.Fatalf("the rescue must be counted and no leak reported: %q", s)
+	}
+}
+
+// 🚨 AND THE DRAIN MUST NOT INVENT LOSS. Taking a packet out of synthCh and
+// dropping it when sendCh is full is a DROP — and under real TCP a full sendCh is
+// ordinary. The generator has already numbered that packet, so losing it is a
+// permanent hole in the synthetic's own sequence that the server blames on the
+// network: the arm would report loss we caused ourselves.
+//
+// SABOTAGE SEEN TO FAIL: in the drain, replace the put-back with a counter
+// increment (the original destructive shape). Compiles; the packet then vanishes
+// from both queues.
+func TestTheDrainNeverDestroysAPacket(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// A shared queue with NO room at all, which is the case that used to drop.
+	p := &Proxy{ctx: ctx, sendCh: make(chan sendItem, 1), synthCh: make(chan sendItem, 4)}
+	registerSynthDrain(p)
+	t.Cleanup(func() { synthDrainHook.Store((func() (int, int))(nil)) })
+
+	SetUplinkSplitN(15)
+	_ = p.SendPacketSynth([]byte("a"))
+	_ = p.SendPacketSynth([]byte("b"))
+	p.sendCh <- sendItem{buf: []byte("occupies the only slot")} // sendCh is now full
+
+	SetUplinkSplitN(UplinkSplitOff) // triggers the drain against a full shared queue
+
+	// One packet fits (nothing does, here), the rest must remain QUEUED — never
+	// silently gone. Total conservation is the assertion.
+	if got := len(p.sendCh) + len(p.synthCh); got != 3 {
+		t.Fatalf("packets were destroyed: %d of 3 survive (sendCh=%d synthCh=%d)",
+			got, len(p.sendCh), len(p.synthCh))
+	}
+}
