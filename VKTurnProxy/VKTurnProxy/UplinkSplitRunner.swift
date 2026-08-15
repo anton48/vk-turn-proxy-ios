@@ -77,11 +77,14 @@ final class UplinkSplitRunner: ObservableObject {
     /// drain when it goes the other way.
     private let settleSec = 12
 
-    /// 🎯 THE SEQUENCE, and it is the user's (2026-08-16). Six arms, a palindrome
-    /// in every condition, so a drift across the session cannot load onto any of
-    /// them:
+    /// 🎯 THE SEQUENCE, and it is the user's (2026-08-16). EIGHT arms, a nested
+    /// palindrome, so a drift across the session cannot load onto any of them:
     ///
-    ///     solo · shared · split · split · shared · solo
+    ///     shared · solo · colocated · split · split · colocated · solo · shared
+    ///
+    /// ⚠️ It started as six — `solo · shared · split · split · shared · solo` —
+    /// and grew the two COLOCATED arms when the historical `shared` one turned
+    /// out not to be a control for the split at all (see below).
     ///
     /// The two SOLO arms are what make the reading unambiguous, and they are the
     /// part my first plan got wrong: it leaned on the ramp's 0.02-0.03% from
@@ -120,9 +123,32 @@ final class UplinkSplitRunner: ObservableObject {
     /// middle and a linear drift loads on none of them.
     private let arms: [Arm] = [.shared, .solo, .colocated, .split, .split, .colocated, .solo, .shared]
 
-    /// Two transitions of the real load (on before arm 2, off before arm 6)
-    /// each cost a settle.
-    var estimatedSeconds: Int { warmupSec + arms.count * (armSec + gapSec) + 2 * settleSec }
+    /// How many times the REAL load has to be switched on or off across the
+    /// sequence. Each one costs a `settleSec`.
+    ///
+    /// 🚨 DERIVED FROM `arms`, NOT WRITTEN DOWN — because the written-down number
+    /// was 2 and went stale the moment the sequence grew from six arms to eight.
+    /// The true count is FIVE (on for arm 1, off for the first solo, on again for
+    /// arm 3, then continuous through arm 6, off for the second solo, on for the
+    /// last shared arm), so the estimate was **36 s short**. The predicate below
+    /// is the same `arm != .solo` the run loop itself uses, so a future change to
+    /// the sequence carries the estimate with it. *(User-caught, 2026-08-16.)*
+    private var loadTransitions: Int {
+        var count = 0
+        var running = false
+        for arm in arms {
+            let wantsLoad = (arm != .solo)
+            if wantsLoad != running {
+                count += 1
+                running = wantsLoad
+            }
+        }
+        return count
+    }
+
+    var estimatedSeconds: Int {
+        warmupSec + arms.count * (armSec + gapSec) + loadTransitions * settleSec
+    }
 
     func start(host: String, port: UInt16, probe: UplinkCwndProbe) {
         guard !running else { return }
@@ -235,7 +261,10 @@ final class UplinkSplitRunner: ObservableObject {
             + "shared allocation at all; all three equal ⇒ the effect needs another load, or the "
             + "treatment did not engage. "
             + "🚨 Read `split=N/mode synth→A=… synth→B=… wg→A=… wg→B=… wrong=… leftover-QUEUED` on the "
-            + "FIRST: wrong>0 VOIDS the arm, and either group at 0 means nothing was tested. "
+            + "FIRST: wrong>0 VOIDS the arm. 🚨 WHAT A ZERO MEANS DEPENDS ON THE MODE — in "
+            + "DISJOINT both groups must carry traffic and either at 0 means nothing was tested, "
+            + "while in COLOCATED group B is REQUIRED to read 0 (synth→B=0 wg→B=0) and what would "
+            + "say nothing was tested there is synth→A or wg→A at 0. "
             + "⚠️ EXPECT ONE `🚧 NOT SCORED` LINE PER ARM and do not read it as a fault: the memstats "
             + "tick that straddles the switch counted its cross terms under TWO rules (wg→A is legal "
             + "in colocated and a leak in disjoint), so it carries an epoch=A→B marker and NO "
@@ -273,7 +302,9 @@ final class UplinkSplitRunner: ObservableObject {
             // probe does would spend its first seconds measuring a ramp, so a
             // arm that turns the load ON waits for bytes AND then settles before
             // it is declared. The arms that inherit an already-running probe pay
-            // nothing, which is why the plan keeps arms 2-5 continuous.
+            // nothing, which is why the plan keeps arms 3-6 — colocated · split ·
+            // split · colocated, the three SCORED conditions and their repeat —
+            // continuous. Five transitions in all; `loadTransitions` counts them.
             let wantsLoad = arm != .solo
             if wantsLoad && !probeRunning {
                 DispatchQueue.main.async {
@@ -324,8 +355,12 @@ final class UplinkSplitRunner: ObservableObject {
         DispatchQueue.main.async { probe.stop() }
         let done = cancelled ? "cancelled" : "done"
         log.log("\(runName) DONE state=\(done) — load restored to 0 and the pool un-split. "
-            + "The comparison is the synthetic's loss in the two shared arms against the two "
-            + "split ones, read against the ramp's 0.02-0.03% for a smooth stream alone.")
+            + "🚨 THE COMPARISON IS COLOCATED ↔ SPLIT, scored against the SOLO arms of this same "
+            + "session: those three are fully matched (the synthetic on the same 15 allocations "
+            + "at the same 15 Mbit/s) and differ only in WHERE the neighbour is — nowhere, on my "
+            + "allocations, on the other fifteen. The two SHARED arms are a positive control that "
+            + "the effect is present at all; NEVER read shared↔split as the measurement, because "
+            + "shared moves the fan-out and the rate as well as the neighbour.")
         publish(done == "done" ? "done — export the log" : "cancelled", running: false)
     }
 
