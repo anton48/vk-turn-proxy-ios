@@ -285,7 +285,7 @@ final class UplinkSplitRunner: ObservableObject {
             + "address with `cwndsink` listening, or the real load never reaches server1.")
         log.log("\(runName) \(knobs)")
         log.log("\(runName) PLAN pool=\(active)/\(total) split=\(n)+\(conns - n) "
-            + "synth=\(Int(splitMbit))Mbit/s(solo,split) vs \(Int(sharedMbit))Mbit/s(shared) "
+            + "synth=\(Int(splitMbit))Mbit/s(solo,colocated,split) vs \(Int(sharedMbit))Mbit/s(shared) "
             + "flows=\(probeFlows) armSec=\(armSec) arms=\(arms.count) transport=TCP k=1 "
             + "estimated=\(estimatedSeconds)s — arms are "
             + "shared·solo·colocated·split·split·colocated·solo·shared, a nested PALINDROME. "
@@ -302,11 +302,16 @@ final class UplinkSplitRunner: ObservableObject {
             + "shared allocation at all; all three equal ⇒ the effect needs another load, or the "
             + "treatment did not engage. "
             + "🚨 Read `split=N/mode synth→A=… synth→B=… wg→A=… wg→B=… wrong=… leftover-QUEUED` on the "
-            + "FIRST: wrong>0 VOIDS the arm. 🚨 WHAT A ZERO MEANS DEPENDS ON THE MODE — in "
-            + "DISJOINT both groups must carry traffic and either at 0 means nothing was tested, "
-            + "while in COLOCATED group B is REQUIRED to read 0 (synth→B=0 wg→B=0) and what would "
-            + "say nothing was tested there is synth→A or wg→A at 0. "
-            + "⚠️ EXPECT ONE `🚧 NOT SCORED` LINE PER ARM and do not read it as a fault: the memstats "
+            + "FIRST: wrong>0 VOIDS the arm. 🚨 WHAT A ZERO MEANS IS PER ARM, NOT PER MODE — "
+            + "SOLO also routes as disjoint but has no real load, so a zero there is expected: "
+            + "SOLO wants synth→A>0 and says nothing about wg→B (0 is fine, keepalives may make it "
+            + "small and non-zero), and only wg→A>0 is a fault; SPLIT wants synth→A>0 AND wg→B>0 "
+            + "with both cross terms at 0; COLOCATED wants synth→A>0 AND wg→A>0 with the whole of "
+            + "group B at 0 (synth→B=0 wg→B=0). SHARED prints no split line at all — the lever is "
+            + "off there by design. "
+            + "⚠️ EXPECT ONE `🚧 NOT SCORED` LINE PER ARM — OCCASIONALLY TWO, when the switch lands "
+            + "inside the tick's own read and the carry discards the next interval as well — and do "
+            + "not read either as a fault: the memstats "
             + "tick that straddles the switch counted its cross terms under TWO rules (wg→A is legal "
             + "in colocated and a leak in disjoint), so it carries an epoch=A→B marker and NO "
             + "verdict. The next full interval scores normally. A `leaked=` alarm still fires there, "
@@ -356,7 +361,7 @@ final class UplinkSplitRunner: ObservableObject {
             let no = i + 1
             setLevel(0)
             log.log("\(runName) GAP a=\(no)/\(arms.count) sec=\(gapSec)")
-            publish("gap \(no == 1 ? 1 : gapSec)s before arm \(no)/\(arms.count)")
+            publish("gap \(gapSec)s before arm \(no)/\(arms.count)")
             sleep(seconds: gapSec)
             if cancelled { break }
 
