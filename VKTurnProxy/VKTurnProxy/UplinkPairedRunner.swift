@@ -116,6 +116,11 @@ final class UplinkPairedRunner: ObservableObject {
             return
         }
 
+        log.log("pairedab TARGET \(host):\(port) — 🚨 this must be server1's INNER "
+            + "(tunnel) address and `cwndsink` must be listening there. A public address "
+            + "can be routed AROUND the tunnel (serverAddress is exempt under "
+            + "includeAllNetworks), and then the real load never reaches server1's "
+            + "WireGuard — which is the entire point of the paired arms.")
         log.log("pairedab PLAN pool=\(active)/\(total) synth=\(Int(synthMbit))Mbit/s "
             + "flows=\(probeFlows) armSec=\(armSec) arms=\(paired.count) "
             + "estimated=\(estimatedSeconds)s — arms are solo·paired·paired·solo, the synthetic "
@@ -141,11 +146,30 @@ final class UplinkPairedRunner: ObservableObject {
 
             setLevel(synthMbit)
             if withProbe {
-                // The probe's own duration bounds it, so a cancelled runner
-                // cannot leave real load running after the arm.
+                // 🚨 THE REAL LOAD IS THE cwnd PROBE, AND IT NEEDS `cwndsink`
+                // LISTENING ON THE OTHER END. If it is not, every flow fails to
+                // connect, the arm carries the synthetic only, and the run
+                // becomes solo·solo·solo·solo — a null that looks like a
+                // finding. The probe's own duration outlives the arm and it is
+                // stopped explicitly below, so a slow connect cannot end the
+                // real load early either.
                 DispatchQueue.main.async {
                     probe.start(host: host, port: port, flows: self.probeFlows,
-                                durationSec: self.armSec)
+                                durationSec: self.armSec + 60)
+                }
+                // ⚠️ WAIT FOR BYTES, NOT FOR THE CALL — connecting the flows
+                // through the tunnel took 25.8 s in one recorded run, and an arm
+                // that starts on `running` would spend that time measuring an
+                // idle link. `sending` is the probe's own "bytes are moving".
+                guard waitForRealLoad(probe, upTo: 45) else {
+                    log.log("pairedab ABORTED at arm \(arm) — the cwnd probe never started "
+                        + "sending. 🚨 `cwndsink` must be LISTENING on \(host):\(port); without "
+                        + "it every paired arm is a solo arm in disguise and the whole "
+                        + "comparison is void. Nothing further was run.")
+                    publish("aborted — no real load; is cwndsink running?", running: false)
+                    setLevel(0)
+                    DispatchQueue.main.async { probe.stop() }
+                    return
                 }
             }
             let mode = withProbe ? "paired" : "solo"
@@ -163,6 +187,22 @@ final class UplinkPairedRunner: ObservableObject {
         log.log("pairedab DONE state=\(done) — load restored to 0. Export the log; the "
             + "comparison is the synthetic's loss in the two solo arms against the two paired ones.")
         publish(done == "done" ? "done — export the log" : "cancelled", running: false)
+    }
+
+    /// Blocks until the probe reports that bytes are actually moving, or gives
+    /// up. 🚨 `running` is set the moment `start()` is called and says nothing
+    /// about whether a single flow connected; `sending` is the probe's own
+    /// statement that the CSV's clock has started. Scheduling an arm against
+    /// the wrong one is the defect that cost two runs of six on 2026-08-13.
+    private func waitForRealLoad(_ probe: UplinkCwndProbe, upTo seconds: Int) -> Bool {
+        let deadline = Date().addingTimeInterval(TimeInterval(seconds))
+        while Date() < deadline && !cancelled {
+            var moving = false
+            DispatchQueue.main.sync { moving = probe.sending }
+            if moving { return true }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return false
     }
 
     private func setLevel(_ mbit: Double) {
