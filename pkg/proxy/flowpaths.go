@@ -585,8 +585,50 @@ func (p *Proxy) nextSendItem(done <-chan struct{}, connIdx int) (sendItem, bool)
 			continue
 		default:
 		}
-		if st.n > UplinkSplitOff && connIdx >= 0 {
+		if st.on() && connIdx >= 0 {
 			toA := splitOwnsSynth(connIdx, st.n)
+			// COLOCATED: both streams live on group A, so an A writer serves BOTH
+			// queues and a B writer serves neither — it parks until the mode
+			// changes. That is the arm which holds the synthetic's own conditions
+			// fixed and moves only the neighbour. → uplinksplit.go
+			if st.mode == splitColocated {
+				if !toA {
+					select {
+					case <-st.wake:
+						continue
+					case <-done:
+						return sendItem{}, false
+					}
+				}
+				select {
+				case item := <-p.synthCh:
+					if !splitAdmits(connIdx, item) {
+						if p.requeueStale(item) {
+							continue
+						}
+						splitLeaked.Add(1)
+					}
+					noteSplitDispatch(item.synth, true)
+					item.via = viaShared
+					p.noteDispatch(item, connIdx, "shared")
+					return item, true
+				case item := <-p.sendCh:
+					if !splitAdmits(connIdx, item) {
+						if p.requeueStale(item) {
+							continue
+						}
+						splitLeaked.Add(1)
+					}
+					noteSplitDispatch(item.synth, true)
+					item.via = viaShared
+					p.noteDispatch(item, connIdx, "shared")
+					return item, true
+				case <-st.wake:
+					continue
+				case <-done:
+					return sendItem{}, false
+				}
+			}
 			src := p.sendCh
 			if toA {
 				src = p.synthCh

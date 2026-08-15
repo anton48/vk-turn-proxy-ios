@@ -97,21 +97,21 @@ type vkCredentials struct {
 // minted 0 creds. Two findings, both harness-verified from our own IP (see
 // 29.05.2026/proxy-turn-vk-android-1.2.2/go_client iptest_test.go MINT TEST):
 //
-//   1. Dropped 3 app_ids (52461373 VK_WEB_VKVIDEO, 52649896 VK_MVK_VKVIDEO,
-//      51781872 VK_ID_AUTH): they return error_code 3 "Unknown method passed"
-//      for calls.getAnonymousToken (method not exposed to those apps) — never
-//      produced a cred, and the wasted attempts amplified VK's per-IP captcha
-//      escalation (checkbox→slider→BOT).
+//  1. Dropped 3 app_ids (52461373 VK_WEB_VKVIDEO, 52649896 VK_MVK_VKVIDEO,
+//     51781872 VK_ID_AUTH): they return error_code 3 "Unknown method passed"
+//     for calls.getAnonymousToken (method not exposed to those apps) — never
+//     produced a cred, and the wasted attempts amplified VK's per-IP captcha
+//     escalation (checkbox→slider→BOT).
 //
-//   2. Replaced our stale secrets. Our old secrets for 6287487
-//      (QbYic1K3lEV5kTGiqlq2) and 7879029 (aR5NKGmm03GYrCiNKsaw) SOLVE the
-//      captcha fine but then VK returns error_code 10 "Internal server error"
-//      on the post-captcha getAnonymousToken MINT — the token1 they yield is
-//      mint-invalid. amurcanov's secret for 6287487 (MuAxFaKDYDOICzGnEOhp) and
-//      their 2nd app 8202606 BOTH mint a call token cleanly from the same
-//      IP/method (verified 2026-05-31: MINT OK 2/2). So the method is NOT
-//      sunset — our secrets were stale. Matched amurcanov's exact pair.
-//      (7879029 dropped: no known-good secret; re-add if one is found.)
+//  2. Replaced our stale secrets. Our old secrets for 6287487
+//     (QbYic1K3lEV5kTGiqlq2) and 7879029 (aR5NKGmm03GYrCiNKsaw) SOLVE the
+//     captcha fine but then VK returns error_code 10 "Internal server error"
+//     on the post-captcha getAnonymousToken MINT — the token1 they yield is
+//     mint-invalid. amurcanov's secret for 6287487 (MuAxFaKDYDOICzGnEOhp) and
+//     their 2nd app 8202606 BOTH mint a call token cleanly from the same
+//     IP/method (verified 2026-05-31: MINT OK 2/2). So the method is NOT
+//     sunset — our secrets were stale. Matched amurcanov's exact pair.
+//     (7879029 dropped: no known-good secret; re-add if one is found.)
 var vkCredentialsList = []vkCredentials{
 	{ClientID: "6287487", ClientSecret: "MuAxFaKDYDOICzGnEOhp"}, // VK_WEB — amurcanov's current working secret
 	{ClientID: "8202606", ClientSecret: "lMRsTiMCyPnp5vfoldmn"}, // amurcanov's 2nd stable app_id
@@ -524,14 +524,14 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 	}
 
 	// Step 1.5: call getCallPreview (warms up the session, as in reference impl)
-	previewData := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&access_token=%s&device_id=%s", linkID, token1, deviceID)
+	previewData := fmt.Sprintf("vk_join_link="+vkCallJoinBase+"%s&access_token=%s&device_id=%s", linkID, token1, deviceID)
 	_, _ = doRequest(previewData, fmt.Sprintf("https://%s/method/calls.getCallPreview?v=5.282&client_id=%s", vkAPIHost(), vc.ClientID))
 
 	// Step 2: get anonymous call token (with captcha retry)
 	var token2 string
 	var resp map[string]interface{}
 	var err error
-	step2Data := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
+	step2Data := fmt.Sprintf("vk_join_link="+vkCallJoinBase+"%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
 
 	// buildCaptchaRetry builds the step2 body carrying a solved captcha. VK's
 	// new error_code-14 format (2026-06-24) OMITS captcha_sid — it ships only
@@ -540,10 +540,10 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 	// samosvalishe/cacggghp fix); an empty captcha_sid in the body confuses VK.
 	buildCaptchaRetry := func(sid, successToken string, ts, attempt float64) string {
 		if sid == "" {
-			return fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&success_token=%s&device_id=%s",
+			return fmt.Sprintf("vk_join_link="+vkCallJoinBase+"%s&name=%s&access_token=%s&success_token=%s&device_id=%s",
 				linkID, escapedName, token1, neturl.QueryEscape(successToken), deviceID)
 		}
-		return fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d&device_id=%s",
+		return fmt.Sprintf("vk_join_link="+vkCallJoinBase+"%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d&device_id=%s",
 			linkID, escapedName, token1, sid, neturl.QueryEscape(successToken), ts, int(attempt), deviceID)
 	}
 
@@ -622,7 +622,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 				}
 
 				if powTry < maxPoWRetries {
-					freshData := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
+					freshData := fmt.Sprintf("vk_join_link="+vkCallJoinBase+"%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
 					freshResp, freshErr := doRequest(freshData, step2URL)
 					if freshErr != nil {
 						log.Printf("vk: failed to get fresh captcha for PoW retry: %v", freshErr)
@@ -673,7 +673,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			// anti-bot tooling (sandbox iframe pure fetch check) but it's
 			// for analytics instrumentation, not bot blocking. The actual
 			// issue is purely session_token consumption.
-			freshData := fmt.Sprintf("vk_join_link=" + vkCallJoinBase + "%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
+			freshData := fmt.Sprintf("vk_join_link="+vkCallJoinBase+"%s&name=%s&access_token=%s&device_id=%s", linkID, escapedName, token1, deviceID)
 			if freshResp, freshErr := doRequest(freshData, step2URL); freshErr == nil {
 				if fSID, fImg, fTs, fAttempt := extractCaptcha(freshResp); fImg != "" {
 					log.Printf("vk: fetched untouched captcha for caller (was sid=%s, now sid=%s)", currentSID, fSID)
@@ -998,7 +998,7 @@ const vkActiveAllocationsCooldown = 11 * time.Minute
 // refreshes every ~5min during a conn's life. So the latest allocation
 // expiry timestamp is:
 //
-//   T_last_refresh + 600s, where T_last_refresh ∈ [T_conn_die - 5m, T_conn_die]
+//	T_last_refresh + 600s, where T_last_refresh ∈ [T_conn_die - 5m, T_conn_die]
 //
 // Worst case (refresh fired just before death): T_conn_die + 600s = +10m.
 // Our `lastUsedAt` is set when conn count drops to 0 (≈ T_conn_die for
@@ -1054,16 +1054,17 @@ const pauseAcquireAfterPathEvent = 500 * time.Millisecond
 // too. Result: pool wiped after 3-4 events.
 //
 // Observed multi-event cascades and their gaps:
-//   2026-05-13 20:01-20:02 — gaps 46s, 27s
-//   2026-05-14 19:43-19:45 — gaps 51s, 36s
-//   2026-05-14 14:30      — gaps ~3s + ~3s (with iface=other in middle,
-//                            handled by Variant B's 5s extended pause)
+//
+//	2026-05-13 20:01-20:02 — gaps 46s, 27s
+//	2026-05-14 19:43-19:45 — gaps 51s, 36s
+//	2026-05-14 14:30      — gaps ~3s + ~3s (with iface=other in middle,
+//	                         handled by Variant B's 5s extended pause)
 //
 // On each path event we check `gap = now - lastPathEventAt`:
 //
-//   gap < 500ms                → iOS dual-event, normal pause refresh (500ms)
-//   500ms ≤ gap < 90s           → CASCADE detected, set pause to 30s
-//   gap ≥ 90s                  → isolated event, normal pause (500ms)
+//	gap < 500ms                → iOS dual-event, normal pause refresh (500ms)
+//	500ms ≤ gap < 90s           → CASCADE detected, set pause to 30s
+//	gap ≥ 90s                  → isolated event, normal pause (500ms)
 //
 // 90s window comfortably covers observed real cascades with margin (typical
 // gap 25-60s). 30s pause covers the time conns would otherwise redistribute
@@ -1261,11 +1262,11 @@ type credPool struct {
 //
 // History — formula bumped twice in two days:
 //
-//   * 2026-05-10 build 70: ceil(n * 1.5 / 10) → ceil(n * 2.5 / 10).
+//   - 2026-05-10 build 70: ceil(n * 1.5 / 10) → ceil(n * 2.5 / 10).
 //     The previous +50% buffer (3 working + 2 spare for typical N=30)
 //     was empirically insufficient for rapid-flap saturation cascades.
 //
-//   * 2026-05-10 build 73: ceil(n * 2.5 / 10) → ceil(n * 4 / 10).
+//   - 2026-05-10 build 73: ceil(n * 2.5 / 10) → ceil(n * 4 / 10).
 //     Build 72's smart-pause + pool=8 worked perfectly for SINGLE
 //     transitions (vpn.wifi.3.log: WiFi→LTE recovery 7.5s, 0 quota
 //     errors). But back-to-back transitions saturate disjoint slot
@@ -1289,18 +1290,19 @@ type credPool struct {
 // pool=12 covers practically all real-world scenarios.
 //
 // Examples (cred slots → max conns at 10/slot, of which N for live
-//          conns, remainder are spare):
-//   n=1..4   → 2 (clamped to 2 for refresh insurance)
-//   n=5..7   → 4 (was 2 with old formula)
-//   n=8..12  → 4-5
-//   n=13..17 → 6-7
-//   n=18..22 → 8-9
-//   n=23..27 → 10-11
-//   n=28..32 → 12 (typical NumConns=30: 3 for conns + 9 spare)
-//   n=33..37 → 14
-//   n=38..42 → 16-17
-//   n=43..47 → 18-19
-//   n=48..52 → 20 (typical NumConns=50: 5 for conns + 15 spare)
+//
+//	       conns, remainder are spare):
+//	n=1..4   → 2 (clamped to 2 for refresh insurance)
+//	n=5..7   → 4 (was 2 with old formula)
+//	n=8..12  → 4-5
+//	n=13..17 → 6-7
+//	n=18..22 → 8-9
+//	n=23..27 → 10-11
+//	n=28..32 → 12 (typical NumConns=30: 3 for conns + 9 spare)
+//	n=33..37 → 14
+//	n=38..42 → 16-17
+//	n=43..47 → 18-19
+//	n=48..52 → 20 (typical NumConns=50: 5 for conns + 15 spare)
 //
 // Trade-off: each extra spare slot is one more cred VK needs to issue
 // (PoW + slider, ~20-60 sec but happens in background after pre-bootstrap)
@@ -1725,6 +1727,7 @@ func (cp *credPool) saveToDisk() {
 //     VK call). On success, fills pool[connIdx]. On failure, sets
 //     cooldown on pool[connIdx] and re-checks for fresh fallback (some
 //     other goroutine may have filled one while we were fetching).
+//
 // connsPerSlot is VK's hard quota of simultaneous TURN allocations on
 // one cred set. Confirmed empirically: vpn.wifi.19.1.log showed conn
 // 0-9 saturating cred 0, with conn 10+ ONLY succeeding on a separate
@@ -2391,9 +2394,10 @@ func (cp *credPool) armPauseAcquireBroadcastLocked() {
 // os-default during the brief window between physical interfaces).
 //
 // Motivation: vpn.over24h.log 2026-05-13 15:26 outage. Sequence was:
-//   T+0     requiresConnection cellular (Event 1)
-//   T+162ms satisfied iface=other os-default=192.168.102.4 (our TUN!)
-//   T+3.3s  satisfied iface=cellular (Event 3 — real new path)
+//
+//	T+0     requiresConnection cellular (Event 1)
+//	T+162ms satisfied iface=other os-default=192.168.102.4 (our TUN!)
+//	T+3.3s  satisfied iface=cellular (Event 3 — real new path)
 //
 // MarkInUseSlotsForPathChange on Event 1 correctly marked 6 active slots
 // and set pauseAcquireUntil = now + 500ms. By the time Event 2 fired
@@ -2936,6 +2940,7 @@ func (cp *credPool) countWithCredsLocked() int {
 //   - messages.getCallPreview / getAnonymCallToken (VK Calls free path): the 95x
 //     block — 951 "Call not found", 954 "Invalid join link". Caught here BEFORE
 //     the legacy fallback so we never solve a captcha for a doomed call/link.
+//
 // error_msg is passed through as the user-facing Message.
 func fatalCallError(resp map[string]interface{}) *CallUnavailableError {
 	errObj, ok := resp["error"].(map[string]interface{})

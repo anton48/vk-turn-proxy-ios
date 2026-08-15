@@ -188,7 +188,11 @@ void wgSetFlowPathsCover(int32_t on);
 /// Uplink POOL SPLIT: N connections carry the paced synthetic and the rest carry
 /// WireGuard, so the two streams share the relay but not an allocation. 0 = off.
 /// 🚨 DIAGNOSTIC with no UI — driven only by the split A/B runner as an arm.
-void wgSetUplinkSplitN(int32_t n);
+/// @param colocated 0 = the two streams take DISJOINT groups (synthetic on the
+///        first N, WireGuard on the rest); 1 = BOTH take the first N and the
+///        rest carry nothing — the arm that holds the synthetic's own
+///        conditions fixed and moves only where the neighbour is.
+void wgSetUplinkSplitN(int32_t n, int32_t colocated);
 
 /// Uplink chunk size K, applied live. 1 = off and is what production runs.
 /// 🚨 A RETIRED lever with no UI: K > 1 is only ever an arm of the paired A/B.

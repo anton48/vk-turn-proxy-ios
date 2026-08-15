@@ -88,30 +88,37 @@ final class UplinkSplitRunner: ObservableObject {
     /// ANOTHER SESSION as the "alone" reference, on a line that moves 75 → 363
     /// Mbit/s inside 70 minutes. The control belongs in the same minutes.
     ///
-    ///	  shared loses, split ≈ solo   ⇒ the competition is ALLOCATION-LOCAL:
-    ///	                                 a shared meter or buffer per allocation.
-    ///	  shared > split > solo        ⇒ allocation-local AND something wider —
-    ///	                                 the relay, or the leg before it.
-    ///	  shared ≈ split > solo        ⇒ the mechanism is NOT the shared
-    ///	                                 allocation; it is the relay or beyond.
-    ///	  all three equal              ⇒ either the effect needs a different load,
-    ///	                                 or the treatment did not engage — read
-    ///	                                 `split=` before concluding anything.
+    ///	  colocated loses, split ≈ solo ⇒ the competition is ALLOCATION-LOCAL:
+    ///	                                  a shared meter or buffer per allocation.
+    ///	  colocated > split > solo      ⇒ allocation-local AND something wider —
+    ///	                                  the relay, or the leg before it.
+    ///	  colocated ≈ split > solo      ⇒ the mechanism is NOT the shared
+    ///	                                  allocation; it is the relay or beyond.
+    ///	  all three equal               ⇒ either the effect needs a different load,
+    ///	                                  or the treatment did not engage — read
+    ///	                                  `split=` before concluding anything.
     ///
-    /// 🚨 SOLO AND SPLIT ARE GEOMETRY-MATCHED, which is the other half of making
-    /// the table unambiguous: in BOTH the synthetic rides the same 15
-    /// allocations at the same 15 Mbit/s, and the ONLY difference is whether real
-    /// TCP is running on the other 15. Without that, "split ≈ solo" could be a
-    /// coincidence of fan-out (15 paths against 30) rather than a statement about
-    /// the neighbour.
+    /// 🚨 THE THREE SCORED ARMS ARE FULLY MATCHED, and this is what makes that
+    /// table mean what it says: in **solo, colocated and split alike** the
+    /// synthetic rides the **same 15 allocations at the same 15 Mbit/s**. The
+    /// only thing that moves is WHERE the neighbour is — nowhere, on my
+    /// allocations, on the other fifteen.
     ///
-    /// ⚠️ SHARED IS DELIBERATELY *NOT* GEOMETRY-MATCHED — it is the historical
-    /// condition (synthetic over all 30 at 30 Mbit/s, real TCP over all 30), kept
-    /// exactly as the runs that produced 0.5-2.7% so this session can show the
-    /// effect is present at all. Read shared↔split as a positive control, and
-    /// solo↔split as the measurement.
-    private enum Arm { case solo, shared, split }
-    private let arms: [Arm] = [.solo, .shared, .split, .split, .shared, .solo]
+    /// ⚠️ **THE HISTORICAL ARM IS NOT THAT CONTROL, and using it as one was the
+    /// design's mistake** *(user-caught)*: `shared` (synthetic over all 30 at 30
+    /// Mbit/s, real TCP over all 30) differs from `split` in THREE ways at once —
+    /// whether TCP is on the synthetic's allocations, the synthetic's fan-out
+    /// (30 against 15) and its rate (30 against 15) — so "shared loses while
+    /// split ≈ solo" could be the fan-out or the level talking. It is kept, at
+    /// the ends of the palindrome, ONLY as a positive control that the effect is
+    /// present in this session at all. **Never read shared↔split as the
+    /// measurement; colocated↔split is the measurement.**
+    private enum Arm { case solo, colocated, split, shared }
+
+    /// `shared · solo · colocated · split · split · colocated · solo · shared` —
+    /// a nested palindrome, so every condition sits symmetrically about the
+    /// middle and a linear drift loads on none of them.
+    private let arms: [Arm] = [.shared, .solo, .colocated, .split, .split, .colocated, .solo, .shared]
 
     /// Two transitions of the real load (on before arm 2, off before arm 6)
     /// each cost a settle.
@@ -213,19 +220,21 @@ final class UplinkSplitRunner: ObservableObject {
         log.log("\(runName) PLAN pool=\(active)/\(total) split=\(n)+\(conns - n) "
             + "synth=\(Int(splitMbit))Mbit/s(solo,split) vs \(Int(sharedMbit))Mbit/s(shared) "
             + "flows=\(probeFlows) armSec=\(armSec) arms=\(arms.count) transport=TCP k=1 "
-            + "estimated=\(estimatedSeconds)s — arms are solo·shared·split·split·shared·solo, a "
-            + "PALINDROME in every condition. "
-            + "🚨 SOLO AND SPLIT ARE GEOMETRY-MATCHED: in both, the synthetic rides the SAME 15 "
-            + "allocations at the SAME 15 Mbit/s, and the only difference is whether real TCP is "
-            + "on the other 15 — so solo↔split is the MEASUREMENT. SHARED is the historical "
-            + "condition (synthetic over all 30 at 30, real over all 30) and is the POSITIVE "
-            + "CONTROL that the effect is present in this session at all; it is not "
-            + "geometry-matched, so read shared↔split with that in mind. "
-            + "READING: shared loses while split ≈ solo ⇒ allocation-local; shared > split > solo "
-            + "⇒ allocation-local AND something wider; shared ≈ split > solo ⇒ not the shared "
-            + "allocation at all; all three equal ⇒ the effect needs another load, or the "
+            + "estimated=\(estimatedSeconds)s — arms are "
+            + "shared·solo·colocated·split·split·colocated·solo·shared, a nested PALINDROME. "
+            + "🚨 THE THREE SCORED ARMS ARE FULLY MATCHED: in solo, colocated AND split the "
+            + "synthetic rides the SAME 15 allocations at the SAME 15 Mbit/s, and the only thing "
+            + "that moves is WHERE the neighbour is — nowhere / on my allocations / on the other "
+            + "fifteen. ⚠️ SHARED (synthetic over all 30 at 30, real over all 30) is NOT that "
+            + "control: it differs from split in THREE ways at once — whether TCP is on the "
+            + "synthetic's allocations, the fan-out (30 vs 15) and the rate (30 vs 15) — so it is "
+            + "kept ONLY as a positive control that the effect is present in this session. "
+            + "🚨 NEVER read shared↔split as the measurement; COLOCATED↔SPLIT is the measurement. "
+            + "READING: colocated loses while split ≈ solo ⇒ ALLOCATION-LOCAL; colocated > split > "
+            + "solo ⇒ allocation-local AND something wider; colocated ≈ split > solo ⇒ not the "
+            + "shared allocation at all; all three equal ⇒ the effect needs another load, or the "
             + "treatment did not engage. "
-            + "🚨 Read `split=N synth→A=… synth→B=… wg→A=… wg→B=… wrong=…` on the memstats line "
+            + "🚨 Read `split=N/mode synth→A=… synth→B=… wg→A=… wg→B=… wrong=… leftover-QUEUED` on the "
             + "FIRST: wrong>0 VOIDS the arm, and either group at 0 means nothing was tested. "
             + "🎯 SCORE THE SYNTHETIC ALONE — its own cum-lost (index 5d170000), and in the pcap "
             + "only the SSRCs of group A, never the aggregate of both groups. Group A is conns "
@@ -289,14 +298,16 @@ final class UplinkSplitRunner: ObservableObject {
                 if cancelled { break }
             }
 
-            // Geometry: solo and split are IDENTICAL for the synthetic (same 15
-            // allocations, same 15 Mbit/s); only shared puts it back on all 30.
+            // Geometry: solo, colocated and split are IDENTICAL for the
+            // synthetic (same 15 allocations, same 15 Mbit/s); only the
+            // historical `shared` arm puts it back on all 30.
             let splitN = (arm == .shared) ? 0 : n
             let mbit = (arm == .shared) ? sharedMbit : splitMbit
-            setSplit(splitN)
+            setSplit(splitN, colocated: arm == .colocated)
             setLevel(mbit)
             let mode = "\(arm)"
             log.log("\(runName) ARM a=\(no)/\(arms.count) mode=\(mode) splitN=\(splitN) "
+                + "routing=\(arm == .colocated ? "colocated" : (splitN > 0 ? "disjoint" : "whole-pool")) "
                 + "synth=\(Int(mbit))Mbit/s flows=\(wantsLoad ? probeFlows : 0) sec=\(armSec)")
             publish("arm \(no)/\(arms.count) · \(mode) · \(armSec)s")
             sleep(seconds: armSec)
@@ -334,8 +345,10 @@ final class UplinkSplitRunner: ObservableObject {
     /// ⚠️ Sent to the running tunnel and deliberately NOT persisted: an arm is a
     /// transient state of one measurement, and a diagnostic that survives a
     /// reconnect is how a retired lever once drove the tunnel for three days.
-    private func setSplit(_ n: Int) {
-        DispatchQueue.main.async { TunnelManager.shared.applyUplinkSplitN(n) }
+    private func setSplit(_ n: Int, colocated: Bool = false) {
+        DispatchQueue.main.async {
+            TunnelManager.shared.applyUplinkSplitN(n, colocated: colocated)
+        }
     }
 
     private func sleep(seconds: Int) {

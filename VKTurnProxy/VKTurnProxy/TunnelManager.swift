@@ -1025,9 +1025,14 @@ class TunnelManager: ObservableObject {
     /// 🚨 No setting behind it and none must be added — the split A/B runner is
     /// the only caller, and it passes the value as an ARGUMENT so an arm can
     /// never be overridden by stored state.
-    func applyUplinkSplitN(_ n: Int) {
+    /// - Parameter colocated: false puts the two streams on DISJOINT groups;
+    ///   true puts BOTH on the first `n` connections and leaves the rest idle —
+    ///   the arm that holds the synthetic's own conditions fixed and moves only
+    ///   where the neighbour is.
+    func applyUplinkSplitN(_ n: Int, colocated: Bool = false) {
         guard let session = manager?.connection as? NETunnelProviderSession,
-              let msg = "set_uplink_split_n:\(max(0, n))".data(using: .utf8) else { return }
+              let msg = "set_uplink_split_n:\(max(0, n)),\(colocated ? 1 : 0)".data(using: .utf8)
+        else { return }
         try? session.sendProviderMessage(msg) { _ in }
     }
 

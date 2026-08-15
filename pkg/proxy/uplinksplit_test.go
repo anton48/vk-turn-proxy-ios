@@ -532,3 +532,83 @@ func TestNewProxyRegistersTheSynthDepthProbe(t *testing.T) {
 			"the summary would never report a queue surviving an un-split")
 	}
 }
+
+// 🚨 THE COLOCATED ARM, and why it had to exist: the historical "shared" arm is
+// NOT a control for the split. It moves three things at once — whether TCP is on
+// the synthetic's allocations, the synthetic's fan-out (30 against 15) and its
+// rate (30 against 15 Mbit/s) — so "shared loses while split ≈ solo" could be
+// the fan-out or the level talking. Colocated holds the synthetic's own
+// conditions fixed and moves only WHERE the neighbour is. *(User-caught.)*
+//
+// Both streams belong on group A; group B must carry NOTHING.
+//
+// SABOTAGE SEEN TO FAIL: drop the `if st.mode == splitColocated` block from
+// nextSendItem, so colocated falls through to the disjoint routing. Compiles;
+// writer 0 then refuses the WireGuard packet it is supposed to serve.
+func TestColocatedPutsBothStreamsOnGroupA(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+	SetUplinkSplit(15, true)
+	p, cancel := splitTestProxy()
+	defer cancel()
+
+	_ = p.SendPacketSynth([]byte("synthetic"))
+	_ = p.SendPacketFlow([]byte("wireguard"), 0)
+
+	// An A writer serves BOTH kinds. 🚨 The deadline is part of the test: with
+	// the colocated routing removed the writer serves only one queue and blocks
+	// on the other, and a test that hangs for a minute reports far less than one
+	// that says which packet never came.
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		bounded := make(chan struct{})
+		go func() { time.Sleep(300 * time.Millisecond); close(bounded) }()
+		item, ok := p.nextSendItem(bounded, 0)
+		if !ok {
+			t.Fatalf("a group-A writer must serve BOTH queues in colocated mode; "+
+				"it stalled after %v", got)
+		}
+		got[string(item.buf)] = true
+	}
+	if !got["synthetic"] || !got["wireguard"] {
+		t.Fatalf("group A must carry both streams, got %v", got)
+	}
+
+	// A B writer carries nothing at all, however long it waits.
+	_ = p.SendPacketFlow([]byte("more wireguard"), 0)
+	done := make(chan struct{})
+	go func() { time.Sleep(250 * time.Millisecond); close(done) }()
+	if item, ok := p.nextSendItem(done, 20); ok {
+		t.Fatalf("group B must be idle in colocated mode, but it took %q", item.buf)
+	}
+	if s := splitSummary(); !strings.Contains(s, "split=15/colocated") ||
+		!strings.Contains(s, "synth→A=1") || !strings.Contains(s, "wg→A=1") ||
+		!strings.Contains(s, "wrong=0") {
+		t.Fatalf("colocated must be labelled and its cross terms clean: %q", s)
+	}
+}
+
+// 🚨 AND "WRONG" MEANS DIFFERENT THINGS IN THE TWO MODES. Disjoint: the
+// synthetic must not reach B and WireGuard must not reach A. Colocated: BOTH
+// belong on A, so anything on B is the error. Getting that backwards would
+// either hide a leak or condemn a correct arm.
+//
+// SABOTAGE SEEN TO FAIL: use the disjoint formula in both modes (delete the
+// `if mode == splitColocated` branch). Compiles; a colocated arm with traffic on
+// group B then reports wrong=0.
+func TestWrongIsModeAware(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+
+	SetUplinkSplit(15, true) // colocated: anything on B is wrong
+	noteSplitDispatch(false, false)
+	if s := splitSummary(); !strings.Contains(s, "wrong=1") {
+		t.Fatalf("colocated: WireGuard on group B must count as wrong: %q", s)
+	}
+
+	SetUplinkSplit(15, false) // disjoint: WireGuard on B is exactly right
+	noteSplitDispatch(false, false)
+	if s := splitSummary(); !strings.Contains(s, "wrong=0") {
+		t.Fatalf("disjoint: WireGuard on group B is correct, not wrong: %q", s)
+	}
+}

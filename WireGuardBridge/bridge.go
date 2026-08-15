@@ -1136,9 +1136,16 @@ func wgSetFlowPathsK(k C.int32_t) {
 // writer.
 //
 //export wgSetUplinkSplitN
-func wgSetUplinkSplitN(n C.int32_t) {
-	proxy.SetUplinkSplitN(int(n))
-	log.Printf("handleAppMessage: uplink split N = %d (0 = off; DIAGNOSTIC, no UI)", int(n))
+func wgSetUplinkSplitN(n C.int32_t, colocated C.int32_t) {
+	proxy.SetUplinkSplit(int(n), colocated != 0)
+	mode := "disjoint"
+	if colocated != 0 {
+		mode = "colocated"
+	}
+	if int(n) <= 0 {
+		mode = "off"
+	}
+	log.Printf("handleAppMessage: uplink split N = %d, mode = %s (DIAGNOSTIC, no UI)", int(n), mode)
 }
 
 //export wgSetUplinkChunkK

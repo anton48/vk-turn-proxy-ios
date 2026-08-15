@@ -500,9 +500,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // the two streams stop sharing allocations. Live, because an arm
             // applied through a reconnect costs a ~107 s thirty-connection ramp.
             // No UI: the split A/B runner is the only caller. Go clamps.
-            let raw = Int(msg.dropFirst("set_uplink_split_n:".count)) ?? 0
-            logMsg("handleAppMessage: uplink split N = \(raw)")
-            wgSetUplinkSplitN(Int32(raw))
+            // "N,colocated" — one message, because the size and the mode are one
+            // decision and applying them separately would put the tunnel through
+            // a state nobody asked for.
+            let parts = msg.dropFirst("set_uplink_split_n:".count).split(separator: ",")
+            let raw = Int(parts.first ?? "") ?? 0
+            let colo = parts.count > 1 ? (Int(parts[1]) ?? 0) : 0
+            logMsg("handleAppMessage: uplink split N = \(raw), colocated = \(colo)")
+            wgSetUplinkSplitN(Int32(raw), Int32(colo))
             completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("set_uplink_chunk_k:") {
             // The uplink chunk size, applied to the RUNNING tunnel. 🚨 There is

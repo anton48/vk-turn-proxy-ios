@@ -71,17 +71,48 @@ const UplinkSplitOff = 0
 // parking — so whichever side of the swap a reader lands on, the channel it
 // holds is the one the NEXT change closes. *(User-caught, 2026-08-16, after the
 // first fix closed only the half where the writer parks BEFORE the flip.)*
+// splitMode says WHERE the two streams are put relative to each other. The three
+// values are the three arms of the experiment, and they differ in exactly one
+// thing each — which is the whole point.
+type splitMode uint8
+
+const (
+	// splitOffMode: one shared pool, every writer serving everything. Production.
+	splitOffMode splitMode = iota
+	// splitDisjoint: the synthetic on group A, WireGuard on group B. The streams
+	// share the relay and the phone but NOT an allocation.
+	splitDisjoint
+	// splitColocated: BOTH streams on group A; group B carries nothing.
+	//
+	// 🚨 THIS ARM EXISTS BECAUSE THE HISTORICAL "shared" ONE IS NOT A CONTROL FOR
+	// THE SPLIT. Shared moves three things at once — whether TCP is on the
+	// synthetic's allocations, the synthetic's fan-out (30 against 15) and its
+	// rate (30 against 15 Mbit/s) — so "shared loses while split ≈ solo" could be
+	// caused by the fan-out or the level rather than by the neighbour. Colocated
+	// holds the synthetic's own conditions FIXED (same 15 allocations, same 15
+	// Mbit/s, same everything) and changes only WHERE the neighbour is: nowhere
+	// (solo), on my allocations (colocated), on the other fifteen (split).
+	// *(User-caught, 2026-08-16.)*
+	splitColocated
+)
+
 type splitState struct {
 	n    int
+	mode splitMode
 	wake chan struct{}
 }
+
+// on reports whether any grouping is in force.
+func (s *splitState) on() bool { return s.mode != splitOffMode && s.n > UplinkSplitOff }
 
 var (
 	splitCur   atomic.Pointer[splitState]
 	splitSetMu sync.Mutex
 )
 
-func init() { splitCur.Store(&splitState{n: UplinkSplitOff, wake: make(chan struct{})}) }
+func init() {
+	splitCur.Store(&splitState{n: UplinkSplitOff, mode: splitOffMode, wake: make(chan struct{})})
+}
 
 // splitNow returns the current snapshot. Load it ONCE per decision and use both
 // fields from that one value; re-reading either separately re-opens the race
@@ -95,11 +126,21 @@ func splitNow() *splitState { return splitCur.Load() }
 // Swap FIRST, then close the superseded channel: every reader that lands after
 // the swap gets the new mode, and every reader that landed before it holds a
 // channel that is about to close.
-func SetUplinkSplitN(n int) {
+func SetUplinkSplitN(n int) { SetUplinkSplit(n, false) }
+
+// SetUplinkSplit applies the size AND the mode together — they are one decision,
+// and applying them in two calls would make the tunnel pass through a state
+// nobody asked for.
+func SetUplinkSplit(n int, colocated bool) {
 	splitSetMu.Lock()
 	defer splitSetMu.Unlock()
 	old := splitCur.Load()
-	next := &splitState{n: ClampUplinkSplitN(n), wake: make(chan struct{})}
+	next := &splitState{n: ClampUplinkSplitN(n), mode: splitDisjoint, wake: make(chan struct{})}
+	if next.n <= UplinkSplitOff {
+		next.mode = splitOffMode
+	} else if colocated {
+		next.mode = splitColocated
+	}
 	splitCur.Store(next)
 	close(old.wake)
 }
@@ -118,7 +159,13 @@ func ClampUplinkSplitN(n int) int {
 
 // uplinkSplit reports the split size, 0 when off. For callers that need only the
 // size and never park — the summary line, and tests.
-func uplinkSplit() int { return splitNow().n }
+func uplinkSplit() int {
+	st := splitNow()
+	if !st.on() {
+		return UplinkSplitOff
+	}
+	return st.n
+}
 
 // synthDepthHook lets the summary READ the synthetic queue's depth. Read-only on
 // purpose: the transfer that used to live here is what destroyed packets, and
@@ -163,8 +210,12 @@ func splitOwnsSynth(connIdx, n int) bool { return connIdx >= 0 && connIdx < n }
 // after it is in hand.
 func splitAdmits(connIdx int, item sendItem) bool {
 	st := splitNow()
-	if st.n <= UplinkSplitOff {
+	if !st.on() {
 		return true
+	}
+	if st.mode == splitColocated {
+		// Both streams live on group A; group B may send nothing at all.
+		return splitOwnsSynth(connIdx, st.n)
 	}
 	return splitOwnsSynth(connIdx, st.n) == item.synth
 }
@@ -175,7 +226,7 @@ func splitAdmits(connIdx int, item sendItem) bool {
 // would be loss, and a visible leak beats an invented gap.
 func (p *Proxy) requeueStale(item sendItem) bool {
 	dst := p.sendCh
-	if item.synth && uplinkSplit() > UplinkSplitOff {
+	if item.synth && splitNow().on() {
 		dst = p.synthCh
 	}
 	select {
@@ -260,6 +311,7 @@ func SplitStatsAndReset() (synthA, synthB, wgA, wgB, requeued, leaked, leftover 
 // this project nine runs.
 func splitSummary() string {
 	synthA, synthB, wgA, wgB, requeued, leaked, leftover, n := SplitStatsAndReset()
+	mode := splitNow().mode
 	if n <= UplinkSplitOff {
 		// 🚨 One exception to the silence: leftovers served by the ordinary path
 		// AFTER an un-split. They are not an error — that is the design — but a
@@ -278,7 +330,16 @@ func splitSummary() string {
 	}
 	// A leak is a packet that WAS sent under the superseded mode, so it counts as
 	// wrong; a requeue is the same event caught in time and costs nothing.
-	wrong := synthB + wgA + leaked
+	// 🚨 WHICH CROSS TERMS ARE "WRONG" DEPENDS ON THE MODE, and getting that
+	// backwards would either hide a leak or condemn a correct arm. Disjoint: the
+	// synthetic must not reach B and WireGuard must not reach A. Colocated: BOTH
+	// belong on A, so anything at all on B is the error.
+	wrong := leaked
+	if mode == splitColocated {
+		wrong += synthB + wgB
+	} else {
+		wrong += synthB + wgA
+	}
 	note := ""
 	if wrong > 0 {
 		// 🚨 Not a statistic — a broken run. If a packet crossed groups the two
@@ -286,6 +347,10 @@ func splitSummary() string {
 		// thing it was built to remove.
 		note = " 🚨 WRONG-GROUP — the split LEAKED and this arm is void"
 	}
-	return fmt.Sprintf(" split=%d synth→A=%d synth→B=%d wg→A=%d wg→B=%d requeued=%d leaked=%d leftover=%d wrong=%d%s",
-		n, synthA, synthB, wgA, wgB, requeued, leaked, leftover, wrong, note)
+	name := "disjoint"
+	if mode == splitColocated {
+		name = "colocated"
+	}
+	return fmt.Sprintf(" split=%d/%s synth→A=%d synth→B=%d wg→A=%d wg→B=%d requeued=%d leaked=%d leftover=%d wrong=%d%s",
+		n, name, synthA, synthB, wgA, wgB, requeued, leaked, leftover, wrong, note)
 }

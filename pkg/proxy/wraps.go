@@ -60,10 +60,10 @@ func NewWrapCodec(profile string, key []byte, isServer bool) (WrapCodec, error) 
 // WrapInto / UnwrapPacket / Overhead / HeaderLen satisfy WrapCodec for wrapConn.
 // wrapConn already has wrapInto/unwrapPacket (unexported); these thin exported
 // methods bridge to the interface. Behaviour is identical to SRTP-WRAP.
-func (w *wrapConn) WrapInto(dst, payload []byte) (int, error)   { return w.wrapInto(dst, payload) }
-func (w *wrapConn) UnwrapPacket(wire, dst []byte) (int, error)  { return w.unwrapPacket(wire, dst) }
-func (w *wrapConn) Overhead() int                               { return wrapOverhead }
-func (w *wrapConn) HeaderLen() int                              { return wrapHeaderLen }
+func (w *wrapConn) WrapInto(dst, payload []byte) (int, error)  { return w.wrapInto(dst, payload) }
+func (w *wrapConn) UnwrapPacket(wire, dst []byte) (int, error) { return w.unwrapPacket(wire, dst) }
+func (w *wrapConn) Overhead() int                              { return wrapOverhead }
+func (w *wrapConn) HeaderLen() int                             { return wrapHeaderLen }
 
 // WriteClientID writes the free-turn-proxy Client-ID record — [1B len | id
 // bytes] (id truncated to 255) — as the FIRST DTLS application record after the

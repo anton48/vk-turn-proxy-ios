@@ -1851,7 +1851,7 @@ func (p *Proxy) sendPacketMarked(data []byte, flowKey uint64, synth bool) error 
 	// snapshot's wake and re-picks the queue. → uplinksplit.go
 	st := splitNow()
 	ch := p.sendCh
-	if st.n > UplinkSplitOff && synth {
+	if st.on() && synth {
 		ch = p.synthCh
 	}
 	// Flow-local path set (PR2), inert unless flow_paths_k is set. A packet that
@@ -1894,7 +1894,7 @@ func (p *Proxy) sendPacketMarked(data []byte, flowKey uint64, synth bool) error 
 			// one we were holding may now have no reader at all.
 			st = splitNow()
 			ch = p.sendCh
-			if st.n > UplinkSplitOff && synth {
+			if st.on() && synth {
 				ch = p.synthCh
 			}
 		case <-p.ctx.Done():
