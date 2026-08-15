@@ -22,8 +22,15 @@ func splitTestProxy() (*Proxy, context.CancelFunc) {
 
 func resetSplit() {
 	SetUplinkSplitN(UplinkSplitOff)
-	SplitStatsAndReset()
+	splitStatsAndReset()
 }
+
+// settleSplit closes the counting interval that a mode change straddles, so what
+// follows is a clean, scoreable one. On a device this is what the FIRST memstats
+// tick after an arm change does by itself — it prints `NOT SCORED` and opens a
+// fresh interval. Tests that want to assert a verdict have to reach the same
+// state, and calling it explicitly says so.
+func settleSplit() { splitStatsAndReset() }
 
 // OFF IS BYTE-FOR-BYTE THE OLD BEHAVIOUR: the generator's packet goes to the
 // shared channel and any writer may take it, including one whose index would
@@ -122,6 +129,7 @@ func TestSplitSummaryCountsBothGroupsAndIsSilentWhenOff(t *testing.T) {
 	}
 
 	SetUplinkSplitN(15)
+	settleSplit()
 	p, cancel := splitTestProxy()
 	defer cancel()
 	_ = p.SendPacketSynth([]byte("s"))
@@ -156,6 +164,7 @@ func TestSplitShoutsWhenAPacketCrossedGroups(t *testing.T) {
 	resetSplit()
 	t.Cleanup(resetSplit)
 	SetUplinkSplitN(15)
+	settleSplit()
 	noteSplitDispatch(true, false) // a synthetic packet served by group B
 	s := splitSummary()
 	if !strings.Contains(s, "wrong=1") || !strings.Contains(s, "WRONG-GROUP") {
@@ -389,6 +398,7 @@ func TestAWriterReturnsAPacketThatIsNotItsGroups(t *testing.T) {
 	p, cancel := splitTestProxy()
 	defer cancel()
 	SetUplinkSplitN(15)
+	settleSplit()
 
 	// A SYNTHETIC packet on the SHARED queue — the leftover shape a mode change
 	// produces. Writer 20 serves the shared queue and must not send it.
@@ -549,6 +559,7 @@ func TestColocatedPutsBothStreamsOnGroupA(t *testing.T) {
 	resetSplit()
 	t.Cleanup(resetSplit)
 	SetUplinkSplit(15, true)
+	settleSplit()
 	p, cancel := splitTestProxy()
 	defer cancel()
 
@@ -601,14 +612,146 @@ func TestWrongIsModeAware(t *testing.T) {
 	t.Cleanup(resetSplit)
 
 	SetUplinkSplit(15, true) // colocated: anything on B is wrong
+	settleSplit()
 	noteSplitDispatch(false, false)
 	if s := splitSummary(); !strings.Contains(s, "wrong=1") {
 		t.Fatalf("colocated: WireGuard on group B must count as wrong: %q", s)
 	}
 
 	SetUplinkSplit(15, false) // disjoint: WireGuard on B is exactly right
+	settleSplit()
 	noteSplitDispatch(false, false)
 	if s := splitSummary(); !strings.Contains(s, "wrong=0") {
 		t.Fatalf("disjoint: WireGuard on group B is correct, not wrong: %q", s)
+	}
+}
+
+// 🚨🚨 THE VALIDITY DEFECT THE USER FOUND BEFORE THE RUN, and it would have
+// thrown away CLEAN arms rather than dirty ones — the worst kind, because a run
+// that voids itself looks like a run that found something.
+//
+// The counters are cleared on the memstats tick and the rule they are read
+// against was taken AFTERWARDS, from whatever mode happened to be in force by
+// then. So a tick straddling `colocated → split` carries `wg→A` packets that were
+// completely legitimate under colocated, scores them under the disjoint rule
+// where `wg→A` is a leak, and prints `wrong>0 … this arm is void`.
+//
+// The interval must therefore carry its own epoch, and one that spans a change is
+// reported without a verdict.
+//
+// 🚨 The change is made with NO splitSummary() in between, which is the whole
+// point: on a device the switch lands between two ticks, not on one.
+//
+// SABOTAGE SEEN TO FAIL: change the guard in splitSummary to
+// `if false && s.spanned {`. Compiles; the straddling interval is then scored
+// under the disjoint rule and this test sees the false alarm.
+func TestAnIntervalSpanningAModeChangeIsNotScored(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+
+	SetUplinkSplit(15, true) // colocated
+	settleSplit()
+
+	// Legitimate under colocated: BOTH streams belong on group A.
+	noteSplitDispatch(false, true) // wg→A
+	noteSplitDispatch(true, true)  // synth→A
+
+	SetUplinkSplit(15, false) // → disjoint, where wg→A would be a leak
+	noteSplitDispatch(false, false)
+
+	s := splitSummary()
+	if !strings.Contains(s, "NOT SCORED") {
+		t.Fatalf("an interval spanning colocated→disjoint must not be scored, got %q", s)
+	}
+	if strings.Contains(s, "WRONG-GROUP") {
+		t.Fatalf("nothing leaked — a legitimate colocated wg→A was condemned by the "+
+			"disjoint rule and a clean arm declared void: %q", s)
+	}
+	// The counters are still shown; they are the engagement witness.
+	if !strings.Contains(s, "wg→A=1") || !strings.Contains(s, "synth→A=1") {
+		t.Fatalf("the counters must still be printed, unscored: %q", s)
+	}
+
+	// 🎯 And the NEXT full interval is normal again — the guard costs one tick,
+	// not the arm.
+	noteSplitDispatch(false, false) // wg→B, correct under disjoint
+	next := splitSummary()
+	if strings.Contains(next, "NOT SCORED") {
+		t.Fatalf("the interval after the change is clean and must score: %q", next)
+	}
+	if !strings.Contains(next, "wg→B=1") || !strings.Contains(next, "wrong=0") {
+		t.Fatalf("the first full interval under the new mode must score normally: %q", next)
+	}
+}
+
+// The mirror, and it fails the other way round: under disjoint a `wg→B` packet is
+// exactly what is supposed to happen, and under colocated group B must be silent,
+// so the same straddle turns correct traffic into `wrong` in the other direction.
+// Both directions occur in the planned arm order (…colocated·split·split·colocated…).
+//
+// SABOTAGE SEEN TO FAIL: same guard, `if false && s.spanned {`. Compiles; the
+// legitimate disjoint wg→B is then scored under the colocated rule.
+func TestTheStraddleIsWrongInBothDirections(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+
+	SetUplinkSplit(15, false) // disjoint
+	settleSplit()
+	noteSplitDispatch(false, false) // wg→B — correct here
+
+	SetUplinkSplit(15, true) // → colocated, where anything on B is wrong
+	s := splitSummary()
+	if !strings.Contains(s, "NOT SCORED") || strings.Contains(s, "WRONG-GROUP") {
+		t.Fatalf("a legitimate disjoint wg→B was condemned by the colocated rule: %q", s)
+	}
+}
+
+// 🚨 WHY AN EPOCH COUNTER AND NOT A COMPARISON OF MODES. Two changes are invisible
+// to "did the mode differ": one that RETURNS to the same mode, and one that moves
+// only the SIZE — and a size change re-partitions the groups, so the same writer
+// index changes sides and the cross terms mean something different on either side
+// of it. Both are boundaries; neither changes `mode`.
+//
+// SABOTAGE SEEN TO FAIL: in SetUplinkSplit compute the epoch as
+// `ep := old.epoch; if old.mode != next.mode { ep++ }; next.epoch = ep`.
+// Compiles; a size-only change then reads as one continuous interval.
+func TestASizeChangeAloneIsAlsoABoundary(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+
+	SetUplinkSplit(15, false)
+	settleSplit()
+	noteSplitDispatch(false, false)
+
+	SetUplinkSplit(20, false) // same mode, different partition
+	if s := splitSummary(); !strings.Contains(s, "NOT SCORED") {
+		t.Fatalf("a size change re-partitions the groups and must open a new interval: %q", s)
+	}
+}
+
+// A LEAK IS EPOCH-INDEPENDENT AND MUST STILL SHOUT. `leaked` is decided at
+// dispatch by splitAdmits, against the mode in force at that instant — so unlike
+// the cross terms it does not depend on which rule the line is read against, and
+// suppressing it along with them would hide a real defect inside the one interval
+// per arm that is not scored.
+//
+// SABOTAGE SEEN TO FAIL: drop `leakNote` from the spanned branch's format string
+// (keep the variable used elsewhere so it still compiles). The alarm then
+// disappears exactly when a mode change is in flight.
+func TestALeakStillShoutsOnAnUnscoredInterval(t *testing.T) {
+	resetSplit()
+	t.Cleanup(resetSplit)
+
+	SetUplinkSplit(15, false)
+	settleSplit()
+	splitLeaked.Add(1) // a packet that WAS sent under the superseded mode
+
+	SetUplinkSplit(15, true) // the straddle
+	s := splitSummary()
+	if !strings.Contains(s, "NOT SCORED") {
+		t.Fatalf("expected the unscored form, got %q", s)
+	}
+	if !strings.Contains(s, "leaked=1") || !strings.Contains(s, "WRONG-GROUP") {
+		t.Fatalf("a leak is epoch-independent and must shout even here: %q", s)
 	}
 }

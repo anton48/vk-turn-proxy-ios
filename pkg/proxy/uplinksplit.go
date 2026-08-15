@@ -100,6 +100,19 @@ type splitState struct {
 	n    int
 	mode splitMode
 	wake chan struct{}
+	// epoch increments on EVERY change, and it is what makes a counting interval
+	// attributable to ONE rule.
+	//
+	// 🚨 WHY A COUNTER AND NOT THE MODE. The cross terms mean different things in
+	// different modes — `wg→A` is legal in colocated and a leak in disjoint — so a
+	// memstats interval that straddles a change mixes two rules and would be
+	// scored against whichever mode happened to be in force when the line was
+	// rendered. A LEGITIMATE colocated `wg→A` then reads as `wrong>0` and a clean
+	// arm is declared VOID. Comparing modes instead of a counter would miss two
+	// cases that are just as wrong: a change that RETURNS to the same mode
+	// (split → off → split), and a change of the SIZE alone, which re-partitions
+	// the groups so the same `connIdx` changes sides. *(User-caught, 2026-08-16.)*
+	epoch uint64
 }
 
 // on reports whether any grouping is in force.
@@ -113,6 +126,19 @@ var (
 func init() {
 	splitCur.Store(&splitState{n: UplinkSplitOff, mode: splitOffMode, wake: make(chan struct{})})
 }
+
+var (
+	// splitIntervalEpoch is the epoch in force when the CURRENT counting interval
+	// was opened. The interval is scoreable only if the epoch has not moved since.
+	splitIntervalEpoch atomic.Uint64
+	// splitSpanCarry closes the one window the two-step read leaves open: a change
+	// landing between the counter swap and the epoch read splits the counters
+	// across THIS interval and the NEXT, because packets counted after the swap
+	// but before the change belong to the old rule. Carrying the flag forward
+	// discards the next interval too — one wasted 10 s tick in an event that
+	// should never occur, against a silently mis-scored arm if it does.
+	splitSpanCarry atomic.Bool
+)
 
 // splitNow returns the current snapshot. Load it ONCE per decision and use both
 // fields from that one value; re-reading either separately re-opens the race
@@ -135,7 +161,16 @@ func SetUplinkSplit(n int, colocated bool) {
 	splitSetMu.Lock()
 	defer splitSetMu.Unlock()
 	old := splitCur.Load()
-	next := &splitState{n: ClampUplinkSplitN(n), mode: splitDisjoint, wake: make(chan struct{})}
+	// The epoch moves on EVERY call, including one that lands on the same mode and
+	// the same size: what it marks is "a boundary passed here", and the counters
+	// on either side of it are not comparable. Under splitSetMu, so old.epoch+1
+	// cannot race another setter.
+	next := &splitState{
+		n:     ClampUplinkSplitN(n),
+		mode:  splitDisjoint,
+		wake:  make(chan struct{}),
+		epoch: old.epoch + 1,
+	}
 	if next.n <= UplinkSplitOff {
 		next.mode = splitOffMode
 	} else if colocated {
@@ -155,16 +190,6 @@ func ClampUplinkSplitN(n int) int {
 		return 29
 	}
 	return n
-}
-
-// uplinkSplit reports the split size, 0 when off. For callers that need only the
-// size and never park — the summary line, and tests.
-func uplinkSplit() int {
-	st := splitNow()
-	if !st.on() {
-		return UplinkSplitOff
-	}
-	return st.n
 }
 
 // synthDepthHook lets the summary READ the synthetic queue's depth. Read-only on
@@ -288,17 +313,57 @@ func noteSplitDispatch(synth, toA bool) {
 	}
 }
 
-// SplitStatsAndReset reports every split counter and clears them ALL in one
-// call.
+// splitStats is ONE interval's counters together with the rule they have to be
+// read against. The two travel in one value on purpose: reading the counters and
+// then reading the mode separately is exactly how a legitimate colocated `wg→A`
+// gets scored under the disjoint rule.
+type splitStats struct {
+	synthA, synthB, wgA, wgB   int64
+	requeued, leaked, leftover int64
+	n                          int
+	mode                       splitMode
+	// spanned: the mode or the size changed DURING this interval, so its cross
+	// terms were produced under two different rules and mean nothing together.
+	spanned    bool
+	from, upto uint64
+}
+
+// splitStatsAndReset closes the current interval: it reports every counter,
+// clears them ALL in one call, and says whether the interval is scoreable.
 //
 // 🚨 It returns the requeue and leak counts rather than leaving them to the
 // caller, because the first version cleared them here and read them afterwards —
 // so the field printed 0 no matter what happened. A reset that runs before the
 // read is the same silent zero this project has now shipped three times.
-func SplitStatsAndReset() (synthA, synthB, wgA, wgB, requeued, leaked, leftover int64, n int) {
-	return splitSynthToA.Swap(0), splitSynthToB.Swap(0),
-		splitWGToA.Swap(0), splitWGToB.Swap(0),
-		splitRequeued.Swap(0), splitLeaked.Swap(0), splitLeftover.Swap(0), uplinkSplit()
+//
+// 🚨 THE ORDER OF THE TWO READS IS LOAD-BEARING. The epoch is read AFTER the
+// counters are swapped, never before. Read first, a change could land between the
+// read and the swap — the counters would then hold packets from both rules while
+// the epoch said "clean", and the arm would be scored wrong SILENTLY. Read after,
+// the only error is the harmless one: a change landing in that window makes a
+// clean interval read as spanned, and the carry flag makes the next one spanned
+// too, which is the conservative direction.
+func splitStatsAndReset() splitStats {
+	before := splitNow().epoch
+	s := splitStats{
+		synthA: splitSynthToA.Swap(0), synthB: splitSynthToB.Swap(0),
+		wgA: splitWGToA.Swap(0), wgB: splitWGToB.Swap(0),
+		requeued: splitRequeued.Swap(0), leaked: splitLeaked.Swap(0),
+		leftover: splitLeftover.Swap(0),
+	}
+	st := splitNow()
+	carried := splitSpanCarry.Swap(before != st.epoch)
+	s.from = splitIntervalEpoch.Swap(st.epoch)
+	s.upto = st.epoch
+	// Epochs only increase, so `from != upto` covers both "a change before the
+	// swap" and "a change during it".
+	s.spanned = carried || s.from != st.epoch
+	s.mode = st.mode
+	s.n = UplinkSplitOff
+	if st.on() {
+		s.n = st.n
+	}
+	return s
 }
 
 // splitSummary renders the engagement witness and CLEARS the interval. Empty
@@ -310,9 +375,16 @@ func SplitStatsAndReset() (synthA, synthB, wgA, wgB, requeued, leaked, leftover 
 // failure as a chunk size that is live but inert on a shallow queue, which cost
 // this project nine runs.
 func splitSummary() string {
-	synthA, synthB, wgA, wgB, requeued, leaked, leftover, n := SplitStatsAndReset()
-	mode := splitNow().mode
-	if n <= UplinkSplitOff {
+	s := splitStatsAndReset()
+	// A leak is decided AT DISPATCH by splitAdmits, against the mode in force at
+	// that instant — so it is epoch-independent evidence and stays an alarm even
+	// on an interval that cannot be scored. The cross terms are the opposite: they
+	// only mean something once you know which rule to read them against.
+	leakNote := ""
+	if s.leaked > 0 {
+		leakNote = " 🚨 WRONG-GROUP — the split LEAKED and this arm is void"
+	}
+	if s.n <= UplinkSplitOff {
 		// 🚨 One exception to the silence: leftovers served by the ordinary path
 		// AFTER an un-split. They are not an error — that is the design — but a
 		// large number means the switch left a lot behind, and the reader should
@@ -321,12 +393,36 @@ func splitSummary() string {
 			return fmt.Sprintf(" split=0 leftover-sent=%d 🚨 leftover-QUEUED=%d — the split is "+
 				"OFF and packets are still in the synthetic queue; they age past the receiver's "+
 				"8128-counter window and become loss that never recovers. THIS ARM IS VOID",
-				leftover, depth)
+				s.leftover, depth)
 		}
-		if leftover > 0 {
-			return fmt.Sprintf(" split=0 leftover-sent=%d", leftover)
+		if s.spanned {
+			return fmt.Sprintf(" split=0 epoch=%d→%d 🚧 NOT SCORED (interval spans a mode change) "+
+				"leftover-sent=%d leaked=%d%s", s.from, s.upto, s.leftover, s.leaked, leakNote)
+		}
+		if s.leftover > 0 || s.leaked > 0 {
+			return fmt.Sprintf(" split=0 leftover-sent=%d leaked=%d%s", s.leftover, s.leaked, leakNote)
 		}
 		return ""
+	}
+	name := "disjoint"
+	if s.mode == splitColocated {
+		name = "colocated"
+	}
+	// 🚨🚨 AN INTERVAL THAT SPANS A MODE CHANGE IS NOT SCORED, and this is a
+	// VALIDITY guard, not tidiness. `wg→A` is CORRECT under colocated and a leak
+	// under disjoint; a memstats tick straddling `colocated → split` therefore
+	// carries legitimate colocated packets that the disjoint rule condemns, and
+	// the line would print `wrong>0` and void a perfectly clean arm. The counters
+	// are still shown — they are the engagement witness and a reader wants them —
+	// but no verdict is attached to them. Expect exactly one such line per arm,
+	// on the first tick after the switch; the next full interval scores normally.
+	// *(User-caught, 2026-08-16.)*
+	if s.spanned {
+		return fmt.Sprintf(" split=%d/%s epoch=%d→%d 🚧 NOT SCORED — this interval spans a mode "+
+			"change and its cross terms were counted under TWO rules: synth→A=%d synth→B=%d "+
+			"wg→A=%d wg→B=%d requeued=%d leaked=%d leftover=%d%s",
+			s.n, name, s.from, s.upto, s.synthA, s.synthB, s.wgA, s.wgB,
+			s.requeued, s.leaked, s.leftover, leakNote)
 	}
 	// A leak is a packet that WAS sent under the superseded mode, so it counts as
 	// wrong; a requeue is the same event caught in time and costs nothing.
@@ -334,11 +430,11 @@ func splitSummary() string {
 	// backwards would either hide a leak or condemn a correct arm. Disjoint: the
 	// synthetic must not reach B and WireGuard must not reach A. Colocated: BOTH
 	// belong on A, so anything at all on B is the error.
-	wrong := leaked
-	if mode == splitColocated {
-		wrong += synthB + wgB
+	wrong := s.leaked
+	if s.mode == splitColocated {
+		wrong += s.synthB + s.wgB
 	} else {
-		wrong += synthB + wgA
+		wrong += s.synthB + s.wgA
 	}
 	note := ""
 	if wrong > 0 {
@@ -347,10 +443,6 @@ func splitSummary() string {
 		// thing it was built to remove.
 		note = " 🚨 WRONG-GROUP — the split LEAKED and this arm is void"
 	}
-	name := "disjoint"
-	if mode == splitColocated {
-		name = "colocated"
-	}
-	return fmt.Sprintf(" split=%d/%s synth→A=%d synth→B=%d wg→A=%d wg→B=%d requeued=%d leaked=%d leftover=%d wrong=%d%s",
-		n, name, synthA, synthB, wgA, wgB, requeued, leaked, leftover, wrong, note)
+	return fmt.Sprintf(" split=%d/%s epoch=%d synth→A=%d synth→B=%d wg→A=%d wg→B=%d requeued=%d leaked=%d leftover=%d wrong=%d%s",
+		s.n, name, s.upto, s.synthA, s.synthB, s.wgA, s.wgB, s.requeued, s.leaked, s.leftover, wrong, note)
 }
