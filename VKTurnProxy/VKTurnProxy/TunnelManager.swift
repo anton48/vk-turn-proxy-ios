@@ -158,6 +158,7 @@ extension TunnelConfig {
             flowPathsK: FlowPaths.stored(in: d),
             flowPathsCover: FlowPaths.coverStored(in: d),
             uplinkChunkK: UplinkChunk.stored(in: d),
+            uplinkPaceOn: UplinkPace.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
@@ -1044,6 +1045,25 @@ class TunnelManager: ObservableObject {
     /// 🚨 The values are ARGUMENTS and this never reads UserDefaults — an arm is
     /// a transient state of one measurement, and a retired lever whose stored
     /// value kept driving the tunnel cost this project three days.
+    /// Applies the Settings switch to a running tunnel. 🚨 Separate from
+    /// `applyUplinkPace` on purpose: that one takes its values as ARGUMENTS and
+    /// must never read UserDefaults, because its caller is the diagnostic runner,
+    /// which sets rates the user never chose. This one is the opposite — it reads
+    /// the setting and nothing else. Keeping them apart is what stops an arm from
+    /// being silently overwritten by a stored value mid-run.
+    func applyUplinkPaceFromSettings() {
+        // 🚨 UserDefaults.standard, because that is what `currentConfig()` reads
+        // and what @AppStorage writes. Reading a DIFFERENT store here would give a
+        // switch that shows one thing and a tunnel that does another — the exact
+        // split-brain shape of the re-signed-IPA App Group defect (#59), where
+        // UserDefaults(suiteName:) does not return nil, it just returns the wrong
+        // answer.
+        let d = UserDefaults.standard
+        applyUplinkPace(kib: UplinkPace.rate(in: d),
+                        burstKiB: UplinkPace.burstKiB,
+                        groupBOnly: false)
+    }
+
     func applyUplinkPace(kib: Int, burstKiB: Int, groupBOnly: Bool) {
         guard let session = manager?.connection as? NETunnelProviderSession,
               let msg = "set_uplink_pace:\(max(0, kib)),\(max(0, burstKiB)),\(groupBOnly ? 1 : 0)"
@@ -1945,6 +1965,10 @@ class TunnelManager: ObservableObject {
             "uplink_synth_sec": config.uplinkSynthSec,
             "memstats_fast_ticks": config.memstatsFastTicks,
             "uplink_chunk_k": config.uplinkChunkK,
+            // Derived here, from the one stored bool. `?? true` matches
+            // UplinkPace.register: an absent key means ON.
+            "uplink_pace_kib": (config.uplinkPaceOn ?? true) ? UplinkPace.rateKiB : 0,
+            "uplink_pace_burst_kib": UplinkPace.burstKiB,
             "flow_paths_k": config.flowPathsK,
             "flow_paths_cover": config.flowPathsCover,
             "use_wrap": config.useWrap,
@@ -2498,6 +2522,12 @@ struct TunnelConfig {
     /// behaviour. See UplinkChunk.swift; expected to be removed with the
     /// setting once the sweep has answered.
     var uplinkChunkK: Int = UplinkChunk.off
+
+    /// The uplink pacer switch, carried so a reconnect keeps it. 🎯 ONE BOOL,
+    /// not a rate and a depth: those are constants on `UplinkPace`, and a second
+    /// copy of them here could disagree with the one the live setter uses.
+    /// Default matches `UplinkPace.register` — an absent key means ON.
+    var uplinkPaceOn: Bool = true
     // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
     // anonymous fallback). The cookie itself lives in the Keychain
     // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.

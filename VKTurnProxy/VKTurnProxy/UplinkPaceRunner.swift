@@ -471,7 +471,15 @@ final class UplinkPaceRunner: ObservableObject {
             log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode) tp=\(isTCP ? "tcp" : "udp")\(note)")
         }
 
-        setPace(0); setLevel(0); setSplit(0)
+        // 🚨 RESTORE THE SETTING, DO NOT FORCE OFF. The pacer became a user setting
+        // in build 296 and its default is ON, so ending every run at 0 would leave
+        // the tunnel unpaced while Settings still showed the switch on — silently,
+        // until the next reconnect. That is the retired-chunk-size trap with the
+        // sign flipped, and it would quietly de-pace every run taken afterwards.
+        // ⚠️ The last arm's own PACE-ARMEND verdict still prints: this call bumps
+        // the generation exactly as setPace(0) did.
+        DispatchQueue.main.async { TunnelManager.shared.applyUplinkPaceFromSettings() }
+        setLevel(0); setSplit(0)
         DispatchQueue.main.async { probe.stop() }
         let done = cancelled ? "cancelled" : "done"
         // 🚨 THE CLOSING LINE IS WHERE THE READER TAKES THE COMPARISON FROM, so it

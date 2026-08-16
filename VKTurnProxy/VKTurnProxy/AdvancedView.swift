@@ -58,6 +58,14 @@ struct AdvancedView: View {
     /// between runs, and one had none. Same rule as the keys above: declared
     /// HERE, never in ContentView.
     @AppStorage("memstatsFastTicks") private var memstatsFastTicks = false
+    // 🚨 DECLARED HERE ONLY. An @AppStorage the NavigationView HOST observes
+    // re-renders the host and POPS this pushed screen — the cause of build 177
+    // and issue #65 — and an UNUSED one is still subscribed.
+    // Default lives in UplinkPace.register, not in this literal: a bare
+    // `= true` here would read true in the view and FALSE in every
+    // non-view caller, since UserDefaults.bool returns false for an
+    // absent key. The switch would show on while the tunnel ran unpaced.
+    @AppStorage(UplinkPace.key) private var uplinkPaceOn = true
     // 🚨 Declared HERE and nowhere else — never in ContentView or SettingsView.
     // An @AppStorage is subscribed even when unused, and a write to a key the
     // NavigationView host observes re-renders the host and tears down whatever
@@ -193,6 +201,24 @@ struct AdvancedView: View {
                 Text("Logging")
             } footer: {
                 Text("Writes the memory and queue lines once a second instead of once every ten — the resolution needed to see what happens inside a single second of a transfer. Takes effect immediately, on a tunnel that is already connected.\n\nLeave it off for everyday use: the log fills about ten times faster, so it starts discarding its oldest entries after roughly half a day instead of several. Turn it on for a measurement, then off.")
+            }
+
+            // 🚨 ITS OWN SECTION, for the reason the comment below repeats: a Form
+            // footer belongs to its SECTION, so sharing one would leave the other
+            // switch's explanation reading as if it described this one.
+            Section {
+                Toggle("Pace the uplink", isOn: $uplinkPaceOn)
+                    // Live, then carried by proxyConfig — same shape as the
+                    // logging switch, and for the same reason: applying it
+                    // through a reconnect would re-ramp 30 connections over
+                    // ~107 s and measure the ramp.
+                    .onChange(of: uplinkPaceOn) { _ in
+                        TunnelManager.shared.applyUplinkPaceFromSettings()
+                    }
+            } header: {
+                Text("Uplink pacing")
+            } footer: {
+                Text("Spaces this device's uploads so each relay allocation receives an even \(UplinkPace.rateKiB) KiB/s instead of bursts. Measured on 2026-08-16: upload loss fell sevenfold and delivered speed rose 43%.\n\n🚧 A TEST SWITCH, ON BY DEFAULT SO IT IS ARMED WHILE MEASURING — not a finished setting. It has only been measured on half the connection pool, with a bulk upload and no download running at the same time, and it costs latency: packets queue inside the app, which a speed test will not show but a video call would. Turn it off if anything feels less responsive, and say so.")
             }
 
             // 🚨 ITS OWN SECTION, and the note above the Logging one says why:

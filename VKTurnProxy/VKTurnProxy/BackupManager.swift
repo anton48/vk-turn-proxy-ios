@@ -108,6 +108,10 @@ enum BackupManager {
         // one would produce a backup whose restore shows a different number
         // than the tunnel uses.
         let chunkK = UplinkChunk.clamp((d.object(forKey: "uplinkChunkK") as? Int) ?? UplinkChunk.off)
+        // 🚨 Read through UplinkPace.stored so an absent key exports the REGISTERED
+        // default (on) rather than the bare-`bool` false. An export that says
+        // "off" for a device that is pacing would restore the wrong tunnel.
+        let pacing = UplinkPace.stored(in: d)
         // Named servers (build 179+). The legacy flat per-server fields are
         // deliberately NOT written alongside them — a backup from this build is
         // not meant to be readable by 178 and earlier.
@@ -135,6 +139,7 @@ enum BackupManager {
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,
             uplinkChunkK: chunkK,
+            uplinkPaceOn: pacing,
             tunnelMTU: mtu
         )
 
@@ -266,6 +271,9 @@ enum BackupManager {
         // backup is untrusted, and a K the picker cannot display would leave the
         // screen showing something other than what the tunnel runs.
         if let v = s.uplinkChunkK { d.set(UplinkChunk.clamp(v), forKey: "uplinkChunkK") }
+        // Symmetric with the export above: a field that imports but never exports
+        // (or the reverse) is the forceLegacyCaptcha defect, which shipped.
+        if let v = s.uplinkPaceOn { d.set(v, forKey: UplinkPace.key) }
 
         if let backedUpServers = s.servers, !backedUpServers.isEmpty {
             // Build 179+ backup: the named server sets ARE the configuration.

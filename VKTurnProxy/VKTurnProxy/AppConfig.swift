@@ -189,6 +189,13 @@ struct AppSettings: Codable {
     /// import-without-export asymmetry is the `forceLegacyCaptcha` trap.
     /// Expected to be removed with the setting once the sweep has answered.
     var uplinkChunkK: Int? = nil
+    /// The uplink pacer switch (Settings › Advanced, build 296). 🎯 The BOOL is
+    /// stored, not the rate it implies: rate and depth are constants owned by
+    /// `UplinkPace`, and a second copy of them here would be a pair of values
+    /// that can disagree — the defect this project keeps paying for. nil = the
+    /// key was absent, so a restore leaves the device's own setting alone
+    /// rather than forcing the default onto it.
+    var uplinkPaceOn: Bool? = nil
     /// Tunnel MTU override (Settings › Advanced, build 209). `0` = automatic,
     /// which is also what an older backup means by omitting the key entirely —
     /// so nil-preserve on import leaves whatever the device already had.

@@ -242,6 +242,25 @@ type ProxyConfig struct {
 	// pkg/proxy/uplinkchunk.go for the full finding.
 	UplinkChunkK int `json:"uplink_chunk_k,omitempty"`
 
+	// UplinkPaceKiB arms the per-allocation uplink token bucket at connect time,
+	// in KiB/s of COUNTED bytes (payload + 30 B/packet) per allocation. 0 = off.
+	//
+	// 🚨 IT RIDES THE CONFIG so the choice survives a reconnect. The live setter
+	// (wgSetUplinkPace) exists for the diagnostic runner, which changes it between
+	// arms; without this field a tunnel restart would silently drop back to off —
+	// the mirror of the trap that left a RETIRED chunk size driving the tunnel for
+	// three days, and just as quiet.
+	//
+	// ⚠️ NOT a production default. 16 KiB is the accepted DEPTH (16.08/tcptest3)
+	// but the 247 KiB/s + 16 KiB point FAILS its own registered KEEP gate on
+	// latency, and no tested point yet passes goodput and latency together.
+	UplinkPaceKiB int `json:"uplink_pace_kib,omitempty"`
+
+	// UplinkPaceBurstKiB is that bucket's capacity. 0 falls back to the shipped
+	// default (16 KiB) rather than to no burst at all, which would be a
+	// one-packet bucket and a very different treatment.
+	UplinkPaceBurstKiB int `json:"uplink_pace_burst_kib,omitempty"`
+
 	// FlowPathsK arms the flow-local path set: how many of the N relay
 	// connections one inner 5-tuple prefers. 0 (unset) is today's behaviour —
 	// every packet races all N. 3-8 pins each flow to a stable subset that it
@@ -331,6 +350,9 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
+	// groupBOnly=false: the split is a diagnostic, and a config-driven pace
+	// applies to every connection.
+	proxy.SetUplinkPace(pcfg.UplinkPaceKiB, pcfg.UplinkPaceBurstKiB, false)
 	proxy.SetFlowPathsK(pcfg.FlowPathsK)
 	proxy.SetFlowPathsHealth(pcfg.FlowPathsHealth)
 	proxy.SetFlowPathsCover(pcfg.FlowPathsCover)
@@ -473,6 +495,9 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
+	// groupBOnly=false: the split is a diagnostic, and a config-driven pace
+	// applies to every connection.
+	proxy.SetUplinkPace(pcfg.UplinkPaceKiB, pcfg.UplinkPaceBurstKiB, false)
 	proxy.SetFlowPathsK(pcfg.FlowPathsK)
 	proxy.SetFlowPathsHealth(pcfg.FlowPathsHealth)
 	proxy.SetFlowPathsCover(pcfg.FlowPathsCover)

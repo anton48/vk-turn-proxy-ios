@@ -186,6 +186,27 @@ func init() {
 	paceCur.Store(&paceState{})
 }
 
+// PaceResetConn discards connIdx's bucket, so the next reservation builds a fresh
+// one with a full burst.
+//
+// 🚨 WHY THIS EXISTS. `paceBuckets` is indexed by CONNECTION INDEX at package scope
+// and was only ever rebuilt when the pace GENERATION changed. That is harmless in a
+// diagnostic run — every arm bumps the generation, so every arm starts clean — and
+// WRONG the moment the pacer is left on: a connection that drops and reconnects gets
+// a brand-new TURN allocation, whose policer at VK's end starts full, while our
+// bucket carried over the dead allocation's token debt and denied the new one its
+// opening burst. Conservative rather than dangerous, and invisible in a two-minute
+// arm, which is exactly why it survived three runs.
+//
+// Called once per session attempt, before the writer goroutines start, so it covers
+// every transport mode through the one dispatch site.
+func PaceResetConn(connIdx int) {
+	if connIdx < 0 || connIdx >= paceMaxConns {
+		return
+	}
+	paceBuckets[connIdx].Store(nil)
+}
+
 func paceNow() *paceState { return paceCur.Load() }
 
 // SetUplinkPace applies the pacer to THIS process without a reconnect, so an

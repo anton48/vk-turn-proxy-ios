@@ -2232,6 +2232,10 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		default:
 		}
 
+		// 🚨 A FRESH SESSION MEANS A FRESH TURN ALLOCATION, SO IT MEANS A FRESH
+		// BUCKET. Without this the reconnecting connection inherits the dead
+		// allocation's token debt — see PaceResetConn. One site, all four modes.
+		PaceResetConn(connIdx)
 		start := time.Now()
 		var err error
 		switch {
@@ -2966,15 +2970,21 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			return werr
 		}
 		for {
+			// 🚨 RESERVE BEFORE THE DEQUEUE — see uplinkpace.go. A writer that
+			// takes a packet and then finds it has no budget holds it where
+			// work-stealing cannot see it (the run-20 pathology).
+			ticket := p.paceReserve(connIdx)
 			// nextSendItem takes this connection's own flow-path queue first and
 			// the shared sendCh otherwise; with the lever off it IS the shared
 			// sendCh. connIdx addresses the path queue — the -1 below is a
 			// separate question, about TX accounting.
 			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
 			if !ok {
+				p.paceSettle(ticket, 0)
 				log.Printf("proxy: [conn %d] DTLS send goroutine: ctx cancelled", connIdx)
 				return
 			}
+			p.paceSettle(ticket, len(item.buf))
 			// -1: this site has never maintained the per-conn TX counters,
 			// and writeChunk must not quietly start. That is what keeps
 			// K=1 byte-for-byte identical to the pre-chunking code here.
@@ -3227,10 +3237,14 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			return werr
 		}
 		for {
+			// 🚨 RESERVE BEFORE THE DEQUEUE — see uplinkpace.go.
+			ticket := p.paceReserve(connIdx)
 			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
 			if !ok {
+				p.paceSettle(ticket, 0)
 				return
 			}
+			p.paceSettle(ticket, len(item.buf))
 			// -1: no per-conn TX accounting at this site today.
 			if err := p.writeChunk(item, -1, writeOne); err != nil {
 				return
@@ -3419,10 +3433,14 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			return werr
 		}
 		for {
+			// 🚨 RESERVE BEFORE THE DEQUEUE — see uplinkpace.go.
+			ticket := p.paceReserve(connIdx)
 			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
 			if !ok {
+				p.paceSettle(ticket, 0)
 				return
 			}
+			p.paceSettle(ticket, len(item.buf))
 			// -1: no per-conn TX accounting at this site today.
 			if err := p.writeChunk(item, -1, writeOne); err != nil {
 				log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)

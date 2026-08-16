@@ -346,22 +346,85 @@ func TestReservationPrecedesTheDequeue(t *testing.T) {
 		t.Fatalf("reading proxy.go: %v", err)
 	}
 	s := string(src)
-	// ⚠️ The scan follows the CALL, not a particular variable name: this guard
-	// went red on correct code once already, when `reserved` became `ticket`
-	// because the reservation started carrying its generation. Anchoring on the
-	// call keeps it tight without being brittle about naming.
-	res := strings.Index(s, "p.paceReserve(connIdx)")
-	if res < 0 {
-		t.Fatal("the SRTP writer no longer reserves at all — the pacer is unwired")
+	// 🚨 EVERY WRITER LOOP, NOT JUST THE ONE. The first version anchored on the
+	// FIRST `p.paceReserve(connIdx)` it found, so it passed while three of the
+	// four writers were unwired — and a mode whose writer has no bucket looks
+	// exactly like a bucket that never had to wait (`waited=0` renders as "NEVER
+	// WAITED"), which is the failure this project has paid for twice.
+	// The dequeue is the anchor because there is exactly one per writer loop.
+	const deqCall = "p.nextSendItem(connCtx.Done(), connIdx)"
+	deqs := strings.Count(s, deqCall)
+	if deqs != 4 {
+		t.Fatalf("expected 4 sendCh writer loops in proxy.go, found %d — if a writer "+
+			"was added or removed, this guard must be re-derived, not relaxed", deqs)
 	}
-	deq := strings.Index(s[res:], "p.nextSendItem(connCtx.Done(), connIdx)")
-	if deq < 0 {
-		t.Fatal("no dequeue follows the reservation")
+	if got := strings.Count(s, "p.paceReserve(connIdx)"); got != deqs {
+		t.Fatalf("%d writer loops but %d reservations — a writer dequeues without a "+
+			"bucket, and its mode would run unpaced with nothing in the log saying so",
+			deqs, got)
 	}
-	// And the settle must follow the dequeue, or the true size is never charged.
-	if !strings.Contains(s[res:res+deq+400], "p.paceSettle(ticket, len(item.buf))") {
-		t.Fatal("the reservation is never settled with the real packet size — " +
-			"the bucket would throttle to the maximum size rather than the traffic")
+	// ...and in each loop the reserve precedes the dequeue and the settle follows it.
+	for i, off := 0, 0; i < deqs; i++ {
+		d := strings.Index(s[off:], deqCall)
+		abs := off + d
+		// the reservation must be the nearest one BEFORE this dequeue
+		res := strings.LastIndex(s[:abs], "p.paceReserve(connIdx)")
+		if res < 0 || abs-res > 900 {
+			t.Fatalf("writer %d dequeues at byte %d with no reservation above it — "+
+				"a writer that takes a packet and then finds no budget holds it where "+
+				"work-stealing cannot see it (the run-20 pathology)", i+1, abs)
+		}
+		if !strings.Contains(s[abs:min(abs+700, len(s))], "p.paceSettle(ticket, len(item.buf))") {
+			t.Fatalf("writer %d never settles with the real packet size — the bucket "+
+				"would throttle to the maximum size rather than to the traffic", i+1)
+		}
+		off = abs + len(deqCall)
+	}
+}
+
+// A fresh session must get a fresh bucket: `paceBuckets` is package-scope and keyed
+// by connIdx, so without this a reconnecting connection inherits the token debt of
+// the allocation that just died.
+//
+// SABOTAGE SEEN TO FAIL: delete the PaceResetConn call from the dispatch site.
+func TestEverySessionAttemptResetsItsBucket(t *testing.T) {
+	src, err := os.ReadFile("proxy.go")
+	if err != nil {
+		t.Fatalf("reading proxy.go: %v", err)
+	}
+	s := string(src)
+	call := strings.Index(s, "PaceResetConn(connIdx)")
+	if call < 0 {
+		t.Fatal("no PaceResetConn call — a reconnecting connection would inherit the " +
+			"dead allocation's token debt and lose its opening burst")
+	}
+	// It must sit ABOVE the mode switch, so it covers all four transports rather
+	// than whichever one someone remembered.
+	sw := strings.Index(s, "case p.config.UseWrapA:")
+	if sw < 0 || call > sw || sw-call > 700 {
+		t.Fatal("PaceResetConn is not immediately above the session-mode switch, so it " +
+			"does not cover every transport mode")
+	}
+}
+
+func TestPaceResetConnGivesBackTheBurst(t *testing.T) {
+	SetUplinkPace(PaceDefaultKiB, PaceDefaultBurstKiB, false)
+	defer SetUplinkPace(PaceOff, 0, false)
+	p, cancel := paceTestProxy()
+	defer cancel()
+	// Drain the bucket: enough reservations to exhaust a 16 KiB burst.
+	for i := 0; i < 40; i++ {
+		tk := p.paceReserve(7)
+		p.paceSettle(tk, 1200)
+	}
+	drained := paceBuckets[7].Load()
+	if drained == nil {
+		t.Fatal("no bucket after draining it — the reservation never built one")
+	}
+	PaceResetConn(7)
+	if paceBuckets[7].Load() != nil {
+		t.Fatal("PaceResetConn did not discard the bucket, so the new allocation " +
+			"would start with the dead one's debt")
 	}
 }
 
