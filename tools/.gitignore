@@ -10,11 +10,22 @@
 # could not see it — a fresh clone had the claim and not the test. A blanket
 # ignore hides a test exactly as well as it hides a binary. (2026-08-16)
 !.gitignore
+# 🚨 THE WHOLE DIRECTORY, NOT A LIST OF EXTENSIONS. This re-include was
+# `!swiftcheck/*.swift` and it dropped `run.sh` in silence — the THIRD time this
+# blanket ignore has hidden something that belongs in the repo (the harness itself,
+# then the log scorers, then the harness's own runner). An allowlist that has to be
+# extended for every new file TYPE will keep failing that way, because the failure
+# is a file that simply is not there. Re-include the directory and re-ignore the
+# junk instead. (2026-08-16)
 !swiftcheck/
-!swiftcheck/*.swift
+!swiftcheck/**
 # …and the log scorers, for the same reason plus one more: THE INSTRUMENT AND
 # ITS SCORER ARE ONE SYSTEM. A parser that lives only on one laptop gets
 # rewritten from memory next time, and a scorer written AFTER a run gets tuned
 # to that run's data. These are versioned beside the code they score.
 !logscore/
-!logscore/*.py
+!logscore/**
+
+# …and the junk that lives inside them anyway.
+swiftcheck/build/
+logscore/__pycache__/
