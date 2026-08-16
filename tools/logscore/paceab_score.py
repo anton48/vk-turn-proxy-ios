@@ -128,6 +128,42 @@ if not marks:
 # 🚨 EXACTLY EIGHT MARKERS. The old loop stepped in pairs and SILENTLY DROPPED a
 # trailing odd one — so a complete first run followed by a single `ARM` of a
 # second passed as a normal first run. *(User-caught, 2026-08-16.)*
+# 🚨 A DROPPED ARMEND IS RECONSTRUCTED, LOUDLY — but nothing else is forgiven.
+# The client log CAN lose a line (recorded once before, for a `uplink-synth` ARM-END
+# whose code must have run because the next ARM was logged). `16.08/udptest1` lost
+# arm 2's ARMEND while the arm itself ran in full: its PACE-ARMEND verdict exists at
+# the right generation, and ARM a=2 -> GAP a=3 measures 121.0 s, the same as every
+# other arm.
+# The reconstruction is EXACT rather than approximate: the runner emits `GAP a=k+1`
+# in the same statement as `ARMEND a=k`, and in this very log the two carry
+# IDENTICAL timestamps for every arm that has both. So a missing ARMEND is filled
+# from the following GAP — and the run says so on its own output.
+# ⚠️ What CANNOT be recovered is that arm's load witness (`load=`, `idle=`,
+# `gapmax=`, `flows=`), so the byte-level guarantee for it is weaker than for the
+# others and this prints as a warning, not a footnote.
+gapmark = {}
+for line in open(LOG, errors="replace"):
+    m = re.search(rf"\[([\d-]+ [\d:.]+)\] {RUNNER} GAP a=(\d+)/", line)
+    if m:
+        gapmark[int(m.group(2))] = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f")
+have = {(k, w) for w, k, *_ in ((m[0], m[1]) for m in marks)}
+rebuilt = []
+for a_no in sorted({m[1] for m in marks if m[0] == "ARM"}):
+    if (a_no, "ARMEND") in have:
+        continue
+    src = gapmark.get(a_no + 1)
+    if src is None:
+        continue
+    proto = next(m for m in marks if m[0] == "ARM" and m[1] == a_no)
+    marks.append(("ARMEND", a_no, proto[2], src, proto[4], None, proto[6]))
+    rebuilt.append(a_no)
+if rebuilt:
+    marks.sort(key=lambda m: m[3])
+    print(f"# 🚨 ARMEND RECONSTRUCTED for arm(s) {rebuilt} from the following `GAP` marker — the "
+          "client log dropped the line, and `GAP a=k+1` is emitted in the same statement so the "
+          "timestamp is exact. ⚠️ THAT ARM HAS NO LOAD WITNESS (no `load=`/`idle=`/`gapmax=`/"
+          "`flows=`), so verify its load from the pacer verdict and the sink before trusting it.")
+
 if STRICT and len(marks) != 8:
     die(f"{len(marks)} ARM/ARMEND markers, expected exactly 8 (four arms). An odd count "
         "means a second run started in this log; a different even count means a different "
