@@ -1,70 +1,107 @@
 import Foundation
 
-/// The per-allocation uplink token bucket, as a Settings knob.
+/// The per-allocation uplink token bucket, as a Settings knob — now a RATE, not a
+/// switch, because the rate is the axis the evidence points at.
 ///
-/// 🚨 THIS IS A TEST KNOB, NOT A SHIPPED DEFAULT, AND THE DIFFERENCE IS RECORDED
-/// HERE BECAUSE THE DEFAULT IS `on`. The bucket's effect is measured and large —
-/// `16.08/tcptest2` cut group-B loss sevenfold (0.85% → 0.12%) and raised delivered
-/// goodput 43% (17.1 → 24.4 Mbit/s) — but that run **failed its own registered KEEP
-/// gate**, and the reason it is on by default is that the person running these
-/// builds wants it armed while testing, not that it is ready to ship.
+/// 🎯 WHY A SWEEP OF RATES AND NOT A TOGGLE. `16.08/udptest2` ran the bucket on all
+/// 30 connections under real bidirectional traffic and the registered gate came back
+/// **three of four**: upload 30.3 → 46.6 Mbit/s (+54%), loss 2.04% → 0.059% (four of
+/// five pairs under the ≲0.05% criterion), download and idle ping untouched — and
+/// loaded-UPLOAD ping 228 → 289 ms, which is the one that fails.
 ///
-/// What is NOT yet measured, and each one is load-bearing:
-///  • it has only ever run on **15 of 30** connections (the diagnostic split);
-///  • the load has only ever been **bulk TCP** — 8 probe flows to `cwndsink`, with
-///    **no downlink workload at all** (rx was ACK-only in every arm);
-///  • **no tested point passes goodput and latency together.** 16 KiB wins
-///    throughput at the price of bufferbloat in OUR OWN queue (`sendch-peak`
-///    82 → 256/256, the producer blocked in 67-71 of 120 ticks, ≈91 ms of FIFO
-///    residence that the OUTER sockets' srtt never sees — it stayed flat at
-///    119-120 ms while the inner flows went 155 → 222-371 ms); 2 KiB removes the
-///    loss at the price of throughput (−10.5% on TCP, −15.4% on UDP).
+/// The same run named the axis. Matching each speedtest to its own `PACE-ARMEND`,
+/// **Spearman(engagement, loaded-up ping) = +1.00** and (engagement, upload) = +0.90:
+/// the run whose bucket engaged 5.5% sat almost exactly on the unpaced arm, the
+/// 45.9-48.8% runs took the full gain AND the full price. **Benefit and cost are one
+/// dial.** Depth is closed at 16 KiB (`16.08/tcptest3`), so the dial is the RATE.
 ///
-/// ⇒ The open question is not *"does it work"* but *"is there a point on the
-/// rate × depth plane that passes both"*, and that needs a run on the full pool
-/// under real bidirectional traffic.
+/// ⚠️ AND THE LEVER ARM IS SHORT — say this before reading any result. The measured
+/// ON load is ~194 KiB/s of counted bytes per allocation, 77% of the ~253 KiB/s knee,
+/// so the rate never bound the MEAN; it sets the burst threshold. Over a 100 ms
+/// window 247 → 270 moves what the bucket admits from 161% to 170% of the knee — a
+/// **6% change on the axis that does the clipping**, while `udptest2`'s ON and OFF
+/// latency ranges cleared each other by only 3 ms. A null here means "this range
+/// cannot test the rate", NOT "the rate does not matter".
+///
+/// 🚨 AND KEEP AN `off` ARM IN THE ROTATION. `16.08/tcptest3` dropped its control and
+/// produced an unresolvable null: its within-condition replicate spread (3.65× and
+/// 6.17×) exceeded the between-condition contrast (3.75×). `udptest2` was clean
+/// BECAUSE it alternated with off — that is what removed the line's drift and gave
+/// the direction-specific control (download must not move).
 enum UplinkPace {
-    /// 🚨 The key is read by non-view code too, so it lives here rather than in a
-    /// `@AppStorage` literal — the same reason `UplinkChunk` exists. A second copy
-    /// of a key is a second thing to go stale.
-    static let key = "uplinkPaceOn"
+    /// 🚨 A NEW KEY, because the value changed TYPE. The old `uplinkPaceOn` was a
+    /// Bool; `UserDefaults.integer(forKey:)` on a Bool-typed value returns 1/0, which
+    /// would silently mean "1 KiB/s" — a bucket 247× too strict, and one that would
+    /// look like a plausible run rather than an error.
+    static let key = "uplinkPaceKiB"
 
-    /// Rate and depth are NOT exposed. The depth was swept and settled at 16 KiB
-    /// (`16.08/tcptest3`) and the rate is the server pacer's shipped 247; a picker
-    /// for either would invite a sweep that has already been run.
-    static let rateKiB = 247
+    /// The retired key, kept ONLY so the migration can find and clear it. This
+    /// project ran a RETIRED lever for three days because a deleted picker left its
+    /// value in UserDefaults; the reverse — a stale key silently outvoting the new
+    /// one — is the same defect wearing the other hat.
+    static let legacyBoolKey = "uplinkPaceOn"
+
+    static let off = 0
+
+    /// 🚨 SWEEP POINTS, NOT A DIAL. Same reasoning as `UplinkChunk`: these are
+    /// comparison points chosen against a measured knee, and a free-form stepper
+    /// would invite arms that cannot be compared with anything already run.
+    ///  • 247 — the server pacer's shipped rate, 95% of the 260 KiB/s the packet-size
+    ///    sweep put the policer at, and the rate every pacer run so far used;
+    ///  • 260 — the TOP of the measured 247-260 KiB/s knee bracket;
+    ///  • 270 — deliberately ABOVE it: accept a little policer loss in exchange for
+    ///    less time spent waiting in our own queue.
+    /// ⚠️ At 260 and 270 the pool-wide allowance (30 × rate) passes the ~62 Mbit/s
+    /// budget, so the bucket stops being an aggregate limiter altogether and is
+    /// purely a burst limiter. That is the intent, and it is worth knowing when
+    /// reading the result.
+    static let choices = [off, 247, 260, 270]
+
+    /// The default, and it is a TEST default. 247 is what every measurement so far
+    /// used, so leaving it here keeps a device that nobody has touched comparable
+    /// with `udptest2`.
+    static let defaultKiB = 247
+
+    /// Depth is SETTLED and deliberately not offered: `16.08/tcptest3` swept it and
+    /// 2 KiB bought nothing while costing 10.5% goodput on TCP and 15.4% on UDP, and
+    /// the same run showed why depth cannot be the lever on TCP at all.
     static let burstKiB = 16
 
-    /// 🚨 DEFAULT ON — and `register` is what makes that true on a device that has
-    /// never opened Settings. `UserDefaults.bool(forKey:)` returns **false** for an
-    /// absent key, so a bare `@AppStorage("…") var on = true` reads `true` in the
-    /// view and `false` everywhere else, and the tunnel would run unpaced while the
-    /// switch showed on. That split-brain is the shape of the App Group defect this
-    /// project has already paid for twice.
+    static func clamp(_ v: Int) -> Int {
+        choices.contains(v) ? v : (choices.min(by: { abs($0 - v) < abs($1 - v) }) ?? defaultKiB)
+    }
+
+    /// 🚨 THE MIGRATION, AND IT RUNS BEFORE ANY READ. A device that has already used
+    /// the Bool switch carries `uplinkPaceOn`; on/off becomes 247/0 exactly once, the
+    /// old key is REMOVED so it cannot outlive its own meaning, and the step is
+    /// announced — the failure mode of a silent migration is that it looks like a
+    /// setting the user chose.
+    static func migrateOnce(in d: UserDefaults) {
+        let marker = "uplinkPaceKiBMigrated"
+        guard !d.bool(forKey: marker) else { return }
+        d.set(true, forKey: marker)
+        guard d.object(forKey: legacyBoolKey) != nil else { return }
+        let was = d.bool(forKey: legacyBoolKey)
+        let now = was ? defaultKiB : off
+        d.set(now, forKey: key)
+        d.removeObject(forKey: legacyBoolKey)
+        SharedLogger.shared.log("[UplinkPace] migrated \(legacyBoolKey)=\(was) → \(key)=\(now) "
+            + "and removed the old key; the pacer is a RATE now, not a switch")
+    }
+
     static func register(in d: UserDefaults) {
-        d.register(defaults: [key: true])
+        migrateOnce(in: d)
+        d.register(defaults: [key: defaultKiB])
     }
 
-    /// Whether the bucket should be armed. Non-view callers use this.
-    static func stored(in d: UserDefaults) -> Bool {
+    /// The configured rate in KiB/s of counted bytes per allocation; 0 = off.
+    /// 🎯 Off is a rate of ZERO rather than a separate flag, because that is exactly
+    /// what the Go side's `PaceOff` means — one representation, no pair of values
+    /// that can disagree.
+    static func stored(in d: UserDefaults) -> Int {
         register(in: d)
-        return d.bool(forKey: key)
+        return clamp(d.integer(forKey: key))
     }
 
-    /// The rate to hand the extension: the configured one when on, 0 when off.
-    /// 🎯 Off is expressed as a RATE OF ZERO rather than a separate flag, because
-    /// that is exactly what the Go side's `PaceOff` means — one representation, no
-    /// pair of values that can disagree.
-    static func rate(in d: UserDefaults) -> Int {
-        stored(in: d) ? rateKiB : 0
-    }
-
-    /// 🚨 The bucket is wired into ALL FOUR writer loops as of build 296, so every
-    /// transport mode is paced. It was SRTP-only before that, and three of the four
-    /// modes whose names contain "SRTP" (`.srtpWrap`, `.srtpWrapS`, `.srtpWrapA`)
-    /// leave `useSrtp = false` — so a mode-based reading of "is it on" was wrong in
-    /// a way the log could not show, because an unwired writer renders exactly like
-    /// a bucket that never had to wait (`waited=0` → "NEVER WAITED").
-    /// Kept as a note rather than a check: there is nothing left to refuse.
-    static let wiredIntoEveryWriter = true
+    static func label(_ v: Int) -> String { v == off ? "Off" : "\(v) KiB/s" }
 }

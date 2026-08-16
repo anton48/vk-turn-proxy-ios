@@ -38,21 +38,24 @@ enum ExperimentKnobs {
         let cover = FlowPaths.coverStored(in: defaults)
         let synth = UplinkSynth.stored(in: defaults)
         let mtu = TunnelMTU.stored(in: defaults)
-        let pace = UplinkPace.stored(in: defaults)
+        let paceKiB = UplinkPace.stored(in: defaults)
 
         var offenders: [String] = []
         if chunk != UplinkChunk.off { offenders.append("uplinkChunkK=\(chunk)") }
         if flowK != FlowPaths.off { offenders.append("flowPathsK=\(flowK)") }
         if cover { offenders.append("flowPathsCover=on") }
         if synth > 0 { offenders.append("uplinkSynthMbit=\(synth)") }
-        // 🚨 THE PACER IS DEFAULT ON as of build 296, so the DEVIATION is OFF.
-        // It has to appear here for the reason the chunk size does: a live
-        // lever that no PLAN line mentions drove this tunnel for three days
-        // once, and every run taken in those days had to be re-qualified.
-        if !pace { offenders.append("uplinkPace=OFF") }
+        // 🚨 THE PACER IS A RATE as of build 299, and the DEVIATION is any rate
+        // that is not the shipped test default — including OFF. It has to appear
+        // here for the reason the chunk size does: a live lever that no PLAN line
+        // mentions drove this tunnel for three days once, and every run taken in
+        // those days had to be re-qualified.
+        if paceKiB != UplinkPace.defaultKiB {
+            offenders.append("uplinkPace=\(UplinkPace.label(paceKiB))")
+        }
 
         let base = "knobs chunkK=\(chunk) flowK=\(flowK) cover=\(cover ? "on" : "off") "
-            + "pace=\(pace ? "\(UplinkPace.rateKiB)KiB/\(UplinkPace.burstKiB)KiB" : "off") "
+            + "pace=\(paceKiB == UplinkPace.off ? "off" : "\(paceKiB)KiB")/\(UplinkPace.burstKiB)KiB "
             + "synth=\(synth)Mbit mtu=\(mtu) conns=\(server.numConnections) "
             + "transport=\(server.useUDP ? "UDP" : "TCP")"
 

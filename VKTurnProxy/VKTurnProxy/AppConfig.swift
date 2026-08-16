@@ -195,6 +195,12 @@ struct AppSettings: Codable {
     /// that can disagree — the defect this project keeps paying for. nil = the
     /// key was absent, so a restore leaves the device's own setting alone
     /// rather than forcing the default onto it.
+    /// The uplink pacer RATE in KiB/s of counted bytes per allocation; 0 = off.
+    /// 🚨 Was a Bool through build 298. `uplinkPaceOn` is still read on import for
+    /// backups written by those builds — dropping it would silently reset a device
+    /// restoring from one, which is the import-without-export asymmetry in reverse.
+    var uplinkPaceKiB: Int? = nil
+    /// Retired. Read-only on import, never written on export.
     var uplinkPaceOn: Bool? = nil
     /// Tunnel MTU override (Settings › Advanced, build 209). `0` = automatic,
     /// which is also what an older backup means by omitting the key entirely —

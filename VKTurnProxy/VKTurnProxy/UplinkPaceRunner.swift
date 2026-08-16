@@ -405,10 +405,10 @@ final class UplinkPaceRunner: ObservableObject {
             // say ON while the command carried OFF. Read and send in the SAME block
             // on main, and report THAT value, using the explicit-argument form of
             // apply rather than the one that re-reads. *(User-caught.)*
-            var on = false
+            var kib = 0
             DispatchQueue.main.sync {
-                on = UplinkPace.stored(in: UserDefaults.standard)
-                TunnelManager.shared.applyUplinkPace(kib: on ? UplinkPace.rateKiB : 0,
+                kib = UplinkPace.stored(in: UserDefaults.standard)
+                TunnelManager.shared.applyUplinkPace(kib: kib,
                                                      burstKiB: UplinkPace.burstKiB,
                                                      groupBOnly: false)
             }
@@ -417,9 +417,9 @@ final class UplinkPaceRunner: ObservableObject {
             // (`sendProviderMessage` under a `try?`, completion ignored), so this line
             // can only honestly claim what was SENT. The same distinction the pace
             // scorer enforces between what an arm ASKED for and what it APPLIED.
-            return on
-                ? "pace RESTORE REQUESTED at the setting (\(UplinkPace.rateKiB)KiB/s burst "
-                    + "\(UplinkPace.burstKiB)KiB, ON, every writer), load 0, pool un-split"
+            return kib != UplinkPace.off
+                ? "pace RESTORE REQUESTED at the setting (\(kib)KiB/s burst "
+                    + "\(UplinkPace.burstKiB)KiB, every writer), load 0, pool un-split"
                 : "pace restore requested at the setting (OFF), load 0, pool un-split"
         }
 

@@ -158,7 +158,7 @@ extension TunnelConfig {
             flowPathsK: FlowPaths.stored(in: d),
             flowPathsCover: FlowPaths.coverStored(in: d),
             uplinkChunkK: UplinkChunk.stored(in: d),
-            uplinkPaceOn: UplinkPace.stored(in: d),
+            uplinkPaceKiB: UplinkPace.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
@@ -1059,7 +1059,7 @@ class TunnelManager: ObservableObject {
         // UserDefaults(suiteName:) does not return nil, it just returns the wrong
         // answer.
         let d = UserDefaults.standard
-        applyUplinkPace(kib: UplinkPace.rate(in: d),
+        applyUplinkPace(kib: UplinkPace.stored(in: d),
                         burstKiB: UplinkPace.burstKiB,
                         groupBOnly: false)
     }
@@ -1965,9 +1965,9 @@ class TunnelManager: ObservableObject {
             "uplink_synth_sec": config.uplinkSynthSec,
             "memstats_fast_ticks": config.memstatsFastTicks,
             "uplink_chunk_k": config.uplinkChunkK,
-            // Derived here, from the one stored bool. `?? true` matches
-            // UplinkPace.register: an absent key means ON.
-            "uplink_pace_kib": (config.uplinkPaceOn ?? true) ? UplinkPace.rateKiB : 0,
+            // The rate rides the config so the choice survives a reconnect; 0 = off,
+            // which is exactly what the Go side's PaceOff means.
+            "uplink_pace_kib": config.uplinkPaceKiB,
             "uplink_pace_burst_kib": UplinkPace.burstKiB,
             "flow_paths_k": config.flowPathsK,
             "flow_paths_cover": config.flowPathsCover,
@@ -2526,8 +2526,9 @@ struct TunnelConfig {
     /// The uplink pacer switch, carried so a reconnect keeps it. 🎯 ONE BOOL,
     /// not a rate and a depth: those are constants on `UplinkPace`, and a second
     /// copy of them here could disagree with the one the live setter uses.
-    /// Default matches `UplinkPace.register` — an absent key means ON.
-    var uplinkPaceOn: Bool = true
+    /// Default matches `UplinkPace.register` — an absent key means the shipped
+    /// test default, 247 KiB/s. 0 = off.
+    var uplinkPaceKiB: Int = UplinkPace.defaultKiB
     // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
     // anonymous fallback). The cookie itself lives in the Keychain
     // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.

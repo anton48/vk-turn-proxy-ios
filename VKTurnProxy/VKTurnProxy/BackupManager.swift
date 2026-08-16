@@ -111,7 +111,7 @@ enum BackupManager {
         // 🚨 Read through UplinkPace.stored so an absent key exports the REGISTERED
         // default (on) rather than the bare-`bool` false. An export that says
         // "off" for a device that is pacing would restore the wrong tunnel.
-        let pacing = UplinkPace.stored(in: d)
+        let paceKiB = UplinkPace.stored(in: d)
         // Named servers (build 179+). The legacy flat per-server fields are
         // deliberately NOT written alongside them — a backup from this build is
         // not meant to be readable by 178 and earlier.
@@ -139,7 +139,7 @@ enum BackupManager {
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,
             uplinkChunkK: chunkK,
-            uplinkPaceOn: pacing,
+            uplinkPaceKiB: paceKiB,
             tunnelMTU: mtu
         )
 
@@ -273,7 +273,15 @@ enum BackupManager {
         if let v = s.uplinkChunkK { d.set(UplinkChunk.clamp(v), forKey: "uplinkChunkK") }
         // Symmetric with the export above: a field that imports but never exports
         // (or the reverse) is the forceLegacyCaptcha defect, which shipped.
-        if let v = s.uplinkPaceOn { d.set(v, forKey: UplinkPace.key) }
+        // 🚨 CLAMP, because a hand-edited backup is untrusted and an off-sweep rate
+        // would be a run nobody could compare with anything.
+        if let v = s.uplinkPaceKiB {
+            d.set(UplinkPace.clamp(v), forKey: UplinkPace.key)
+        } else if let old = s.uplinkPaceOn {
+            // A backup from build 296-298, when this was a switch. Same mapping the
+            // device migration uses, so a restore and an upgrade agree.
+            d.set(old ? UplinkPace.defaultKiB : UplinkPace.off, forKey: UplinkPace.key)
+        }
 
         if let backedUpServers = s.servers, !backedUpServers.isEmpty {
             // Build 179+ backup: the named server sets ARE the configuration.

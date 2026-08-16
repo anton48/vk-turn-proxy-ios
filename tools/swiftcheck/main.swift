@@ -387,5 +387,62 @@ func checkPaceRunnerRestore() {
 print("section 10: the pace runner's two exits")
 checkPaceRunnerRestore()
 
+
+// ─── section 11: the pacer's Bool → rate migration ─────────────────────────
+//
+// 🚨 IT RUNS ONCE AND DELETES ITS SOURCE, so a defect here is unrecoverable on the
+// device that hits it. And the failure is SILENT in the worst way: reading a
+// Bool-typed value with `integer(forKey:)` yields 1, which is a legal-looking
+// 1 KiB/s — a bucket 247x too strict that would produce a plausible run rather
+// than an error.
+func checkUplinkPaceMigration() {
+    // 1. ON becomes the default rate, and the retired key is REMOVED.
+    let d1 = freshDefaults("pace.on")
+    d1.set(true, forKey: UplinkPace.legacyBoolKey)
+    check(UplinkPace.stored(in: d1) == UplinkPace.defaultKiB,
+          "section 11: uplinkPaceOn=true migrates to \(UplinkPace.defaultKiB) "
+          + "(got \(UplinkPace.stored(in: d1)))")
+    check(d1.object(forKey: UplinkPace.legacyBoolKey) == nil,
+          "section 11: the retired Bool key is removed — a stale key that outlives its "
+          + "meaning is how a RETIRED lever drove this tunnel for three days")
+
+    // 2. OFF becomes 0, not the default. Getting this backwards would silently ARM
+    //    the pacer on a device whose owner had turned it off.
+    let d2 = freshDefaults("pace.off")
+    d2.set(false, forKey: UplinkPace.legacyBoolKey)
+    check(UplinkPace.stored(in: d2) == UplinkPace.off,
+          "section 11: uplinkPaceOn=false migrates to off (got \(UplinkPace.stored(in: d2)))")
+
+    // 3. A device that never touched the switch gets the default and nothing else.
+    let d3 = freshDefaults("pace.fresh")
+    check(UplinkPace.stored(in: d3) == UplinkPace.defaultKiB,
+          "section 11: a fresh device reads the default rate")
+
+    // 4. IT RUNS ONCE. A second pass must not undo a rate the user has since chosen.
+    let d4 = freshDefaults("pace.once")
+    d4.set(true, forKey: UplinkPace.legacyBoolKey)
+    _ = UplinkPace.stored(in: d4)
+    d4.set(270, forKey: UplinkPace.key)
+    d4.set(false, forKey: UplinkPace.legacyBoolKey)   // a stale key reappears
+    check(UplinkPace.stored(in: d4) == 270,
+          "section 11: the migration is once-only — a re-run would overwrite the rate "
+          + "the user chose (got \(UplinkPace.stored(in: d4)))")
+
+    // 5. Off-sweep values are snapped: a hand-edited backup is untrusted, and an
+    //    arm at a rate nobody swept cannot be compared with anything.
+    check(UplinkPace.clamp(255) == 260 || UplinkPace.clamp(255) == 247,
+          "section 11: clamp snaps an off-sweep rate to a sweep point "
+          + "(255 -> \(UplinkPace.clamp(255)))")
+    check(UplinkPace.clamp(9999) == 270,
+          "section 11: clamp snaps a wild value to the nearest point "
+          + "(9999 -> \(UplinkPace.clamp(9999)))")
+    check(UplinkPace.choices.contains(UplinkPace.off) && UplinkPace.choices.contains(247),
+          "section 11: the sweep keeps an OFF arm and the 247 anchor — udptest2 was "
+          + "clean BECAUSE it alternated with off, and tcptest3's null came of dropping it")
+}
+
+print("section 11: the pacer's Bool -> rate migration")
+checkUplinkPaceMigration()
+
 print(failures == 0 ? "PASS" : "FAIL (\(failures))")
 exit(failures == 0 ? 0 : 1)

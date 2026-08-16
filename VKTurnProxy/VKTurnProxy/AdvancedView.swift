@@ -65,7 +65,7 @@ struct AdvancedView: View {
     // `= true` here would read true in the view and FALSE in every
     // non-view caller, since UserDefaults.bool returns false for an
     // absent key. The switch would show on while the tunnel ran unpaced.
-    @AppStorage(UplinkPace.key) private var uplinkPaceOn = true
+    @AppStorage(UplinkPace.key) private var uplinkPaceKiB = UplinkPace.defaultKiB
     // 🚨 Declared HERE and nowhere else — never in ContentView or SettingsView.
     // An @AppStorage is subscribed even when unused, and a write to a key the
     // NavigationView host observes re-renders the host and tears down whatever
@@ -207,18 +207,22 @@ struct AdvancedView: View {
             // footer belongs to its SECTION, so sharing one would leave the other
             // switch's explanation reading as if it described this one.
             Section {
-                Toggle("Pace the uplink", isOn: $uplinkPaceOn)
+                Picker("Uplink pacing", selection: $uplinkPaceKiB) {
+                    ForEach(UplinkPace.choices, id: \.self) { v in
+                        Text(UplinkPace.label(v)).tag(v)
+                    }
+                }
                     // Live, then carried by proxyConfig — same shape as the
                     // logging switch, and for the same reason: applying it
                     // through a reconnect would re-ramp 30 connections over
                     // ~107 s and measure the ramp.
-                    .onChange(of: uplinkPaceOn) { _ in
+                    .onChange(of: uplinkPaceKiB) { _ in
                         TunnelManager.shared.applyUplinkPaceFromSettings()
                     }
             } header: {
                 Text("Uplink pacing")
             } footer: {
-                Text("Spaces this device's uploads so each relay allocation receives an even \(UplinkPace.rateKiB) KiB/s instead of bursts. Measured on 2026-08-16: upload loss fell sevenfold and delivered speed rose 43%.\n\n🚧 A TEST SWITCH, ON BY DEFAULT SO IT IS ARMED WHILE MEASURING — not a finished setting. It has only been measured on half the connection pool, with a bulk upload and no download running at the same time, and it costs latency: packets queue inside the app, which a speed test will not show but a video call would. Turn it off if anything feels less responsive, and say so.")
+                Text("Spaces this device's uploads so each relay allocation receives an even stream instead of bursts. Measured on 2026-08-16 across 30 connections and ten alternating speed tests: upload rose 30 → 47 Mbit/s and upload packet loss fell from 2.0% to 0.06%.\n\n🚧 A TEST SETTING, and the rates are COMPARISON POINTS, not a dial. 247 is what every measurement so far used. Higher rates hold back less, which should cost less delay — that is the open question this sweep exists to answer.\n\n⚠️ IT COSTS UPLOAD LATENCY: the same run measured loaded upload ping 228 → 289 ms, because packets wait in a queue inside the app. A speed test will not show it; a video call will. When comparing rates, always run Off in between — the line itself moves, and only an alternating comparison controls for that.")
             }
 
             // 🚨 ITS OWN SECTION, and the note above the Logging one says why:
