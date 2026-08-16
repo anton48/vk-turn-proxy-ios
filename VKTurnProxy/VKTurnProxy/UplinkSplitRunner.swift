@@ -457,8 +457,7 @@ final class UplinkSplitRunner: ObservableObject {
             // the remaining 119 leaves a POSITIVE delta, so the arm passes while
             // having been 99% unloaded. What the arm needs is that the load was
             // alive AT ITS END. *(User-caught, 2026-08-16.)*
-            probe.beginLoadWindow()
-            let before = probe.loadProgress()
+            let before = probe.openLoadWindow()
             sleep(seconds: armSec)
             let after = probe.loadProgress()
             var stillUp = false

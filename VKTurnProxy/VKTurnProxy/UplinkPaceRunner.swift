@@ -327,7 +327,10 @@ final class UplinkPaceRunner: ObservableObject {
                 + "sec=\(armSec)")
             publish("arm \(no)/\(arms.count) · \(mode) · \(armSec)s")
 
-            let before = probe.loadProgress()
+            // 🚨 openLoadWindow, not loadProgress: it RESETS the gap watermark so
+            // `gapmax` measures THIS arm. Reading the snapshot without opening the
+            // window is what made three arms report the same 2041 ms.
+            let before = probe.openLoadWindow()
             sleep(seconds: armSec)
             let after = probe.loadProgress()
             var stillUp = false

@@ -92,9 +92,21 @@ final class UplinkCwndProbe: ObservableObject {
 
     private let progress = LoadProgress()
     func loadProgress() -> (bytes: UInt64, idleMs: Int, worstGapMs: Int) { progress.snapshot() }
-    /// Open a new scoring window. A runner calls this at each arm's start so the
-    /// gap watermark measures THAT arm and not the run.
-    func beginLoadWindow() { progress.openWindow() }
+
+    /// Opens a new scoring window AND returns its opening snapshot, in one call.
+    ///
+    /// 🚨 ONE CALL ON PURPOSE. This used to be two — `beginLoadWindow()` followed
+    /// by `loadProgress()` — and the second runner written against it did the
+    /// snapshot and forgot the open, so its `gapmax` was a watermark over the
+    /// WHOLE RUN wearing an arm's label: three arms reported the same 2041 ms,
+    /// which was one stall in an earlier arm. Nothing was voided (the bound was
+    /// generous enough) but the number was not what the line called it. A paired
+    /// call that can be half-made will eventually be half-made; merging them
+    /// makes the omission unrepresentable. *(2026-08-16, found in the run.)*
+    func openLoadWindow() -> (bytes: UInt64, idleMs: Int, worstGapMs: Int) {
+        progress.openWindow()
+        return progress.snapshot()
+    }
 
     /// Ask the run to end early. Safe from any thread; the loop notices within a
     /// tick and tears the flows down through its normal path.
