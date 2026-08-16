@@ -99,10 +99,25 @@ if not re.search(rf"{RUNNER} DONE state=done", text):
 off = datetime.timedelta(hours=OFFSET_H)
 marks = []
 for line in open(LOG, errors="replace"):
-    m = re.search(rf"\[([\d-]+ [\d:.]+)\] {RUNNER} (ARM|ARMEND) a=(\d+)/(\d+) mode=(\w+)", line)
+    m = re.search(rf"\[([\d-]+ [\d:.]+)\] {RUNNER} (ARM|ARMEND) a=(\d+)/(\d+) mode=(\w+)(.*)", line)
     if m:
         t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f")
-        marks.append((m.group(2), int(m.group(3)), m.group(5), t, int(m.group(4))))
+        # 🚨 WHAT THE ARM ASKED FOR, taken from the runner's OWN declaration
+        # rather than from a constant copied into this scorer. The `pace=` clause
+        # is the only place the request is written down; comparing it against the
+        # verdict's `rate=`/`burst=` is what makes the label mean something.
+        # (Copying `paceKiB` here instead would be the day's own repeated defect:
+        # a second copy of something that already has an owner.)
+        asked = None
+        if m.group(2) == "ARM":
+            pm = re.search(r"pace=(\d+)KiB/s burst (\d+)KiB", m.group(6))
+            if pm:
+                asked = (int(pm.group(1)), int(pm.group(2)))
+            elif not re.search(r"pace=off", m.group(6)):
+                die(f"arm {m.group(3)}: the ARM marker carries no readable `pace=` clause, so "
+                    "what this arm ASKED FOR is unknown and its verdict cannot be checked "
+                    f"against it. The runner's marker format changed.\n    {line.strip()}")
+        marks.append((m.group(2), int(m.group(3)), m.group(5), t, int(m.group(4)), asked))
 if not marks:
     die(f"no `{RUNNER} ARM/ARMEND` markers — wrong log, or the run never declared an arm?")
 
@@ -123,8 +138,16 @@ for i in range(0, len(marks) - 1, 2):
         # and produce a table that looks perfectly normal.
         die(f"arm {a[1]} appears twice — this log holds more than one {RUNNER} run. "
             "Split it, or the arms silently overwrite each other.")
-    arms[a[1]] = (a[2], a[3].timestamp(), b[3].timestamp(), a[4], b[3])
+    arms[a[1]] = (a[2], a[3].timestamp(), b[3].timestamp(), a[4], b[3], a[5])
     # client-clock seconds; +OFFSET only when selecting from the pcap
+    # 🚨 THE LABEL AND THE COMMAND MUST AGREE. `mode=unpaced` with a `pace=` rate,
+    # or a paced label with `pace=off`, means the runner named an arm one thing
+    # and asked for another — and every later check would be run against the
+    # wrong expectation.
+    if (a[2] == "unpaced") != (a[5] is None):
+        die(f"arm {a[1]} is labelled '{a[2]}' but its ARM marker asked for "
+            f"{'pace=off' if a[5] is None else str(a[5])} — the label and the command disagree, "
+            "so neither can be trusted.")
 
 if STRICT:
     if sorted(arms) != [1, 2, 3, 4]:
@@ -157,20 +180,40 @@ if STRICT:
     # >= check, and a verdict that landed anywhere in the run would pass a bare
     # count. Each must fall between its paced arm's ARMEND and the next ARM.
     # The `[Go]` prefix carries its own clock, already on the pcap's timeline.
+    # 🚨 AND THE VERDICT'S `rate=`/`burst=` ARE READ, NOT SKIPPED. Taking only
+    # `waited` accepts a sweep labelled 16·2·2·16 whose four buckets all actually
+    # ran at 16 — a perfect null that reads as "depth does not matter". The
+    # setting reaches the extension over a FIRE-AND-FORGET provider message
+    # (`sendProviderMessage`, `try?`, no completion checked), so "the runner asked"
+    # and "the tunnel applied" are two different facts and only the verdict knows
+    # the second. *(User-caught, 2026-08-16.)*
+    # ⚠️ Detect the line LOOSELY and parse its fields STRICTLY, so a Go format
+    # change says "I found the verdict and could not read it" instead of "there
+    # are no verdicts" — the second would be blamed on the run.
     vlines = []
     for line in open(LOG, errors="replace"):
-        m = re.match(r"\[Go\] (\d\d):(\d\d):(\d\d)\.(\d+).*PACE-ARMEND .*?waited=(\d+)\(", line)
-        if m:
-            # `[Go]` carries a time of day and no date. Pick the date that puts it
-            # nearest the run — a run can straddle midnight, and guessing the
-            # first marker's date would then be a day out.
-            tod = datetime.time(int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                                int(m.group(4)[:6].ljust(6, "0")))
-            base = marks[0][3]
-            cand = [datetime.datetime.combine(base.date() + datetime.timedelta(days=d), tod)
-                    for d in (-1, 0, 1)]
-            t = min(cand, key=lambda c: abs((c - base).total_seconds()))
-            vlines.append((t.timestamp(), int(m.group(5)), line.strip()))
+        if "PACE-ARMEND gen=" not in line:
+            continue
+        fm = re.search(r"rate=(\d+)KiB burst=(\d+)KiB", line)
+        if not fm:
+            die("a PACE-ARMEND verdict carries no readable `rate=…KiB burst=…KiB` — the Go "
+                "format changed, and without those fields this scorer cannot tell whether the "
+                f"arm ran at the depth it was labelled with.\n    {line.strip()}")
+        m = re.match(r"\[Go\] (\d\d):(\d\d):(\d\d)\.(\d+).*?waited=(\d+)\(", line)
+        if not m:
+            die("a PACE-ARMEND verdict has no `[Go] HH:MM:SS` stamp or no `waited=` — it cannot "
+                f"be bound to an arm.\n    {line.strip()}")
+        # `[Go]` carries a time of day and no date. Pick the date that puts it
+        # nearest the run — a run can straddle midnight, and guessing the
+        # first marker's date would then be a day out.
+        tod = datetime.time(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            int(m.group(4)[:6].ljust(6, "0")))
+        base = marks[0][3]
+        cand = [datetime.datetime.combine(base.date() + datetime.timedelta(days=d), tod)
+                for d in (-1, 0, 1)]
+        t = min(cand, key=lambda c: abs((c - base).total_seconds()))
+        vlines.append((t.timestamp(), int(m.group(5)), line.strip(),
+                       (int(fm.group(1)), int(fm.group(2)))))
     # Every arm whose bucket is armed needs its own verdict — in the burst sweep
     # that is all four, not two.
     paced = [k for k in sorted(arms) if arms[k][0] != "unpaced"]
@@ -202,7 +245,20 @@ if STRICT:
         if owned[0][1] == 0:
             die(f"arm {k}: PACE-ARMEND reports waited=0 — the bucket never emptied, so this "
                 "arm tested NOTHING. Lower the BURST before the rate: the losses are "
-                "block-shaped, i.e. a depth.\n    {owned[0][2]}")
+                f"block-shaped, i.e. a depth.\n    {owned[0][2]}")
+        # 🚨 THE ARM RAN AT THE DEPTH ITS LABEL CLAIMS — asked (ARM marker) against
+        # applied (the verdict). Without this the sweep's labels are decoration:
+        # `burst16·burst2·burst2·burst16` would be accepted with all four buckets
+        # at 16, and the answer would read as "depth does not matter".
+        want, got = arms[k][5], owned[0][3]
+        if want != got:
+            die(f"arm {k} is labelled '{arms[k][0]}' and its ARM marker asked for "
+                f"{want[0]}KiB/s burst {want[1]}KiB, but its verdict reports "
+                f"{got[0]}KiB/s burst {got[1]}KiB — THE ARM DID NOT RUN AT THE SETTING IT IS "
+                "NAMED AFTER. The pace setting reaches the extension over a fire-and-forget "
+                "provider message, so a send that never lands leaves the PREVIOUS arm's bucket "
+                "in place and the arm runs under a label it never had.\n    "
+                f"{owned[0][2]}")
 
 # ---- 3. one streaming pass; only the first 64 B of each frame is read.
 f = open(PCAP, "rb")
@@ -271,7 +327,7 @@ while True:
     u = hi[ssrc] + seq
 
     arm = None
-    for k, (mode, s, e, _dn, _te) in arms.items():
+    for k, (mode, s, e, _dn, _te, _ask) in arms.items():
         if s + OFF_S <= ts <= e + OFF_S:
             arm = k
             break
@@ -322,9 +378,20 @@ for k in sorted(arms):
         share = f"{100*mis/exp:.4f}%" if exp else "—"
         print(f"{k:<4}{mode:<10}{gname:<4}{allocs:>7}{exp:>11}{rec:>10}{mis:>9}{share:>9}{ro:>7}{dp:>6}")
 
-print("\n🎯 THE COMPARISON IS GROUP B, PACED ARMS AGAINST UNPACED ONES.")
+# 🚨 THE CLOSING HINT NAMES THIS RUN'S OWN COMPARISON. It used to say "paced
+# against unpaced" and "both verdicts" unconditionally — written for the first
+# A/B and left standing when the burst sweep arrived, where every arm is paced,
+# there are FOUR verdicts and no unpaced arm exists. The reader takes the
+# comparison from this line, so a stale one renames the experiment.
+_paced = [k for k in sorted(arms) if arms[k][0] != "unpaced"]
+_sweep = len(_paced) == len(arms)
+print("\n🎯 THE COMPARISON IS GROUP B, " + ("BURST16 ARMS AGAINST BURST2 ONES — every arm is"
+      "\n   PACED and there is NO unpaced control in these minutes, so the 0.85% baseline is a"
+      "\n   PRIOR from another session and must not be differenced against these arms."
+      if _sweep else "PACED ARMS AGAINST UNPACED ONES."))
 print("   Group A is the CROSS-TALK CONTROL and must not move; it is the synthetic,")
 print("   whose own cum-lost at index 5d170000 is the second, independent reading of it.")
-print("🚨 The engagement verdict is `PACE-ARMEND`, one per paced arm — NOT the per-tick")
-print("   `pace=` field, which covers ten seconds and cannot speak for an arm. This scorer")
-print("   already refused to print anything unless both verdicts exist and both engaged.")
+print(f"🚨 The engagement verdict is `PACE-ARMEND`, one per paced arm ({len(_paced)} here) — NOT")
+print("   the per-tick `pace=` field, which covers ten seconds and cannot speak for an arm.")
+print("   This scorer refused to print anything unless every paced arm has its own verdict,")
+print("   in its own gap, engaged, AND REPORTING THE RATE AND BURST ITS LABEL CLAIMS.")
