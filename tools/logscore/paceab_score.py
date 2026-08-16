@@ -133,11 +133,22 @@ if STRICT:
     if denoms != {4}:
         die(f"arms declare denominators {sorted(denoms)}, expected /4 everywhere — this log "
             "is from a plan with a different number of arms.")
-    want = ["unpaced", "paced", "paced", "unpaced"]
+    # 🚨 THE SEQUENCE IS PART OF THE CONTRACT, and there are two of them now: the
+    # first pacer A/B (`unpaced·paced·paced·unpaced`, which asked whether a bucket
+    # helps at all) and the burst sweep (`burst16·burst2·burst2·burst16`, which
+    # asks what the residual floor is made of). Both are mirrored palindromes of
+    # four; anything else is a different experiment.
     got = [arms[k][0] for k in sorted(arms)]
-    if got != want:
-        die(f"arms are {got}, and this scorer only reads {want}. A different sequence is a "
-            "different experiment.")
+    KNOWN = [["unpaced", "paced", "paced", "unpaced"],
+             ["burst16", "burst2", "burst2", "burst16"]]
+    if got not in KNOWN:
+        die(f"arms are {got}, and this scorer reads only {KNOWN}. A different sequence is a "
+            "different experiment; add it here deliberately rather than letting it through.")
+    if got == KNOWN[1]:
+        print("# 🚨 BURST SWEEP: every arm is PACED and there is NO unpaced control in these "
+              "minutes. `burst16` vs `burst2` is the whole measurement — the 0.85% unpaced "
+              "baseline is a PRIOR from another session and must not be differenced against "
+              "these arms.")
     # 🚨 EVERY PACED ARM MUST CARRY ITS OWN ENGAGEMENT VERDICT. The per-tick
     # `pace=` field covers ten seconds and cannot speak for an arm; `PACE-ARMEND`
     # is the arm's own accumulator, printed once when the pacer is turned off.
@@ -160,7 +171,9 @@ if STRICT:
                     for d in (-1, 0, 1)]
             t = min(cand, key=lambda c: abs((c - base).total_seconds()))
             vlines.append((t.timestamp(), int(m.group(5)), line.strip()))
-    paced = [k for k in sorted(arms) if arms[k][0] == "paced"]
+    # Every arm whose bucket is armed needs its own verdict — in the burst sweep
+    # that is all four, not two.
+    paced = [k for k in sorted(arms) if arms[k][0] != "unpaced"]
     if len(vlines) != len(paced):
         die(f"{len(vlines)} PACE-ARMEND lines for {len(paced)} paced arms — expected exactly "
             "one per paced arm. An arm without its own verdict cannot be scored, because a "

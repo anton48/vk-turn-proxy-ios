@@ -75,10 +75,35 @@ final class UplinkPaceRunner: ObservableObject {
     /// `waited=` must be read before any conclusion. If it reads 0 the arm
     /// tested nothing, and the number to move is the BURST, not the rate.
     private let paceKiB = 247
-    private let paceBurstKiB = 16
 
-    private enum Arm { case off, on }
-    private let arms: [Arm] = [.off, .on, .on, .off]
+    /// 🎯 THE ARMS ARE BURST DEPTHS NOW, AND THE RATE NEVER MOVES. `16.08/tcptest2`
+    /// answered the first question — a per-allocation bucket cuts the loss 7× and
+    /// raises goodput 68% — and left a residual **floor** of 0.10-0.14%. This run
+    /// asks what that floor is made of, by moving the ONE parameter the evidence
+    /// points at.
+    ///
+    /// **Why depth and not rate.** At 247 KiB/s a 100 ms window admits
+    /// 24.7 KiB of drain plus the whole bucket: **40.7 KiB against the 26 KiB
+    /// that 260 KiB/s allows in the same window.** The bucket is still the
+    /// generous term. And the server's own 100 ms sampler agrees: the top
+    /// windows fell from an almost constant 166% unpaced to a median ~130%
+    /// paced, while still reaching 161-166%.
+    ///
+    /// **2 KiB is a one-packet credit** at `paceMaxCost` = 1530 counted bytes, so
+    /// it is the diagnostic end of the axis rather than a candidate setting: it
+    /// separates *"16 KiB is still too much"* from *"the spacing is destroyed
+    /// BELOW us, after the pacer"*. ⚠️ Expect it to cost MORE latency, not less
+    /// — nearly every packet will wait ~6 ms — which is the price of an answer,
+    /// not a regression.
+    ///
+    /// ⚠️ **AND THE ONE THING THIS DESIGN GIVES UP, SAID OUT LOUD: there is no
+    /// UNPACED arm**, so the 0.85% baseline is a PRIOR from another session and
+    /// NOT a control in these minutes. The line moves 75 → 363 Mbit/s in 70
+    /// minutes. That is the right trade for *"does depth move the floor"*, which
+    /// is answered entirely within `burst16 ↔ burst2`; it is the wrong trade for
+    /// any sentence of the form *"burst 2 recovers X% of the unpaced loss"*.
+    /// If that sentence is wanted, add `off` arms at both ends and pay 4 minutes.
+    private let arms: [Int] = [16, 2, 2, 16]   // KiB of burst; 0 would be off
 
     /// Every transition of the REAL load costs a settle. Here the load runs
     /// CONTINUOUSLY through all four arms — only the bucket is toggled — so
@@ -102,7 +127,13 @@ final class UplinkPaceRunner: ObservableObject {
     /// unpaced one — that is the pacer working — so this bound is deliberately
     /// generous and `gapmax=` is printed on every arm so the first run can say
     /// what the honest value is.
-    private let staleLoadMs = 3000
+    /// 🚨 RAISED FOR THE BURST SWEEP, DELIBERATELY. At a 2 KiB burst nearly every
+    /// packet waits, and `16.08/tcptest2` already produced a 2041 ms worst gap at
+    /// 16 KiB. A bound of 3 s would abort the very arm the run exists to take —
+    /// throwing away ten minutes over the treatment WORKING. The bound is here to
+    /// catch a load that DIED, and death shows up as `moved == 0` or a probe that
+    /// is no longer running, both of which the witness checks separately.
+    private let staleLoadMs = 8000
 
     func stop() { cancelledFlag.set(true) }
 
@@ -208,11 +239,26 @@ final class UplinkPaceRunner: ObservableObject {
             + "listening, or the real load never reaches server1 and every arm is a control.")
         log.log("\(runName) \(knobs)")
         log.log("\(runName) PLAN pool=\(conns) split=\(n)+\(n) synth=\(Int(synthMbit))Mbit/s on A "
-            + "(NEVER paced) · real TCP flows=\(probeFlows) on B · pace=\(paceKiB)KiB/s "
-            + "burst=\(paceBurstKiB)KiB on B ONLY · arms=off·on·on·off · armSec=\(armSec) "
-            + "transport=TCP k=1 estimated=\(estimatedSeconds)s. "
-            + "🎯 THE QUESTION: does a per-allocation bucket remove the allocation-local drops "
-            + "measured at 0.82-0.91% on this same group at a mean of 60% of the knee? "
+            + "(NEVER paced) · real TCP flows=\(probeFlows) on B · pace=\(paceKiB)KiB/s on B ONLY, "
+            + "THE RATE NEVER MOVES · arms=burst" + arms.map(String.init).joined(separator: "·burst")
+            + "KiB · armSec=\(armSec) transport=TCP k=1 estimated=\(estimatedSeconds)s. "
+            + "🎯 THE QUESTION: the bucket already cut the loss 7× and raised goodput 68%, leaving a "
+            + "FLOOR of 0.10-0.14%. Is that floor made of bucket DEPTH, or of spacing destroyed "
+            + "BELOW us after the pacer? At 247 KiB/s a 100 ms window admits 24.7KiB of drain PLUS "
+            + "the whole bucket — 40.7KiB against the 26KiB that 260 KiB/s allows — so the burst is "
+            + "still the generous term, and the server's 100 ms sampler agrees (top windows 166% "
+            + "unpaced → median ~130% paced, still touching 161-166%). 2KiB is a ONE-PACKET credit "
+            + "at paceMaxCost=1530: the diagnostic end of the axis, not a candidate setting. "
+            + "⚠️ EXPECT 2KiB TO COST MORE LATENCY, not less — nearly every packet waits ~6ms. "
+            + "⚠️ AND THERE IS NO UNPACED ARM: the 0.85% baseline is a PRIOR from another session, "
+            + "NOT a control in these minutes. `burst16↔burst2` is the whole measurement; any "
+            + "sentence of the form \"burst2 recovers X% of the unpaced loss\" is cross-session "
+            + "and not supported by this run. "
+            + "🎯 NEW INSTRUMENT: `rtx-by-conn=[conn:+N sb=…]` on the memstats line names WHICH "
+            + "outer socket retransmitted, so a capture gap keyed to one relay port can be joined "
+            + "to a stall on the SAME allocation instead of to the pool. The prior correlation "
+            + "(57-66% of paced loss within ±2s of any retransmit against 19-20% unpaced) is "
+            + "AGGREGATE and cannot carry a mechanism on its own. "
             + "🚨🚨 THE SINGLE SOURCE OF B-LOSS, FIXED BEFORE THE RUN: `cum-lost`/`by-idx` is "
             + "UNUSABLE for B — the real stream's WireGuard keypairs ROTATE, so a difference "
             + "between arm boundaries is undefined and its spans go NEGATIVE. The recipe is "
@@ -318,11 +364,11 @@ final class UplinkPaceRunner: ObservableObject {
             // the generator; it only refreshes the deadline.
             // *(User-caught, 2026-08-16.)*
             setLevel(synthMbit)
-            let paced = (arm == .on)
-            setPace(paced ? paceKiB : 0)
-            let mode = paced ? "paced" : "unpaced"
+            let paced = arm > 0
+            setPace(paced ? paceKiB : 0, burstKiB: arm)
+            let mode = paced ? "burst\(arm)" : "unpaced"
             log.log("\(runName) ARM a=\(no)/\(arms.count) mode=\(mode) "
-                + "pace=\(paced ? "\(paceKiB)KiB/s burst \(paceBurstKiB)KiB on B" : "off") "
+                + "pace=\(paced ? "\(paceKiB)KiB/s burst \(arm)KiB on B" : "off") "
                 + "synth=\(Int(synthMbit))Mbit/s(A) flows=\(probe.flowCensus().live)/\(probeFlows)(B) "
                 + "sec=\(armSec)")
             publish("arm \(no)/\(arms.count) · \(mode) · \(armSec)s")
@@ -385,10 +431,9 @@ final class UplinkPaceRunner: ObservableObject {
         return false
     }
 
-    private func setPace(_ kib: Int) {
+    private func setPace(_ kib: Int, burstKiB: Int = 16) {
         DispatchQueue.main.async {
-            TunnelManager.shared.applyUplinkPace(kib: kib, burstKiB: self.paceBurstKiB,
-                                                 groupBOnly: true)
+            TunnelManager.shared.applyUplinkPace(kib: kib, burstKiB: burstKiB, groupBOnly: true)
         }
     }
 

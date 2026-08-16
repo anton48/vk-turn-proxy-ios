@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -197,6 +198,7 @@ func (s *sockStats) summary() string {
 	var pairs []sbWnd
 	var rtxDelta uint64
 	var lossRec, reord int
+	var perConn []rtxOne
 	for _, i := range idx {
 		info, ok := sampleTCPInfo(s.conns[i])
 		if !ok {
@@ -215,7 +217,20 @@ func (s *sockStats) summary() string {
 		// max(0, …): a reconnect restarts the socket counter, so a smaller
 		// value than last time means "new socket", not "negative retransmits".
 		if prev, seen := s.lastRtx[i]; seen && info.rtxPkts >= prev {
-			rtxDelta += info.rtxPkts - prev
+			d := info.rtxPkts - prev
+			rtxDelta += d
+			// 🚨 WHICH CONNECTION, NOT JUST HOW MANY. The pool-wide `rtx=+N` can
+			// only ever support an AGGREGATE correlation — "some socket
+			// retransmitted in the same second as some allocation lost" — and
+			// this project has already been burned by a correlation that fired
+			// perfectly while measuring its own shadow. A gap in the capture is
+			// keyed to ONE relay port; naming the connection here is what turns
+			// "the pool stalled near the loss" into "the SAME allocation
+			// stalled", which is the only version that can carry a mechanism.
+			// *(User-raised, 2026-08-16.)*
+			if d > 0 {
+				perConn = append(perConn, rtxOne{conn: i, pkts: d, sbKiB: int(info.sbBytes) / 1024})
+			}
 		}
 		s.lastRtx[i] = info.rtxPkts
 		if info.inLossRecovery {
@@ -240,7 +255,24 @@ func (s *sockStats) summary() string {
 	// so a reader can see how much of it could be in flight rather than waiting.
 	// srtt's SPREAD is the number that speaks to "the disorder is RTT spread
 	// between connections": min-max across the pool, in one glance.
-	return fmt.Sprintf(" sock=%d sb=%d/%dKiB cwnd=%dKiB wnd=%d/%dKiB wscale=%s sbmax-wnd=%dKiB srtt=%d/%d-%dms rtx=+%d lossrec=%d reord=%d",
+	// The per-connection breakdown rides beside the total, and ONLY when there is
+	// something to say: an empty list prints nothing, so an ordinary tick is
+	// unchanged and a reader's eye is drawn to the ticks that matter.
+	byConn := ""
+	if len(perConn) > 0 {
+		sort.Slice(perConn, func(a, b int) bool { return perConn[a].pkts > perConn[b].pkts })
+		var b strings.Builder
+		b.WriteString(" rtx-by-conn=[")
+		for i, r := range perConn {
+			if i > 0 {
+				b.WriteByte(' ')
+			}
+			fmt.Fprintf(&b, "%d:+%d sb=%dKiB", r.conn, r.pkts, r.sbKiB)
+		}
+		b.WriteString("]")
+		byConn = b.String()
+	}
+	return fmt.Sprintf(" sock=%d sb=%d/%dKiB cwnd=%dKiB wnd=%d/%dKiB wscale=%s sbmax-wnd=%dKiB srtt=%d/%d-%dms rtx=+%d lossrec=%d reord=%d%s",
 		len(sb),
 		pct(sb, 0.5)/1024, sb[len(sb)-1]/1024,
 		pct(cwnd, 0.5)/1024,
@@ -248,7 +280,7 @@ func (s *sockStats) summary() string {
 		formatWscale(wscale),
 		hotWnd/1024,
 		pct(srtt, 0.5), srtt[0], srtt[len(srtt)-1],
-		rtxDelta, lossRec, reord)
+		rtxDelta, lossRec, reord, byConn)
 }
 
 // formatWscale renders one number when every connection agrees and a range when
@@ -279,6 +311,15 @@ func formatWscale(v []int) string {
 
 // sbWnd pairs one connection's send-buffer occupancy with the window its peer
 // is advertising, so the two can be reported for the SAME connection.
+// rtxOne is one connection's retransmit delta for an interval, with the send
+// buffer it was carrying when the sample was taken — together they are what a
+// stall looks like from the sender's side.
+type rtxOne struct {
+	conn  int
+	pkts  uint64
+	sbKiB int
+}
+
 type sbWnd struct{ sb, wnd int }
 
 // windowAtDeepestBuffer returns the peer window seen by the connection holding
