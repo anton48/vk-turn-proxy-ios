@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -156,14 +159,18 @@ func TestARateChangeRebuildsTheBuckets(t *testing.T) {
 	}
 }
 
-// 🚨 THE ENGAGEMENT WITNESS, and the reason it exists: at the arm's own numbers
-// the bucket is expected to act only on BURSTS, so `waited=0` is the difference
-// between "pacing does nothing" and "this arm tested nothing". A knob believed
-// on the strength of its configured value cost this project nine runs.
+// 🚨 THE ARM'S VERDICT IS NOT THE TICK'S, AND CONFLATING THEM WAS THE DEFECT.
+// `paceSummary` clears its counters on every memstats tick, so a zero there is a
+// QUIET TEN SECONDS — one tick can read zero while the pacer worked in the
+// others, and the tail after a switch is cleared silently because the state is
+// already off. The arm-level verdict has its own accumulators and is printed
+// ONCE, by the setter, at the moment the generation ends.
+// *(User-caught, 2026-08-16, before the run.)*
 //
-// SABOTAGE SEEN TO FAIL: drop the `if w == 0` note from paceSummary and leave
-// `_ = w`. Compiles; a completely inert arm then prints as a normal one.
-func TestPaceSummaryShoutsWhenItNeverEngaged(t *testing.T) {
+// SABOTAGE SEEN TO FAIL: in SetUplinkPace, drop the `if wt == 0` branch and
+// always print "ENGAGED". Compiles; a completely inert arm then certifies
+// itself.
+func TestTheArmVerdictShoutsWhenTheBucketNeverEmptied(t *testing.T) {
 	resetPace()
 	t.Cleanup(resetPace)
 	resetSplit()
@@ -172,27 +179,41 @@ func TestPaceSummaryShoutsWhenItNeverEngaged(t *testing.T) {
 	p, cancel := paceTestProxy()
 	defer cancel()
 
-	// A rate far above anything the test sends: the bucket can never empty.
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	// A rate far above anything this sends: the bucket can never empty.
 	SetUplinkPace(100000, 1024, true)
 	for i := 0; i < 5; i++ {
 		r := p.paceReserve(20)
 		p.paceSettle(20, r, 1312)
 	}
-	s := paceSummary()
-	if !strings.Contains(s, "waited=0") || !strings.Contains(s, "NEVER WAITED") {
-		t.Fatalf("an arm whose bucket never emptied must say so loudly, got %q", s)
+	// The TICK line must not pretend to be a verdict.
+	if tick := paceSummary(); strings.Contains(tick, "TESTED NOTHING") {
+		t.Fatalf("the per-tick line covers ten seconds and must not judge the arm: %q", tick)
 	}
-	if !strings.Contains(s, "paced=5") {
-		t.Fatalf("the paced count is the other half of the witness: %q", s)
+	SetUplinkPace(PaceOff, 0, true) // ends the generation → prints its verdict
+
+	out := buf.String()
+	if !strings.Contains(out, "PACE-ARMEND") {
+		t.Fatalf("turning the pacer off must print the arm's own verdict, got %q", out)
+	}
+	if !strings.Contains(out, "NEVER WAITED") || !strings.Contains(out, "waited=0") {
+		t.Fatalf("an arm whose bucket never emptied must say so on PACE-ARMEND: %q", out)
+	}
+	if !strings.Contains(out, "paced=5") {
+		t.Fatalf("the arm's verdict must carry its own totals, not the last tick's: %q", out)
 	}
 }
 
-// And the mirror: when the bucket DOES empty, the line reports the waits rather
-// than staying silent about them.
+// The mirror: a bucket that DOES empty certifies the arm as engaged, and the
+// dose is reported as MEASURED writer-time beside what the bucket asked for.
 //
-// SABOTAGE SEEN TO FAIL: stop counting paceWaited (drop its Add(1)). Compiles;
-// a genuinely throttled arm then reports waited=0 and reads as inert.
-func TestPaceSummaryReportsRealWaits(t *testing.T) {
+// SABOTAGE SEEN TO FAIL: report `planned` in the `total=` field (pass plan
+// twice). Compiles; a wait cut short by a live toggle is then overstated as
+// writer-time, which is the quantity a dose is divided from.
+func TestTheArmVerdictReportsMeasuredWaitAndEngagement(t *testing.T) {
 	resetPace()
 	t.Cleanup(resetPace)
 	resetSplit()
@@ -200,6 +221,10 @@ func TestPaceSummaryReportsRealWaits(t *testing.T) {
 	SetUplinkSplitN(15)
 	p, cancel := paceTestProxy()
 	defer cancel()
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
 	// 1 KiB/s with a 1 KiB burst: the second full-size packet must wait.
 	SetUplinkPace(1, 1, true)
@@ -207,9 +232,30 @@ func TestPaceSummaryReportsRealWaits(t *testing.T) {
 		r := p.paceReserve(20)
 		p.paceSettle(20, r, 1312)
 	}
-	s := paceSummary()
-	if strings.Contains(s, "waited=0") || strings.Contains(s, "NEVER WAITED") {
-		t.Fatalf("a bucket this small must have made a writer wait, got %q", s)
+	SetUplinkPace(PaceOff, 0, true)
+
+	out := buf.String()
+	if !strings.Contains(out, "ENGAGED") || strings.Contains(out, "NEVER WAITED") {
+		t.Fatalf("a bucket this small must certify the arm as engaged: %q", out)
+	}
+	// 🚨 AND `total` MUST BE THE MEASURED TIME, NOT A COPY OF `planned`. Checking
+	// only that both FIELDS exist is a test that cannot fail — it was, and the
+	// sabotage that reports `planned` in both slots ran straight through it. A
+	// real sleep always overshoots its request, so measured > planned strictly;
+	// when the two are the same value they are the same variable.
+	mt := regexp.MustCompile(`total=(\S+) planned=(\S+)`).FindStringSubmatch(out)
+	if mt == nil {
+		t.Fatalf("the arm's verdict must carry both total= and planned=: %q", out)
+	}
+	total, err1 := time.ParseDuration(mt[1])
+	plan, err2 := time.ParseDuration(mt[2])
+	if err1 != nil || err2 != nil {
+		t.Fatalf("unparseable durations %q / %q", mt[1], mt[2])
+	}
+	if total <= plan {
+		t.Fatalf("total (%v) must EXCEED planned (%v) — a real sleep overshoots its "+
+			"request, and equality means `total` is just a copy of the bucket's ask "+
+			"rather than measured writer-time", total, plan)
 	}
 }
 

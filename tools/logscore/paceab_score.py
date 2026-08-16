@@ -48,7 +48,21 @@ PCAP, LOG = sys.argv[1], sys.argv[2]
 OFFSET_H = 2.0
 if "--offset-hours" in sys.argv:
     OFFSET_H = float(sys.argv[sys.argv.index("--offset-hours") + 1])
+# 🚨 THE RUNNER IS PART OF THE CONTRACT, NOT A LABEL. Without this the utility
+# happily scored an old EIGHT-ARM `splitab` log, printed its table and exited 0 —
+# a different experiment, silently rendered as this one. `--runner splitab` is
+# kept only so the commissioning regression can still be re-run.
+# *(User-caught, 2026-08-16, before the run.)*
+RUNNER = "paceab"
+if "--runner" in sys.argv:
+    RUNNER = sys.argv[sys.argv.index("--runner") + 1]
+STRICT = RUNNER == "paceab"
 DSTPORT = 56001
+
+
+def die(msg):
+    sys.exit("🚨 REFUSING TO SCORE: " + msg)
+
 
 # ---- 1. conn -> relay port, straight from the client's own allocation lines.
 port2conn = {}
@@ -57,28 +71,63 @@ for line in open(LOG, errors="replace"):
     if m:
         port2conn[int(m.group(2))] = int(m.group(1))
 if not port2conn:
-    sys.exit("no `[conn N] TURN relay allocated:` lines — wrong log?")
+    die("no `[conn N] TURN relay allocated:` lines — wrong log?")
 nconn = max(port2conn.values()) + 1
 half = nconn // 2
 groupA = {p for p, c in port2conn.items() if c < half}
 groupB = {p for p, c in port2conn.items() if c >= half}
 
-# ---- 2. arm windows, from the runner's own markers, shifted to the pcap clock.
+# ---- 2. the run must be THIS run, and it must have finished.
+text = open(LOG, errors="replace").read()
+if re.search(rf"{RUNNER} ABORTED", text):
+    die(f"the log contains `{RUNNER} ABORTED` — the run voided itself and nothing in it "
+        "is comparable across the break.")
+if not re.search(rf"{RUNNER} DONE state=done", text):
+    die(f"no `{RUNNER} DONE state=done` — the run did not finish, so its last arm is "
+        "truncated and its palindrome is incomplete.")
+
 off = datetime.timedelta(hours=OFFSET_H)
 marks = []
 for line in open(LOG, errors="replace"):
-    m = re.search(r"\[([\d-]+ [\d:.]+)\] (\w+) (ARM|ARMEND) a=(\d+)/(\d+) mode=(\w+)", line)
+    m = re.search(rf"\[([\d-]+ [\d:.]+)\] {RUNNER} (ARM|ARMEND) a=(\d+)/(\d+) mode=(\w+)", line)
     if m:
         t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f") + off
-        marks.append((m.group(3), int(m.group(4)), m.group(6), t))
+        marks.append((m.group(2), int(m.group(3)), m.group(5), t))
 if not marks:
-    sys.exit("no ARM/ARMEND markers — wrong log, or the run never started an arm?")
+    die(f"no `{RUNNER} ARM/ARMEND` markers — wrong log, or the run never declared an arm?")
+
 arms = {}
 for i in range(0, len(marks) - 1, 2):
     a, b = marks[i], marks[i + 1]
     if a[0] != "ARM" or b[0] != "ARMEND" or a[1] != b[1]:
-        sys.exit(f"unpaired markers around arm {a[1]} — refusing to guess")
+        die(f"unpaired markers around arm {a[1]} — refusing to guess.")
+    if a[1] in arms:
+        # 🚨 Two runs in one log would otherwise OVERWRITE each other arm by arm
+        # and produce a table that looks perfectly normal.
+        die(f"arm {a[1]} appears twice — this log holds more than one {RUNNER} run. "
+            "Split it, or the arms silently overwrite each other.")
     arms[a[1]] = (a[2], a[3].timestamp(), b[3].timestamp())
+
+if STRICT:
+    want = ["unpaced", "paced", "paced", "unpaced"]
+    got = [arms[k][0] for k in sorted(arms)]
+    if got != want:
+        die(f"arms are {got}, and this scorer only reads {want}. A different sequence is a "
+            "different experiment.")
+    # 🚨 EVERY PACED ARM MUST CARRY ITS OWN ENGAGEMENT VERDICT. The per-tick
+    # `pace=` field covers ten seconds and cannot speak for an arm; `PACE-ARMEND`
+    # is the arm's own accumulator, printed once when the pacer is turned off.
+    verdicts = re.findall(r"PACE-ARMEND gen=(\d+) .*?waited=(\d+)\(", text)
+    npaced = sum(1 for k in arms if arms[k][0] == "paced")
+    if len(verdicts) < npaced:
+        die(f"{len(verdicts)} PACE-ARMEND lines for {npaced} paced arms — an arm without its "
+            "own engagement verdict cannot be scored, because a per-tick zero is a quiet "
+            "interval and not a verdict.")
+    inert = [g for g, w in verdicts if int(w) == 0]
+    if inert:
+        die(f"PACE-ARMEND generation(s) {inert} report waited=0 — the bucket never emptied, "
+            "so those arms tested NOTHING. Lower the BURST before the rate: the losses are "
+            "block-shaped, i.e. a depth.")
 
 # ---- 3. one streaming pass; only the first 64 B of each frame is read.
 f = open(PCAP, "rb")
@@ -99,6 +148,7 @@ hi = {}                            # ssrc -> unwrap epoch
 prevseq = {}                       # ssrc -> last raw seq
 dups = defaultdict(int)
 reord = defaultdict(int)
+maxseen = {}                       # (arm, ssrc) -> highest unwrapped seq so far
 rtp_total = pcap_first = pcap_last = 0
 
 while True:
@@ -155,6 +205,13 @@ while True:
     key = (arm, ssrc)
     if u in seen[key]:
         dups[key] += 1
+    else:
+        # Reordering, counted the only way span-minus-distinct allows: a
+        # sequence arriving after a HIGHER one has already been seen.
+        hiq = maxseen.get(key)
+        if hiq is not None and u < hiq:
+            reord[key] += 1
+        maxseen[key] = u if hiq is None else max(hiq, u)
     seen[key].add(u)
 
 # ---- 4. report.
@@ -167,13 +224,13 @@ print(f"# pcap RTP={rtp_total} span={datetime.datetime.fromtimestamp(pcap_first)
 if not span_ok:
     print("# 🚨 THE CAPTURE DOES NOT COVER EVERY ARM — check --offset-hours before reading anything below")
 
-hdr = f"{'arm':<4}{'mode':<10}{'grp':<4}{'allocs':>7}{'expected':>11}{'received':>10}{'missing':>9}{'loss':>9}{'dup':>6}"
+hdr = f"{'arm':<4}{'mode':<10}{'grp':<4}{'allocs':>7}{'expected':>11}{'received':>10}{'missing':>9}{'loss':>9}{'reord':>7}{'dup':>6}"
 print(hdr)
 print("-" * len(hdr))
 for k in sorted(arms):
     mode, s, e = arms[k]
     for gname, ports in (("A", groupA), ("B", groupB)):
-        exp = rec = mis = dp = 0
+        exp = rec = mis = dp = ro = 0
         allocs = 0
         for (arm, ssrc), got in seen.items():
             if arm != k or port_of.get(ssrc) not in ports:
@@ -183,9 +240,10 @@ for k in sorted(arms):
             exp += hiq - lo + 1
             rec += len(got)
             dp += dups[(arm, ssrc)]
+            ro += reord[(arm, ssrc)]
         mis = exp - rec
         share = f"{100*mis/exp:.4f}%" if exp else "—"
-        print(f"{k:<4}{mode:<10}{gname:<4}{allocs:>7}{exp:>11}{rec:>10}{mis:>9}{share:>9}{dp:>6}")
+        print(f"{k:<4}{mode:<10}{gname:<4}{allocs:>7}{exp:>11}{rec:>10}{mis:>9}{share:>9}{ro:>7}{dp:>6}")
 
 print("\n🎯 THE COMPARISON IS GROUP B, PACED ARMS AGAINST UNPACED ONES.")
 print("   Group A is the CROSS-TALK CONTROL and must not move; it is the synthetic,")

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -128,6 +129,22 @@ var (
 	// touches its entry.
 	paceBuckets [paceMaxConns]atomic.Pointer[paceBucket]
 
+	// 🚨 PER-GENERATION, NOT PER-TICK. `paceSummary` clears its counters on every
+	// memstats tick, so `NEVER WAITED` there is a statement about TEN SECONDS and
+	// not about the arm — one tick can read it while the pacer worked in the
+	// others, the tail after a switch is cleared silently because the state is
+	// already `off`, and an 8-second gap containing no tick spills one arm's tail
+	// into the next. The arm-level verdict therefore has its own accumulators,
+	// reset only when the generation changes, and is printed ONCE at that moment.
+	// *(User-caught, 2026-08-16, before the run.)*
+	genAwaits  atomic.Int64
+	genWaited  atomic.Int64
+	genWaitNs  atomic.Int64 // ACTUAL writer-time, measured
+	genPlanNs  atomic.Int64 // what the bucket asked for, before sleeping
+	genWaitMax atomic.Int64
+	genBytes   atomic.Int64
+	genSkipA   atomic.Int64
+
 	paceAwaits   atomic.Int64 // reservations attempted
 	paceWaited   atomic.Int64 // reservations that actually slept
 	paceWaitNs   atomic.Int64 // total slept
@@ -157,6 +174,40 @@ func SetUplinkPace(kib int, burstKiB int, groupBOnly bool) {
 			burstKiB = PaceDefaultBurstKiB
 		}
 		next.burst = float64(burstKiB) * 1024
+	}
+	// 🚨 THE OUTGOING GENERATION'S VERDICT, PRINTED EXACTLY ONCE, HERE. This is
+	// the only moment at which an arm's pacing is complete and nothing has yet
+	// been attributed to the next one.
+	if old.on() {
+		aw, wt := genAwaits.Swap(0), genWaited.Swap(0)
+		ns, plan := genWaitNs.Swap(0), genPlanNs.Swap(0)
+		mx, by, sk := genWaitMax.Swap(0), genBytes.Swap(0), genSkipA.Swap(0)
+		share := 0.0
+		if aw > 0 {
+			share = 100 * float64(wt) / float64(aw)
+		}
+		verdict := "ENGAGED"
+		if wt == 0 {
+			verdict = "🚨 NEVER WAITED — THE BUCKET NEVER EMPTIED, SO THIS ARM TESTED NOTHING"
+		}
+		log.Printf("proxy: PACE-ARMEND gen=%d rate=%.0fKiB burst=%.0fKiB paced=%d unpaced-A=%d "+
+			"waited=%d(%.1f%%) total=%s planned=%s max=%s bytes=%dKiB — %s",
+			old.gen, old.rate/1024, old.burst/1024, aw, sk, wt, share,
+			// ⚠️ MICROSECONDS, not milliseconds: `total` and `planned` differ by the
+			// scheduler's own overshoot, and rounding to ms can collapse that
+			// difference to nothing — which would also make the guard that
+			// distinguishes them unable to fail.
+			time.Duration(ns).Round(time.Microsecond),
+			time.Duration(plan).Round(time.Microsecond),
+			time.Duration(mx).Round(time.Microsecond), by/1024, verdict)
+	} else {
+		genAwaits.Store(0)
+		genWaited.Store(0)
+		genWaitNs.Store(0)
+		genPlanNs.Store(0)
+		genWaitMax.Store(0)
+		genBytes.Store(0)
+		genSkipA.Store(0)
 	}
 	paceCur.Store(next)
 }
@@ -255,6 +306,7 @@ func (p *Proxy) paceReserve(connIdx int) float64 {
 	if !pacesWriter(st, connIdx) {
 		if st.on() {
 			paceSkippedA.Add(1)
+			genSkipA.Add(1)
 		}
 		return 0
 	}
@@ -265,11 +317,20 @@ func (p *Proxy) paceReserve(connIdx int) float64 {
 	}
 	wait := b.take(paceMaxCost)
 	paceAwaits.Add(1)
+	genAwaits.Add(1)
 	if wait <= 0 {
 		return paceMaxCost
 	}
 	paceWaited.Add(1)
+	genWaited.Add(1)
+	// ⚠️ TWO DIFFERENT QUANTITIES, KEPT APART. `planned` is what the bucket asked
+	// for; `total` is the writer-time actually spent. They diverge whenever the
+	// wait is cut short (the pacer turned off, the context ended) or the
+	// scheduler oversleeps — and only the measured one may be divided by the
+	// interval to get a dose. *(User-caught, 2026-08-16.)*
+	genPlanNs.Add(int64(wait))
 	paceWaitNs.Add(int64(wait))
+	slept0 := time.Now()
 	for {
 		prev := paceWaitMax.Load()
 		if int64(wait) <= prev || paceWaitMax.CompareAndSwap(prev, int64(wait)) {
@@ -304,6 +365,14 @@ func (p *Proxy) paceReserve(connIdx int) float64 {
 		}
 		left -= d
 	}
+	actual := time.Since(slept0)
+	genWaitNs.Add(int64(actual))
+	for {
+		prev := genWaitMax.Load()
+		if int64(actual) <= prev || genWaitMax.CompareAndSwap(prev, int64(actual)) {
+			break
+		}
+	}
 	return paceMaxCost
 }
 
@@ -318,6 +387,7 @@ func (p *Proxy) paceSettle(connIdx int, reserved float64, payloadBytes int) {
 		actual = reserved
 	}
 	paceBytes.Add(int64(actual))
+	genBytes.Add(int64(actual))
 	if connIdx >= 0 && connIdx < paceMaxConns {
 		if b := paceBuckets[connIdx].Load(); b != nil {
 			b.refund(reserved - actual)
@@ -353,10 +423,14 @@ func paceSummary() string {
 	if w > 0 {
 		mean = time.Duration(ns / w)
 	}
+	// ⚠️ THIS LINE IS A SHAPE, NOT A VERDICT. It covers ONE memstats interval, so
+	// a zero here is a quiet ten seconds and says nothing about the arm — the
+	// arm's verdict is the `PACE-ARMEND` line, printed once when the generation
+	// ends. Saying "tested nothing" here was the reading error this note now
+	// prevents. *(User-caught, 2026-08-16.)*
 	note := ""
 	if w == 0 {
-		note = " 🚨 NEVER WAITED — the bucket never emptied, so this arm tested NOTHING;" +
-			" lower the BURST before the rate (the losses are block-shaped, i.e. a depth)"
+		note = " (quiet interval — the ARM's verdict is on PACE-ARMEND, not here)"
 	}
 	// 🚨 THE DOSE, NOT JUST THE FACT. `waited>0` says the bucket engaged; it does
 	// NOT say by how much, and "one packet delayed 40 µs" and "a fifth of them

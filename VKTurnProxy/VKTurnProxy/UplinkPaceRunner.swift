@@ -144,6 +144,7 @@ final class UplinkPaceRunner: ObservableObject {
         var flowK = 0
         var conns = 0
         var isTCP = false
+        var isSRTP = false
         DispatchQueue.main.sync {
             let live = TunnelManager.shared.live
             received = live.statsReceivedOnce
@@ -154,6 +155,7 @@ final class UplinkPaceRunner: ObservableObject {
             flowK = FlowPaths.stored(in: UserDefaults.standard)
             conns = server.numConnections
             isTCP = !server.useUDP
+            isSRTP = server.useSrtp
         }
         let n = conns / 2
 
@@ -178,6 +180,16 @@ final class UplinkPaceRunner: ObservableObject {
                 + "terminated at the relay, so every counted gap is made at or after it — the "
                 + "region this run acts on. Switch the server to TCP.")
             publish("not started — switch to TCP transport", running: false); return
+        }
+        // 🚨 SRTP, NOT MERELY TCP. The pacer is wired into the SRTP writer alone —
+        // the other three writer sites keep no per-connection identity and cannot
+        // own a per-allocation bucket. A TCP-but-not-SRTP profile would spend the
+        // whole run with the treatment silently absent.
+        guard isSRTP else {
+            log.log("\(runName) REFUSED — the active server is not in SRTP mode. The uplink "
+                + "pacer is wired into the SRTP writer only, so every paced arm would run "
+                + "unpaced with nothing saying so.")
+            publish("not started — server must be in SRTP mode", running: false); return
         }
         guard flowK == FlowPaths.off else {
             log.log("\(runName) REFUSED — flowPathsK is armed and would route WireGuard onto the "
@@ -215,11 +227,17 @@ final class UplinkPaceRunner: ObservableObject {
             + "`16.08.2026/tcptest1`, where it reproduced 0.88%/0.79% on B and 0.0000% on A. "
             + "Group A's synthetic REMAINS scoreable from the counter (index 5d170000, fixed by "
             + "construction) and is the CROSS-TALK CONTROL: it must stay ~0. "
-            + "🚨 READ `pace=` FIRST: `waited=0` means the bucket never emptied and THE ARM "
-            + "TESTED NOTHING — group B's mean is ~152 KiB/s against a \(paceKiB) KiB/s rate, so "
-            + "this bucket can only act on BURSTS by construction. If loss does not fall, move "
-            + "the BURST before the rate: the losses are block-shaped (14-21 packets, 20-28 KB), "
-            + "i.e. a DEPTH. "
+            + "🚨 THE ENGAGEMENT VERDICT IS THE `PACE-ARMEND` LINE, ONE PER PACED ARM, NOT the "
+            + "per-tick `pace=` field — that one covers ten seconds and a zero in it is a quiet "
+            + "interval, not a verdict. `PACE-ARMEND … waited=N(x%) total=… planned=… max=…` is "
+            + "the arm's own accumulator, printed once when the pacer is turned off. "
+            + "`waited=0` there means the bucket never emptied and THE ARM TESTED NOTHING — "
+            + "group B's mean is ~152 KiB/s against a \(paceKiB) KiB/s rate, so this bucket can "
+            + "only act on BURSTS by construction and an inert arm is the likely failure, not a "
+            + "null. ⚠️ `total` is MEASURED writer-time and `planned` is what the bucket asked "
+            + "for; only `total` may be divided by the interval to get a dose. If loss does not "
+            + "fall, move the BURST before the rate: the losses are block-shaped (14-21 packets, "
+            + "20-28 KB), i.e. a DEPTH. "
             + "⚠️ EXPECT `sendch-block` AND `gapmax` TO RISE IN THE PACED ARMS — a writer without "
             + "budget sleeps and the queue backs up into the inner TCP. That is the pacer "
             + "working, not a regression; do not void an arm for it. "
@@ -291,6 +309,15 @@ final class UplinkPaceRunner: ObservableObject {
                 if cancelled { break }
             }
 
+            // 🚨 RE-ARM THE SYNTHETIC EVERY ARM. Its generator carries a TEN-MINUTE
+            // safety stop, and this plan is 549 s nominal plus up to 45 s waiting
+            // for the real load to come up — 594 s, leaving six seconds for
+            // oversleep, IPC and scheduling. If that deadline fires, the real
+            // load keeps running, nothing tells the runner, and GROUP A SILENTLY
+            // STOPS BEING A CONTROL. Re-sending the SAME rate does not restart
+            // the generator; it only refreshes the deadline.
+            // *(User-caught, 2026-08-16.)*
+            setLevel(synthMbit)
             let paced = (arm == .on)
             setPace(paced ? paceKiB : 0)
             let mode = paced ? "paced" : "unpaced"
@@ -311,8 +338,14 @@ final class UplinkPaceRunner: ObservableObject {
                                             probeStillRunning: stillUp,
                                             liveFlows: census.live, wantFlows: probeFlows,
                                             staleMs: staleLoadMs)
+            // ⚠️ `synthA=` is the re-armed level, not a measurement of what flowed —
+            // the measurement is `synth→A` on the memstats lines inside the arm,
+            // which must sit at ~1430 packets/s for 15 Mbit/s. Printing the level
+            // here is what makes a silent generator deadline visible as a
+            // disagreement between the two.
             let note = " load=+\(moved / (1 << 20))MiB idle=\(after.idleMs)ms "
-                + "gapmax=\(after.worstGapMs)ms flows=\(census.live)/\(probeFlows)"
+                + "gapmax=\(after.worstGapMs)ms flows=\(census.live)/\(probeFlows) "
+                + "synthA=\(Int(synthMbit))Mbit/s(re-armed)"
             if verdict != .ok {
                 let why = LoadWitness.reason(verdict)
                 log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)\(note) 🚨 \(why)")
