@@ -358,8 +358,15 @@ func paceSummary() string {
 		note = " 🚨 NEVER WAITED — the bucket never emptied, so this arm tested NOTHING;" +
 			" lower the BURST before the rate (the losses are block-shaped, i.e. a depth)"
 	}
-	return fmt.Sprintf(" pace=%.0f/%.0fKiB paced=%d unpaced-A=%d waited=%d(%.1f%%) mean=%s max=%s bytes=%dKiB cancel=%d%s",
+	// 🚨 THE DOSE, NOT JUST THE FACT. `waited>0` says the bucket engaged; it does
+	// NOT say by how much, and "one packet delayed 40 µs" and "a fifth of them
+	// delayed 3 ms" are different treatments with the same flag. TOTAL wait is
+	// what separates them — divide it by the interval and the number of paced
+	// writers and you have the fraction of writer-time the bucket held.
+	// *(User-raised, 2026-08-16.)*
+	return fmt.Sprintf(" pace=%.0f/%.0fKiB paced=%d unpaced-A=%d waited=%d(%.1f%%) total=%s mean=%s max=%s bytes=%dKiB cancel=%d%s",
 		st.rate/1024, st.burst/1024, n, sk, w, share,
+		time.Duration(ns).Round(time.Millisecond),
 		mean.Round(time.Microsecond), time.Duration(mx).Round(time.Microsecond),
 		by/1024, cx, note)
 }

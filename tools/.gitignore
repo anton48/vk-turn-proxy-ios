@@ -12,3 +12,9 @@
 !.gitignore
 !swiftcheck/
 !swiftcheck/*.swift
+# …and the log scorers, for the same reason plus one more: THE INSTRUMENT AND
+# ITS SCORER ARE ONE SYSTEM. A parser that lives only on one laptop gets
+# rewritten from memory next time, and a scorer written AFTER a run gets tuned
+# to that run's data. These are versioned beside the code they score.
+!logscore/
+!logscore/*.py
