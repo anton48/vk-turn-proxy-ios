@@ -87,6 +87,7 @@ struct AdvancedView: View {
     @ObservedObject private var flowAB = UplinkFlowABRunner.shared
     @ObservedObject private var synthAB = UplinkSynthRunner.shared
     @ObservedObject private var splitAB = UplinkSplitRunner.shared
+    @ObservedObject private var paceAB = UplinkPaceRunner.shared
     @State private var probeHost = "192.168.102.1:5202"
 
     /// The sink address, parsed once. It used to be split inline at every call
@@ -341,11 +342,31 @@ struct AdvancedView: View {
                     splitAB.start(host: h, port: p, probe: cwndProbe)
                 }
                 .disabled(splitAB.running || pairedAB.running || synthAB.running
-                          || cwndProbe.running || flowAB.running)
+                          || cwndProbe.running || flowAB.running || paceAB.running)
                 if splitAB.running {
                     Button("Stop the split A/B", role: .destructive) { splitAB.cancel() }
                 }
                 Text(splitAB.status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                // 🎯 The answer to what the split run FOUND: the loss is
+                // per-allocation and block-shaped, so a per-allocation token
+                // bucket is the direct treatment. The synthetic stays unpaced on
+                // group A as the cross-talk control; only group B gets the
+                // bucket. 🚨 Score group B from the CAPTURE — its keypair
+                // rotates and `cum-lost` cannot difference it.
+                Button(paceAB.running
+                        ? "Running the pace A/B…"
+                        : "Run uplink-pacer A/B (~\(paceAB.estimatedSeconds / 60) min)") {
+                    let (h, p) = probeTarget()
+                    paceAB.start(host: h, port: p, probe: cwndProbe)
+                }
+                .disabled(paceAB.running || splitAB.running || pairedAB.running
+                          || synthAB.running || cwndProbe.running || flowAB.running)
+                if paceAB.running {
+                    Button("Stop the pace A/B", role: .destructive) { paceAB.stop() }
+                }
+                Text(paceAB.status)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } header: {

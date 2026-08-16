@@ -1036,6 +1036,22 @@ class TunnelManager: ObservableObject {
         try? session.sendProviderMessage(msg) { _ in }
     }
 
+    /// Arms the per-allocation token bucket on the uplink. `kib` is KiB/s of
+    /// COUNTED bytes per allocation, 0 is off (the production default), and
+    /// `groupBOnly` keeps the synthetic's own writers unpaced so group A stays
+    /// an untouched in-run control.
+    ///
+    /// 🚨 The values are ARGUMENTS and this never reads UserDefaults — an arm is
+    /// a transient state of one measurement, and a retired lever whose stored
+    /// value kept driving the tunnel cost this project three days.
+    func applyUplinkPace(kib: Int, burstKiB: Int, groupBOnly: Bool) {
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_uplink_pace:\(max(0, kib)),\(max(0, burstKiB)),\(groupBOnly ? 1 : 0)"
+                  .data(using: .utf8)
+        else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
     /// Applies the uplink chunk size to the RUNNING tunnel.
     ///
     /// 🚨 THERE IS NO SETTING BEHIND THIS, and that is deliberate. Chunking is a

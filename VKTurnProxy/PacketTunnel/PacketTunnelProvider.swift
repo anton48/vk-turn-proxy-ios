@@ -509,6 +509,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: uplink split N = \(raw), colocated = \(colo)")
             wgSetUplinkSplitN(Int32(raw), Int32(colo))
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_uplink_pace:") {
+            // The per-allocation token bucket on the uplink, applied to the
+            // RUNNING tunnel. Live for the same reason as the split: an arm
+            // through a reconnect costs a ~107 s ramp. No UI — the pace A/B
+            // runner is the only caller, and 0 (off) is the production default.
+            // "kib,burstKiB,groupBOnly" in ONE message: rate, depth and scope
+            // are one decision, and applying them separately would put the
+            // tunnel through a state nobody asked for.
+            let parts = msg.dropFirst("set_uplink_pace:".count).split(separator: ",")
+            let kib = Int(parts.first ?? "") ?? 0
+            let burst = parts.count > 1 ? (Int(parts[1]) ?? 0) : 0
+            let bOnly = parts.count > 2 ? (Int(parts[2]) ?? 0) : 0
+            logMsg("handleAppMessage: uplink pace = \(kib) KiB/s burst \(burst) KiB, groupBOnly = \(bOnly)")
+            wgSetUplinkPace(Int32(kib), Int32(burst), Int32(bOnly))
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("set_uplink_chunk_k:") {
             // The uplink chunk size, applied to the RUNNING tunnel. 🚨 There is
             // no picker for this and there must not be one — chunking is a

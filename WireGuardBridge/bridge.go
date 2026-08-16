@@ -1148,6 +1148,28 @@ func wgSetUplinkSplitN(n C.int32_t, colocated C.int32_t) {
 	log.Printf("handleAppMessage: uplink split N = %d, mode = %s (DIAGNOSTIC, no UI)", int(n), mode)
 }
 
+// wgSetUplinkPace arms the per-allocation token bucket on the uplink. kib is
+// KiB/s of COUNTED bytes per allocation and 0 is off, which is the production
+// default; groupBOnly restricts it to the writers that do NOT serve the
+// synthetic, so group A stays an untouched in-run control for cross-talk.
+//
+// 🚨 Live, like the split: an arm costs no reconnect, and a rate change rebuilds
+// the existing buckets rather than applying only to connections opened after it.
+//
+//export wgSetUplinkPace
+func wgSetUplinkPace(kib C.int32_t, burstKiB C.int32_t, groupBOnly C.int32_t) {
+	proxy.SetUplinkPace(int(kib), int(burstKiB), groupBOnly != 0)
+	scope := "all writers"
+	if groupBOnly != 0 {
+		scope = "group B only"
+	}
+	if int(kib) <= 0 {
+		scope = "off"
+	}
+	log.Printf("handleAppMessage: uplink pace = %d KiB/s burst %d KiB, %s (DIAGNOSTIC, no UI)",
+		int(kib), int(burstKiB), scope)
+}
+
 //export wgSetUplinkChunkK
 func wgSetUplinkChunkK(k C.int32_t) {
 	proxy.SetUplinkChunkK(int(k))

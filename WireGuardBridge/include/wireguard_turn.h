@@ -193,6 +193,7 @@ void wgSetFlowPathsCover(int32_t on);
 ///        rest carry nothing — the arm that holds the synthetic's own
 ///        conditions fixed and moves only where the neighbour is.
 void wgSetUplinkSplitN(int32_t n, int32_t colocated);
+void wgSetUplinkPace(int32_t kib, int32_t burstKiB, int32_t groupBOnly);
 
 /// Uplink chunk size K, applied live. 1 = off and is what production runs.
 /// 🚨 A RETIRED lever with no UI: K > 1 is only ever an arm of the paired A/B.

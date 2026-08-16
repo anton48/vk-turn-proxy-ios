@@ -4287,7 +4287,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s%s flowkey=%d/%d%s%s%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s%s%s flowkey=%d/%d%s%s%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4339,6 +4339,10 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// split is armed. 🚨 A split with one side reading 0 tested nothing —
 			// read this before any conclusion from a split arm. See uplinksplit.go.
 			splitSummary(),
+			// Whether the uplink pacer engaged, and how hard. Empty unless it is
+			// armed. 🚨 `waited=0` means the arm tested NOTHING — read it before
+			// any conclusion from a paced arm. See uplinkpace.go.
+			paceSummary(),
 			p.recvChPeak.Swap(0),
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
@@ -5328,11 +5332,20 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			return werr
 		}
 		for {
+			// 🚨 RESERVE BEFORE THE DEQUEUE. A writer that takes a packet and
+			// then discovers it has no budget holds it where work-stealing
+			// cannot see it — the run-20 pathology, and the reason writeChunk
+			// writes each packet before taking the next. Reserving first means
+			// a writer without tokens sleeps while the packet is still in the
+			// shared queue, available to any other writer. See uplinkpace.go.
+			reserved := p.paceReserve(connIdx)
 			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
 			if !ok {
+				p.paceSettle(connIdx, reserved, 0)
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
 			}
+			p.paceSettle(connIdx, reserved, len(item.buf))
 			// connIdx (not -1) below because this site keeps the per-conn TX
 			// counters, which writeChunk maintains per packet: the pre-SRTP
 			// payload bytes — the WireGuard records that came out of sendCh —
