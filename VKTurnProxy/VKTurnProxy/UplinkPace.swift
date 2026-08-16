@@ -15,13 +15,26 @@ import Foundation
 /// 45.9-48.8% runs took the full gain AND the full price. **Benefit and cost are one
 /// dial.** Depth is closed at 16 KiB (`16.08/tcptest3`), so the dial is the RATE.
 ///
-/// ⚠️ AND THE LEVER ARM IS SHORT — say this before reading any result. The measured
-/// ON load is ~194 KiB/s of counted bytes per allocation, 77% of the ~253 KiB/s knee,
-/// so the rate never bound the MEAN; it sets the burst threshold. Over a 100 ms
-/// window 247 → 270 moves what the bucket admits from 161% to 170% of the knee — a
-/// **6% change on the axis that does the clipping**, while `udptest2`'s ON and OFF
-/// latency ranges cleared each other by only 3 ms. A null here means "this range
-/// cannot test the rate", NOT "the rate does not matter".
+/// 🚫 I REGISTERED THIS RANGE AS A SHORT LEVER AND THAT IS RETRACTED — `udptest3`
+/// ran it and the contrast is 123×. I had sized the lever as the shift in the 100 ms
+/// admission window (161% → 170% of the knee, 6%). **The swept range crosses the
+/// policer**: 247 KiB/s is 97.6% of the ~253 KiB/s knee, 260 is 102.8%, 270 is
+/// 106.7%. That is a change of SIGN, not of magnitude — a bucket below the knee
+/// cannot sustain an overload because its burst is repaid out of headroom, while one
+/// above it sustains an overload indefinitely.
+/// 🎯 **The error to avoid next time: I sized a lever by the LENGTH of its span when
+/// the decisive quantity changed sign inside it. Ask where the zero is.**
+///
+/// ✅ MEASURED (`16.08/udptest3`, 13 arms, `off` between every rate, rates a
+/// palindrome): loss OFF 1.906% · **247 0.0046%** · 260 0.486% · 270 0.898%, the six
+/// paced arms separating with no overlap and forming a symmetric hump in time that
+/// mirrors the palindrome. ⇒ **247 is the only swept rate BELOW the knee and the only
+/// one that holds the loss gate.** 260 and 270 do buy latency back (+34 / +27 ms of
+/// drift-free loaded-up ping against 247's +90) — by letting the overload through to
+/// the policer, at 100-200× the loss.
+/// ⚠️ The 260↔270 leg is inside its own replicate noise (270's pair differs 1.89×,
+/// the boundary 1.09×), so the defensible statement is *"the two lowest-loss arms are
+/// both 247"*, not a three-way ordering.
 ///
 /// 🚨 AND KEEP AN `off` ARM IN THE ROTATION. `16.08/tcptest3` dropped its control and
 /// produced an unresolvable null: its within-condition replicate spread (3.65× and
