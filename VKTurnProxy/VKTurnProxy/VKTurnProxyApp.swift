@@ -25,6 +25,15 @@ struct VKTurnProxyApp: App {
         // the source git state — earlier confusion (2026-05-10) was caused
         // by an extension running stale Go code from a not-rebuilt xcframework
         // while the source had moved on.
+        // 🚨 MIGRATE BEFORE ANY UI EXISTS. UplinkPace changed from a Bool to a rate,
+        // and its migration runs on the first read. If the first read is an
+        // @AppStorage `onChange` — i.e. the user opened Advanced and picked a rate
+        // before the tunnel ever started — the migration would land AFTER that
+        // write. Doing it here means the first read happens before anything can
+        // choose, and the guard inside migrateOnce covers the backup-import order
+        // as well. Two defences because the failure is a silent wrong rate, not an
+        // error. *(User-caught, 2026-08-16.)*
+        UplinkPace.migrate(in: .standard)
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         SharedLogger.shared.log("[App] VKTurnProxy launched (build \(build))")
 

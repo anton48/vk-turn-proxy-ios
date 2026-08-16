@@ -80,6 +80,18 @@ enum UplinkPace {
         let marker = "uplinkPaceKiBMigrated"
         guard !d.bool(forKey: marker) else { return }
         d.set(true, forKey: marker)
+        // 🚨 NEVER OVERWRITE A VALUE THAT IS ALREADY UNDER THE NEW KEY. The marker
+        // alone is not enough: on an upgraded device the old key is still present
+        // and this runs at the FIRST read — so a user who opens Advanced before the
+        // tunnel starts writes 260 through @AppStorage, `onChange` triggers the
+        // first read, and an unconditional migration puts 247 straight back over it.
+        // A restore from backup before the first read does the same. The result is
+        // not a crash but a first arm at a rate nobody chose — the worst kind of
+        // defect for this run, because it scores. *(User-caught, 2026-08-16.)*
+        if d.object(forKey: key) != nil {
+            d.removeObject(forKey: legacyBoolKey)   // retire it anyway
+            return
+        }
         guard d.object(forKey: legacyBoolKey) != nil else { return }
         let was = d.bool(forKey: legacyBoolKey)
         let now = was ? defaultKiB : off
@@ -89,18 +101,25 @@ enum UplinkPace {
             + "and removed the old key; the pacer is a RATE now, not a switch")
     }
 
-    static func register(in d: UserDefaults) {
-        migrateOnce(in: d)
-        d.register(defaults: [key: defaultKiB])
-    }
+    /// 🚨 NO `register(defaults:)`, DELIBERATELY. A registration-domain value is
+    /// visible to `object(forKey:)`, which makes the only question the migration
+    /// needs to ask — *"has a value been WRITTEN under the new key?"* —
+    /// unanswerable the moment registration has happened. The migration would then
+    /// skip itself and leave the device on the registered default instead of its
+    /// own choice. Reading the default explicitly costs one line and keeps
+    /// `object(forKey:) != nil` meaning exactly "someone wrote this".
+    /// *(Found by section 11 when the registration domain leaked between suites —
+    /// it is process-wide, not per-instance.)*
+    static func migrate(in d: UserDefaults) { migrateOnce(in: d) }
 
     /// The configured rate in KiB/s of counted bytes per allocation; 0 = off.
     /// 🎯 Off is a rate of ZERO rather than a separate flag, because that is exactly
     /// what the Go side's `PaceOff` means — one representation, no pair of values
     /// that can disagree.
     static func stored(in d: UserDefaults) -> Int {
-        register(in: d)
-        return clamp(d.integer(forKey: key))
+        migrateOnce(in: d)
+        guard let v = d.object(forKey: key) as? Int else { return defaultKiB }
+        return clamp(v)
     }
 
     static func label(_ v: Int) -> String { v == off ? "Off" : "\(v) KiB/s" }

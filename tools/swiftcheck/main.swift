@@ -1,12 +1,14 @@
 // A standalone check for the app's dependency-free invariants, compiled against
 // the REAL source files rather than copies:
 //
-//   swiftc VKTurnProxy/VKTurnProxy/UplinkChunk.swift \
-//          VKTurnProxy/VKTurnProxy/ProbeDuration.swift \
-//          VKTurnProxy/VKTurnProxy/LoadWitness.swift \
-//          VKTurnProxy/VKTurnProxy/LoadProgress.swift \
-//          VKTurnProxy/VKTurnProxy/DiagnosticRunLock.swift \
-//          tools/swiftcheck/main.swift -o /tmp/chunkcheck && /tmp/chunkcheck
+//   ./tools/swiftcheck/run.sh          (from the repository root)
+//
+// 🚨 THE COMMAND LIVES IN run.sh, NOT HERE. It was written out in this comment
+// until section 11 added UplinkPace — which needs SharedLogger, which needs
+// AppEntitlements — and the documented command silently stopped compiling while
+// the harness was fine. A recorded way to run something that does not run is the
+// same family as the harness that was green and not in the repo.
+// *(User-caught, 2026-08-16.)*
 //
 // (the compile line lists every source it asserts about; leaving one out is a
 // link error, not a silent skip, which is the property that keeps it honest)
@@ -427,6 +429,32 @@ func checkUplinkPaceMigration() {
     check(UplinkPace.stored(in: d4) == 270,
           "section 11: the migration is once-only — a re-run would overwrite the rate "
           + "the user chose (got \(UplinkPace.stored(in: d4)))")
+
+    // 4b. 🚨 THE ONE THAT WAS MISSING, AND IT IS THE ONLY ORDER THAT HAPPENS ON A
+    //     REAL DEVICE. Check 4 sets the marker by migrating first, so it only ever
+    //     exercised the SECOND pass. The dangerous order is: upgraded device still
+    //     carries the old Bool, marker NOT yet set, and the user opens Advanced and
+    //     picks a rate before the tunnel has ever started — @AppStorage writes 260,
+    //     `onChange` triggers the first read, and an unconditional migration puts
+    //     247 straight back over it. A backup restored before the first read does
+    //     the same. The result is a first arm at a rate nobody chose, which SCORES.
+    //     *(User-caught, 2026-08-16.)*
+    let d5 = freshDefaults("pace.chosen.first")
+    d5.set(true, forKey: UplinkPace.legacyBoolKey)   // upgraded, not yet migrated
+    d5.set(260, forKey: UplinkPace.key)              // ...and the user picks 260
+    check(UplinkPace.stored(in: d5) == 260,
+          "section 11: a rate chosen BEFORE the first read survives the migration "
+          + "(got \(UplinkPace.stored(in: d5)) — 247 or 0 means the migration overwrote it)")
+    check(d5.object(forKey: UplinkPace.legacyBoolKey) == nil,
+          "section 11: ...and the retired key is still retired in that path")
+
+    // 4c. The same for an import: a backup restored before the first read.
+    let d6 = freshDefaults("pace.imported.first")
+    d6.set(false, forKey: UplinkPace.legacyBoolKey)
+    d6.set(270, forKey: UplinkPace.key)              // BackupManager wrote this
+    check(UplinkPace.stored(in: d6) == 270,
+          "section 11: an imported rate survives the migration "
+          + "(got \(UplinkPace.stored(in: d6)))")
 
     // 5. Off-sweep values are snapped: a hand-edited backup is untrusted, and an
     //    arm at a rate nobody swept cannot be compared with anything.
