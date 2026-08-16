@@ -223,11 +223,41 @@ final class UplinkPaceRunner: ObservableObject {
                 + "and half of an odd pool is not a half.")
             publish("not started — NumConns must be even", running: false); return
         }
-        guard isTCP else {
-            log.log("\(runName) REFUSED — the active server is on UDP transport. TURN over TCP is "
-                + "terminated at the relay, so every counted gap is made at or after it — the "
-                + "region this run acts on. Switch the server to TCP.")
-            publish("not started — switch to TCP transport", running: false); return
+        // 🚨 UDP IS ALLOWED, DELIBERATELY, AND IT CHANGES WHAT THE SCORE MEANS.
+        //
+        // This was a hard refusal while the question was "does a bucket help".
+        // TURN over TCP is terminated at the relay, so every counted gap is made
+        // at or after it, and that is the region the bucket acts on. On UDP a gap
+        // can ALSO be made on the phone → relay leg, so `lost` and the RTP-gap
+        // table cover a DIFFERENT SET OF LEGS and are not comparable with any TCP
+        // run. That is why the refusal existed and it was right.
+        //
+        // 🎯 It is lifted because `16.08/tcptest3` asked a question only UDP can
+        // answer. At 247 KiB/s a 2 KiB bucket admits ≤26.7 KiB per 100 ms ≈ 106%
+        // of the knee, yet the server's 100 ms sampler read 166-167% in ALL FOUR
+        // arms — so the spacing is destroyed BELOW the pacer. On TCP the suspect
+        // is the relay's reassembly releasing a clump when a retransmit closes a
+        // hole. UDP has NO reassembly to compress anything, so it separates that
+        // suspect from the network and the relay's own scheduler.
+        //
+        // ⚠️ The deciding metric is therefore the SERVER'S 100 ms MAXIMUM, not
+        // `lost` — that one is transport-independent in the sense needed here,
+        // because it measures what the relay actually handed to server1.
+        // 🚫 The pacer itself is unaffected: `runSRTPSession` is transport-agnostic
+        // (`setupSRTPSession` branches on UseUDP internally) and `paceReserve` runs
+        // in the same writer loop either way. The SRTP guard below is the one that
+        // protects the treatment; this one only protected the reading.
+        if !isTCP {
+            log.log("\(runName) 🚨 UDP TRANSPORT — THIS IS THE UDP VARIANT AND ITS SCORE IS NOT "
+                + "COMPARABLE WITH ANY TCP RUN. On UDP the phone→relay leg is unprotected, so the "
+                + "RTP-gap table and `lost` cover phone→relay→server1 while every TCP run of this "
+                + "series covers relay→server1 only. 🎯 THE DECIDING METRIC HERE IS THE SERVER'S "
+                + "100 ms PER-ALLOCATION MAXIMUM, not loss: on TCP it read 166-167% of the knee in "
+                + "all four arms against a 2 KiB bucket's own 106% ceiling. If burst2 now falls to "
+                + "~106-110%, the compressor is the outer TCP's reassembly at the relay and it is "
+                + "CONFIRMED. If it stays 160%+, the spacing is destroyed by the network or the "
+                + "relay's own scheduler and no client-side bucket can reach it. ⚠️ Do NOT "
+                + "difference this run's loss against `16.08/tcptest3`.")
         }
         // 🚨 SRTP, NOT MERELY TCP. The pacer is wired into the SRTP writer alone —
         // the other three writer sites keep no per-connection identity and cannot
@@ -263,7 +293,7 @@ final class UplinkPaceRunner: ObservableObject {
         log.log("\(runName) PLAN pool=\(conns) split=\(n)+\(n) synth=\(Int(synthMbit))Mbit/s on A "
             + "(NEVER paced) · real TCP flows=\(probeFlows) on B · pace=\(paceKiB)KiB/s on B ONLY, "
             + "THE RATE NEVER MOVES · arms=burst" + arms.map(String.init).joined(separator: "·burst")
-            + "KiB · armSec=\(armSec) transport=TCP k=1 estimated=\(estimatedSeconds)s. "
+            + "KiB · armSec=\(armSec) transport=\(isTCP ? "TCP" : "UDP") k=1 estimated=\(estimatedSeconds)s. "
             + "🎯 THE QUESTION: the bucket already cut the loss 7× and raised DELIVERED goodput 43% (17.1→24.6 Mbit/s at the sink; the sender-side load= agrees at +43%), leaving a "
             + "FLOOR of 0.10-0.14%. Is that floor made of bucket DEPTH, or of spacing destroyed "
             + "BELOW us after the pacer? At 247 KiB/s a 100 ms window admits 24.7KiB of drain PLUS "
@@ -403,7 +433,7 @@ final class UplinkPaceRunner: ObservableObject {
             let paced = arm > 0
             setPace(paced ? paceKiB : 0, burstKiB: arm)
             let mode = paced ? "burst\(arm)" : "unpaced"
-            log.log("\(runName) ARM a=\(no)/\(arms.count) mode=\(mode) "
+            log.log("\(runName) ARM a=\(no)/\(arms.count) mode=\(mode) tp=\(isTCP ? "tcp" : "udp") "
                 + "pace=\(paced ? "\(paceKiB)KiB/s burst \(arm)KiB on B" : "off") "
                 + "synth=\(Int(synthMbit))Mbit/s(A) flows=\(probe.flowCensus().live)/\(probeFlows)(B) "
                 + "sec=\(armSec)")
@@ -433,12 +463,12 @@ final class UplinkPaceRunner: ObservableObject {
                 + "synthA=\(Int(synthMbit))Mbit/s(re-armed)"
             if verdict != .ok {
                 let why = LoadWitness.reason(verdict)
-                log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)\(note) 🚨 \(why)")
+                log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode) tp=\(isTCP ? "tcp" : "udp")\(note) 🚨 \(why)")
                 abortRun("arm \(no) was labelled '\(mode)' but \(why) — it is "
                     + "\(LoadWitness.mislabel(verdict))")
                 return
             }
-            log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode)\(note)")
+            log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode) tp=\(isTCP ? "tcp" : "udp")\(note)")
         }
 
         setPace(0); setLevel(0); setSplit(0)

@@ -109,6 +109,10 @@ for line in open(LOG, errors="replace"):
         # (Copying `paceKiB` here instead would be the day's own repeated defect:
         # a second copy of something that already has an owner.)
         asked = None
+        tp = None
+        tm = re.search(r"\btp=(tcp|udp)\b", m.group(6))
+        if tm:
+            tp = tm.group(1)
         if m.group(2) == "ARM":
             pm = re.search(r"pace=(\d+)KiB/s burst (\d+)KiB", m.group(6))
             if pm:
@@ -117,7 +121,7 @@ for line in open(LOG, errors="replace"):
                 die(f"arm {m.group(3)}: the ARM marker carries no readable `pace=` clause, so "
                     "what this arm ASKED FOR is unknown and its verdict cannot be checked "
                     f"against it. The runner's marker format changed.\n    {line.strip()}")
-        marks.append((m.group(2), int(m.group(3)), m.group(5), t, int(m.group(4)), asked))
+        marks.append((m.group(2), int(m.group(3)), m.group(5), t, int(m.group(4)), asked, tp))
 if not marks:
     die(f"no `{RUNNER} ARM/ARMEND` markers — wrong log, or the run never declared an arm?")
 
@@ -138,7 +142,7 @@ for i in range(0, len(marks) - 1, 2):
         # and produce a table that looks perfectly normal.
         die(f"arm {a[1]} appears twice — this log holds more than one {RUNNER} run. "
             "Split it, or the arms silently overwrite each other.")
-    arms[a[1]] = (a[2], a[3].timestamp(), b[3].timestamp(), a[4], b[3], a[5])
+    arms[a[1]] = (a[2], a[3].timestamp(), b[3].timestamp(), a[4], b[3], a[5], a[6])
     # client-clock seconds; +OFFSET only when selecting from the pcap
     # 🚨 THE LABEL AND THE COMMAND MUST AGREE. `mode=unpaced` with a `pace=` rate,
     # or a paced label with `pace=off`, means the runner named an arm one thing
@@ -148,6 +152,30 @@ for i in range(0, len(marks) - 1, 2):
         die(f"arm {a[1]} is labelled '{a[2]}' but its ARM marker asked for "
             f"{'pace=off' if a[5] is None else str(a[5])} — the label and the command disagree, "
             "so neither can be trusted.")
+
+# 🚨 THE TRANSPORT IS PART OF WHAT THE LOSS COLUMN MEANS, so it is read from the
+# log rather than assumed. TURN over TCP is terminated at the relay: the phone →
+# relay leg is retransmission-protected, so every counted gap is made AT OR AFTER
+# the relay. On UDP that leg is exposed and the SAME column covers
+# phone → relay → server1. Scoring a UDP run against a TCP run's numbers compares
+# two different sets of legs — the project's own standing rule.
+TP = {arms[k][6] for k in arms}
+if len(TP) > 1:
+    die(f"the arms declare more than one transport ({sorted(x or '?' for x in TP)}) — a log holding "
+        "both cannot be scored as one experiment.")
+TRANSPORT = TP.pop() if TP else None
+if TRANSPORT == "udp":
+    print("# 🚨 UDP TRANSPORT. The loss column below covers phone→relay→server1, NOT the "
+          "relay→server1 leg a TCP run of this series measures — the first hop is unprotected "
+          "here. 🚫 DO NOT DIFFERENCE THESE NUMBERS AGAINST ANY TCP RUN.")
+    print("# 🎯 THE DECIDING METRIC FOR THE UDP VARIANT IS THE SERVER'S 100 ms PER-ALLOCATION "
+          "MAXIMUM, not this table: on TCP it read 166-167% of the knee in all four arms against "
+          "a 2 KiB bucket's own 106% ceiling. burst2 falling to ~106-110% confirms the outer TCP's "
+          "reassembly as the compressor; staying at 160%+ puts it in the network or the relay.")
+elif TRANSPORT is None:
+    print("# ⚠️ NO `tp=` ON THE ARM MARKERS — this log predates build 295. Transport is UNKNOWN, "
+          "so which legs the loss column covers is unknown too. Treat it as TCP only if you know "
+          "the run was TCP.")
 
 if STRICT:
     if sorted(arms) != [1, 2, 3, 4]:
@@ -327,7 +355,7 @@ while True:
     u = hi[ssrc] + seq
 
     arm = None
-    for k, (mode, s, e, _dn, _te, _ask) in arms.items():
+    for k, (mode, s, e, _dn, _te, _ask, _tp) in arms.items():
         if s + OFF_S <= ts <= e + OFF_S:
             arm = k
             break
