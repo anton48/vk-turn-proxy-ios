@@ -259,16 +259,15 @@ final class UplinkPaceRunner: ObservableObject {
                 + "relay's own scheduler and no client-side bucket can reach it. ⚠️ Do NOT "
                 + "difference this run's loss against `16.08/tcptest3`.")
         }
-        // 🚨 SRTP, NOT MERELY TCP. The pacer is wired into the SRTP writer alone —
-        // the other three writer sites keep no per-connection identity and cannot
-        // own a per-allocation bucket. A TCP-but-not-SRTP profile would spend the
-        // whole run with the treatment silently absent.
-        guard isSRTP else {
-            log.log("\(runName) REFUSED — the active server is not in SRTP mode. The uplink "
-                + "pacer is wired into the SRTP writer only, so every paced arm would run "
-                + "unpaced with nothing saying so.")
-            publish("not started — server must be in SRTP mode", running: false); return
-        }
+        // 🚫 THE SRTP REFUSAL IS GONE, AND ITS REASON WAS THE POINT. It read "the
+        // pacer is wired into the SRTP writer alone, so every paced arm would run
+        // unpaced with nothing saying so" — TRUE until build 296 and FALSE after it:
+        // all four writer loops reserve, and the join the scorer needs
+        // (`[conn N] TURN relay allocated:`) is printed by BOTH `runTURN` and
+        // `setupSRTPSession`, so a non-SRTP run is fully scoreable.
+        // ⚠️ Leaving a refusal in place with a reason that has become false is worse
+        // than having none: the next reader trusts the reason, not the code.
+        // *(User-caught, 2026-08-16.)*
         guard flowK == FlowPaths.off else {
             log.log("\(runName) REFUSED — flowPathsK is armed and would route WireGuard onto the "
                 + "synthetic's own connections, undoing the split this run stands on.")
@@ -293,7 +292,7 @@ final class UplinkPaceRunner: ObservableObject {
         log.log("\(runName) PLAN pool=\(conns) split=\(n)+\(n) synth=\(Int(synthMbit))Mbit/s on A "
             + "(NEVER paced) · real TCP flows=\(probeFlows) on B · pace=\(paceKiB)KiB/s on B ONLY, "
             + "THE RATE NEVER MOVES · arms=burst" + arms.map(String.init).joined(separator: "·burst")
-            + "KiB · armSec=\(armSec) transport=\(isTCP ? "TCP" : "UDP") k=1 estimated=\(estimatedSeconds)s. "
+            + "KiB · armSec=\(armSec) transport=\(isTCP ? "TCP" : "UDP") \(isSRTP ? "mode=SRTP" : "mode=non-SRTP(paced anyway since 296)") k=1 estimated=\(estimatedSeconds)s. "
             + "🎯 THE QUESTION: the bucket already cut the loss 7× and raised DELIVERED goodput 43% (17.1→24.6 Mbit/s at the sink; the sender-side load= agrees at +43%), leaving a "
             + "FLOOR of 0.10-0.14%. Is that floor made of bucket DEPTH, or of spacing destroyed "
             + "BELOW us after the pacer? At 247 KiB/s a 100 ms window admits 24.7KiB of drain PLUS "
@@ -363,10 +362,27 @@ final class UplinkPaceRunner: ObservableObject {
         // tunnel for three days once.
         DispatchQueue.main.async { TunnelManager.shared.applyUplinkChunkK(UplinkChunk.off) }
 
+        // 🚨 ONE RESTORE, CALLED BY BOTH EXITS, AND IT REPORTS WHAT IT DID.
+        // The first version of this fix restored the setting on the NORMAL path and
+        // left `abortRun` calling `setPace(0)` — so an aborted run ended with the
+        // switch showing ON and the tunnel unpaced until the next reconnect, and the
+        // closing line still claimed "restored to 0" in both cases. Two exits and a
+        // hand-written summary is the same shape as the paired call that can be
+        // half-made; the summary is now DERIVED from the restore. *(User-caught.)*
+        func restoreAfterRun() -> String {
+            let on = UplinkPace.stored(in: UserDefaults.standard)
+            DispatchQueue.main.async { TunnelManager.shared.applyUplinkPaceFromSettings() }
+            setLevel(0); setSplit(0)
+            return on
+                ? "pace RESTORED TO THE SETTING (\(UplinkPace.rateKiB)KiB/s burst "
+                    + "\(UplinkPace.burstKiB)KiB, ON, every writer), load 0, pool un-split"
+                : "pace restored to the setting (OFF), load 0, pool un-split"
+        }
+
         func abortRun(_ why: String) {
+            let restored = restoreAfterRun()
             log.log("\(runName) ABORTED — \(why). The palindrome is broken; score nothing from "
-                + "this session. Pace and load restored to 0 and the pool un-split.")
-            setPace(0); setLevel(0); setSplit(0)
+                + "this session. \(restored).")
             DispatchQueue.main.async { probe.stop() }
             publish("aborted — the real load failed mid-run", running: false)
         }
@@ -471,15 +487,9 @@ final class UplinkPaceRunner: ObservableObject {
             log.log("\(runName) ARMEND a=\(no)/\(arms.count) mode=\(mode) tp=\(isTCP ? "tcp" : "udp")\(note)")
         }
 
-        // 🚨 RESTORE THE SETTING, DO NOT FORCE OFF. The pacer became a user setting
-        // in build 296 and its default is ON, so ending every run at 0 would leave
-        // the tunnel unpaced while Settings still showed the switch on — silently,
-        // until the next reconnect. That is the retired-chunk-size trap with the
-        // sign flipped, and it would quietly de-pace every run taken afterwards.
-        // ⚠️ The last arm's own PACE-ARMEND verdict still prints: this call bumps
-        // the generation exactly as setPace(0) did.
-        DispatchQueue.main.async { TunnelManager.shared.applyUplinkPaceFromSettings() }
-        setLevel(0); setSplit(0)
+        // ⚠️ The last arm's own PACE-ARMEND verdict still prints: restoring bumps the
+        // generation exactly as setPace(0) did.
+        let restored = restoreAfterRun()
         DispatchQueue.main.async { probe.stop() }
         let done = cancelled ? "cancelled" : "done"
         // 🚨 THE CLOSING LINE IS WHERE THE READER TAKES THE COMPARISON FROM, so it
@@ -497,7 +507,7 @@ final class UplinkPaceRunner: ObservableObject {
                 + "0.85% unpaced baseline is a PRIOR from another session and must not be "
                 + "differenced against these arms"
             : "THE COMPARISON IS THE PACED ARMS AGAINST THE UNPACED ONES"
-        log.log("\(runName) DONE state=\(done) — pace, load and split all restored to 0. "
+        log.log("\(runName) DONE state=\(done) — \(restored). "
             + "🚨 \(comparison), on group B's "
             + "RTP-sequence gaps from the capture — NOT on `cum-lost`, which cannot difference a "
             + "rotating keypair. Group A's synthetic is the cross-talk control and must still "

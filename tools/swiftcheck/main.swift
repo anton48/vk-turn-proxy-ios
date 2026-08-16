@@ -306,5 +306,43 @@ do {
     check(p.snapshot().worstGapMs == 0, "no elapsed time, no gap")
 }
 
+
+// ─── section 10: the run's two EXITS must restore the same way ──────────────
+//
+// 🚨 WHY A SOURCE SCAN AND NOT A BEHAVIOUR TEST. The runner cannot be built
+// standalone (it needs TunnelManager, the probe, the log), and the property is
+// SILENT: an aborted run that forgets to restore looks exactly like one that did,
+// until someone notices the tunnel is unpaced while Settings shows the switch on.
+// That is precisely what shipped in build 296 — the normal exit restored the
+// setting and `abortRun` still called `setPace(0)`, and the closing line claimed
+// "restored to 0" on both paths. *(User-caught.)*
+func checkPaceRunnerRestore() {
+    let path = "VKTurnProxy/VKTurnProxy/UplinkPaceRunner.swift"
+    guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
+        check(false, "section 10: cannot read \(path)"); return
+    }
+    // 1. Exactly one restore helper, and both exits go through it.
+    let restores = src.components(separatedBy: "restoreAfterRun()").count - 1
+    check(restores >= 3,
+          "section 10: expected the restore helper plus a call from EACH exit "
+          + "(abort and done); found \(restores) mentions of restoreAfterRun()")
+    // 2. No exit may force the pacer off behind the setting's back.
+    let afterHelper = src.range(of: "func restoreAfterRun()").map { String(src[$0.upperBound...]) } ?? src
+    check(!afterHelper.contains("setPace(0); setLevel(0); setSplit(0)"),
+          "section 10: an exit path still calls setPace(0) directly — an aborted run "
+          + "would leave the tunnel unpaced while the Settings switch still shows ON")
+    // 3. The closing line must be DERIVED, not a hand-written claim.
+    check(!src.contains("restored to 0."),
+          "section 10: the log still hard-codes \"restored to 0\", which is false "
+          + "whenever the setting is ON — the summary must come from the restore")
+    // 4. The obsolete SRTP refusal must be gone: its stated reason is false since 296.
+    check(!src.contains("pacer is wired into the SRTP writer only"),
+          "section 10: the SRTP refusal is back, and its reason is false — all four "
+          + "writer loops reserve since build 296")
+}
+
+print("section 10: the pace runner's two exits")
+checkPaceRunnerRestore()
+
 print(failures == 0 ? "PASS" : "FAIL (\(failures))")
 exit(failures == 0 ? 0 : 1)
