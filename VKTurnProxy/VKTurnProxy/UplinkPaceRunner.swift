@@ -192,7 +192,8 @@ final class UplinkPaceRunner: ObservableObject {
         var flowK = 0
         var conns = 0
         var isTCP = false
-        var isSRTP = false
+        var hasOuterRTP = false
+        var modeLabel = "?"
         DispatchQueue.main.sync {
             let live = TunnelManager.shared.live
             received = live.statsReceivedOnce
@@ -203,7 +204,18 @@ final class UplinkPaceRunner: ObservableObject {
             flowK = FlowPaths.stored(in: UserDefaults.standard)
             conns = server.numConnections
             isTCP = !server.useUDP
-            isSRTP = server.useSrtp
+            // 🚨 THE SCORER NEEDS AN OUTER RTP SEQUENCE, NOT A MODE NAME. It counts
+            // B-loss purely from RTP sequence gaps in the :56001 capture and exits
+            // with "no RTP" if there is none — so the question is not "is this
+            // SRTP" but "does this mode put an RTP header on the wire".
+            // SRTP does; WRAP wraps every datagram in an SRTP-shaped envelope
+            // (proxy.go's runTURN: RTP header + nonce + AEAD); WRAP-A is RTP-obfs
+            // and WRAP-S carries an rtpopus profile. LEGACY is raw DTLS+WG and has
+            // no RTP at all. *(User-caught: my earlier justification checked the
+            // conn→port join line, which every mode prints, and that is NOT the
+            // quantity the loss is measured from.)*
+            hasOuterRTP = server.useSrtp || server.useWrap || server.useWrapA || server.useWrapS
+            modeLabel = server.modeLabel
         }
         let n = conns / 2
 
@@ -259,7 +271,23 @@ final class UplinkPaceRunner: ObservableObject {
                 + "relay's own scheduler and no client-side bucket can reach it. ⚠️ Do NOT "
                 + "difference this run's loss against `16.08/tcptest3`.")
         }
-        // 🚫 THE SRTP REFUSAL IS GONE, AND ITS REASON WAS THE POINT. It read "the
+        // 🚨 LEGACY IS REFUSED — and the reason is the SCORER, not the pacer.
+        // The old refusal said "the pacer is wired into the SRTP writer only",
+        // which was true until build 296 and false after it, so it was removed.
+        // Removing it went too far: `.legacy` is raw DTLS+WG with NO RTP wrapper,
+        // and B-loss is counted from outer RTP sequence gaps, so a legacy run
+        // would burn nine minutes and be unscorable. Every other mode wraps in
+        // RTP. *(User-caught, 2026-08-16 — the second reason was hiding behind
+        // the first one being false.)*
+        guard hasOuterRTP else {
+            log.log("\(runName) REFUSED — mode is \(modeLabel), which puts NO RTP header on "
+                + "the wire. The pacer would work (all four writers reserve since build 296), "
+                + "but B-loss is counted from outer RTP sequence gaps in the capture and this "
+                + "run would be unscorable. Use SRTP, SRTP+WRAP, WRAP-A or WRAP-S.")
+            publish("not started — \(modeLabel) has no outer RTP to score", running: false); return
+        }
+
+        // 🚫 THE OLD SRTP-ONLY REFUSAL IS GONE, AND ITS REASON WAS THE POINT. It read "the
         // pacer is wired into the SRTP writer alone, so every paced arm would run
         // unpaced with nothing saying so" — TRUE until build 296 and FALSE after it:
         // all four writer loops reserve, and the join the scorer needs
@@ -292,7 +320,7 @@ final class UplinkPaceRunner: ObservableObject {
         log.log("\(runName) PLAN pool=\(conns) split=\(n)+\(n) synth=\(Int(synthMbit))Mbit/s on A "
             + "(NEVER paced) · real TCP flows=\(probeFlows) on B · pace=\(paceKiB)KiB/s on B ONLY, "
             + "THE RATE NEVER MOVES · arms=burst" + arms.map(String.init).joined(separator: "·burst")
-            + "KiB · armSec=\(armSec) transport=\(isTCP ? "TCP" : "UDP") \(isSRTP ? "mode=SRTP" : "mode=non-SRTP(paced anyway since 296)") k=1 estimated=\(estimatedSeconds)s. "
+            + "KiB · armSec=\(armSec) transport=\(isTCP ? "TCP" : "UDP") mode=\(modeLabel) k=1 estimated=\(estimatedSeconds)s. "
             + "🎯 THE QUESTION: the bucket already cut the loss 7× and raised DELIVERED goodput 43% (17.1→24.6 Mbit/s at the sink; the sender-side load= agrees at +43%), leaving a "
             + "FLOOR of 0.10-0.14%. Is that floor made of bucket DEPTH, or of spacing destroyed "
             + "BELOW us after the pacer? At 247 KiB/s a 100 ms window admits 24.7KiB of drain PLUS "
@@ -370,13 +398,29 @@ final class UplinkPaceRunner: ObservableObject {
         // hand-written summary is the same shape as the paired call that can be
         // half-made; the summary is now DERIVED from the restore. *(User-caught.)*
         func restoreAfterRun() -> String {
-            let on = UplinkPace.stored(in: UserDefaults.standard)
-            DispatchQueue.main.async { TunnelManager.shared.applyUplinkPaceFromSettings() }
+            // 🚨 ONE SNAPSHOT FOR THE COMMAND AND FOR THE SENTENCE ABOUT IT. The first
+            // version read the setting HERE, on the runner's queue, and then let
+            // `applyUplinkPaceFromSettings` read UserDefaults AGAIN, later, on main —
+            // two reads of a value the user can flip between them, so the log could
+            // say ON while the command carried OFF. Read and send in the SAME block
+            // on main, and report THAT value, using the explicit-argument form of
+            // apply rather than the one that re-reads. *(User-caught.)*
+            var on = false
+            DispatchQueue.main.sync {
+                on = UplinkPace.stored(in: UserDefaults.standard)
+                TunnelManager.shared.applyUplinkPace(kib: on ? UplinkPace.rateKiB : 0,
+                                                     burstKiB: UplinkPace.burstKiB,
+                                                     groupBOnly: false)
+            }
             setLevel(0); setSplit(0)
+            // ⚠️ "REQUESTED", not "restored". The provider message is fire-and-forget
+            // (`sendProviderMessage` under a `try?`, completion ignored), so this line
+            // can only honestly claim what was SENT. The same distinction the pace
+            // scorer enforces between what an arm ASKED for and what it APPLIED.
             return on
-                ? "pace RESTORED TO THE SETTING (\(UplinkPace.rateKiB)KiB/s burst "
+                ? "pace RESTORE REQUESTED at the setting (\(UplinkPace.rateKiB)KiB/s burst "
                     + "\(UplinkPace.burstKiB)KiB, ON, every writer), load 0, pool un-split"
-                : "pace restored to the setting (OFF), load 0, pool un-split"
+                : "pace restore requested at the setting (OFF), load 0, pool un-split"
         }
 
         func abortRun(_ why: String) {

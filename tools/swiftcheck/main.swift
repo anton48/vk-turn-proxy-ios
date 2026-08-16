@@ -318,9 +318,21 @@ do {
 // "restored to 0" on both paths. *(User-caught.)*
 func checkPaceRunnerRestore() {
     let path = "VKTurnProxy/VKTurnProxy/UplinkPaceRunner.swift"
-    guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
+    guard let raw = try? String(contentsOfFile: path, encoding: .utf8) else {
         check(false, "section 10: cannot read \(path)"); return
     }
+    // 🚨 SCAN THE CODE, NOT THE PROSE ABOUT IT. Both of these assertions failed on
+    // CORRECT code the first time they ran, because the comments explaining why the
+    // old refusal was removed quote its old reason verbatim, and the comment
+    // explaining the two-reads defect names `applyUplinkPaceFromSettings`. A
+    // source scan that reads comments tests the documentation. Same family as the
+    // guard that once matched a function's own declaration.
+    let src = raw.split(separator: "\n", omittingEmptySubsequences: false)
+        .map { line -> String in
+            guard let r = line.range(of: "//") else { return String(line) }
+            return String(line[line.startIndex..<r.lowerBound])
+        }
+        .joined(separator: "\n")
     // 1. Exactly one restore helper, and both exits go through it.
     let restores = src.components(separatedBy: "restoreAfterRun()").count - 1
     check(restores >= 3,
@@ -339,6 +351,37 @@ func checkPaceRunnerRestore() {
     check(!src.contains("pacer is wired into the SRTP writer only"),
           "section 10: the SRTP refusal is back, and its reason is false — all four "
           + "writer loops reserve since build 296")
+    // 5. ...but LEGACY must still be refused, and for the SCORER's reason. `.legacy`
+    //    is raw DTLS+WG with no RTP wrapper, and B-loss is counted purely from outer
+    //    RTP sequence gaps — so such a run burns nine minutes and cannot be scored.
+    //    The predicate must be the RTP one, not `useSrtp` alone.
+    check(src.contains("server.useSrtp || server.useWrap || server.useWrapA || server.useWrapS"),
+          "section 10: the outer-RTP predicate is missing — either Legacy is admitted "
+          + "(unscorable: no RTP to count gaps in) or the WRAP modes are refused for "
+          + "no reason")
+    check(src.contains("guard hasOuterRTP else"),
+          "section 10: nothing refuses a mode without an outer RTP header")
+    // 6. The restore must take ONE snapshot: reading the setting and sending the
+    //    command in the same block, not a read here and a second read on main.
+    let restoreBody: String = {
+        guard let a = src.range(of: "func restoreAfterRun()"),
+              let b = src.range(of: "func abortRun(", range: a.upperBound..<src.endIndex)
+        else { return "" }
+        return String(src[a.upperBound..<b.lowerBound])
+    }()
+    check(!restoreBody.isEmpty, "section 10: cannot isolate restoreAfterRun()")
+    check(!restoreBody.contains("applyUplinkPaceFromSettings"),
+          "section 10: the restore delegates to the re-reading form, so the value it "
+          + "REPORTS and the value it SENDS come from two different reads of a switch "
+          + "the user can flip in between")
+    check(restoreBody.contains("DispatchQueue.main.sync"),
+          "section 10: the restore does not read and send in one synchronous block, so "
+          + "its return value need not describe the command it issued")
+    // 7. The sentence may only claim what was SENT: the provider message is
+    //    fire-and-forget, so "restored" is a promise the code cannot keep.
+    check(restoreBody.lowercased().contains("requested"),
+          "section 10: the restore line claims a completed restore, but the provider "
+          + "message is fire-and-forget — it can only report what was requested")
 }
 
 print("section 10: the pace runner's two exits")
