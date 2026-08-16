@@ -58,6 +58,7 @@ if "--runner" in sys.argv:
     RUNNER = sys.argv[sys.argv.index("--runner") + 1]
 STRICT = RUNNER == "paceab"
 DSTPORT = 56001
+OFF_S = OFFSET_H * 3600.0   # client clock → pcap clock, applied ONLY to the pcap
 
 
 def die(msg):
@@ -86,12 +87,21 @@ if not re.search(rf"{RUNNER} DONE state=done", text):
     die(f"no `{RUNNER} DONE state=done` — the run did not finish, so its last arm is "
         "truncated and its palindrome is incomplete.")
 
+# 🚨 TWO CLOCKS, AND ONLY ONE OF THEM NEEDS THE OFFSET. The Swift `ARM/ARMEND`
+# markers and the Go `[Go] PACE-ARMEND` lines are both written by the PHONE, on
+# the same device clock. The pcap is written by the SERVER. So arm windows are
+# kept in CLIENT time — which is what the verdicts are compared against — and the
+# offset is added only when those windows are used to select packets.
+# ⚠️ The first version shifted the markers at parse time and then compared the
+# unshifted verdicts against them, so both verdicts fell two hours outside their
+# own arms and a perfectly good run would have been refused.
+# *(User-caught, 2026-08-16, on the run itself.)*
 off = datetime.timedelta(hours=OFFSET_H)
 marks = []
 for line in open(LOG, errors="replace"):
     m = re.search(rf"\[([\d-]+ [\d:.]+)\] {RUNNER} (ARM|ARMEND) a=(\d+)/(\d+) mode=(\w+)", line)
     if m:
-        t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f") + off
+        t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f")
         marks.append((m.group(2), int(m.group(3)), m.group(5), t, int(m.group(4))))
 if not marks:
     die(f"no `{RUNNER} ARM/ARMEND` markers — wrong log, or the run never declared an arm?")
@@ -114,6 +124,7 @@ for i in range(0, len(marks) - 1, 2):
         die(f"arm {a[1]} appears twice — this log holds more than one {RUNNER} run. "
             "Split it, or the arms silently overwrite each other.")
     arms[a[1]] = (a[2], a[3].timestamp(), b[3].timestamp(), a[4], b[3])
+    # client-clock seconds; +OFFSET only when selecting from the pcap
 
 if STRICT:
     if sorted(arms) != [1, 2, 3, 4]:
@@ -139,16 +150,34 @@ if STRICT:
     for line in open(LOG, errors="replace"):
         m = re.match(r"\[Go\] (\d\d):(\d\d):(\d\d)\.(\d+).*PACE-ARMEND .*?waited=(\d+)\(", line)
         if m:
-            base = marks[0][3].date()
-            t = datetime.datetime.combine(base, datetime.time(
-                int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                int(m.group(4)[:6].ljust(6, "0"))))
+            # `[Go]` carries a time of day and no date. Pick the date that puts it
+            # nearest the run — a run can straddle midnight, and guessing the
+            # first marker's date would then be a day out.
+            tod = datetime.time(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                                int(m.group(4)[:6].ljust(6, "0")))
+            base = marks[0][3]
+            cand = [datetime.datetime.combine(base.date() + datetime.timedelta(days=d), tod)
+                    for d in (-1, 0, 1)]
+            t = min(cand, key=lambda c: abs((c - base).total_seconds()))
             vlines.append((t.timestamp(), int(m.group(5)), line.strip()))
     paced = [k for k in sorted(arms) if arms[k][0] == "paced"]
     if len(vlines) != len(paced):
         die(f"{len(vlines)} PACE-ARMEND lines for {len(paced)} paced arms — expected exactly "
             "one per paced arm. An arm without its own verdict cannot be scored, because a "
             "per-tick zero is a quiet interval and not a verdict.")
+    # 🚨 An instrument that can misjudge should name its own likeliest failure.
+    # Verdicts that exist but bind to NOTHING is the signature of a clock
+    # mismatch in this scorer, not of a bad run — it is exactly the defect that
+    # shipped here once.
+    bound = sum(1 for v in vlines
+                if any(arms[k][2] - 2 <= v[0] <= (arms[k + 1][1] if (k + 1) in arms
+                                                  else arms[k][2] + 3600) + 2
+                       for k in paced))
+    if vlines and bound == 0:
+        die(f"{len(vlines)} PACE-ARMEND lines exist but NONE falls inside a paced arm's gap. "
+            "That is almost certainly a clock mismatch in this scorer rather than a bad run: "
+            "`[Go]` lines and `ARM` markers are both PHONE time and must be compared without "
+            "the pcap offset. Check before blaming the run.")
     for k in paced:
         end = arms[k][2]
         nxt = arms[k + 1][1] if (k + 1) in arms else end + 3600
@@ -230,7 +259,7 @@ while True:
 
     arm = None
     for k, (mode, s, e, _dn, _te) in arms.items():
-        if s <= ts <= e:
+        if s + OFF_S <= ts <= e + OFF_S:
             arm = k
             break
     if arm is None:
@@ -250,7 +279,8 @@ while True:
 # ---- 4. report.
 if pcap_first == 0:
     sys.exit("no RTP to :%d in the capture" % DSTPORT)
-span_ok = pcap_first <= min(a[1] for a in arms.values()) and pcap_last >= max(a[2] for a in arms.values())
+span_ok = (pcap_first <= min(a[1] for a in arms.values()) + OFF_S
+           and pcap_last >= max(a[2] for a in arms.values()) + OFF_S)
 print(f"# pcap RTP={rtp_total} span={datetime.datetime.fromtimestamp(pcap_first)} "
       f"→ {datetime.datetime.fromtimestamp(pcap_last)}  conns={nconn} "
       f"groupA={len(groupA)} groupB={len(groupB)} offset={OFFSET_H}h")
