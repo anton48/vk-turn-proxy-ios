@@ -92,10 +92,17 @@ for line in open(LOG, errors="replace"):
     m = re.search(rf"\[([\d-]+ [\d:.]+)\] {RUNNER} (ARM|ARMEND) a=(\d+)/(\d+) mode=(\w+)", line)
     if m:
         t = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f") + off
-        marks.append((m.group(2), int(m.group(3)), m.group(5), t))
+        marks.append((m.group(2), int(m.group(3)), m.group(5), t, int(m.group(4))))
 if not marks:
     die(f"no `{RUNNER} ARM/ARMEND` markers — wrong log, or the run never declared an arm?")
 
+# 🚨 EXACTLY EIGHT MARKERS. The old loop stepped in pairs and SILENTLY DROPPED a
+# trailing odd one — so a complete first run followed by a single `ARM` of a
+# second passed as a normal first run. *(User-caught, 2026-08-16.)*
+if STRICT and len(marks) != 8:
+    die(f"{len(marks)} ARM/ARMEND markers, expected exactly 8 (four arms). An odd count "
+        "means a second run started in this log; a different even count means a different "
+        "experiment.")
 arms = {}
 for i in range(0, len(marks) - 1, 2):
     a, b = marks[i], marks[i + 1]
@@ -106,9 +113,15 @@ for i in range(0, len(marks) - 1, 2):
         # and produce a table that looks perfectly normal.
         die(f"arm {a[1]} appears twice — this log holds more than one {RUNNER} run. "
             "Split it, or the arms silently overwrite each other.")
-    arms[a[1]] = (a[2], a[3].timestamp(), b[3].timestamp())
+    arms[a[1]] = (a[2], a[3].timestamp(), b[3].timestamp(), a[4], b[3])
 
 if STRICT:
+    if sorted(arms) != [1, 2, 3, 4]:
+        die(f"arm numbers are {sorted(arms)}, expected 1..4.")
+    denoms = {arms[k][3] for k in arms}
+    if denoms != {4}:
+        die(f"arms declare denominators {sorted(denoms)}, expected /4 everywhere — this log "
+            "is from a plan with a different number of arms.")
     want = ["unpaced", "paced", "paced", "unpaced"]
     got = [arms[k][0] for k in sorted(arms)]
     if got != want:
@@ -117,17 +130,37 @@ if STRICT:
     # 🚨 EVERY PACED ARM MUST CARRY ITS OWN ENGAGEMENT VERDICT. The per-tick
     # `pace=` field covers ten seconds and cannot speak for an arm; `PACE-ARMEND`
     # is the arm's own accumulator, printed once when the pacer is turned off.
-    verdicts = re.findall(r"PACE-ARMEND gen=(\d+) .*?waited=(\d+)\(", text)
-    npaced = sum(1 for k in arms if arms[k][0] == "paced")
-    if len(verdicts) < npaced:
-        die(f"{len(verdicts)} PACE-ARMEND lines for {npaced} paced arms — an arm without its "
-            "own engagement verdict cannot be scored, because a per-tick zero is a quiet "
-            "interval and not a verdict.")
-    inert = [g for g, w in verdicts if int(w) == 0]
-    if inert:
-        die(f"PACE-ARMEND generation(s) {inert} report waited=0 — the bucket never emptied, "
-            "so those arms tested NOTHING. Lower the BURST before the rate: the losses are "
-            "block-shaped, i.e. a depth.")
+    # 🚨 EXACTLY TWO VERDICTS, EACH IN ITS OWN ARM'S GAP. Counting them is not
+    # enough: two lines from one arm and none from the other would pass a
+    # >= check, and a verdict that landed anywhere in the run would pass a bare
+    # count. Each must fall between its paced arm's ARMEND and the next ARM.
+    # The `[Go]` prefix carries its own clock, already on the pcap's timeline.
+    vlines = []
+    for line in open(LOG, errors="replace"):
+        m = re.match(r"\[Go\] (\d\d):(\d\d):(\d\d)\.(\d+).*PACE-ARMEND .*?waited=(\d+)\(", line)
+        if m:
+            base = marks[0][3].date()
+            t = datetime.datetime.combine(base, datetime.time(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)[:6].ljust(6, "0"))))
+            vlines.append((t.timestamp(), int(m.group(5)), line.strip()))
+    paced = [k for k in sorted(arms) if arms[k][0] == "paced"]
+    if len(vlines) != len(paced):
+        die(f"{len(vlines)} PACE-ARMEND lines for {len(paced)} paced arms — expected exactly "
+            "one per paced arm. An arm without its own verdict cannot be scored, because a "
+            "per-tick zero is a quiet interval and not a verdict.")
+    for k in paced:
+        end = arms[k][2]
+        nxt = arms[k + 1][1] if (k + 1) in arms else end + 3600
+        owned = [v for v in vlines if end - 2 <= v[0] <= nxt + 2]
+        if len(owned) != 1:
+            die(f"arm {k} (paced) has {len(owned)} PACE-ARMEND lines in its own gap — the "
+                "verdict must be the one printed when THAT arm's pacer was turned off, not "
+                "a line from somewhere else in the run.")
+        if owned[0][1] == 0:
+            die(f"arm {k}: PACE-ARMEND reports waited=0 — the bucket never emptied, so this "
+                "arm tested NOTHING. Lower the BURST before the rate: the losses are "
+                "block-shaped, i.e. a depth.\n    {owned[0][2]}")
 
 # ---- 3. one streaming pass; only the first 64 B of each frame is read.
 f = open(PCAP, "rb")
@@ -196,7 +229,7 @@ while True:
     u = hi[ssrc] + seq
 
     arm = None
-    for k, (mode, s, e) in arms.items():
+    for k, (mode, s, e, _dn, _te) in arms.items():
         if s <= ts <= e:
             arm = k
             break
@@ -222,13 +255,14 @@ print(f"# pcap RTP={rtp_total} span={datetime.datetime.fromtimestamp(pcap_first)
       f"→ {datetime.datetime.fromtimestamp(pcap_last)}  conns={nconn} "
       f"groupA={len(groupA)} groupB={len(groupB)} offset={OFFSET_H}h")
 if not span_ok:
-    print("# 🚨 THE CAPTURE DOES NOT COVER EVERY ARM — check --offset-hours before reading anything below")
+    die("the capture does not cover every arm — check --offset-hours. Printing a table over "
+        "a partial capture is how a missing tail reads as a clean arm.")
 
 hdr = f"{'arm':<4}{'mode':<10}{'grp':<4}{'allocs':>7}{'expected':>11}{'received':>10}{'missing':>9}{'loss':>9}{'reord':>7}{'dup':>6}"
 print(hdr)
 print("-" * len(hdr))
 for k in sorted(arms):
-    mode, s, e = arms[k]
+    mode, s, e = arms[k][0], arms[k][1], arms[k][2]
     for gname, ports in (("A", groupA), ("B", groupB)):
         exp = rec = mis = dp = ro = 0
         allocs = 0
@@ -248,5 +282,6 @@ for k in sorted(arms):
 print("\n🎯 THE COMPARISON IS GROUP B, PACED ARMS AGAINST UNPACED ONES.")
 print("   Group A is the CROSS-TALK CONTROL and must not move; it is the synthetic,")
 print("   whose own cum-lost at index 5d170000 is the second, independent reading of it.")
-print("🚨 Read `pace=` in the client log FIRST: waited=0 means the bucket never emptied")
-print("   and the arm tested nothing, whatever the numbers above say.")
+print("🚨 The engagement verdict is `PACE-ARMEND`, one per paced arm — NOT the per-tick")
+print("   `pace=` field, which covers ten seconds and cannot speak for an arm. This scorer")
+print("   already refused to print anything unless both verdicts exist and both engaged.")

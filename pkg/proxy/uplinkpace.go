@@ -118,6 +118,20 @@ type paceState struct {
 	// reaches the buckets instead of applying only to connections opened after
 	// it.
 	gen uint64
+
+	// 🚨 THE ARM'S ACCUMULATORS LIVE IN THE STATE, NOT IN GLOBALS, AND THIS IS A
+	// RACE THE FIRST VERSION HAD. With globals the setter read and zeroed them
+	// before the new state was published, so a writer that had already counted
+	// its `waited` but was STILL SLEEPING added its time afterwards — the verdict
+	// printed `waited=1 total=0s`, and the late value was then wiped in the next
+	// off-gap. Binding the counters to the generation makes a late arrival land
+	// in the right place; `inflight` is what lets the setter know when there are
+	// no late arrivals left. *(User-caught, 2026-08-16.)*
+	awaits, waited, waitNs, planNs, waitMax, bytes, skipA atomic.Int64
+	// inflight counts writers currently SLEEPING under this state. It covers the
+	// wait and nothing else: the dequeue that follows can block for as long as
+	// the queue is empty, and waiting for that would hang the setter.
+	inflight atomic.Int64
 }
 
 func (s *paceState) on() bool { return s.rate > 0 }
@@ -129,25 +143,9 @@ var (
 	// touches its entry.
 	paceBuckets [paceMaxConns]atomic.Pointer[paceBucket]
 
-	// 🚨 PER-GENERATION, NOT PER-TICK. `paceSummary` clears its counters on every
-	// memstats tick, so `NEVER WAITED` there is a statement about TEN SECONDS and
-	// not about the arm — one tick can read it while the pacer worked in the
-	// others, the tail after a switch is cleared silently because the state is
-	// already `off`, and an 8-second gap containing no tick spills one arm's tail
-	// into the next. The arm-level verdict therefore has its own accumulators,
-	// reset only when the generation changes, and is printed ONCE at that moment.
-	// *(User-caught, 2026-08-16, before the run.)*
-	genAwaits  atomic.Int64
-	genWaited  atomic.Int64
-	genWaitNs  atomic.Int64 // ACTUAL writer-time, measured
-	genPlanNs  atomic.Int64 // what the bucket asked for, before sleeping
-	genWaitMax atomic.Int64
-	genBytes   atomic.Int64
-	genSkipA   atomic.Int64
-
 	paceAwaits   atomic.Int64 // reservations attempted
 	paceWaited   atomic.Int64 // reservations that actually slept
-	paceWaitNs   atomic.Int64 // total slept
+	pacePlanNs   atomic.Int64 // total the bucket ASKED for (not writer-time)
 	paceWaitMax  atomic.Int64 // longest single sleep
 	paceBytes    atomic.Int64 // counted bytes charged
 	paceCancels  atomic.Int64 // waits abandoned because the context ended
@@ -175,13 +173,31 @@ func SetUplinkPace(kib int, burstKiB int, groupBOnly bool) {
 		}
 		next.burst = float64(burstKiB) * 1024
 	}
-	// 🚨 THE OUTGOING GENERATION'S VERDICT, PRINTED EXACTLY ONCE, HERE. This is
-	// the only moment at which an arm's pacing is complete and nothing has yet
-	// been attributed to the next one.
+	// 🚨 PUBLISH FIRST, THEN DRAIN, THEN PRINT — and the order is the whole fix.
+	// The first version read and zeroed the counters BEFORE publishing, so a
+	// writer that had already counted its `waited` but was still SLEEPING added
+	// its time afterwards: the verdict printed `waited=1 total=0s` and the late
+	// value was wiped in the next off-gap. Publishing first means every writer
+	// still asleep is holding the OLD state and will file against it; draining
+	// then waits for exactly those, and only then is the old generation complete.
+	// *(User-caught, 2026-08-16.)*
+	paceCur.Store(next)
 	if old.on() {
-		aw, wt := genAwaits.Swap(0), genWaited.Swap(0)
-		ns, plan := genWaitNs.Swap(0), genPlanNs.Swap(0)
-		mx, by, sk := genWaitMax.Swap(0), genBytes.Swap(0), genSkipA.Swap(0)
+		// The sleep is sliced at 10 ms and breaks as soon as the pacer reads as
+		// off, so this drains in one slice under any real timing. The bound
+		// exists so a wedged writer cannot hold the setter — and if it is ever
+		// hit, the verdict SAYS SO rather than quietly under-reporting.
+		drained := true
+		for i := 0; old.inflight.Load() > 0; i++ {
+			if i > 40 { // 40 × 5 ms = 200 ms
+				drained = false
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		aw, wt := old.awaits.Load(), old.waited.Load()
+		ns, plan := old.waitNs.Load(), old.planNs.Load()
+		mx, by, sk := old.waitMax.Load(), old.bytes.Load(), old.skipA.Load()
 		share := 0.0
 		if aw > 0 {
 			share = 100 * float64(wt) / float64(aw)
@@ -190,26 +206,21 @@ func SetUplinkPace(kib int, burstKiB int, groupBOnly bool) {
 		if wt == 0 {
 			verdict = "🚨 NEVER WAITED — THE BUCKET NEVER EMPTIED, SO THIS ARM TESTED NOTHING"
 		}
+		if !drained {
+			verdict += " ⚠️ NOT FULLY DRAINED — a writer was still asleep after 200 ms, so " +
+				"total is a LOWER BOUND"
+		}
 		log.Printf("proxy: PACE-ARMEND gen=%d rate=%.0fKiB burst=%.0fKiB paced=%d unpaced-A=%d "+
 			"waited=%d(%.1f%%) total=%s planned=%s max=%s bytes=%dKiB — %s",
 			old.gen, old.rate/1024, old.burst/1024, aw, sk, wt, share,
-			// ⚠️ MICROSECONDS, not milliseconds: `total` and `planned` differ by the
-			// scheduler's own overshoot, and rounding to ms can collapse that
-			// difference to nothing — which would also make the guard that
-			// distinguishes them unable to fail.
+			// ⚠️ MICROSECONDS: `total` and `planned` differ by the scheduler's own
+			// overshoot, and rounding to ms can collapse that difference to
+			// nothing — which would also make the guard that distinguishes them
+			// unable to fail.
 			time.Duration(ns).Round(time.Microsecond),
 			time.Duration(plan).Round(time.Microsecond),
 			time.Duration(mx).Round(time.Microsecond), by/1024, verdict)
-	} else {
-		genAwaits.Store(0)
-		genWaited.Store(0)
-		genWaitNs.Store(0)
-		genPlanNs.Store(0)
-		genWaitMax.Store(0)
-		genBytes.Store(0)
-		genSkipA.Store(0)
 	}
-	paceCur.Store(next)
 }
 
 // UplinkPaceRate reports the configured rate in KiB/s, 0 when off. For the
@@ -297,18 +308,28 @@ func pacesWriter(st *paceState, connIdx int) bool {
 	return !splitOwnsSynth(connIdx, sp.n)
 }
 
+// paceTicket is what a writer carries from its reservation to its settle: the
+// amount reserved AND the generation that granted it, so the bytes are filed
+// against the arm that paced them rather than the one in force by the time the
+// packet finally arrives.
+type paceTicket struct {
+	st       *paceState
+	reserved float64
+	connIdx  int
+}
+
 // paceReserve is called BEFORE the dequeue. It returns the amount reserved, to
 // be handed to paceSettle once the real packet size is known.
 //
 // 🚨 It must never hold a packet: at this point the writer has none.
-func (p *Proxy) paceReserve(connIdx int) float64 {
+func (p *Proxy) paceReserve(connIdx int) paceTicket {
 	st := paceNow()
 	if !pacesWriter(st, connIdx) {
 		if st.on() {
 			paceSkippedA.Add(1)
-			genSkipA.Add(1)
+			st.skipA.Add(1)
 		}
-		return 0
+		return paceTicket{}
 	}
 	b := paceBuckets[connIdx].Load()
 	if b == nil || b.gen != st.gen {
@@ -317,19 +338,24 @@ func (p *Proxy) paceReserve(connIdx int) float64 {
 	}
 	wait := b.take(paceMaxCost)
 	paceAwaits.Add(1)
-	genAwaits.Add(1)
+	st.awaits.Add(1)
 	if wait <= 0 {
-		return paceMaxCost
+		return paceTicket{st: st, reserved: paceMaxCost, connIdx: connIdx}
 	}
 	paceWaited.Add(1)
-	genWaited.Add(1)
+	st.waited.Add(1)
+	// 🚨 IN-FLIGHT COVERS THE SLEEP ONLY. The setter drains on this before it
+	// prints the generation's verdict; extending it over the dequeue that follows
+	// would hang the setter whenever the queue is empty.
+	st.inflight.Add(1)
+	defer st.inflight.Add(-1)
 	// ⚠️ TWO DIFFERENT QUANTITIES, KEPT APART. `planned` is what the bucket asked
 	// for; `total` is the writer-time actually spent. They diverge whenever the
 	// wait is cut short (the pacer turned off, the context ended) or the
 	// scheduler oversleeps — and only the measured one may be divided by the
 	// interval to get a dose. *(User-caught, 2026-08-16.)*
-	genPlanNs.Add(int64(wait))
-	paceWaitNs.Add(int64(wait))
+	st.planNs.Add(int64(wait))
+	pacePlanNs.Add(int64(wait))
 	slept0 := time.Now()
 	for {
 		prev := paceWaitMax.Load()
@@ -355,7 +381,12 @@ func (p *Proxy) paceReserve(connIdx int) float64 {
 		case <-p.ctx.Done():
 			t.Stop()
 			paceCancels.Add(1)
-			return paceMaxCost
+			// The wait was cut short by shutdown; file what was actually spent
+			// so the generation's `total` stays a measurement rather than an
+			// estimate, then leave.
+			cut := time.Since(slept0)
+			st.waitNs.Add(int64(cut))
+			return paceTicket{st: st, reserved: paceMaxCost, connIdx: connIdx}
 		}
 		t.Stop()
 		if !paceNow().on() {
@@ -366,31 +397,36 @@ func (p *Proxy) paceReserve(connIdx int) float64 {
 		left -= d
 	}
 	actual := time.Since(slept0)
-	genWaitNs.Add(int64(actual))
+	st.waitNs.Add(int64(actual))
 	for {
-		prev := genWaitMax.Load()
-		if int64(actual) <= prev || genWaitMax.CompareAndSwap(prev, int64(actual)) {
+		prev := st.waitMax.Load()
+		if int64(actual) <= prev || st.waitMax.CompareAndSwap(prev, int64(actual)) {
 			break
 		}
 	}
-	return paceMaxCost
+	return paceTicket{st: st, reserved: paceMaxCost, connIdx: connIdx}
 }
 
 // paceSettle refunds the unused part of the reservation once the true size is
 // known, and files the counted bytes actually charged.
-func (p *Proxy) paceSettle(connIdx int, reserved float64, payloadBytes int) {
-	if reserved <= 0 {
+func (p *Proxy) paceSettle(t paceTicket, payloadBytes int) {
+	if t.reserved <= 0 || t.st == nil {
 		return
 	}
 	actual := float64(payloadBytes + paceWireOverhead)
-	if actual > reserved {
-		actual = reserved
+	if actual > t.reserved {
+		actual = t.reserved
 	}
 	paceBytes.Add(int64(actual))
-	genBytes.Add(int64(actual))
-	if connIdx >= 0 && connIdx < paceMaxConns {
-		if b := paceBuckets[connIdx].Load(); b != nil {
-			b.refund(reserved - actual)
+	// ⚠️ Filed against the generation that RESERVED, not the one in force now.
+	// The dequeue between them is unbounded, so `bytes` can arrive after that
+	// generation's verdict has printed — it is the one field on that line that
+	// may be short by up to one packet per writer. `waited` and `total`, which
+	// the verdict turns on, are exact because the setter drains on `inflight`.
+	t.st.bytes.Add(int64(actual))
+	if t.connIdx >= 0 && t.connIdx < paceMaxConns {
+		if b := paceBuckets[t.connIdx].Load(); b != nil {
+			b.refund(t.reserved - actual)
 		}
 	}
 }
@@ -407,7 +443,7 @@ func paceSummary() string {
 	st := paceNow()
 	n := paceAwaits.Swap(0)
 	w := paceWaited.Swap(0)
-	ns := paceWaitNs.Swap(0)
+	plan := pacePlanNs.Swap(0)
 	mx := paceWaitMax.Swap(0)
 	by := paceBytes.Swap(0)
 	cx := paceCancels.Swap(0)
@@ -421,7 +457,7 @@ func paceSummary() string {
 	}
 	mean := time.Duration(0)
 	if w > 0 {
-		mean = time.Duration(ns / w)
+		mean = time.Duration(plan / w)
 	}
 	// ⚠️ THIS LINE IS A SHAPE, NOT A VERDICT. It covers ONE memstats interval, so
 	// a zero here is a quiet ten seconds and says nothing about the arm — the
@@ -438,9 +474,9 @@ func paceSummary() string {
 	// what separates them — divide it by the interval and the number of paced
 	// writers and you have the fraction of writer-time the bucket held.
 	// *(User-raised, 2026-08-16.)*
-	return fmt.Sprintf(" pace=%.0f/%.0fKiB paced=%d unpaced-A=%d waited=%d(%.1f%%) total=%s mean=%s max=%s bytes=%dKiB cancel=%d%s",
+	return fmt.Sprintf(" pace=%.0f/%.0fKiB paced=%d unpaced-A=%d waited=%d(%.1f%%) planned=%s mean=%s max=%s bytes=%dKiB cancel=%d%s",
 		st.rate/1024, st.burst/1024, n, sk, w, share,
-		time.Duration(ns).Round(time.Millisecond),
+		time.Duration(plan).Round(time.Millisecond),
 		mean.Round(time.Microsecond), time.Duration(mx).Round(time.Microsecond),
 		by/1024, cx, note)
 }

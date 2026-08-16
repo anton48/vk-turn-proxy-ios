@@ -33,8 +33,8 @@ func TestPaceOffReservesNothingAndSaysNothing(t *testing.T) {
 	p, cancel := paceTestProxy()
 	defer cancel()
 
-	if got := p.paceReserve(20); got != 0 {
-		t.Fatalf("with the pacer off nothing may be reserved, got %v", got)
+	if got := p.paceReserve(20); got.reserved != 0 || got.st != nil {
+		t.Fatalf("with the pacer off nothing may be reserved, got %+v", got)
 	}
 	if s := paceSummary(); s != "" {
 		t.Fatalf("the field must be absent when off, got %q", s)
@@ -145,14 +145,14 @@ func TestARateChangeRebuildsTheBuckets(t *testing.T) {
 	defer cancel()
 
 	SetUplinkPace(200, 16, true)
-	p.paceReserve(20)
+	_ = p.paceReserve(20)
 	first := paceBuckets[20].Load()
 	if first == nil || first.rate != 200*1024 {
 		t.Fatalf("the first bucket should carry the first rate, got %+v", first)
 	}
 
 	SetUplinkPace(100, 16, true)
-	p.paceReserve(20)
+	_ = p.paceReserve(20)
 	second := paceBuckets[20].Load()
 	if second == nil || second.rate != 100*1024 {
 		t.Fatalf("a live rate change must rebuild the bucket; still %.0f B/s", second.rate)
@@ -186,8 +186,8 @@ func TestTheArmVerdictShoutsWhenTheBucketNeverEmptied(t *testing.T) {
 	// A rate far above anything this sends: the bucket can never empty.
 	SetUplinkPace(100000, 1024, true)
 	for i := 0; i < 5; i++ {
-		r := p.paceReserve(20)
-		p.paceSettle(20, r, 1312)
+		tk := p.paceReserve(20)
+		p.paceSettle(tk, 1312)
 	}
 	// The TICK line must not pretend to be a verdict.
 	if tick := paceSummary(); strings.Contains(tick, "TESTED NOTHING") {
@@ -229,8 +229,8 @@ func TestTheArmVerdictReportsMeasuredWaitAndEngagement(t *testing.T) {
 	// 1 KiB/s with a 1 KiB burst: the second full-size packet must wait.
 	SetUplinkPace(1, 1, true)
 	for i := 0; i < 3; i++ {
-		r := p.paceReserve(20)
-		p.paceSettle(20, r, 1312)
+		tk := p.paceReserve(20)
+		p.paceSettle(tk, 1312)
 	}
 	SetUplinkPace(PaceOff, 0, true)
 
@@ -259,6 +259,79 @@ func TestTheArmVerdictReportsMeasuredWaitAndEngagement(t *testing.T) {
 	}
 }
 
+// 🚨🚨 THE GENERATION BOUNDARY, AND IT IS A REAL RACE THE FIRST VERSION HAD. A
+// writer counts its `waited` BEFORE it sleeps and files its time AFTER. With the
+// counters in globals and the setter reading them before publishing the new
+// state, a writer asleep across the switch produced `waited=1 total=0s` — and
+// the time it filed a moment later was then wiped in the next off-gap. The
+// verdict would have understated the dose, silently, in exactly the arms where
+// the pacer worked hardest.
+//
+// ⇒ The counters belong to the STATE, the setter publishes FIRST and then drains
+// on `inflight`. This test builds the interleave directly: a writer parked in a
+// long wait, the pacer turned off underneath it.
+//
+// SABOTAGE SEEN TO FAIL: in SetUplinkPace, move `paceCur.Store(next)` back below
+// the verdict block (publish last). Compiles; the sleeping writer then still
+// reads the OLD state as current, never leaves its wait before the drain's
+// deadline, and the verdict comes out `NOT FULLY DRAINED` with total=0s.
+func TestAWaitStraddlingTheSwitchIsNotLostFromTheVerdict(t *testing.T) {
+	resetPace()
+	t.Cleanup(resetPace)
+	resetSplit()
+	t.Cleanup(resetSplit)
+	SetUplinkSplitN(15)
+	p, cancel := paceTestProxy()
+	defer cancel()
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	// 1 KiB/s with a 1 KiB burst: the first reservation drains the bucket and the
+	// second must sleep for seconds — long enough to be interrupted on purpose.
+	SetUplinkPace(1, 1, true)
+	tk := p.paceReserve(20)
+	p.paceSettle(tk, 1312)
+
+	parked := make(chan struct{})
+	go func() {
+		close(parked)
+		tk2 := p.paceReserve(20) // sleeps
+		p.paceSettle(tk2, 1312)
+	}()
+	<-parked
+	time.Sleep(150 * time.Millisecond) // it is now inside the wait
+
+	SetUplinkPace(PaceOff, 0, true) // the switch lands mid-sleep
+
+	out := buf.String()
+	if !strings.Contains(out, "PACE-ARMEND") {
+		t.Fatalf("no verdict was printed: %q", out)
+	}
+	if strings.Contains(out, "NOT FULLY DRAINED") {
+		t.Fatalf("the setter gave up waiting for a writer it should have drained in one "+
+			"slice: %q", out)
+	}
+	m := regexp.MustCompile(`waited=(\d+)\(.*?total=(\S+) `).FindStringSubmatch(out)
+	if m == nil {
+		t.Fatalf("could not read waited/total from %q", out)
+	}
+	if m[1] == "0" {
+		t.Fatalf("the interrupted wait was counted as waited, so it must appear: %q", out)
+	}
+	total, err := time.ParseDuration(m[2])
+	if err != nil {
+		t.Fatalf("unparseable total %q", m[2])
+	}
+	// 🚨 THE POINT: a counted wait with zero time is the defect. The writer was
+	// asleep for at least the 150 ms above before the switch.
+	if total < 100*time.Millisecond {
+		t.Fatalf("waited=%s but total=%v — the time filed after the switch was lost, "+
+			"which is exactly the race this ordering exists to close: %q", m[1], total, out)
+	}
+}
+
 // 🚨 THE RESERVATION HAPPENS BEFORE THE DEQUEUE — the whole correctness
 // argument, and it is a property of the CALL SITE, not of this file. A writer
 // that dequeues first and then waits holds a packet where work-stealing cannot
@@ -273,7 +346,11 @@ func TestReservationPrecedesTheDequeue(t *testing.T) {
 		t.Fatalf("reading proxy.go: %v", err)
 	}
 	s := string(src)
-	res := strings.Index(s, "reserved := p.paceReserve(connIdx)")
+	// ⚠️ The scan follows the CALL, not a particular variable name: this guard
+	// went red on correct code once already, when `reserved` became `ticket`
+	// because the reservation started carrying its generation. Anchoring on the
+	// call keeps it tight without being brittle about naming.
+	res := strings.Index(s, "p.paceReserve(connIdx)")
 	if res < 0 {
 		t.Fatal("the SRTP writer no longer reserves at all — the pacer is unwired")
 	}
@@ -282,7 +359,7 @@ func TestReservationPrecedesTheDequeue(t *testing.T) {
 		t.Fatal("no dequeue follows the reservation")
 	}
 	// And the settle must follow the dequeue, or the true size is never charged.
-	if !strings.Contains(s[res:res+deq+400], "p.paceSettle(connIdx, reserved, len(item.buf))") {
+	if !strings.Contains(s[res:res+deq+400], "p.paceSettle(ticket, len(item.buf))") {
 		t.Fatal("the reservation is never settled with the real packet size — " +
 			"the bucket would throttle to the maximum size rather than the traffic")
 	}

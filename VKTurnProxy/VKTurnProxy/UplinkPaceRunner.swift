@@ -363,8 +363,11 @@ final class UplinkPaceRunner: ObservableObject {
             + "🚨 THE COMPARISON IS THE TWO PACED ARMS AGAINST THE TWO UNPACED ONES, on group B's "
             + "RTP-sequence gaps from the capture — NOT on `cum-lost`, which cannot difference a "
             + "rotating keypair. Group A's synthetic is the cross-talk control and must still "
-            + "read ~0. Read `pace=` before either: an arm whose bucket never emptied tested "
-            + "nothing.")
+            + "read ~0. 🚨 READ THE TWO `PACE-ARMEND` LINES FIRST — one per paced arm, printed "
+            + "when its pacer was turned off, carrying that ARM's own waited/total. The per-tick "
+            + "`pace=` field covers ten seconds and cannot speak for an arm. "
+            + "`tools/logscore/paceab_score.py` refuses to print a table unless both verdicts "
+            + "exist, sit in their own arms' gaps and both engaged.")
         publish(done == "done" ? "done — export the log" : "cancelled", running: false)
     }
 

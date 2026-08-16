@@ -5338,14 +5338,14 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			// writes each packet before taking the next. Reserving first means
 			// a writer without tokens sleeps while the packet is still in the
 			// shared queue, available to any other writer. See uplinkpace.go.
-			reserved := p.paceReserve(connIdx)
+			ticket := p.paceReserve(connIdx)
 			item, ok := p.nextSendItem(connCtx.Done(), connIdx)
 			if !ok {
-				p.paceSettle(connIdx, reserved, 0)
+				p.paceSettle(ticket, 0)
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
 			}
-			p.paceSettle(connIdx, reserved, len(item.buf))
+			p.paceSettle(ticket, len(item.buf))
 			// connIdx (not -1) below because this site keeps the per-conn TX
 			// counters, which writeChunk maintains per packet: the pre-SRTP
 			// payload bytes — the WireGuard records that came out of sendCh —
