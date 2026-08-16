@@ -103,6 +103,23 @@ final class UplinkPaceRunner: ObservableObject {
     /// is answered entirely within `burst16 ↔ burst2`; it is the wrong trade for
     /// any sentence of the form *"burst 2 recovers X% of the unpaced loss"*.
     /// If that sentence is wanted, add `off` arms at both ends and pay 4 minutes.
+    /// ✅ **THE SWEEP RAN AND THE DEPTH IS SETTLED AT 16 KiB** (`16.08/tcptest3`).
+    /// burst2 bought nothing on loss — within-condition replicate ratios 3.65× and
+    /// 6.17× against a 3.75× between-condition contrast, exact permutation p = 2/3 —
+    /// and cost **−10.5% goodput** and **+9.7% added delay per paced packet**. The
+    /// only branch it excludes is "burst2 loses LESS".
+    ///
+    /// 🚨 And it named why depth cannot be the lever: at 247 KiB/s a 2 KiB bucket
+    /// admits ≤26.7 KiB per 100 ms ≈ **106% of the knee**, yet the server's 100 ms
+    /// sampler read **166-167% in all four arms**. The spacing is destroyed below
+    /// the pacer, by the relay's TCP reassembly releasing a clump when a retransmit
+    /// closes a hole.
+    ///
+    /// ⇒ **These arms are kept ONLY for the one open follow-up: the same sweep over
+    /// TURN/UDP**, where there is no reassembly to compress anything. If 2 KiB then
+    /// reads ~106-110% at the server, the outer TCP is confirmed as the compressor;
+    /// if it stays 160%+, the destroyer is the network or the relay's scheduler.
+    /// 🚫 Do NOT re-run this on TCP transport — that question is answered.
     private let arms: [Int] = [16, 2, 2, 16]   // KiB of burst; 0 would be off
 
     /// Every transition of the REAL load costs a settle. Here the load runs

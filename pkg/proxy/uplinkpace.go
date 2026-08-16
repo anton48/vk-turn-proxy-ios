@@ -92,6 +92,36 @@ const (
 	// back before they drop, while a looser one passes exactly what they cut.
 	// ⇒ If loss does not fall, the diagnosis is "our bucket is looser than
 	// theirs" and the burst comes DOWN before the rate does.
+	//
+	// ✅ THAT SWEEP RAN — `16.08.2026/tcptest3`, arms burst16·burst2·burst2·burst16
+	// at a fixed 247 KiB/s — AND 16 KiB IS SETTLED. Taking the burst DOWN to a
+	// one-packet credit bought nothing and cost twice:
+	//
+	//   - loss: pooled 0.0953% (burst2) against 0.0254% (burst16), but the
+	//     WITHIN-condition replicate ratios are 3.65× and 6.17× against a 3.75×
+	//     between-condition contrast, and the observed 2+2 split is only the
+	//     second most extreme of the three possible partitions (exact
+	//     permutation p = 2/3). ⇒ the run supports NEITHER "burst2 loses more"
+	//     NOR "burst2 ≈ burst16". The one thing it does exclude is the branch
+	//     this constant was written to fear: **"burst2 loses LESS" is not the
+	//     sign of any estimator here**, so 16 KiB is not "looser than theirs".
+	//   - goodput: 20.39 vs 22.78 Mbit/s delivered, −10.5%, strictly ordered.
+	//   - latency: +9.7% added delay per paced packet (4.520 vs 4.122 ms),
+	//     perfectly mode-ordered.
+	//
+	// 🚨 AND THE RUN NAMED WHY DEPTH CANNOT BE THE LEVER. At 247 KiB/s a 2 KiB
+	// bucket admits at most 24.7 + 2 = 26.7 KiB per 100 ms ≈ 106% of the server's
+	// knee — yet the server's own 100 ms sampler read 166/166/167/166% in ALL
+	// FOUR arms. The burst2 arms exceed their own PHYSICAL ceiling downstream, so
+	// the spacing this bucket imposes is destroyed BELOW it: a lost outer-TCP
+	// segment blocks reassembly at the relay, and when the retransmit closes the
+	// hole the relay releases the accumulated ChannelData in one clump that the
+	// allocation policer then cuts. That is an arithmetic impossibility proof,
+	// not a correlation, and no value of this constant can answer it.
+	//
+	// ⇒ **DO NOT SWEEP THE DEPTH BETWEEN 2 AND 16 KiB AGAIN.** 16 KiB is the
+	// accepted setting for this bucket. Anything further belongs to the outer
+	// TCP's recovery, not to us. *(User's decision, 2026-08-16.)*
 	PaceDefaultBurstKiB = 16
 
 	// paceMaxConns bounds the per-connection bucket table. The pool ceiling is
