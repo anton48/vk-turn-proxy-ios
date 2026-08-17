@@ -1,0 +1,23 @@
+# Local scratch tools that have never been part of this repository.
+#
+# 🚨 AN EXPLICIT LIST, NOT A BLANKET `*`. On `flow-local-path` this file was a
+# single `*` with per-extension re-includes, and it silently hid three things
+# that belonged in the repo: the swiftcheck harness itself, the log scorers, and
+# the harness's own run.sh. A file that is simply ABSENT from a fresh clone is
+# invisible to every local check, so the ignore rule names exactly what it hides
+# and nothing else.
+#
+# `swiftcheck/` is deliberately NOT here: it is tracked, and `run.sh` refuses to
+# run if any of its inputs — itself included — is missing from the index.
+
+apppass_test/
+captcha_test/
+cookie_test/
+logscore/
+rtpopus_interop/
+turn_bw_server/
+turn_bw_test/
+turn_quota_test/
+turn_srtp_server/
+turn_srtp_test/
+wrapa_test/
