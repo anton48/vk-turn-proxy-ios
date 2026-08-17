@@ -1004,35 +1004,89 @@ class TunnelManager: ObservableObject {
     ///
     /// ⚠️ Its sibling `applyMemstatsFastTicks` is deliberately left fire-and-forget:
     /// losing it costs log resolution, not traffic shaping.
-    private var uplinkPaceSyncPending = false
+    /// 🚨 AND A RETRY THAT ONLY RUNS ON A FUTURE TRANSITION IS NOT A RETRY.
+    /// Hanging the re-send off `.connected` alone loses it in two ordinary
+    /// situations, both user-caught:
+    ///
+    ///   - **cold attach to a tunnel that is already up.** `NEVPNStatusDidChange`
+    ///     fires on future transitions only, so the initial `.connected` never
+    ///     runs the branch — the same trap this file already documents for
+    ///     `connectedAt` and the stats poll. It bites hardest right after the
+    ///     production reset: UserDefaults says OFF while a tunnel started by a
+    ///     diagnostic build is still pacing at 247, and nothing reconciles them.
+    ///   - **a failure while the status stays `.connected`.** There is no next
+    ///     transition to wait for, so the pending flag would sit there forever.
+    ///
+    /// ⇒ the setting is RE-ASSERTED at attach, `flushPendingUplinkPace()` is
+    /// called from both the initial-connected block and the notification, and a
+    /// bounded timer retries while the tunnel stays up.
+    private var paceSync = UplinkPaceSync()
+    private var paceRetryScheduled = false
 
+    /// A NEW intent: the user changed the switch, or the app is re-asserting the
+    /// stored value against a tunnel it did not start.
     func applyUplinkPaceFromSettings() {
+        paceSync.intend()
+        sendUplinkPace()
+    }
+
+    /// Deliver whatever is outstanding, if anything. Safe to call at any time —
+    /// it is a no-op when the extension has already confirmed the newest intent.
+    func flushPendingUplinkPace() {
+        guard paceSync.isPending else { return }
+        sendUplinkPace()
+    }
+
+    private func sendUplinkPace() {
         let kib = UplinkPace.stored(in: .standard)
-        let msg = "set_uplink_pace:\(kib),\(UplinkPace.burstKiB)"
         guard let session = manager?.connection as? NETunnelProviderSession,
               session.status == .connected,
-              let data = msg.data(using: .utf8)
+              let data = "set_uplink_pace:\(kib),\(UplinkPace.burstKiB)".data(using: .utf8)
         else {
-            uplinkPaceSyncPending = true
-            SharedLogger.shared.log("[App] uplink-pace: \(kib) KiB/s NOT delivered — the tunnel "
-                + "is not connected; queued for the next .connected transition")
+            SharedLogger.shared.log("[App] uplink-pace: \(kib) KiB/s not delivered — the tunnel "
+                + "is not connected; it stays outstanding and is re-sent on .connected")
             return
         }
+        // 🚨 The revision is captured BEFORE the send and quoted back by the
+        // completion, so a slow reply for an older intent cannot clear a newer
+        // one. See UplinkPaceSync.
+        let rev = paceSync.willSend()
         do {
             try session.sendProviderMessage(data) { [weak self] reply in
                 let ok = reply.flatMap { String(data: $0, encoding: .utf8) } == "ok"
                 Task { @MainActor in
                     guard let self = self else { return }
-                    self.uplinkPaceSyncPending = !ok
+                    self.paceSync.acknowledge(revision: rev, ok: ok)
                     SharedLogger.shared.log("[App] uplink-pace: the extension "
-                        + "\(ok ? "acknowledged" : "REFUSED or did not answer") \(kib) KiB/s"
-                        + (ok ? "" : " — queued for the next .connected transition"))
+                        + "\(ok ? "acknowledged" : "REFUSED") \(kib) KiB/s (rev \(rev))"
+                        + (self.paceSync.isPending ? " — still outstanding, will retry" : ""))
                 }
             }
         } catch {
-            uplinkPaceSyncPending = true
-            SharedLogger.shared.log("[App] uplink-pace: send failed (\(error.localizedDescription))"
-                + " — queued for the next .connected transition")
+            SharedLogger.shared.log("[App] uplink-pace: send failed for rev \(rev) "
+                + "(\(error.localizedDescription)) — will retry while the tunnel is up")
+        }
+        scheduleUplinkPaceRetry()
+    }
+
+    /// The timer half of the contract: a completion that NEVER ARRIVES leaves the
+    /// intent outstanding, and there is no event to hang the retry on.
+    private func scheduleUplinkPaceRetry() {
+        guard !paceRetryScheduled else { return }
+        paceRetryScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self = self else { return }
+            self.paceRetryScheduled = false
+            guard self.paceSync.isPending else { return }
+            guard (self.manager?.connection as? NETunnelProviderSession)?.status == .connected
+            else { return } // .connected will flush it
+            guard self.paceSync.canRetry else {
+                SharedLogger.shared.log("[App] uplink-pace: 🚨 GIVING UP after "
+                    + "\(UplinkPaceSync.maxAttempts) attempts — the tunnel may be running a "
+                    + "different pace than Settings shows. Reconnect to resync.")
+                return
+            }
+            self.sendUplinkPace()
         }
     }
 
@@ -1330,6 +1384,16 @@ class TunnelManager: ObservableObject {
         if status == .connected && live.connectedAt == nil {
             live.connectedAt = Date()
         }
+        // 🚨 AND THE PACE IS RE-ASSERTED HERE, FOR THE SAME REASON AS BOTH BLOCKS
+        // AROUND IT: this is the ONLY place that sees an already-running tunnel.
+        // A toggle applied to a session this app did not start would otherwise
+        // never be delivered — and the case that makes it concrete is the
+        // production reset, which puts UserDefaults at OFF while a tunnel started
+        // by a diagnostic build is still pacing at 247. Re-asserting is idempotent;
+        // not re-asserting leaves the switch and the tunnel disagreeing silently.
+        if status == .connected {
+            applyUplinkPaceFromSettings()
+        }
         // ...and for the same reason the stats poll has to be started here.
         // Both of its other entry points miss a cold launch onto a running
         // tunnel: the switch below only runs on FUTURE transitions, and
@@ -1380,10 +1444,7 @@ class TunnelManager: ObservableObject {
                     // so this is belt-and-braces for the case where it did not —
                     // and it is the only thing standing between a lost message
                     // and a switch that lies until the next reconnect.
-                    if self.uplinkPaceSyncPending {
-                        self.uplinkPaceSyncPending = false
-                        self.applyUplinkPaceFromSettings()
-                    }
+                    self.flushPendingUplinkPace()
                     // Once the tunnel is actually up, any error message left
                     // over from a captcha-limit exhaustion or other transient
                     // failure is stale — clear it so the user isn't told

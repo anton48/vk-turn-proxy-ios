@@ -33,7 +33,12 @@
 //     reader of its keys. Guarding the function and not its call site is the shape
 //     that once bought a green suite and an empty log;
 //   • the chunking machinery stays removed — it cannot coexist with a pacer that
-//     reserves once per dequeue.
+//     reserves once per dequeue;
+//   • the live-toggle bookkeeping: an intent is outstanding before it is sent, a
+//     LATE acknowledgement cannot clear a newer one, silence is not success, and
+//     the retry is bounded. The delivery itself needs a live
+//     NETunnelProviderSession and cannot be tested — so everything decidable
+//     without one was moved into a value type that can be.
 
 import Foundation
 
@@ -168,6 +173,70 @@ do {
     check(!UplinkSynth.clearStaleValueOnce(in: d2), "nothing to clear on a clean install")
 }
 
+print("UplinkPaceSync — the delivery bookkeeping")
+
+// 14. A fresh app has nothing outstanding, and an intent makes it outstanding
+//     IMMEDIATELY — before any send. The first version set its flag only when a
+//     send FAILED, so a completion that never arrived left nothing to retry.
+//
+//     SABOTAGE SEEN TO FAIL: make `intend()` not bump the revision. Compiles;
+//     the intent is then never pending and no retry can fire.
+do {
+    var s = UplinkPaceSync()
+    check(!s.isPending, "a fresh sync has nothing outstanding")
+    s.intend()
+    check(s.isPending, "an intent is outstanding the moment it is made, before any send")
+    _ = s.willSend()
+    check(s.isPending, "🚨 and SENDING does not clear it — only an acknowledgement does")
+}
+
+// 15. 🚨🚨 THE LATE ACKNOWLEDGEMENT, AND IT IS THE NASTY ONE. Revision 1 goes out
+//     and is slow; the user flips again; revision 2 is sent and FAILS; then
+//     revision 1's `ok` arrives. Clearing on any `ok` would mark everything
+//     delivered while the extension sits on the OLD value and the switch shows
+//     the new one — with nothing left to reconcile them.
+//
+//     SABOTAGE SEEN TO FAIL: drop the `revision > acknowledgedRevision` half of
+//     the guard in `acknowledge`. Compiles; the stale reply then clears rev 2.
+do {
+    var s = UplinkPaceSync()
+    let rev1 = s.intend()
+    _ = s.willSend()
+    let rev2 = s.intend()          // the user flips again before rev1 answers
+    _ = s.willSend()               // ...and this attempt fails, silently
+
+    s.acknowledge(revision: rev1, ok: true)   // the LATE reply for the old intent
+    check(s.isPending,
+          "🚨 a late ok for rev \(rev1) must NOT clear rev \(rev2) — the extension is "
+          + "still on the old value")
+
+    s.acknowledge(revision: rev2, ok: true)
+    check(!s.isPending, "and the reply for the newest revision does clear it")
+}
+
+// 16. Only an explicit `ok` counts. A refusal, or a reply that is not `ok`, must
+//     leave the intent outstanding rather than being read as delivery.
+do {
+    var s = UplinkPaceSync()
+    let rev = s.intend()
+    _ = s.willSend()
+    s.acknowledge(revision: rev, ok: false)
+    check(s.isPending, "a refusal leaves the intent outstanding")
+}
+
+// 17. The retry is BOUNDED, because it runs on a timer for as long as the tunnel
+//     is up: an unbounded one would spin forever against an extension that is
+//     never going to answer. A NEW intent starts the budget again.
+do {
+    var s = UplinkPaceSync()
+    s.intend()
+    for _ in 0..<UplinkPaceSync.maxAttempts { _ = s.willSend() }
+    check(!s.canRetry, "the attempts for one intent are bounded")
+    check(s.isPending, "...and giving up does not pretend the value was delivered")
+    s.intend()
+    check(s.canRetry, "a new intent gets a fresh budget")
+}
+
 print("The live-toggle message — both ends of it")
 
 // 10. 🚨 THE WORST FAILURE MODE IN THE FEATURE, and the one no unit test can
@@ -244,6 +313,40 @@ do {
           "both ends agree on \(expected) fields (the sender writes \(fieldCount(sent)))")
     check(window.contains("guard") && window.contains("return"),
           "a malformed message is refused rather than half-applied")
+}
+
+// 17b. 🚨 AND THE BOOKKEEPING IS WORTH NOTHING IF NOBODY DRIVES IT. Two call
+//      sites decide whether an outstanding intent is ever delivered, and BOTH
+//      were missing in the first version: the cold-attach block (the only place
+//      that sees a tunnel this app did not start — `NEVPNStatusDidChange` fires
+//      on FUTURE transitions only) and the `.connected` branch of the
+//      notification. A source scan, because neither can run without a live
+//      NETunnelProviderSession.
+//
+//      SABOTAGE SEEN TO FAIL: delete the re-assert from the attach block.
+//      Compiles; a tunnel started by another build then keeps its old pace while
+//      Settings shows the new one.
+do {
+    let tm = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+
+    if let attach = tm.range(of: "if status == .connected {") {
+        let window = String(tm[attach.upperBound...].prefix(200))
+        check(window.contains("applyUplinkPaceFromSettings()"),
+              "🚨 the pace is re-asserted at ATTACH, where an already-running tunnel is seen")
+    } else {
+        check(false, "the cold-attach block is gone — nothing reconciles a running tunnel")
+    }
+
+    if let transition = tm.range(of: "case .connected:") {
+        let window = String(tm[transition.upperBound...].prefix(2500))
+        check(window.contains("flushPendingUplinkPace()"),
+              "and an outstanding intent is flushed on the .connected transition")
+    } else {
+        check(false, "the .connected branch is gone")
+    }
+
+    check(tm.contains("scheduleUplinkPaceRetry"),
+          "a timer retries a delivery whose completion never arrives — silence is not success")
 }
 
 print("The SwiftUI pop rule, and the launch-time calls")

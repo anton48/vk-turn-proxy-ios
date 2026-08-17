@@ -36,6 +36,7 @@ require_tracked() {
 SOURCES=(
     tools/swiftcheck/main.swift
     "$S/UplinkPace.swift"
+    "$S/UplinkPaceSync.swift"
     "$S/UplinkSynth.swift"
 )
 
