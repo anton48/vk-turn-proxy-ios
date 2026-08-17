@@ -190,26 +190,54 @@ do {
     check(s.isPending, "🚨 and SENDING does not clear it — only an acknowledgement does")
 }
 
-// 15. 🚨🚨 THE LATE ACKNOWLEDGEMENT, AND IT IS THE NASTY ONE. Revision 1 goes out
-//     and is slow; the user flips again; revision 2 is sent and FAILS; then
-//     revision 1's `ok` arrives. Clearing on any `ok` would mark everything
-//     delivered while the extension sits on the OLD value and the switch shows
-//     the new one — with nothing left to reconcile them.
+// 15a. 🚨🚨 THE MONOTONIC ACKNOWLEDGEMENT, AND THE FIRST VERSION OF THIS TEST DID
+//      NOT DEFEND IT. It ran ack(rev1) while rev2 was outstanding and asserted
+//      "still pending" — which stays true under the sabotage it NAMED (dropping
+//      the `revision > acknowledgedRevision` comparison leaves acked = 1 < 2), so
+//      the guard was green on the broken code and I reported a different, stronger
+//      sabotage as validating it. *(User-caught, 2026-08-17.)*
 //
-//     SABOTAGE SEEN TO FAIL: drop the `revision > acknowledgedRevision` half of
-//     the guard in `acknowledge`. Compiles; the stale reply then clears rev 2.
+//      The property is that the mark never ROLLS BACK: acknowledge the newest
+//      revision, then let the stale reply for an older one arrive.
+//
+//      SABOTAGE SEEN TO FAIL: drop the `revision > acknowledgedRevision` half of
+//      the guard in `acknowledge`, exactly as written. Compiles; the late reply
+//      then moves the mark backwards and re-opens a delivered intent.
 do {
     var s = UplinkPaceSync()
     let rev1 = s.intend()
     _ = s.willSend()
-    let rev2 = s.intend()          // the user flips again before rev1 answers
-    _ = s.willSend()               // ...and this attempt fails, silently
+    let rev2 = s.intend()
+    _ = s.willSend()
 
-    s.acknowledge(revision: rev1, ok: true)   // the LATE reply for the old intent
+    s.acknowledge(revision: rev2, ok: true)          // the newest intent lands
+    check(!s.isPending, "the newest revision clears the intent")
+
+    s.acknowledge(revision: rev1, ok: true)          // ...and rev1 finally answers
+    check(s.acknowledgedRevision == rev2,
+          "🚨 a late ok for rev \(rev1) must not roll the mark back from rev \(rev2)")
+    check(!s.isPending,
+          "🚨 and it must not re-open a delivery that already happened")
+}
+
+// 15b. THE OTHER HALF OF THE SAME RACE: while a NEWER intent is outstanding — its
+//      own send having failed — a stale ok for the older one must not report
+//      everything delivered. This is the sequence the first test used, kept
+//      because it catches a different shortcut.
+//
+//      SABOTAGE SEEN TO FAIL: `acknowledgedRevision = desiredRevision` on any ok.
+//      Compiles; the stale reply then clears the newer intent.
+do {
+    var s = UplinkPaceSync()
+    let rev1 = s.intend()
+    _ = s.willSend()
+    let rev2 = s.intend()
+    _ = s.willSend()                                  // this attempt fails, silently
+
+    s.acknowledge(revision: rev1, ok: true)
     check(s.isPending,
-          "🚨 a late ok for rev \(rev1) must NOT clear rev \(rev2) — the extension is "
-          + "still on the old value")
-
+          "🚨 a late ok for rev \(rev1) leaves rev \(rev2) outstanding — the extension "
+          + "is still on the old value")
     s.acknowledge(revision: rev2, ok: true)
     check(!s.isPending, "and the reply for the newest revision does clear it")
 }
@@ -329,12 +357,16 @@ do {
 do {
     let tm = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
 
-    if let attach = tm.range(of: "if status == .connected {") {
-        let window = String(tm[attach.upperBound...].prefix(200))
-        check(window.contains("applyUplinkPaceFromSettings()"),
-              "🚨 the pace is re-asserted at ATTACH, where an already-running tunnel is seen")
+    if let call = tm.range(of: "applyUplinkPaceFromSettings()\n        default:") {
+        // The states the attach re-assert covers sit just above the call.
+        let lead = String(tm[..<call.lowerBound].suffix(220))
+        for state in [".connected", ".connecting", ".reasserting"] {
+            check(lead.contains(state),
+                  "🚨 the attach re-assert covers \(state) — an app relaunched while the old "
+                  + "tunnel is still coming up would otherwise create no intent at all")
+        }
     } else {
-        check(false, "the cold-attach block is gone — nothing reconciles a running tunnel")
+        check(false, "the cold-attach re-assert is gone — nothing reconciles a running tunnel")
     }
 
     if let transition = tm.range(of: "case .connected:") {

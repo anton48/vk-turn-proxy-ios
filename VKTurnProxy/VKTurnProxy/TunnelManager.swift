@@ -1391,8 +1391,20 @@ class TunnelManager: ObservableObject {
         // production reset, which puts UserDefaults at OFF while a tunnel started
         // by a diagnostic build is still pacing at 247. Re-asserting is idempotent;
         // not re-asserting leaves the switch and the tunnel disagreeing silently.
-        if status == .connected {
+        // 🚨 AND IT COVERS .connecting AND .reasserting TOO, because what matters
+        // here is recording the INTENT, not delivering it. Relaunch the app while
+        // a tunnel started by a diagnostic build is still coming up: `paceSync` is
+        // empty again, the production reset has already put UserDefaults at OFF,
+        // and a `.connected`-only re-assert creates nothing — so the later
+        // transition flushes an empty queue and the session keeps pacing from the
+        // provider config it started with. In the two transitional states the send
+        // guard simply leaves the intent outstanding until `.connected` arrives.
+        // *(User-caught, 2026-08-17 — the third shape of this same trap.)*
+        switch status {
+        case .connected, .connecting, .reasserting:
             applyUplinkPaceFromSettings()
+        default:
+            break
         }
         // ...and for the same reason the stats poll has to be started here.
         // Both of its other entry points miss a cold launch onto a running
