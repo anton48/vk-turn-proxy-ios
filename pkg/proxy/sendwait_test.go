@@ -178,7 +178,13 @@ func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 		}
 		sites++
 		fed := false
-		for j := i; j < i+5 && j < len(lines); j++ {
+		// 🚨 WIDENED FROM 5 TO 8 LINES, DELIBERATELY, AND THE REASON IS ON THE
+		// RECORD ABOVE: "the fix is to follow the code, never to delete the
+		// guard". The uplink pacer's `paceSettle` now sits between the dequeue
+		// and the write at every site, so the write moved one line further from
+		// its `case`. The window is proximity, not arithmetic — what it enforces
+		// is that a dequeue and its instrument stay in the same breath.
+		for j := i; j < i+8 && j < len(lines); j++ {
 			if strings.Contains(lines[j], "p.sendWait.observe(") ||
 				strings.Contains(lines[j], "p.writeChunk(") {
 				fed = true

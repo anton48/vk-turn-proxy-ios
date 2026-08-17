@@ -2051,6 +2051,12 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		}
 
 		start := time.Now()
+		// A NEW SESSION GETS A FRESH BUCKET. `paceBuckets` is indexed by connection
+		// index at package scope, so without this a connection that reconnects onto
+		// a brand-new TURN allocation — whose policer at VK's end starts full —
+		// would inherit the dead allocation's token debt and be denied its opening
+		// burst. One site, all four transport modes. See uplinkpace.go.
+		PaceResetConn(connIdx)
 		var err error
 		switch {
 		case p.config.UseWrapA:
@@ -2784,11 +2790,20 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			return werr
 		}
 		for {
+			// 🚨 RESERVE BEFORE THE DEQUEUE, at all four writer sites — see
+			// uplinkpace.go for why this ordering IS the correctness argument:
+			// a writer that took the packet first would hold it inside its own
+			// goroutine, where the other 29 writers cannot steal it. Off by
+			// default, and when off `paceReserve` returns an empty ticket and
+			// `paceSettle` is a no-op, so this is byte-for-byte today's path.
+			ticket := p.paceReserve(connIdx)
 			select {
 			case <-connCtx.Done():
+				p.paceSettle(ticket, 0)
 				log.Printf("proxy: [conn %d] DTLS send goroutine: ctx cancelled", connIdx)
 				return
 			case item := <-p.sendCh:
+				p.paceSettle(ticket, len(item.buf))
 				// -1: this site has never maintained the per-conn TX counters,
 				// and writeChunk must not quietly start. That is what keeps
 				// K=1 byte-for-byte identical to the pre-chunking code here.
@@ -3042,10 +3057,14 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			return werr
 		}
 		for {
+			// 🚨 RESERVE BEFORE THE DEQUEUE — see uplinkpace.go.
+			ticket := p.paceReserve(connIdx)
 			select {
 			case <-connCtx.Done():
+				p.paceSettle(ticket, 0)
 				return
 			case item := <-p.sendCh:
+				p.paceSettle(ticket, len(item.buf))
 				// -1: no per-conn TX accounting at this site today.
 				if err := p.writeChunk(item, -1, writeOne); err != nil {
 					return
@@ -3235,10 +3254,14 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			return werr
 		}
 		for {
+			// 🚨 RESERVE BEFORE THE DEQUEUE — see uplinkpace.go.
+			ticket := p.paceReserve(connIdx)
 			select {
 			case <-connCtx.Done():
+				p.paceSettle(ticket, 0)
 				return
 			case item := <-p.sendCh:
+				p.paceSettle(ticket, len(item.buf))
 				// -1: no per-conn TX accounting at this site today.
 				if err := p.writeChunk(item, -1, writeOne); err != nil {
 					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)
@@ -4104,7 +4127,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4152,6 +4175,11 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// null: a configured K that never materialised (shallow queue)
 			// means the run tested nothing. See uplinkchunk.go.
 			p.chunkStats.summary(),
+			// Whether the uplink pacer engaged this interval, and how hard.
+			// EMPTY unless the setting is on, so an unpaced tunnel's line is
+			// unchanged. `waited=` near zero is the ordinary case under light
+			// load, not a fault — see uplinkpace.go before reading it.
+			paceSummary(),
 			p.recvChPeak.Swap(0),
 			cap(p.recvCh),
 			time.Duration(p.recvChBlockNs.Swap(0)).Round(time.Microsecond),
@@ -5109,8 +5137,11 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			return werr
 		}
 		for {
+			// 🚨 RESERVE BEFORE THE DEQUEUE — see uplinkpace.go.
+			ticket := p.paceReserve(connIdx)
 			select {
 			case <-connCtx.Done():
+				p.paceSettle(ticket, 0)
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
 			// connIdx (not -1) below because this site keeps the per-conn TX
@@ -5120,6 +5151,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			// external observer counting WG throughput sees, and keeps the
 			// conn-stats tick reading the same regardless of transport mode.
 			case item := <-p.sendCh:
+				p.paceSettle(ticket, len(item.buf))
 				if err := p.writeChunk(item, connIdx, writeOne); err != nil {
 					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
 					return

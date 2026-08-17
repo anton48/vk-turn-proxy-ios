@@ -32,6 +32,12 @@ struct AdvancedView: View {
     /// item. Same rule as above — declared HERE, never in ContentView.
     @AppStorage("liveActivityCompactClock") private var liveActivityCompactClock = false
 
+    /// The uplink pacer, as a RATE in KiB/s where 0 means off — the same value
+    /// the Go side stores, so the switch and the tunnel cannot disagree. Default
+    /// OFF; see UplinkPace.swift for what it buys and what it costs. Declared
+    /// HERE and nowhere near ContentView, per the file header.
+    @AppStorage(UplinkPace.key) private var uplinkPaceKiB = UplinkPace.off
+
     /// Tunnel MTU. `TunnelMTU.automatic` (0) means "don't override", which is
     /// both the default and what every pre-209 install has — see TunnelMTU.swift
     /// for where the bounds come from. One key, not two: a separate "override?"
@@ -134,6 +140,29 @@ struct AdvancedView: View {
             // happened when this shipped as one section in build 230.
             // One footer, one switch, unless the switches are one feature (the
             // two Live Activity rows above share theirs deliberately).
+            Section {
+                Toggle("Pace the uplink", isOn: Binding(
+                    get: { uplinkPaceKiB != UplinkPace.off },
+                    set: { uplinkPaceKiB = $0 ? UplinkPace.onKiB : UplinkPace.off }
+                ))
+                // 🎯 ONE Int KEY, NOT A BOOL, and the binding is what makes a
+                // rate look like a switch. The stored value IS the rate handed
+                // to Go, where 0 is literally how "off" is spelled — so there is
+                // no second value that can disagree with this one. A Bool key
+                // read back as an integer would mean 1 KiB/s.
+                    .onChange(of: uplinkPaceKiB) { _ in
+                        // Applied to a running tunnel: the alternative is a
+                        // reconnect, whose ~107 s thirty-connection ramp would be
+                        // the price of flipping a switch. proxyConfig carries the
+                        // same value, so a later reconnect keeps it.
+                        TunnelManager.shared.applyUplinkPaceFromSettings()
+                    }
+            } header: {
+                Text("Uplink")
+            } footer: {
+                Text("Spaces this device's uploads across the relay connections instead of sending them in bursts, so the relay's own rate limit stops cutting them.\n\nMeasured here on 30 connections under real traffic: upload 30 → 47 Mbit/s and uplink packet loss 2% → 0.06%, with download and idle ping unchanged. The cost is response time while the upload is saturated — about 60 ms more, against roughly 470 ms that this phone's cellular link adds under the same load.\n\nOff by default. Takes effect immediately, on a tunnel that is already connected.")
+            }
+
             Section {
                 Toggle("Detailed log every second", isOn: $memstatsFastTicks)
                     // Pushed to a running tunnel instead of waiting for the next

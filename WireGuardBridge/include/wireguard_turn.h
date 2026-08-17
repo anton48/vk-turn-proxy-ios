@@ -172,6 +172,20 @@ void wgSetForceLegacyCaptcha(int32_t enabled);
 /// @param enabled 1 = 1s ticks; 0 = the normal 10s cadence
 void wgSetMemstatsFastTicks(int32_t enabled);
 
+/// Apply the uplink pacer (Settings > Advanced) to a tunnel that is already
+/// connected: a per-allocation token bucket over the counted wire bytes VK
+/// meters, which turns our bursts into a stream the relay's policer does not
+/// cut.
+///
+/// The same pair rides ProxyConfig.uplink_pace_kib / uplink_pace_burst_kib at
+/// the next start, so this entry point exists only so that flipping the switch
+/// does not cost a reconnect and its ~107s thirty-connection ramp.
+///
+/// Only the extension runs the send loops, so nothing in the main app calls it.
+/// @param kib KiB/s of counted bytes per allocation; 0 = off (the default)
+/// @param burstKiB bucket capacity in KiB; 0 = the shipped 16 KiB
+void wgSetUplinkPace(int32_t kib, int32_t burstKiB);
+
 /// Returns the current cookie ("VKAuth") fatal-auth message, or "" if none.
 /// The extension polls this after bootstrap (cookie mode only) — a non-empty
 /// value means the saved cookie was rejected/expired in the background, so the

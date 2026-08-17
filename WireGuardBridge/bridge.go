@@ -242,6 +242,25 @@ type ProxyConfig struct {
 	// pkg/proxy/uplinkchunk.go for the full finding.
 	UplinkChunkK int `json:"uplink_chunk_k,omitempty"`
 
+	// UplinkPaceKiB arms the per-allocation uplink token bucket — the client
+	// pacer — at connect time, in KiB/s of COUNTED bytes per allocation. 0 (and
+	// an absent field) is OFF, which is the shipped default and byte-for-byte
+	// the behaviour this tunnel has always had.
+	//
+	// 🎯 UNLIKE UplinkChunkK ABOVE, THIS ONE HAS A SETTING BEHIND IT
+	// (Settings › Advanced), so the value here is a projection of the switch and
+	// not an undocumented knob. It rides the config so the choice survives a
+	// reconnect; the live setter below is what makes the switch take effect
+	// without one. Measured: at 247 KiB/s upload rose 30.3 → 46.6 Mbit/s and
+	// uplink loss fell 2.04% → 0.059% on 30 connections under real traffic, at
+	// the price of ~60 ms of loaded-upload ping. See pkg/proxy/uplinkpace.go.
+	UplinkPaceKiB int `json:"uplink_pace_kib,omitempty"`
+
+	// UplinkPaceBurstKiB is that bucket's capacity. 0 falls back to the shipped
+	// PaceDefaultBurstKiB (16 KiB), which is the settled value: a sweep against
+	// 2 KiB bought nothing on loss and cost 10.5% of goodput.
+	UplinkPaceBurstKiB int `json:"uplink_pace_burst_kib,omitempty"`
+
 	// UseCookieAuth selects the non-anonymous "VKAuth" cred path (a logged-in VK
 	// session cookie → TURN creds; see pkg/proxy/creds_vkcookie.go). When true,
 	// GetVKCreds uses ONLY the cookie path — NO fallback to the anonymous VK
@@ -296,6 +315,10 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
+	// The pacer is applied at BOTH connect sites, because a tunnel that comes up
+	// through the bootstrap path is the same tunnel: applying it at one site only
+	// would make the setting depend on how the session happened to start.
+	proxy.SetUplinkPace(pcfg.UplinkPaceKiB, pcfg.UplinkPaceBurstKiB)
 	if !pcfg.UseCookieAuth {
 		proxy.SetVKCookieAuth(false, "", nil)
 	}
@@ -435,6 +458,10 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
 	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
+	// The pacer is applied at BOTH connect sites, because a tunnel that comes up
+	// through the bootstrap path is the same tunnel: applying it at one site only
+	// would make the setting depend on how the session happened to start.
+	proxy.SetUplinkPace(pcfg.UplinkPaceKiB, pcfg.UplinkPaceBurstKiB)
 	// Defensive: when cookie auth isn't requested, force it OFF (the extension
 	// process can be reused across connects — clear any stale cookie state).
 	// When it IS requested, the extension has already called wgSetVKCookieAuth
@@ -1045,6 +1072,26 @@ func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 //export wgSetMemstatsFastTicks
 func wgSetMemstatsFastTicks(enabled C.int32_t) {
 	proxy.SetMemstatsFastTicks(enabled != 0)
+}
+
+// Applies the uplink pacer to the RUNNING tunnel. kib is KiB/s of counted bytes
+// per allocation, 0 = off; burstKiB 0 falls back to the shipped 16 KiB.
+//
+// 🚨 SAME REASON AS wgSetMemstatsFastTicks ABOVE: the value already rides
+// ProxyConfig, which covers "set it, then connect". This covers the case the
+// switch is actually for — flipping it on a live tunnel — where a reconnect
+// would re-ramp 30 connections over ~107 s and hand the user a stall as the
+// price of a setting. Verified live on device across seven toggles.
+//
+//export wgSetUplinkPace
+func wgSetUplinkPace(kib C.int32_t, burstKiB C.int32_t) {
+	proxy.SetUplinkPace(int(kib), int(burstKiB))
+	if kib > 0 {
+		log.Printf("wgSetUplinkPace: uplink pacer ON at %d KiB/s per allocation, burst %d KiB",
+			int(kib), int(burstKiB))
+	} else {
+		log.Printf("wgSetUplinkPace: uplink pacer OFF")
+	}
 }
 
 // Returns the current cookie ("VKAuth") fatal-auth message, or "" if none. The

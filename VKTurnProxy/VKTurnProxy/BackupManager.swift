@@ -103,6 +103,9 @@ enum BackupManager {
         // one would produce a backup whose restore shows a different number
         // than the tunnel uses.
         let chunkK = UplinkChunk.clamp((d.object(forKey: "uplinkChunkK") as? Int) ?? UplinkChunk.off)
+        // The uplink pacer. Exported as the RATE, snapped the same way the tunnel
+        // snaps it, so a backup can never describe a rate the app does not offer.
+        let paceKiB = UplinkPace.stored(in: d)
         // Named servers (build 179+). The legacy flat per-server fields are
         // deliberately NOT written alongside them — a backup from this build is
         // not meant to be readable by 178 and earlier.
@@ -128,6 +131,7 @@ enum BackupManager {
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,
             uplinkChunkK: chunkK,
+            uplinkPaceKiB: paceKiB,
             tunnelMTU: mtu
         )
 
@@ -254,6 +258,11 @@ enum BackupManager {
         // backup is untrusted, and a K the picker cannot display would leave the
         // screen showing something other than what the tunnel runs.
         if let v = s.uplinkChunkK { d.set(UplinkChunk.clamp(v), forKey: "uplinkChunkK") }
+        // Same snapping on the way in, and for the stronger reason: this key arms a
+        // shaper. A hand-edited backup carrying an arbitrary number would otherwise
+        // set a rate nobody measured — non-zero means ON at the one shipped rate.
+        if let v = s.uplinkPaceKiB { d.set(v == UplinkPace.off ? UplinkPace.off : UplinkPace.onKiB,
+                                           forKey: UplinkPace.key) }
 
         if let backedUpServers = s.servers, !backedUpServers.isEmpty {
             // Build 179+ backup: the named server sets ARE the configuration.

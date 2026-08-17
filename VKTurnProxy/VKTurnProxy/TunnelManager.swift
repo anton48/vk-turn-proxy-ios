@@ -156,6 +156,7 @@ extension TunnelConfig {
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
             memstatsFastTicks: d.bool(forKey: "memstatsFastTicks"),
             uplinkChunkK: UplinkChunk.stored(in: d),
+            uplinkPaceKiB: UplinkPace.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
@@ -975,6 +976,24 @@ class TunnelManager: ObservableObject {
         let on = UserDefaults.standard.bool(forKey: "memstatsFastTicks")
         guard let session = manager?.connection as? NETunnelProviderSession,
               let msg = "set_memstats_fast:\(on ? 1 : 0)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
+    /// Push the uplink pacer's setting to a RUNNING extension — same reasoning as
+    /// the switch above: the alternative is charging a reconnect for a toggle.
+    ///
+    /// 🚨 `UserDefaults.standard`, because that is what `currentConfig()` reads and
+    /// what `@AppStorage` writes. Reading a different store here would give a
+    /// switch that shows one thing while the tunnel does another — the split-brain
+    /// shape of the re-signed-IPA App Group defect (#59), where
+    /// `UserDefaults(suiteName:)` does not return nil, it just answers wrongly.
+    ///
+    /// No-op when the tunnel is down; the value is read again at the next start.
+    func applyUplinkPaceFromSettings() {
+        let kib = UplinkPace.stored(in: .standard)
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_uplink_pace:\(kib),\(UplinkPace.burstKiB)".data(using: .utf8)
+        else { return }
         try? session.sendProviderMessage(msg) { _ in }
     }
 
@@ -1841,6 +1860,12 @@ class TunnelManager: ObservableObject {
             "uplink_synth_sec": config.uplinkSynthSec,
             "memstats_fast_ticks": config.memstatsFastTicks,
             "uplink_chunk_k": config.uplinkChunkK,
+            // The rate rides the config so the choice survives a reconnect; 0 = off,
+            // which is exactly what the Go side's PaceOff means. The burst is not a
+            // setting — it is settled at 16 KiB — but it travels with the rate so
+            // the two can never be applied from different places.
+            "uplink_pace_kib": config.uplinkPaceKiB,
+            "uplink_pace_burst_kib": UplinkPace.burstKiB,
             "use_wrap": config.useWrap,
             "wrap_key_hex": config.wrapKeyHex,
             "use_srtp": config.useSrtp,
@@ -2381,6 +2406,11 @@ struct TunnelConfig {
     /// behaviour. See UplinkChunk.swift; expected to be removed with the
     /// setting once the sweep has answered.
     var uplinkChunkK: Int = UplinkChunk.off
+    /// The uplink pacer's rate in KiB/s of counted bytes per allocation, 0 = off
+    /// (Settings › Advanced). DEFAULT OFF — and the default lives here as well as
+    /// in `UplinkPace.off`, because a config built without going through
+    /// `currentConfig()` must not silently arm a shaper.
+    var uplinkPaceKiB: Int = UplinkPace.off
     // VKAuth: when true, the cred path uses ONLY the logged-in VK cookie (no
     // anonymous fallback). The cookie itself lives in the Keychain
     // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.

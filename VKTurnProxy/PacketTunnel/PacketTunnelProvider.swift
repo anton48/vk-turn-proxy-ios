@@ -472,6 +472,27 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: memstats fast ticks = \(on)")
             wgSetMemstatsFastTicks(on ? 1 : 0)
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_uplink_pace:") {
+            // The uplink pacer (Settings › Advanced), applied to the RUNNING
+            // tunnel for the same reason as the switch above: a reconnect would
+            // charge ~107 s of thirty-connection ramp for flipping a switch.
+            // The same pair rides proxyConfig for the next start.
+            //
+            // 🚨 PARSE STRICTLY AND FAIL CLOSED. A malformed message must leave
+            // the tunnel as it is rather than pace it at some fraction of the
+            // intended rate: a bucket at 1 KiB/s looks like a setting the user
+            // chose and throttles the uplink to nothing.
+            let parts = msg.dropFirst("set_uplink_pace:".count).split(separator: ",")
+            guard parts.count == 2,
+                  let kib = Int(parts[0]), let burst = Int(parts[1]),
+                  kib >= 0, burst >= 0 else {
+                logMsg("handleAppMessage: 🚨 malformed set_uplink_pace \(msg) — ignored")
+                completionHandler?("bad".data(using: .utf8))
+                return
+            }
+            logMsg("handleAppMessage: uplink pace = \(kib) KiB/s per allocation, burst \(burst) KiB")
+            wgSetUplinkPace(Int32(kib), Int32(burst))
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("debug_log:") {
             let debugMsg = String(msg.dropFirst("debug_log:".count))
             logMsg("[AppDebug] \(debugMsg)")
