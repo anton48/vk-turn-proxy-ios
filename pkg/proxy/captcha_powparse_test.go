@@ -212,3 +212,46 @@ func TestEmptyShowHintCountsOnlyWhatVKAnswered(t *testing.T) {
 		t.Errorf("a named challenge resets even on an unreached attempt: %d, want 0", got)
 	}
 }
+
+// 🚨 AN UNREADABLE PREFIX IS NOT `v2.`. The unknown-prefix guard above only
+// catches a prefix we READ; if the page moves the literal into a variable the
+// regex misses, the default survives, and a v3-shaped exchange would go out
+// labelled `v2.` — the same defect as reading `show_captcha_type=""` as VK's
+// answer, an unread value silently becoming a plausible one. *(User-caught.)*
+//
+// The fixture keeps its IIFE and its telemetry; only the literal assignment is
+// taken away, which is exactly the shape of the page being guarded against.
+//
+// SABOTAGE SEEN TO FAIL: drop the `p.Envelope == envelopeTelemetry5 &&
+// !prefixRead` guard.
+func TestParsePowPageRefusesAnUnreadablePrefixOnTheLiveShape(t *testing.T) {
+	html := strings.Replace(loadPowFixture(t),
+		"window['captchaPowResult']='v2.'+", "window['captchaPowResult']=_0xversion+", -1)
+	if strings.Contains(html, "'v2.'") {
+		t.Fatal("fixture still carries a readable prefix — the case is not being exercised")
+	}
+	if !rePowTelemetry.MatchString(html) {
+		t.Fatal("telemetry marker was lost — this would refuse for the wrong reason")
+	}
+	if _, err := parsePowPage(html); err == nil {
+		t.Fatal("expected a refusal: the prefix is unreadable on a telemetry-shaped page")
+	}
+}
+
+// …and the legacy shape KEEPS its fallback: `v2.` is the only prefix that shape
+// has ever carried, and that branch exists so a rollback by VK survives without
+// a build of ours.
+func TestParsePowPageKeepsTheFallbackOnTheLegacyShape(t *testing.T) {
+	html := `<html><script>
+window.captchaPowResult = version + btoa(JSON.stringify({hash: hash, nonce: nonce}));
+const powInput = "Pihj7tyAHFxdwm4t";
+if (h.startsWith('0'.repeat(3))) {}
+</script></html>`
+	p, err := parsePowPage(html)
+	if err != nil {
+		t.Fatalf("legacy page with an unreadable prefix should still parse: %v", err)
+	}
+	if p.Prefix != powPrefixFallback || p.Envelope != envelopeLegacy3 {
+		t.Errorf("legacy parse = %q/%s, want %q/legacy3", p.Prefix, p.Envelope, powPrefixFallback)
+	}
+}

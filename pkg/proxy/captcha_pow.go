@@ -1822,8 +1822,10 @@ var rePowTelemetry = regexp.MustCompile(`["']tel_hash["']\s*:`)
 
 func parsePowPage(html string) (powPageParams, error) {
 	p := powPageParams{Prefix: powPrefixFallback, Envelope: envelopeLegacy3}
+	prefixRead := false
 	if m := rePowPrefix.FindStringSubmatch(html); len(m) >= 2 {
 		p.Prefix = m[1]
+		prefixRead = true
 	}
 	// 🚨 REFUSE A PREFIX WE HAVE NEVER SEEN rather than guess a shape under it.
 	// `v2.` has carried BOTH shapes, so a new prefix tells us nothing about the
@@ -1838,6 +1840,28 @@ func parsePowPage(html string) (powPageParams, error) {
 	// The SHAPE comes from the page's own script, never from the prefix.
 	if rePowTelemetry.MatchString(html) {
 		p.Envelope = envelopeTelemetry5
+	}
+
+	// 🚨 AN UNREADABLE PREFIX IS NOT `v2.` — and on the LIVE shape it must not be
+	// treated as one. The guard above only catches a prefix we READ and did not
+	// recognise; if the page moves the literal into a variable —
+	//
+	//	const version = 'v3.';
+	//	window.captchaPowResult = version + encode(…);
+	//
+	// — the regex simply misses, `Prefix` keeps its default, and we would send
+	// a v3-shaped exchange labelled `v2.`. That is the same defect as reading
+	// `show_captcha_type=""` as VK's answer: an unread value silently becoming a
+	// plausible one. *(User-caught.)*
+	//
+	// ⚖️ Scoped to the telemetry5 shape deliberately, and NOT applied to the
+	// legacy one: `v2.` is the only prefix that shape has ever carried, it is
+	// frozen history, and the legacy branch exists precisely so a rollback by VK
+	// survives WITHOUT a build of ours. The live shape has no such warrant.
+	if p.Envelope == envelopeTelemetry5 && !prefixRead {
+		return powPageParams{}, errors.New(
+			"captcha pow envelope prefix is not readable on a telemetry-shaped page — " +
+				"capture it with VK_DUMP_POW_HTML rather than assuming " + powPrefixFallback)
 	}
 
 	if m := rePowIIFEArgs.FindStringSubmatch(html); len(m) >= 3 {
