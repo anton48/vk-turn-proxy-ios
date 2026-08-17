@@ -7,6 +7,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var tunnelHandle: Int32 = -1
     private let log = OSLog(subsystem: "com.vkturnproxy.tunnel", category: "PacketTunnel")
 
+    // 🚧 DIAGNOSTIC ONLY (issue #72, "DIRECT switch") — the inputs the tunnel
+    // settings were built from, kept so they can be re-applied mid-session
+    // without reconnecting. Nothing on the normal path reads them.
+    private var lastSettingsAddress = ""
+    private var lastSettingsDNS = ""
+    private var lastSettingsMTU = ""
+    private var lastSettingsRemote = "10.0.0.1"
+    /// The TUN fd handed to Go at attach. The DIRECT experiment turns on
+    /// whether a SECOND `setTunnelNetworkSettings` keeps it — if the fd moves,
+    /// wireguard-go is holding a dead descriptor and the whole idea is dead.
+    private var attachedTunFd: Int32 = -1
+    private var protoObservation: NSKeyValueObservation?
+
     // NWPathMonitor: passively logs every meaningful network state change so
     // we can correlate "can't assign requested address" / mass-reconnect
     // events with the underlying iOS network reality (DHCP renewal, WiFi
@@ -181,6 +194,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)\(mtuExplicit ? " (user-set)" : "")")
         logMsg("proxyConfig=\(proxyConfigJSON)")
+
+        // 🚧 DIAGNOSTIC (issue #72). Watch the PROFILE, not just our own
+        // messages: Apple's DTS answer on changing NEVPNProtocol properties
+        // mid-session (forums/thread/749321) is "save them and observe
+        // protocolConfiguration with KVO; they should come into effect
+        // promptly". Whether the extension is actually told is one of the
+        // things this experiment exists to find out — so the observation logs
+        // and does nothing else.
+        protoObservation = observe(\.protocolConfiguration, options: [.new]) { [weak self] _, _ in
+            guard let self = self else { return }
+            let p = self.protocolConfiguration
+            var enforce = "n/a"
+            if #available(iOS 14.2, *) { enforce = "\(p.enforceRoutes)" }
+            self.logMsg("🚧 KVO protocolConfiguration CHANGED: includeAllNetworks=\(p.includeAllNetworks) "
+                + "enforceRoutes=\(enforce) excludeLocalNetworks=\(p.excludeLocalNetworks)")
+        }
 
         // ------------------------------------------------------------------
         // Deferred-setTunnelNetworkSettings bootstrap flow (Step 4 of the
@@ -362,6 +391,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 mtu: effMTU,
                 tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP
             )
+            // 🚧 Diagnostic bookkeeping only (issue #72): remember what this
+            // was built from so the DIRECT experiment can rebuild it live.
+            self.lastSettingsAddress = effAddress
+            self.lastSettingsDNS = effDNS
+            self.lastSettingsMTU = effMTU
+            self.lastSettingsRemote = turnIP.isEmpty ? "10.0.0.1" : turnIP
 
             DispatchQueue.main.async {
                 self.logMsg("setTunnelNetworkSettings: applying full routes (single shot)")
@@ -385,6 +420,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         completionHandler(VPNError.noTunDevice)
                         return
                     }
+                    self.attachedTunFd = tunFd
                     self.logMsg("TUN fd=\(tunFd), calling wgAttachWireGuard...")
 
                     let rc = effWGConfig.withCString { cfgPtr in
@@ -472,6 +508,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: memstats fast ticks = \(on)")
             wgSetMemstatsFastTicks(on ? 1 : 0)
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_direct:") {
+            // 🚧 DIAGNOSTIC, issue #72 — NOT a feature yet. Re-applies the
+            // tunnel's ROUTES on a live session: DIRECT drops the default
+            // route and the tunnel's DNS, so traffic should fall back to the
+            // primary interface while the TURN pool and WireGuard stay up.
+            //
+            // 🚨 THE ROUTES ARE HALF THE ANSWER AND THE DOCUMENTED HALF SAYS
+            // THEY ARE NOT ENOUGH: `enforceRoutes` is what makes iOS honour
+            // includes/excludes, and it is IGNORED while `includeAllNetworks`
+            // is true (Apple: "routing-your-vpn-network-traffic"). The app
+            // flips both profile properties before sending this; what this
+            // handler measures is whether the SESSION survives the pair —
+            // the TUN fd above all, because Go is holding it.
+            let on = msg.hasSuffix("1")
+            applyDirectRoutesDiagnostic(on) { ok in
+                completionHandler?((ok ? "ok" : "bad").data(using: .utf8))
+            }
         } else if msg.hasPrefix("set_uplink_pace:") {
             // The uplink pacer (Settings › Advanced), applied to the RUNNING
             // tunnel for the same reason as the switch above: a reconnect would
@@ -835,9 +888,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // need iOS to give the extension a DNS resolver context so Go-side
         // dial(login.vk.ru) works during bootstrap, but we don't want to
         // capture system traffic into the tunnel before TUN is actually
-        // attached. With includeAllNetworks=true on the VPN profile, an
-        // empty includedRoutes here keeps the tunnel routing-inert — iOS
-        // doesn't have a default route to enforce yet.
+        // attached.
+        //
+        // 🚨 THIS COMMENT USED TO CLAIM MORE THAN WE KNOW, AND IT MISLED A
+        // DESIGN (2026-08-17). It said an empty `includedRoutes` "keeps the
+        // tunnel routing-inert" under `includeAllNetworks=true`. **That was
+        // never measured.** What Phase 1 shows is that OUR OWN bootstrap dial
+        // works during those few seconds; nobody has ever checked whether
+        // other apps' traffic is captured then — and Apple's documentation
+        // says the opposite of the convenient reading: with
+        // `includeAllNetworks=true` the system routes ALL traffic through the
+        // tunnel, `excludedRoutes` have no effect, and `enforceRoutes` — the
+        // property that makes includes/excludes binding — is ignored
+        // ("routing-your-vpn-network-traffic").
+        // ⇒ Treat this parameter as "do not ASK for the default route yet",
+        // never as "traffic will stay outside". A DIRECT mode cannot be built
+        // on it while IAN is true. *(User-caught: I proposed exactly that.)*
         ipv4.includedRoutes = includeDefaultRoute ? [NEIPv4Route.default()] : []
         // No excludedRoutes: with includeAllNetworks=true on the VPN profile,
         // iOS ignores excludedRoutes entirely (Apple docs). The only
@@ -866,6 +932,69 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             mask |= (1 << (31 - i))
         }
         return "\(mask >> 24).\((mask >> 16) & 0xFF).\((mask >> 8) & 0xFF).\(mask & 0xFF)"
+    }
+
+    // MARK: - DIRECT mode (DIAGNOSTIC, issue #72)
+
+    /// Re-applies the tunnel settings on a RUNNING session: DIRECT strips the
+    /// default route and the tunnel DNS, and back again restores both.
+    ///
+    /// 🚨 WHAT THIS IS ACTUALLY TESTING, and it is not "does the toggle work":
+    ///
+    ///   1. **Does the TUN fd survive a second `setTunnelNetworkSettings`?**
+    ///      Go was handed the descriptor once, at attach. If iOS builds a new
+    ///      utun, wireguard-go holds a dead fd and the tunnel is silently
+    ///      finished — so the fd is logged before AND after, and a change is
+    ///      shouted rather than mentioned.
+    ///   2. **Does the TURN pool survive?** The whole point of the feature is
+    ///      that the 30 VK connections are NOT rebuilt, which is the part a
+    ///      reconnect cannot give.
+    ///   3. **Does the session stay `.connected`?**
+    ///
+    /// ⚠️ It deliberately does NOT touch `includeAllNetworks` — that lives on
+    /// the profile, in the app process. Routes alone cannot deliver DIRECT
+    /// while IAN is true; this half only has to prove it costs nothing.
+    private func applyDirectRoutesDiagnostic(_ direct: Bool, completion: @escaping (Bool) -> Void) {
+        guard !lastSettingsAddress.isEmpty else {
+            logMsg("🚧 DIRECT: no settings recorded yet — the tunnel never finished starting; ignored")
+            completion(false)
+            return
+        }
+        let fdBefore = findTunFileDescriptor() ?? -1
+        logMsg("🚧 DIRECT \(direct ? "ON" : "OFF"): re-applying settings; fd before=\(fdBefore) "
+            + "attached=\(attachedTunFd)")
+
+        let settings = createTunnelSettings(
+            address: lastSettingsAddress,
+            dns: lastSettingsDNS,
+            mtu: lastSettingsMTU,
+            tunnelRemoteAddress: lastSettingsRemote,
+            includeDefaultRoute: !direct
+        )
+        if direct {
+            // A resolver that is only reachable THROUGH the tunnel would make
+            // "outside the tunnel" mean "nowhere". Hand DNS back to the system.
+            settings.dnsSettings = nil
+        }
+
+        let t0 = Date()
+        setTunnelNetworkSettings(settings) { [weak self] error in
+            guard let self = self else { return }
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            if let error = error {
+                self.logMsg("🚧 DIRECT: setTunnelNetworkSettings FAILED after \(ms) ms: \(error)")
+                completion(false)
+                return
+            }
+            let fdAfter = self.findTunFileDescriptor() ?? -1
+            let moved = fdAfter != self.attachedTunFd
+            self.logMsg("🚧 DIRECT \(direct ? "ON" : "OFF") applied in \(ms) ms; fd after=\(fdAfter) "
+                + (moved
+                   ? "🚨 THE TUN FD MOVED (attached=\(self.attachedTunFd)) — wireguard-go is holding a "
+                     + "dead descriptor and this design is DEAD"
+                   : "✅ same fd as attach — Go's descriptor is still valid"))
+            completion(true)
+        }
     }
 
     // MARK: - TUN File Descriptor Discovery

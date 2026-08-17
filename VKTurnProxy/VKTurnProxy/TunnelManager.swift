@@ -1023,6 +1023,90 @@ class TunnelManager: ObservableObject {
     private var paceSync = UplinkPaceSync()
     private var paceRetryScheduled = false
 
+    /// 🚧 DIAGNOSTIC (issue #72, the "DIRECT" switch) — flips the PROFILE
+    /// properties on a RUNNING tunnel and reports what happens. Not a feature,
+    /// and deliberately not persisted anywhere: a reconnect rebuilds the
+    /// profile with `includeAllNetworks = true` and undoes all of it.
+    ///
+    /// 🚨 WHY IT HAS TO BE THE PROFILE, after a wrong turn of mine.
+    /// `enforceRoutes` is the property that makes `includedRoutes` /
+    /// `excludedRoutes` binding, and Apple states it is **ignored while
+    /// `includeAllNetworks` is true** — the two are mutually exclusive. So
+    /// routes alone cannot deliver DIRECT in the mode this app ships (IAN is
+    /// what carries APNs through the tunnel), and the toggle necessarily
+    /// changes the profile: `IAN=false + enforceRoutes=true` on the way in.
+    ///
+    /// 🚨 EXPECT A BRIEF NETWORK BLACKOUT, AND IT IS OUR OWN MEASUREMENT, not a
+    /// guess: this file already records that `saveToPreferences()` with a
+    /// changed `includeAllNetworks` "triggers iOS NECP rule rebuild that
+    /// briefly nulls all primary interfaces (en0, pdp_ip0) for ~370 ms"
+    /// (2026-04-30). Apple's own forum thread 731793 describes the same thing
+    /// as a bug they fixed on newer systems — that it is *survivable* is
+    /// exactly what this run is for. The status is sampled afterwards so a
+    /// tunnel that dies quietly cannot look like a success.
+    ///
+    /// ⚠️ Changing IAN also re-prompts iOS for VPN permission on the NEXT
+    /// connect (recorded above, where the profile is built).
+    func runDirectModeDiagnostic(_ direct: Bool) async {
+        let t0 = Date()
+        func note(_ s: String) { SharedLogger.shared.log("[App] 🚧 DIRECT: \(s)") }
+
+        guard let manager = self.manager else {
+            note("no VPN manager loaded — nothing to change")
+            return
+        }
+        note("requested \(direct ? "ON (IAN=false, enforceRoutes=true)" : "OFF (restore IAN=true)"); "
+            + "status before = \(manager.connection.status.rawValue)")
+
+        do {
+            // A stale in-memory profile cannot be saved: load, mutate, save.
+            try await manager.loadFromPreferences()
+            guard let proto = manager.protocolConfiguration as? NETunnelProviderProtocol else {
+                note("protocolConfiguration is not an NETunnelProviderProtocol — aborting")
+                return
+            }
+            var before = "IAN=\(proto.includeAllNetworks)"
+            if #available(iOS 14.2, *) { before += " enforceRoutes=\(proto.enforceRoutes)" }
+            note("profile before: \(before)")
+
+            proto.includeAllNetworks = !direct
+            if #available(iOS 14.2, *) { proto.enforceRoutes = direct }
+            manager.protocolConfiguration = proto
+            try await manager.saveToPreferences()
+            note("saveToPreferences OK in \(Int(Date().timeIntervalSince(t0) * 1000)) ms; "
+                + "status = \(manager.connection.status.rawValue)")
+        } catch {
+            note("🚨 saveToPreferences FAILED: \(error.localizedDescription)")
+            return
+        }
+
+        // Then the routes, in the extension. Sent AFTER the profile change so
+        // the two halves land in the order a real toggle would use.
+        if let session = manager.connection as? NETunnelProviderSession,
+           let data = "set_direct:\(direct ? 1 : 0)".data(using: .utf8) {
+            do {
+                try session.sendProviderMessage(data) { reply in
+                    let r = reply.flatMap { String(data: $0, encoding: .utf8) } ?? "<no reply>"
+                    note("extension answered \(r)")
+                }
+            } catch {
+                note("🚨 provider message failed: \(error.localizedDescription)")
+            }
+        } else {
+            note("no active session — routes not re-applied")
+        }
+
+        // 🚨 SAMPLE THE STATUS AFTERWARDS. The failure mode this experiment is
+        // most likely to hit is not an error return; it is the tunnel dying a
+        // second later while every call above reported success.
+        for delay in [1.0, 3.0, 8.0] {
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            note("t+\(Int(delay))s status=\(manager.connection.status.rawValue) "
+                + "(2=connecting, 3=connected, 4=reasserting, 5=disconnecting, 1=disconnected)")
+        }
+        note("done; a reconnect restores the shipped profile (IAN=true) whatever happened")
+    }
+
     /// A NEW intent: the user changed the switch, or the app is re-asserting the
     /// stored value against a tunnel it did not start.
     func applyUplinkPaceFromSettings() {

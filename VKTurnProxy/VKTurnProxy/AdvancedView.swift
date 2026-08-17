@@ -163,6 +163,23 @@ struct AdvancedView: View {
                 Text("Spaces this device's uploads across the relay connections instead of sending them in bursts, so the relay's own rate limit stops cutting them.\n\nMeasured here on 30 connections under real traffic: upload 30 → 47 Mbit/s and uplink packet loss 2% → 0.06%, with download and idle ping unchanged. The cost is response time while the upload is saturated — about 60 ms more, against roughly 470 ms that this phone's cellular link adds under the same load.\n\nOff by default. Takes effect immediately, on a tunnel that is already connected.")
             }
 
+            // 🚧 DIAGNOSTIC, issue #72 — two buttons rather than a switch, on
+            // purpose: nothing here is persisted, so a state this experiment
+            // gets stuck in cannot survive a reconnect (connect rebuilds the
+            // profile with includeAllNetworks=true).
+            Section {
+                Button("DIRECT on — routes out of the tunnel") {
+                    Task { await TunnelManager.shared.runDirectModeDiagnostic(true) }
+                }
+                Button("DIRECT off — restore the full tunnel") {
+                    Task { await TunnelManager.shared.runDirectModeDiagnostic(false) }
+                }
+            } header: {
+                Text("DIRECT (experiment)")
+            } footer: {
+                Text("Tries to send traffic around the tunnel while keeping the VK connections up, by changing the VPN profile on a live session. This is a measurement, not a feature: expect a short network stall, and possibly a dropped tunnel.\n\nWatch the log for whether the TUN descriptor survives — everything else depends on that. Reconnecting restores the normal configuration no matter how it ends.")
+            }
+
             Section {
                 Toggle("Detailed log every second", isOn: $memstatsFastTicks)
                     // Pushed to a running tunnel instead of waiting for the next
