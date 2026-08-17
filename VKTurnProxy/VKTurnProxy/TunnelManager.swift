@@ -186,6 +186,20 @@ class TunnelManager: ObservableObject {
     @Published var status: NEVPNStatus = .disconnected
     @Published var errorMessage: String?
 
+    /// DIRECT mode (issue #72): traffic goes around the tunnel while the VK
+    /// connections stay up.
+    ///
+    /// 🎯 DERIVED FROM THE PROFILE, NEVER STORED. The truth is
+    /// `includeAllNetworks == false && enforceRoutes == true` on the VPN
+    /// configuration, so this survives an app restart, matches what the tunnel
+    /// is actually doing, and cannot drift the way a second copy would. Every
+    /// connect rebuilds the profile with `includeAllNetworks = true`, so a
+    /// reconnect always lands back in the normal mode — which is also the
+    /// recovery path if anything goes wrong.
+    @Published private(set) var directMode = false
+    /// True while a change is in flight, so the switch can refuse a second tap.
+    @Published private(set) var directModeBusy = false
+
     /// The poll-driven counters. A plain `let`, deliberately NOT `@Published`:
     /// observing it from here would re-couple every 2-second update to
     /// `ContentView` and bring back the pop this split exists to fix.
@@ -1023,10 +1037,37 @@ class TunnelManager: ObservableObject {
     private var paceSync = UplinkPaceSync()
     private var paceRetryScheduled = false
 
-    /// 🚧 DIAGNOSTIC (issue #72, the "DIRECT" switch) — flips the PROFILE
-    /// properties on a RUNNING tunnel and reports what happens. Not a feature,
-    /// and deliberately not persisted anywhere: a reconnect rebuilds the
-    /// profile with `includeAllNetworks = true` and undoes all of it.
+    /// Reads DIRECT's state back out of the VPN profile. Cheap, and the only
+    /// place `directMode` is ever assigned outside a change we made ourselves.
+    func refreshDirectMode() {
+        guard let proto = manager?.protocolConfiguration else { return }
+        var enforced = false
+        if #available(iOS 14.2, *) { enforced = proto.enforceRoutes }
+        directMode = !proto.includeAllNetworks && enforced
+    }
+
+    /// DIRECT mode (issue #72): route traffic around the tunnel WITHOUT tearing
+    /// it down, so the 30 VK connections — the expensive part — survive.
+    ///
+    /// ✅ MEASURED ON DEVICE, 2026-08-17 (`17.08/direct.txt`), before this was a
+    /// feature: the TUN descriptor Go holds is unchanged across seven applies
+    /// (fd 5 → 5), the pool never rebuilds (`sock=30` throughout, zero new TURN
+    /// allocations), the session stays `.connected`, and the TUN goes from
+    /// 1176 pkt/s to **1 pkt/s** — WireGuard keepalives only — and back. The
+    /// cost is one `setTunnelNetworkSettings` of ~420 ms, which the user sees
+    /// as at most one lost ping.
+    ///
+    /// 🚨 WHY IT HAS TO TOUCH THE PROFILE. `enforceRoutes` is what makes
+    /// `includedRoutes` binding, and Apple states it is IGNORED while
+    /// `includeAllNetworks` is true — they are mutually exclusive. Routes alone
+    /// cannot do this in the mode we ship, so DIRECT is
+    /// `IAN=false + enforceRoutes=true` plus an empty route table.
+    ///
+    /// ⚠️ AND IT TURNS THE KILL SWITCH OFF WHILE IT IS ON. `includeAllNetworks`
+    /// is what guarantees nothing leaks if the tunnel drops; in DIRECT that
+    /// guarantee is exactly what the user is asking to suspend. The footer says
+    /// so, because a switch that silently removes a protection is worse than no
+    /// switch.
     ///
     /// 🚨 WHY IT HAS TO BE THE PROFILE, after a wrong turn of mine.
     /// `enforceRoutes` is the property that makes `includedRoutes` /
@@ -1047,64 +1088,67 @@ class TunnelManager: ObservableObject {
     ///
     /// ⚠️ Changing IAN also re-prompts iOS for VPN permission on the NEXT
     /// connect (recorded above, where the profile is built).
-    func runDirectModeDiagnostic(_ direct: Bool) async {
-        let t0 = Date()
-        func note(_ s: String) { SharedLogger.shared.log("[App] 🚧 DIRECT: \(s)") }
+    func setDirectMode(_ direct: Bool) async {
+        func note(_ s: String) { SharedLogger.shared.log("[App] direct: \(s)") }
 
         guard let manager = self.manager else {
-            note("no VPN manager loaded — nothing to change")
+            note("no VPN manager loaded — ignored")
             return
         }
-        note("requested \(direct ? "ON (IAN=false, enforceRoutes=true)" : "OFF (restore IAN=true)"); "
-            + "status before = \(manager.connection.status.rawValue)")
+        guard manager.connection.status == .connected else {
+            // Off a live tunnel the change would be pointless: the next connect
+            // rebuilds the profile from scratch and puts IAN back.
+            note("tunnel is not connected (status=\(manager.connection.status.rawValue)) — ignored")
+            refreshDirectMode()
+            return
+        }
+        if directModeBusy {
+            note("a change is already in flight — ignored")
+            return
+        }
+        directModeBusy = true
+        defer { directModeBusy = false }
 
+        let t0 = Date()
         do {
-            // A stale in-memory profile cannot be saved: load, mutate, save.
+            // Load, mutate, save: a stale in-memory profile cannot be saved.
             try await manager.loadFromPreferences()
             guard let proto = manager.protocolConfiguration as? NETunnelProviderProtocol else {
                 note("protocolConfiguration is not an NETunnelProviderProtocol — aborting")
                 return
             }
-            var before = "IAN=\(proto.includeAllNetworks)"
-            if #available(iOS 14.2, *) { before += " enforceRoutes=\(proto.enforceRoutes)" }
-            note("profile before: \(before)")
-
             proto.includeAllNetworks = !direct
             if #available(iOS 14.2, *) { proto.enforceRoutes = direct }
             manager.protocolConfiguration = proto
             try await manager.saveToPreferences()
-            note("saveToPreferences OK in \(Int(Date().timeIntervalSince(t0) * 1000)) ms; "
-                + "status = \(manager.connection.status.rawValue)")
+            note("profile saved (\(direct ? "DIRECT" : "tunnelled")) in "
+                + "\(Int(Date().timeIntervalSince(t0) * 1000)) ms")
         } catch {
-            note("🚨 saveToPreferences FAILED: \(error.localizedDescription)")
+            note("🚨 could not save the profile: \(error.localizedDescription)")
+            errorMessage = "Could not switch routing: \(error.localizedDescription)"
+            refreshDirectMode()
             return
         }
 
-        // Then the routes, in the extension. Sent AFTER the profile change so
-        // the two halves land in the order a real toggle would use.
+        // 🎯 THE EXTENSION ALSO WATCHES THE PROFILE ITSELF (KVO on
+        // protocolConfiguration — measured firing on device), so the routes
+        // would follow even if this message were lost. It is sent anyway
+        // because KVO's timing is not ours to rely on, and the handler is
+        // idempotent: it re-applies only when the mode actually differs.
         if let session = manager.connection as? NETunnelProviderSession,
            let data = "set_direct:\(direct ? 1 : 0)".data(using: .utf8) {
             do {
                 try session.sendProviderMessage(data) { reply in
                     let r = reply.flatMap { String(data: $0, encoding: .utf8) } ?? "<no reply>"
-                    note("extension answered \(r)")
+                    note("routes: \(r)")
                 }
             } catch {
-                note("🚨 provider message failed: \(error.localizedDescription)")
+                note("routes: send failed (\(error.localizedDescription)) — KVO should still carry it")
             }
-        } else {
-            note("no active session — routes not re-applied")
         }
 
-        // 🚨 SAMPLE THE STATUS AFTERWARDS. The failure mode this experiment is
-        // most likely to hit is not an error return; it is the tunnel dying a
-        // second later while every call above reported success.
-        for delay in [1.0, 3.0, 8.0] {
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            note("t+\(Int(delay))s status=\(manager.connection.status.rawValue) "
-                + "(2=connecting, 3=connected, 4=reasserting, 5=disconnecting, 1=disconnected)")
-        }
-        note("done; a reconnect restores the shipped profile (IAN=true) whatever happened")
+        refreshDirectMode()
+        note("now \(directMode ? "DIRECT — traffic goes around the tunnel" : "tunnelled")")
     }
 
     /// A NEW intent: the user changed the switch, or the app is re-asserting the
@@ -1468,6 +1512,12 @@ class TunnelManager: ObservableObject {
         if status == .connected && live.connectedAt == nil {
             live.connectedAt = Date()
         }
+        // The DIRECT switch reads its state out of the profile, and this is the
+        // only place an already-running tunnel is seen. Without it the switch
+        // would show "off" after an app relaunch while the tunnel is routing
+        // around itself — the same class of split-brain the pacer's re-assert
+        // exists for.
+        refreshDirectMode()
         // 🚨 AND THE PACE IS RE-ASSERTED HERE, FOR THE SAME REASON AS BOTH BLOCKS
         // AROUND IT: this is the ONLY place that sees an already-running tunnel.
         // A toggle applied to a session this app did not start would otherwise
@@ -1541,6 +1591,9 @@ class TunnelManager: ObservableObject {
                     // and it is the only thing standing between a lost message
                     // and a switch that lies until the next reconnect.
                     self.flushPendingUplinkPace()
+                    // A reconnect rebuilds the profile with IAN=true, so DIRECT
+                    // is off again — make the switch say so.
+                    self.refreshDirectMode()
                     // Once the tunnel is actually up, any error message left
                     // over from a captcha-limit exhaustion or other transient
                     // failure is stale — clear it so the user isn't told

@@ -7,16 +7,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var tunnelHandle: Int32 = -1
     private let log = OSLog(subsystem: "com.vkturnproxy.tunnel", category: "PacketTunnel")
 
-    // 🚧 DIAGNOSTIC ONLY (issue #72, "DIRECT switch") — the inputs the tunnel
-    // settings were built from, kept so they can be re-applied mid-session
-    // without reconnecting. Nothing on the normal path reads them.
+    // The inputs the tunnel settings were built from, kept so DIRECT mode
+    // (issue #72) can re-apply them mid-session without a reconnect.
     private var lastSettingsAddress = ""
     private var lastSettingsDNS = ""
     private var lastSettingsMTU = ""
     private var lastSettingsRemote = "10.0.0.1"
-    /// The TUN fd handed to Go at attach. The DIRECT experiment turns on
-    /// whether a SECOND `setTunnelNetworkSettings` keeps it — if the fd moves,
-    /// wireguard-go is holding a dead descriptor and the whole idea is dead.
+    /// The TUN fd handed to Go at attach. 🚨 KEEP LOGGING IT ACROSS EVERY
+    /// re-apply: the whole feature rests on iOS keeping the same descriptor, so
+    /// if it ever moves, wireguard-go is holding a dead one and the tunnel is
+    /// finished in silence. Measured stable across seven applies on 2026-08-17.
     private var attachedTunFd: Int32 = -1
     private var protoObservation: NSKeyValueObservation?
 
@@ -202,13 +202,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // promptly". Whether the extension is actually told is one of the
         // things this experiment exists to find out — so the observation logs
         // and does nothing else.
+        // 🎯 THE PROFILE IS THE SOURCE OF TRUTH FOR DIRECT MODE, and this is how
+        // the extension learns it changed — the mechanism Apple's DTS answer
+        // points at (forums/thread/749321), MEASURED firing on device on
+        // 2026-08-17 with the right values. Deriving the routes from what we
+        // OBSERVE rather than only from a message means the app and the tunnel
+        // cannot end up disagreeing if a message is lost.
         protoObservation = observe(\.protocolConfiguration, options: [.new]) { [weak self] _, _ in
             guard let self = self else { return }
             let p = self.protocolConfiguration
-            var enforce = "n/a"
-            if #available(iOS 14.2, *) { enforce = "\(p.enforceRoutes)" }
-            self.logMsg("🚧 KVO protocolConfiguration CHANGED: includeAllNetworks=\(p.includeAllNetworks) "
-                + "enforceRoutes=\(enforce) excludeLocalNetworks=\(p.excludeLocalNetworks)")
+            var enforce = false
+            if #available(iOS 14.2, *) { enforce = p.enforceRoutes }
+            let direct = !p.includeAllNetworks && enforce
+            self.logMsg("KVO protocolConfiguration: includeAllNetworks=\(p.includeAllNetworks) "
+                + "enforceRoutes=\(enforce) ⇒ \(direct ? "DIRECT" : "tunnelled")")
+            self.applyDirectRoutes(direct, reason: "KVO") { _ in }
         }
 
         // ------------------------------------------------------------------
@@ -391,8 +399,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 mtu: effMTU,
                 tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP
             )
-            // 🚧 Diagnostic bookkeeping only (issue #72): remember what this
-            // was built from so the DIRECT experiment can rebuild it live.
+            // Remember what this was built from, so DIRECT can rebuild it live.
             self.lastSettingsAddress = effAddress
             self.lastSettingsDNS = effDNS
             self.lastSettingsMTU = effMTU
@@ -522,7 +529,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // handler measures is whether the SESSION survives the pair —
             // the TUN fd above all, because Go is holding it.
             let on = msg.hasSuffix("1")
-            applyDirectRoutesDiagnostic(on) { ok in
+            applyDirectRoutes(on, reason: "message") { ok in
                 completionHandler?((ok ? "ok" : "bad").data(using: .utf8))
             }
         } else if msg.hasPrefix("set_uplink_pace:") {
@@ -954,15 +961,27 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// ⚠️ It deliberately does NOT touch `includeAllNetworks` — that lives on
     /// the profile, in the app process. Routes alone cannot deliver DIRECT
     /// while IAN is true; this half only has to prove it costs nothing.
-    private func applyDirectRoutesDiagnostic(_ direct: Bool, completion: @escaping (Bool) -> Void) {
+    /// Tracks what the ROUTES are currently set to, so a repeat request is a
+    /// no-op instead of a second ~420 ms `setTunnelNetworkSettings`. The
+    /// diagnostic had no such guard, and the first field run duly applied the
+    /// same mode four times because the buttons gave no feedback.
+    private var routesAreDirect = false
+
+    private func applyDirectRoutes(_ direct: Bool, reason: String,
+                                   completion: @escaping (Bool) -> Void) {
+        guard direct != routesAreDirect else {
+            logMsg("direct: routes already \(direct ? "DIRECT" : "tunnelled") (\(reason)) — no-op")
+            completion(true)
+            return
+        }
         guard !lastSettingsAddress.isEmpty else {
-            logMsg("🚧 DIRECT: no settings recorded yet — the tunnel never finished starting; ignored")
+            logMsg("direct: no settings recorded yet — the tunnel never finished starting; ignored")
             completion(false)
             return
         }
         let fdBefore = findTunFileDescriptor() ?? -1
-        logMsg("🚧 DIRECT \(direct ? "ON" : "OFF"): re-applying settings; fd before=\(fdBefore) "
-            + "attached=\(attachedTunFd)")
+        logMsg("direct: \(direct ? "ON" : "OFF") via \(reason); re-applying settings; "
+            + "fd before=\(fdBefore) attached=\(attachedTunFd)")
 
         let settings = createTunnelSettings(
             address: lastSettingsAddress,
@@ -982,13 +1001,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self = self else { return }
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             if let error = error {
-                self.logMsg("🚧 DIRECT: setTunnelNetworkSettings FAILED after \(ms) ms: \(error)")
+                self.logMsg("direct: 🚨 setTunnelNetworkSettings FAILED after \(ms) ms: \(error)")
                 completion(false)
                 return
             }
             let fdAfter = self.findTunFileDescriptor() ?? -1
             let moved = fdAfter != self.attachedTunFd
-            self.logMsg("🚧 DIRECT \(direct ? "ON" : "OFF") applied in \(ms) ms; fd after=\(fdAfter) "
+            self.routesAreDirect = direct
+            self.logMsg("direct: \(direct ? "ON" : "OFF") applied in \(ms) ms; fd after=\(fdAfter) "
                 + (moved
                    ? "🚨 THE TUN FD MOVED (attached=\(self.attachedTunFd)) — wireguard-go is holding a "
                      + "dead descriptor and this design is DEAD"

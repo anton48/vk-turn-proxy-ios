@@ -20,6 +20,10 @@
 import SwiftUI
 
 struct AdvancedView: View {
+    /// The DIRECT switch reads its state from the profile via TunnelManager;
+    /// nothing here is @AppStorage, so the pop rule does not apply to it.
+    @ObservedObject private var tunnel = TunnelManager.shared
+
     /// Live Activity master switch (GitHub issue #64). Default OFF — the feature
     /// is opt-in: it puts a persistent card on the Lock Screen and, on iOS 17+,
     /// controls that can disconnect the tunnel or switch servers from there.
@@ -163,21 +167,20 @@ struct AdvancedView: View {
                 Text("Spaces this device's uploads across the relay connections instead of sending them in bursts, so the relay's own rate limit stops cutting them.\n\nMeasured here on 30 connections under real traffic: upload 30 → 47 Mbit/s and uplink packet loss 2% → 0.06%, with download and idle ping unchanged. The cost is response time while the upload is saturated — about 60 ms more, against roughly 470 ms that this phone's cellular link adds under the same load.\n\nOff by default. Takes effect immediately, on a tunnel that is already connected.")
             }
 
-            // 🚧 DIAGNOSTIC, issue #72 — two buttons rather than a switch, on
-            // purpose: nothing here is persisted, so a state this experiment
-            // gets stuck in cannot survive a reconnect (connect rebuilds the
-            // profile with includeAllNetworks=true).
+            // Issue #72. A SWITCH, not the two buttons the experiment used: a
+            // button that starts async work and says nothing reads as broken,
+            // which is exactly how the first field run went (four taps because
+            // nothing acknowledged the first).
             Section {
-                Button("DIRECT on — routes out of the tunnel") {
-                    Task { await TunnelManager.shared.runDirectModeDiagnostic(true) }
-                }
-                Button("DIRECT off — restore the full tunnel") {
-                    Task { await TunnelManager.shared.runDirectModeDiagnostic(false) }
-                }
+                Toggle("Send traffic around the tunnel", isOn: Binding(
+                    get: { tunnel.directMode },
+                    set: { on in Task { await tunnel.setDirectMode(on) } }
+                ))
+                .disabled(tunnel.directModeBusy || tunnel.status != .connected)
             } header: {
-                Text("DIRECT (experiment)")
+                Text("DIRECT")
             } footer: {
-                Text("Tries to send traffic around the tunnel while keeping the VK connections up, by changing the VPN profile on a live session. This is a measurement, not a feature: expect a short network stall, and possibly a dropped tunnel.\n\nWatch the log for whether the TUN descriptor survives — everything else depends on that. Reconnecting restores the normal configuration no matter how it ends.")
+                Text("Sends this device's traffic straight out, while the connections to VK stay up — so switching back is instant instead of rebuilding the whole tunnel. Useful for an app or a site that refuses to work through a proxy.\n\nSwitching takes about half a second, and one packet may be lost.\n\n⚠️ While this is on, the \"all traffic through the tunnel\" protection is off: if the tunnel drops, traffic keeps flowing outside it. Reconnecting always returns to the normal mode.\n\nAvailable only while connected.")
             }
 
             Section {
