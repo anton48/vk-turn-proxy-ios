@@ -594,7 +594,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 			for powTry := 1; powTry <= maxPoWRetries; powTry++ {
 				log.Printf("vk: PoW attempt %d/%d", powTry, maxPoWRetries)
 				powCtx, powCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				powToken, showType, powErr := solveCaptchaPoW(powCtx, fetchClient, currentImg, currentSID, ua)
+				powToken, showType, reachedVK, powErr := solveCaptchaPoW(powCtx, fetchClient, currentImg, currentSID, ua)
 				powCancel()
 				lastPowErr = powErr
 
@@ -625,7 +625,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 				//
 				// So the hint counts only when the attempt actually reached VK's
 				// answer, which is exactly when there is no error to report.
-				consecutiveEmptyShow = nextEmptyShowHint(powErr, showType, consecutiveEmptyShow)
+				consecutiveEmptyShow = nextEmptyShowHint(reachedVK, showType, consecutiveEmptyShow)
 				if consecutiveEmptyShow >= 2 {
 					log.Printf("vk: %d consecutive attempts with show_captcha_type=\"\" — VK has no slider ready, skipping remaining attempts", consecutiveEmptyShow)
 					break
@@ -3013,19 +3013,25 @@ func extractCaptcha(resp map[string]interface{}) (sid, captchaURL string, captch
 // was silently wrong.
 //
 // 🚨 `showType` is only VK's answer when the attempt got far enough to be
-// answered. `solveCaptchaPoW` returns ("", "", err) on every early failure,
-// including a page it could not PARSE — and there `htmlSettings` is never even
+// answered. On a page we could not PARSE, `htmlSettings` is never even
 // extracted, so the empty string is OUR zero value. Counting it accused VK of a
 // verdict it never gave, and skipped the third attempt on top.
 //
-//	powErr != nil            → the attempt says NOTHING about VK's intent: hold
-//	powErr == nil, show ""   → VK answered, and answered "no slider": count it
-//	show non-empty           → VK named a challenge: reset
-func nextEmptyShowHint(powErr error, showType string, consecutive int) int {
+// 🚨 AND THE FIRST FIX OF THIS WAS DEAD CODE: it keyed on `powErr == nil`, but
+// EVERY non-success return of solveCaptchaPoW carries a non-nil error, so the
+// incrementing branch could never run — correct in isolation, unreachable in
+// situ, with a test passing on a state the program cannot produce.
+// *(User-caught, twice; hence an explicit stage flag rather than a proxy for
+// one.)*
+//
+//	!reached               → the attempt says NOTHING about VK's intent: hold
+//	reached, show ""       → VK answered, and answered "no challenge": count it
+//	show non-empty         → VK named a challenge: reset
+func nextEmptyShowHint(reached bool, showType string, consecutive int) int {
 	if showType != "" {
 		return 0
 	}
-	if powErr != nil {
+	if !reached {
 		return consecutive
 	}
 	return consecutive + 1

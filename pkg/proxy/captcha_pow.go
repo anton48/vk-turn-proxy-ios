@@ -8,8 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -633,7 +633,10 @@ func newHTTPClient() *http.Client {
 // user — either from the API `captchaNotRobot.check` response or (when the
 // checkbox check is skipped) from the HTML page's window.init payload. The
 // caller (creds.go) uses it as a signal for retry/backoff decisions.
-func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirectURI, captchaSID, userAgent string) (string, string, error) {
+// Returns (successToken, showType, reached, err). `reached` says whether VK
+// answered the captcha check at all — see callCaptchaNotRobotAPI. Every early
+// exit below is a failure BEFORE VK had an opinion, so they all return false.
+func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirectURI, captchaSID, userAgent string) (string, string, bool, error) {
 	captchaPowProfile = profileForUA(userAgent)
 	if p := desktopChromeProfile(); p != nil {
 		// VK_DESKTOP_CHROME diagnostic: pin the entire identity to Chrome 146
@@ -655,11 +658,11 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 
 	parsed, err := url.Parse(redirectURI)
 	if err != nil {
-		return "", "", fmt.Errorf("parse redirect_uri: %w", err)
+		return "", "", false, fmt.Errorf("parse redirect_uri: %w", err)
 	}
 	sessionToken := parsed.Query().Get("session_token")
 	if sessionToken == "" {
-		return "", "", fmt.Errorf("no session_token in redirect_uri")
+		return "", "", false, fmt.Errorf("no session_token in redirect_uri")
 	}
 	// Captcha domain: VK carries it in the redirect_uri itself
 	// (id.vk.ru/not_robot_captcha?domain=vk.com&session_token=...). Mirror it so
@@ -683,18 +686,19 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	select {
 	case <-time.After(delay):
 	case <-ctx.Done():
-		return "", "", ctx.Err()
+		return "", "", false, ctx.Err()
 	}
 
 	// Step 1: Fetch captcha page and extract PoW parameters + cookies + slider settings + JS bundle URL.
 	// This GETs the redirect_uri (typically id.vk.ru/not_robot_captcha?session_token=...)
 	// and accumulates session cookies (remixlang/remixstid/remixstlid) in the jar.
 	// These cookies are required for subsequent captchaNotRobot.* calls.
-	powInput, difficulty, powPrefix, scriptURL, htmlSettings, err := fetchPoW(ctx, client, redirectURI)
+	powParams, scriptURL, htmlSettings, err := fetchPoW(ctx, client, redirectURI)
 	if err != nil {
-		return "", "", fmt.Errorf("fetch PoW: %w", err)
+		return "", "", false, fmt.Errorf("fetch PoW: %w", err)
 	}
-	log.Printf("pow: input=%s difficulty=%d prefix=%q htmlSettings=%v scriptURL=%s", powInput, difficulty, powPrefix, htmlSettings != nil, scriptURL)
+	log.Printf("pow: input=%s difficulty=%d prefix=%q envelope=%s htmlSettings=%v scriptURL=%s",
+		powParams.Input, powParams.Difficulty, powParams.Prefix, powParams.Envelope, htmlSettings != nil, scriptURL)
 
 	// Phase 6: Pull the version-specific debug_info constant from the
 	// captcha JS bundle. Falls back to hardcoded value if the bundle URL
@@ -735,12 +739,12 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	// Step 2: Solve PoW (brute-force SHA-256), then wrap it the way the page
 	// script does — the API wants the v2 envelope, not the bare digest.
 	powStart := time.Now()
-	hexHash, nonce := solvePoW(powInput, difficulty)
+	hexHash, nonce := solvePoW(powParams.Input, powParams.Difficulty)
 	if hexHash == "" {
-		return "", "", fmt.Errorf("PoW: no solution found within 10M iterations")
+		return "", "", false, fmt.Errorf("PoW: no solution found within 10M iterations")
 	}
 	durationMs := time.Since(powStart).Milliseconds()
-	hash := buildPowResult(powPrefix, hexHash, nonce, durationMs)
+	hash := buildPowResult(powParams, hexHash, nonce, durationMs)
 	if os.Getenv("VK_POW_V1") == "1" {
 		// Diagnostic: send the pre-2026-07 bare hex digest, to establish
 		// whether the v2 envelope is actually load-bearing or merely correct.
@@ -753,13 +757,13 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	time.Sleep(time.Duration(200+mathrand.Intn(300)) * time.Millisecond)
 
 	// Step 3: Call captchaNotRobot API sequence (using same client = same cookies)
-	successToken, showType, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, captchaDomain, hash, adFp, debugInfo, htmlSettings)
+	successToken, showType, reached, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, captchaDomain, hash, adFp, debugInfo, htmlSettings)
 	if err != nil {
-		return "", showType, fmt.Errorf("captchaNotRobot API: %w", err)
+		return "", showType, reached, fmt.Errorf("captchaNotRobot API: %w", err)
 	}
 
 	log.Printf("pow: success! token=%d chars", len(successToken))
-	return successToken, showType, nil
+	return successToken, showType, reached, nil
 }
 
 // debugInfoCache maps captcha-script URL → extracted debug_info hex
@@ -848,10 +852,10 @@ func fetchAndCacheDebugInfo(ctx context.Context, client tls_client.HttpClient, s
 // 1.1.1331/not_robot_captcha.js), used by fetchAndCacheDebugInfo to
 // extract the version-specific debug_info constant. Empty if extraction
 // fails (caller falls back to hardcodedDebugInfo).
-func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI string) (powInput string, difficulty int, powPrefix string, scriptURL string, htmlSettings map[string]interface{}, err error) {
+func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI string) (params powPageParams, scriptURL string, htmlSettings map[string]interface{}, err error) {
 	req, err := fhttp.NewRequestWithContext(ctx, "GET", redirectURI, nil)
 	if err != nil {
-		return "", 0, "", "", nil, err
+		return powPageParams{}, "", nil, err
 	}
 	// Headers calibrated for Safari iOS 17 mobile (see vkReq for full
 	// rationale). For the document GET we keep navigate-mode Sec-Fetch
@@ -875,7 +879,7 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", 0, "", "", nil, fmt.Errorf("HTTP GET failed: %w", err)
+		return powPageParams{}, "", nil, fmt.Errorf("HTTP GET failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -883,7 +887,7 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 
 	body, err := io.ReadAll(resp.Body) // bogdanfinn auto-decompresses gzip
 	if err != nil {
-		return "", 0, "", "", nil, fmt.Errorf("read body (Content-Encoding=%q): %w",
+		return powPageParams{}, "", nil, fmt.Errorf("read body (Content-Encoding=%q): %w",
 			resp.Header.Get("Content-Encoding"), err)
 	}
 	// Phase 3 diagnostic: log cookies the jar received from the page GET.
@@ -910,7 +914,7 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 		}
 	}
 
-	params, perr := parsePowPage(html)
+	parsed, perr := parsePowPage(html)
 	if perr != nil {
 		preview := html
 		if len(preview) > 500 {
@@ -933,9 +937,9 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 		// verified identical in bundles 1.1.1387 and 1.1.1395), so its
 		// presence means a PoW was expected of us.
 		powSnippet(html)
-		return "", 0, "", "", nil, fmt.Errorf("%w (%d bytes)", perr, len(html))
+		return powPageParams{}, "", nil, fmt.Errorf("%w (%d bytes)", perr, len(html))
 	}
-	powInput, difficulty, powPrefix = params.Input, params.Difficulty, params.Prefix
+	params = parsed
 
 	// Also extract captcha_settings from window.init (for slider solver)
 	initRe := regexp.MustCompile(`(?s)window\.init\s*=\s*(\{.*?\})\s*;\s*window\.lang`)
@@ -961,7 +965,7 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 		log.Printf("pow: captcha script URL not found in HTML — debug_info will use hardcoded fallback")
 	}
 
-	return powInput, difficulty, powPrefix, scriptURL, htmlSettings, nil
+	return params, scriptURL, htmlSettings, nil
 }
 
 
@@ -1331,7 +1335,11 @@ func randomUUIDish() string {
 //
 // Returns (successToken, lastShowCaptchaType, err). See solveCaptchaPoW for
 // the meaning of lastShowCaptchaType.
-func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, sessionToken, domain, hash, adFp, debugInfo string, htmlSettings map[string]interface{}) (string, string, error) {
+// The `reached` return says whether VK ANSWERED the check — not whether we
+// succeeded. It is a named return defaulting to FALSE so that any early exit
+// added later is "we never got VK's opinion" by construction; the single place
+// it becomes true is right after the check response parses.
+func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, sessionToken, domain, hash, adFp, debugInfo string, htmlSettings map[string]interface{}) (token string, showType string, reached bool, err error) {
 	vkReq := func(method, postData string) (map[string]interface{}, error) {
 		reqURL := "https://" + vkAPIHost() + "/method/" + method + "?v=5.131"
 		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
@@ -1483,7 +1491,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 	log.Printf("pow: 1/4 captchaNotRobot.settings (%s)", adFpNote)
 	settingsResp, err := vkReq("captchaNotRobot.settings", settingsParams+accessTokenSuffix)
 	if err != nil {
-		return "", lastShowType, fmt.Errorf("settings: %w", err)
+		return "", lastShowType, reached, fmt.Errorf("settings: %w", err)
 	}
 
 	// Short delay after settings (100-200ms) — matches reference impl
@@ -1555,7 +1563,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 	componentData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", componentFp, deviceParam) + accessTokenSuffix
 
 	if _, err := vkReq("captchaNotRobot.componentDone", componentData); err != nil {
-		return "", lastShowType, fmt.Errorf("componentDone: %w", err)
+		return "", lastShowType, reached, fmt.Errorf("componentDone: %w", err)
 	}
 
 	// 3/4: check (checkbox-style).
@@ -1577,7 +1585,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 		select {
 		case <-time.After(checkDelay):
 		case <-ctx.Done():
-			return "", lastShowType, ctx.Err()
+			return "", lastShowType, reached, ctx.Err()
 		}
 
 		log.Printf("pow: 3/4 captchaNotRobot.check")
@@ -1644,12 +1652,15 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 
 		checkResp, err := vkReq("captchaNotRobot.check", checkData)
 		if err != nil {
-			return "", lastShowType, fmt.Errorf("check: %w", err)
+			return "", lastShowType, reached, fmt.Errorf("check: %w", err)
 		}
 
+		// VK answered the check. Whatever happens below, `lastShowType` is
+		// now ITS word and not our zero value.
+		reached = true
 		respObj, ok := checkResp["response"].(map[string]interface{})
 		if !ok {
-			return "", lastShowType, fmt.Errorf("check: invalid response: %v", checkResp)
+			return "", lastShowType, reached, fmt.Errorf("check: invalid response: %v", checkResp)
 		}
 		status, _ := respObj["status"].(string)
 		showCaptchaType, _ := respObj["show_captcha_type"].(string)
@@ -1659,7 +1670,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 		if status == "OK" {
 			successToken, ok := respObj["success_token"].(string)
 			if !ok || successToken == "" {
-				return "", lastShowType, fmt.Errorf("check: no success_token in response")
+				return "", lastShowType, reached, fmt.Errorf("check: no success_token in response")
 			}
 			time.Sleep(200 * time.Millisecond)
 			log.Printf("pow: 4/4 captchaNotRobot.endSession")
@@ -1667,7 +1678,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 			if err != nil {
 				log.Printf("pow: endSession failed (non-fatal): %v", err)
 			}
-			return successToken, lastShowType, nil
+			return successToken, lastShowType, true, nil
 		}
 
 		// Checkbox check failed. ALL non-OK statuses are treated as transient
@@ -1694,10 +1705,10 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 		if _, esErr := vkReq("captchaNotRobot.endSession", baseParams+accessTokenSuffix); esErr != nil {
 			log.Printf("pow: endSession failed (non-fatal): %v", esErr)
 		}
-		return sliderToken, lastShowType, nil
+		return sliderToken, lastShowType, true, nil
 	}
 	log.Printf("pow: slider solver failed: %v", sliderErr)
-	return "", lastShowType, fmt.Errorf("checkbox check failed and slider also failed: %v", sliderErr)
+	return "", lastShowType, reached, fmt.Errorf("checkbox check failed and slider also failed: %v", sliderErr)
 }
 
 func min(a, b int) int {
@@ -1749,13 +1760,43 @@ func powSnippet(html string) {
 //	}("gMbKzMjN77r4NVrv",2,"pow_timeout"));
 //
 // Parse the ARGUMENTS, not the names.
+// powEnvelope is the SHAPE the page wraps a solved PoW in.
+//
+// 🚨 IT IS NOT THE PREFIX, and that correction is the point of this type. The
+// comment this file used to carry — "the prefix is the field VK bumps when the
+// envelope changes shape" — is REFUTED by the very pages in testdata: bundle
+// 1.1.1387 sent {hash,nonce,duration_ms} and 1.1.1395 sends five fields, and
+// BOTH call themselves `v2.`. So the prefix is a constant we must echo, never a
+// schema version we may reason from. *(User-caught: the same commit that grew
+// the envelope also proved the prefix does not track it.)*
+type powEnvelope uint8
+
+const (
+	// envelopeLegacy3 is {hash, nonce, duration_ms} — bundle 1.1.1387 and
+	// earlier. Still reachable: VK serves different pages to different
+	// identities, so a page without telemetry must be answered in ITS shape.
+	envelopeLegacy3 powEnvelope = iota
+	// envelopeTelemetry5 adds telemetry + tel_hash — bundle 1.1.1395.
+	envelopeTelemetry5
+)
+
+func (e powEnvelope) String() string {
+	if e == envelopeTelemetry5 {
+		return "telemetry5"
+	}
+	return "legacy3"
+}
+
 type powPageParams struct {
 	Input      string
 	Difficulty int
-	// Prefix is the envelope version taken FROM THE PAGE (`v2.` today). Read
-	// rather than hardcoded: it is the one field VK bumps when the envelope
-	// changes shape, so hardcoding it guarantees we send the old shape under
-	// the new name on the day it moves.
+	// Envelope is derived from the PAGE's own script, not from the prefix.
+	Envelope powEnvelope
+	// Prefix is the literal the page concatenates before the base64 (`v2.`
+	// on every page seen so far). Echoed, not interpreted — see powEnvelope
+	// for why it cannot be used to decide the shape. Read from the page
+	// anyway so that a value we have never seen can be REFUSED rather than
+	// guessed at.
 	Prefix string
 }
 
@@ -1774,10 +1815,29 @@ var (
 // powPrefixFallback is used only when the page carries no readable prefix.
 const powPrefixFallback = "v2."
 
+// rePowTelemetry finds the page building the five-field envelope. Both the
+// obfuscated form (`'tel_hash':_0x1b5962`) and a plain one match: the KEY is
+// wire format and cannot be renamed by an obfuscator.
+var rePowTelemetry = regexp.MustCompile(`["']tel_hash["']\s*:`)
+
 func parsePowPage(html string) (powPageParams, error) {
-	p := powPageParams{Prefix: powPrefixFallback}
+	p := powPageParams{Prefix: powPrefixFallback, Envelope: envelopeLegacy3}
 	if m := rePowPrefix.FindStringSubmatch(html); len(m) >= 2 {
 		p.Prefix = m[1]
+	}
+	// 🚨 REFUSE A PREFIX WE HAVE NEVER SEEN rather than guess a shape under it.
+	// `v2.` has carried BOTH shapes, so a new prefix tells us nothing about the
+	// schema — and sending a guessed body under a version VK just bumped is a
+	// silent wrong answer, where a refusal is one loud line and one build.
+	// Capture the page with VK_DUMP_POW_HTML and teach this function.
+	if p.Prefix != powPrefixFallback {
+		return powPageParams{}, fmt.Errorf(
+			"captcha pow envelope prefix %q is unknown — capture the page with "+
+				"VK_DUMP_POW_HTML and add its shape before sending anything", p.Prefix)
+	}
+	// The SHAPE comes from the page's own script, never from the prefix.
+	if rePowTelemetry.MatchString(html) {
+		p.Envelope = envelopeTelemetry5
 	}
 
 	if m := rePowIIFEArgs.FindStringSubmatch(html); len(m) >= 3 {
@@ -1815,7 +1875,7 @@ func parsePowPage(html string) (powPageParams, error) {
 // 🚨 THE TWO NEW FIELDS ARE VK'S ANTI-AUTOMATION PROBES, and we deliberately
 // send them EMPTY. That is not a guess at a shape: the page computes telemetry
 // inside a try/catch and, when the collector throws, carries `telemetry:{}` and
-// `tel_hash:''` into the very same success envelope — so an empty pair is a
+// an empty `tel_hash` into the very same success envelope — so that pair is a
 // form real browsers produce, not one we invented. Sending it is the cheapest
 // way to learn whether the PARSE was the only thing between us and a verdict;
 // filling the probes truthfully is a much larger job (they must agree with the
@@ -1826,12 +1886,22 @@ func parsePowPage(html string) (powPageParams, error) {
 // telemetry, tel_hash — with no whitespace, and standard base64 WITH padding
 // (the page's encoder is a plain btoa wrapper), so the caller must form-escape
 // the result.
-func buildPowResult(prefix, hexHash string, nonce int, durationMs int64) string {
+func buildPowResult(p powPageParams, hexHash string, nonce int, durationMs int64) string {
+	prefix := p.Prefix
 	if prefix == "" {
 		prefix = powPrefixFallback
 	}
-	payload := fmt.Sprintf(
-		`{"hash":"%s","nonce":%d,"duration_ms":%d,"telemetry":{},"tel_hash":""}`,
-		hexHash, nonce, durationMs)
+	// 🚨 ANSWER THE PAGE IN ITS OWN SHAPE. Emitting five fields at a page that
+	// builds three is not "newer", it is wrong — and it would happen silently
+	// on exactly the identities VK still serves the old page to.
+	var payload string
+	switch p.Envelope {
+	case envelopeTelemetry5:
+		payload = fmt.Sprintf(
+			`{"hash":"%s","nonce":%d,"duration_ms":%d,"telemetry":{},"tel_hash":""}`,
+			hexHash, nonce, durationMs)
+	default:
+		payload = fmt.Sprintf(`{"hash":"%s","nonce":%d,"duration_ms":%d}`, hexHash, nonce, durationMs)
+	}
 	return prefix + base64.StdEncoding.EncodeToString([]byte(payload))
 }

@@ -19,6 +19,14 @@ import (
 // it has to match.
 const powFixture = "testdata/captcha_pow_page_1_1_1395.html"
 
+// legacyPowPage is the pre-obfuscation shape, from the 2026-07-31 capture
+// recorded in the wire reference: three fields, and the SAME `v2.` prefix.
+const legacyPowPage = `<html><script>
+window.captchaPowResult = "v2." + btoa(JSON.stringify({hash: hash, nonce: nonce}));
+const powInput = "Pihj7tyAHFxdwm4t";
+if (h.startsWith('0'.repeat(3))) {}
+</script></html>`
+
 func loadPowFixture(t *testing.T) string {
 	t.Helper()
 	b, err := os.ReadFile(powFixture)
@@ -26,6 +34,19 @@ func loadPowFixture(t *testing.T) string {
 		t.Fatalf("read %s: %v", powFixture, err)
 	}
 	return string(b)
+}
+
+func decodePowPayload(t *testing.T, result, prefix string) string {
+	t.Helper()
+	payload, ok := strings.CutPrefix(result, prefix)
+	if !ok {
+		t.Fatalf("result = %q, want prefix %q", result, prefix)
+	}
+	raw, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		t.Fatalf("payload is not standard base64 with padding: %v", err)
+	}
+	return string(raw)
 }
 
 // The values are the ones the page hands its own script:
@@ -47,40 +68,77 @@ func TestParsePowPageObfuscated(t *testing.T) {
 	}
 }
 
-// 🚨 THE PREFIX MUST COME FROM THE PAGE, not from our constant. It is the one
-// field VK bumps when the envelope changes shape, so a hardcoded value
-// guarantees we send the OLD shape under the NEW name on the day it moves —
-// which is exactly the failure this whole change is repairing.
-//
-// SABOTAGE SEEN TO FAIL: return powPrefixFallback unconditionally from
-// parsePowPage. Compiles, and every other assertion here still passes.
-func TestParsePowPageReadsPrefixFromThePage(t *testing.T) {
-	html := strings.Replace(loadPowFixture(t),
-		"window['captchaPowResult']='v2.'+", "window['captchaPowResult']='v3.'+", -1)
-	p, err := parsePowPage(html)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if p.Prefix != "v3." {
-		t.Errorf("prefix = %q, want v3. — the page's value, not ours", p.Prefix)
-	}
-}
-
-// The pre-obfuscation page must keep working: VK serves different pages to
+// The pre-obfuscation page must keep parsing: VK serves different pages to
 // different identities, and a rollback on their side must not need a build on
 // ours.
 func TestParsePowPageLegacyStillParses(t *testing.T) {
-	html := `<html><script>
-window.captchaPowResult = "v2." + btoa(JSON.stringify({hash: hash, nonce: nonce}));
-const powInput = "Pihj7tyAHFxdwm4t";
-if (h.startsWith('0'.repeat(3))) {}
-</script></html>`
-	p, err := parsePowPage(html)
+	p, err := parsePowPage(legacyPowPage)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 	if p.Input != "Pihj7tyAHFxdwm4t" || p.Difficulty != 3 || p.Prefix != "v2." {
 		t.Errorf("legacy parse = %q/%d/%q", p.Input, p.Difficulty, p.Prefix)
+	}
+}
+
+// 🚨 THE TWO PAGES MUST BE CLASSIFIED DIFFERENTLY, or the shape choice below has
+// nothing to act on. Detection is by the page's own script — the `tel_hash` KEY
+// is wire format and an obfuscator cannot rename it.
+//
+// SABOTAGE SEEN TO FAIL: set Envelope = envelopeTelemetry5 unconditionally in
+// parsePowPage.
+func TestParsePowPageDetectsTheEnvelopeShape(t *testing.T) {
+	p, err := parsePowPage(loadPowFixture(t))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p.Envelope != envelopeTelemetry5 {
+		t.Errorf("1.1.1395 classified as %s, want telemetry5", p.Envelope)
+	}
+
+	lp, err := parsePowPage(legacyPowPage)
+	if err != nil {
+		t.Fatalf("parse legacy: %v", err)
+	}
+	if lp.Envelope != envelopeLegacy3 {
+		t.Errorf("legacy page classified as %s, want legacy3", lp.Envelope)
+	}
+}
+
+// 🚨 ANSWER THE PAGE IN ITS OWN SHAPE — the correction that matters most here.
+// BOTH pages call themselves `v2.`: bundle 1.1.1387 sent three fields, 1.1.1395
+// sends five. So a parser that reads the legacy page and then emits five fields
+// answers it in a shape its own script never produced — silently, and on exactly
+// the identities VK still serves the old page to.
+// *(User-caught. The comment this file used to carry, "VK bumps the prefix when
+// the shape changes", is refuted by these two fixtures.)*
+//
+// SABOTAGE SEEN TO FAIL: make buildPowResult always emit the five-field body.
+func TestBuildPowResultAnswersInThePagesOwnShape(t *testing.T) {
+	five := buildPowResult(powPageParams{Prefix: "v2.", Envelope: envelopeTelemetry5}, "00ab", 7, 42)
+	want5 := `{"hash":"00ab","nonce":7,"duration_ms":42,"telemetry":{},"tel_hash":""}`
+	if got := decodePowPayload(t, five, "v2."); got != want5 {
+		t.Errorf("telemetry5 payload =\n  %s\nwant\n  %s", got, want5)
+	}
+
+	three := buildPowResult(powPageParams{Prefix: "v2.", Envelope: envelopeLegacy3}, "00ab", 7, 42)
+	want3 := `{"hash":"00ab","nonce":7,"duration_ms":42}`
+	if got := decodePowPayload(t, three, "v2."); got != want3 {
+		t.Errorf("legacy3 payload =\n  %s\nwant\n  %s — a three-field page must get three fields", got, want3)
+	}
+}
+
+// 🚨 AN UNKNOWN PREFIX MUST BE REFUSED, NOT GUESSED AT. `v2.` has already
+// carried two different shapes, so a NEW prefix tells us nothing about the
+// schema — and a guessed body under a version VK just bumped is a silent wrong
+// answer, where a refusal is one loud line and one build.
+//
+// SABOTAGE SEEN TO FAIL: drop the `p.Prefix != powPrefixFallback` guard.
+func TestParsePowPageRefusesAnUnknownPrefix(t *testing.T) {
+	html := strings.Replace(loadPowFixture(t),
+		"window['captchaPowResult']='v2.'+", "window['captchaPowResult']='v3.'+", -1)
+	if _, err := parsePowPage(html); err == nil {
+		t.Fatal("expected a refusal for a prefix we have never seen")
 	}
 }
 
@@ -104,37 +162,6 @@ func TestParsePowPageRefusesAbsurdDifficulty(t *testing.T) {
 	}
 }
 
-// 🚨 THE ENVELOPE MUST CARRY THE TWO NEW FIELDS, in the page's own key order,
-// with the empty values the page itself produces when its telemetry collector
-// throws. The three-field form is what VK stopped accepting.
-//
-// SABOTAGE SEEN TO FAIL: drop `"telemetry":{},"tel_hash":""` from the payload.
-func TestBuildPowResultShape(t *testing.T) {
-	got := buildPowResult("v2.", "00ab", 7, 42)
-	payload, ok := strings.CutPrefix(got, "v2.")
-	if !ok {
-		t.Fatalf("result = %q, want a v2. prefix", got)
-	}
-	raw, err := base64.StdEncoding.DecodeString(payload)
-	if err != nil {
-		t.Fatalf("payload is not standard base64 with padding: %v", err)
-	}
-	want := `{"hash":"00ab","nonce":7,"duration_ms":42,"telemetry":{},"tel_hash":""}`
-	if string(raw) != want {
-		t.Errorf("payload =\n  %s\nwant\n  %s", raw, want)
-	}
-}
-
-// The prefix threads through rather than being re-hardcoded at the last step.
-func TestBuildPowResultUsesTheGivenPrefix(t *testing.T) {
-	if got := buildPowResult("v3.", "00ab", 1, 1); !strings.HasPrefix(got, "v3.") {
-		t.Errorf("result = %q, want the v3. prefix it was given", got)
-	}
-	if got := buildPowResult("", "00ab", 1, 1); !strings.HasPrefix(got, powPrefixFallback) {
-		t.Errorf("empty prefix should fall back to %q, got %q", powPrefixFallback, got)
-	}
-}
-
 // End to end on the real page: parse it, solve it, and check the digest the
 // page's own condition would accept.
 func TestSolvePoWAgainstTheRealPage(t *testing.T) {
@@ -152,30 +179,36 @@ func TestSolvePoWAgainstTheRealPage(t *testing.T) {
 	t.Logf("solved the captured page: nonce=%d hash=%s…", nonce, hash[:12])
 }
 
-// 🚨 A FAILED ATTEMPT MUST NOT BE COUNTED AS A VERDICT BY VK. When VK obfuscated
-// the PoW script every attempt died at the parse with showType="" — our own zero
-// value — and the old counter read that as "VK has no slider ready" and skipped
-// the remaining attempt. The log then blamed VK for a defect that was ours, which
-// is what made the failure look like an identity problem for hours.
+// 🚨 A FAILED ATTEMPT MUST NOT BE COUNTED AS A VERDICT BY VK, and it must be
+// REACHABLE for the rule to mean anything.
 //
-// SABOTAGE SEEN TO FAIL: count every empty showType regardless of powErr, i.e.
-// `if showType == "" { return consecutive + 1 }` as the first clause.
-func TestEmptyShowHintIgnoresFailedAttempts(t *testing.T) {
-	boom := os.ErrDeadlineExceeded
-
-	if got := nextEmptyShowHint(boom, "", 0); got != 0 {
-		t.Errorf("a FAILED attempt moved the counter to %d — it says nothing about VK", got)
+// The first version of this guard keyed on `powErr == nil`, which made it dead
+// code: every non-success return of solveCaptchaPoW carries a non-nil error, so
+// the incrementing branch could never run. The predicate was correct in
+// isolation and unreachable in situ — and the test passed on a state the
+// program cannot produce. *(User-caught.)*
+//
+// The stage is now explicit: `reached` is true only once VK has actually
+// answered the check, whatever the outcome.
+//
+// SABOTAGE SEEN TO FAIL: count every empty showType regardless of `reached`.
+func TestEmptyShowHintCountsOnlyWhatVKAnswered(t *testing.T) {
+	// Never got to VK: transport, parse, or a page we could not read.
+	if got := nextEmptyShowHint(false, "", 0); got != 0 {
+		t.Errorf("an UNREACHED attempt moved the counter to %d — it says nothing about VK", got)
 	}
-	if got := nextEmptyShowHint(boom, "", 1); got != 1 {
-		t.Errorf("a failed attempt changed a standing count: %d, want 1 held", got)
+	if got := nextEmptyShowHint(false, "", 1); got != 1 {
+		t.Errorf("an unreached attempt changed a standing count: %d, want 1 held", got)
 	}
-	if got := nextEmptyShowHint(nil, "", 1); got != 2 {
+	// VK answered, and answered "no challenge type": that is its verdict.
+	if got := nextEmptyShowHint(true, "", 1); got != 2 {
 		t.Errorf("VK answering with no slider should count: %d, want 2", got)
 	}
-	if got := nextEmptyShowHint(nil, "slider", 5); got != 0 {
+	// VK named a challenge: the next attempt has a real chance.
+	if got := nextEmptyShowHint(true, "slider", 5); got != 0 {
 		t.Errorf("a named challenge should reset: %d, want 0", got)
 	}
-	if got := nextEmptyShowHint(boom, "slider", 5); got != 0 {
-		t.Errorf("a named challenge resets even on a failed attempt: %d, want 0", got)
+	if got := nextEmptyShowHint(false, "slider", 5); got != 0 {
+		t.Errorf("a named challenge resets even on an unreached attempt: %d, want 0", got)
 	}
 }
