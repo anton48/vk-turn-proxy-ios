@@ -442,6 +442,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     self.logMsg("wgAttachWireGuard OK — tunnel fully up")
                     completionHandler(nil)
+
+                    // 🚨 AND NOW HONOUR A PROFILE THAT ALREADY SAYS DIRECT.
+                    // The bootstrap above always applies the FULL routes, which
+                    // is right for a user-driven connect: the app rewrites the
+                    // profile with includeAllNetworks=true on its way in. But
+                    // iOS can restart this extension on its own — after a
+                    // jetsam kill, which this project has a history of — and
+                    // then startTunnel runs against whatever the profile says.
+                    // Without this, the switch in the app would read DIRECT
+                    // (it derives from the profile) while every packet went
+                    // through the tunnel: a split-brain nobody would see until
+                    // they wondered why DIRECT stopped working.
+                    // *(User-caught by asking how "survives an app restart" and
+                    // "a reconnect returns to normal" can both be true.)*
+                    let p = self.protocolConfiguration
+                    var enforce = false
+                    if #available(iOS 14.2, *) { enforce = p.enforceRoutes }
+                    if !p.includeAllNetworks && enforce {
+                        self.logMsg("direct: the profile says DIRECT at startup — applying it, "
+                            + "because this start did not come through the app's connect()")
+                        self.applyDirectRoutes(true, reason: "startup") { _ in }
+                    }
                 }
             }
         }

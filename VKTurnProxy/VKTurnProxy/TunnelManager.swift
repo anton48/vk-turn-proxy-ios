@@ -189,13 +189,24 @@ class TunnelManager: ObservableObject {
     /// DIRECT mode (issue #72): traffic goes around the tunnel while the VK
     /// connections stay up.
     ///
-    /// 🎯 DERIVED FROM THE PROFILE, NEVER STORED. The truth is
+    /// 🎯 DERIVED FROM THE PROFILE, NEVER STORED — the truth is
     /// `includeAllNetworks == false && enforceRoutes == true` on the VPN
-    /// configuration, so this survives an app restart, matches what the tunnel
-    /// is actually doing, and cannot drift the way a second copy would. Every
-    /// connect rebuilds the profile with `includeAllNetworks = true`, so a
-    /// reconnect always lands back in the normal mode — which is also the
-    /// recovery path if anything goes wrong.
+    /// configuration, so it cannot drift the way a second copy would.
+    ///
+    /// 🚨 TWO DIFFERENT EVENTS, AND SAYING THEM IN ONE BREATH READS AS A
+    /// CONTRADICTION *(it did — user-caught)*:
+    ///
+    ///   - **the APP restarts** while the tunnel keeps running: nothing rewrote
+    ///     the profile, so DIRECT is still on and this reads it back at attach.
+    ///     The switch survives.
+    ///   - **the TUNNEL is reconnected** through `connect()`: that path rebuilds
+    ///     the profile with `includeAllNetworks = true`, so DIRECT ends. That is
+    ///     also the recovery path if anything ever goes wrong.
+    ///   - 🚨 **and the third case, which the question above uncovered**: iOS
+    ///     restarting the EXTENSION on its own (jetsam) does neither — the
+    ///     profile still says DIRECT while `startTunnel` applies the full
+    ///     routes. The extension now re-applies DIRECT at startup for exactly
+    ///     that, or the switch would say DIRECT while everything was tunnelled.
     @Published private(set) var directMode = false
     /// True while a change is in flight, so the switch can refuse a second tap.
     @Published private(set) var directModeBusy = false
