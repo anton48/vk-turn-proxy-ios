@@ -223,6 +223,19 @@ class TunnelManager: ObservableObject {
     ///     routes. The extension now re-applies DIRECT at startup for exactly
     ///     that, or the switch would say DIRECT while everything was tunnelled.
     @Published private(set) var directMode = false
+
+    /// What went wrong with the LAST routing change, shown under the DIRECT
+    /// switch itself.
+    ///
+    /// 🚨 DELIBERATELY NOT THE SHARED `errorMessage`. Two reasons, both learned
+    /// here: that one is about connecting and is cleared by flows that have
+    /// nothing to do with routing, so a routing failure could outlive its cause
+    /// or be wiped by an unrelated success — and clearing it from here would
+    /// erase a VPN error that still matters. A dedicated field can be cleared
+    /// the moment a routing change is CONFIRMED, which is the only event that
+    /// actually resolves it. *(User-caught: a successful retry left the old
+    /// routing error on screen.)*
+    @Published private(set) var directModeError: String?
     /// True while a change is in flight, so the switch can refuse a second tap.
     @Published private(set) var directModeBusy = false
 
@@ -1134,6 +1147,9 @@ class TunnelManager: ObservableObject {
         }
         directModeBusy = true
         defer { directModeBusy = false }
+        // A new attempt supersedes the previous verdict. It is set again below
+        // unless this one is CONFIRMED — silence must never clear it.
+        directModeError = nil
 
         let t0 = Date()
         do {
@@ -1168,7 +1184,7 @@ class TunnelManager: ObservableObject {
                 + "\(Int(Date().timeIntervalSince(t0) * 1000)) ms")
         } catch {
             note("🚨 could not save the profile: \(error.localizedDescription)")
-            errorMessage = "Could not switch routing: \(error.localizedDescription)"
+            directModeError = "Could not switch routing: \(error.localizedDescription)"
             // The in-memory restore above fixes the object we hold; re-reading
             // fixes anything else that moved. Only then may the switch refresh.
             try? await manager.loadFromPreferences()
@@ -1185,19 +1201,65 @@ class TunnelManager: ObservableObject {
         // the extension is ASKED what the routes actually are.
         let ack = await confirmDirectApplied(direct)
         refreshDirectMode()
+        // 🚨 THE TWO DIRECTIONS ARE NOT SYMMETRIC, which is why an unconfirmed
+        // result cannot simply be logged:
+        //
+        //   Unconfirmed ON  — worst case the traffic is still TUNNELLED. The
+        //     kill switch is still on, nothing leaks, and the user merely does
+        //     not get the bypass they asked for. Say so and let them retry.
+        //
+        //   Unconfirmed OFF — worst case the traffic is still going AROUND the
+        //     tunnel while the profile has already put `includeAllNetworks`
+        //     back and the switch, the Live Activity and the status all say
+        //     "tunnelled". That is unprotected traffic under a UI claiming
+        //     protection, and it is the one outcome this feature must never
+        //     produce. *(User-caught: `.silent` still looked like success, and
+        //     ON → OFF is where it is dangerous.)*
         switch ack {
         case .applied(let actual) where actual == direct:
+            // The ONLY event that resolves a routing error is a confirmation.
+            directModeError = nil
             note("confirmed by the extension: routes are "
                 + (actual ? "DIRECT — traffic goes around the tunnel" : "tunnelled"))
         case .applied(let actual):
             note("🚨 the extension reports the routes are \(actual ? "DIRECT" : "tunnelled") "
                 + "while the profile now asks for \(direct ? "DIRECT" : "tunnelled")")
-            errorMessage = direct
-                ? "Routing did not switch: traffic is still going through the tunnel."
-                : "Routing did not switch back: traffic is still going around the tunnel."
+            await directChangeUnconfirmed(
+                wanted: direct,
+                message: direct
+                    ? "Routing did not switch — traffic is still going through the tunnel."
+                    : "Routing did not switch back — traffic was still going around the tunnel.")
         case .silent:
-            note("⚠️ the extension did not answer — the profile is saved and KVO should carry it, "
-                + "but this switch is showing the profile, not a confirmation")
+            note("⚠️ the extension did not answer, twice — the state of the routes is UNKNOWN")
+            await directChangeUnconfirmed(
+                wanted: direct,
+                message: direct
+                    ? "No answer from the tunnel — routing may not have switched."
+                    : "No answer from the tunnel — routing may still be bypassed.")
+        }
+    }
+
+    /// A routing change that was not confirmed. Surfaces it under the switch,
+    /// and for the dangerous direction repairs it the one way that cannot
+    /// itself fail to be confirmed.
+    private func directChangeUnconfirmed(wanted direct: Bool, message: String) async {
+        directModeError = message
+        // An unconfirmed ON is safe: at worst nothing changed and the tunnel is
+        // still carrying everything. Leave the retry to the user rather than
+        // charging them a reconnect — which would end DIRECT anyway.
+        guard !direct else { return }
+
+        SharedLogger.shared.log("[App] direct: 🚨 an unconfirmed return to the tunnel may be a LEAK "
+            + "— reconnecting, which rebuilds the full-tunnel routes from scratch")
+        directModeError = message + " Reconnecting to restore it."
+        await switchAndReconnect(to: ServerStore.shared.activeServerId)
+        refreshDirectMode()
+        if directMode {
+            // The rebuilt profile should be full-tunnel; if it is not, say so
+            // rather than leaving the switch to imply everything is fine.
+            directModeError = "Reconnected, but routing is still bypassing the tunnel."
+        } else {
+            directModeError = "Routing could not be confirmed, so the tunnel was rebuilt."
         }
     }
 

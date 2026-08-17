@@ -177,6 +177,21 @@ struct AdvancedView: View {
                     set: { on in Task { await tunnel.setDirectMode(on) } }
                 ))
                 .disabled(tunnel.directModeBusy || tunnel.status != .connected)
+
+                // 🚨 AN UNCONFIRMED CHANGE MUST NOT LOOK LIKE A SUCCESSFUL ONE.
+                // The switch is driven by the PROFILE, so it flips as soon as
+                // the profile is saved — before anything has confirmed that the
+                // routes followed. Without this row a lost acknowledgement is
+                // indistinguishable from success, and in the ON → OFF direction
+                // that means the UI claims the tunnel is protecting traffic
+                // that may still be going around it. Its own field, not the
+                // shared `errorMessage`: that one is about connecting and is
+                // cleared by unrelated flows. *(User-caught.)*
+                if let problem = tunnel.directModeError {
+                    Label(problem, systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
             } header: {
                 Text("DIRECT")
             } footer: {

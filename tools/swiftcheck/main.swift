@@ -564,6 +564,45 @@ do {
     check(DirectRouteSync.parseReply("direct=yes") == nil, "a malformed value is refused, not guessed")
 }
 
+// 24. 🚨 AN UNCONFIRMED ROUTING CHANGE MUST REACH THE SCREEN, AND ONLY A
+//     CONFIRMATION MAY CLEAR IT. This is the two-part-hookup trap: a `@Published`
+//     nobody renders is a green suite and a silent failure, and the dangerous
+//     half is ON → OFF, where an unconfirmed result leaves traffic possibly
+//     outside a tunnel the UI says is carrying it.
+//
+//     FOUR SABOTAGES, EACH RUN AND EACH REDDENING EXACTLY ONE CHECK:
+//       a. delete the `if let problem = tunnel.directModeError` row from
+//          AdvancedView — the state survives and nothing renders it;
+//       b. write the save failure to `errorMessage` again;
+//       c. drop `guard !direct else { return }` — an unconfirmed ON would then
+//          reconnect too, which ends the DIRECT the user just asked for;
+//       d. replace the `switchAndReconnect` call — an unconfirmed OFF would be
+//          reported and left alone, which is the leak this section exists for.
+//     ⚠️ The comment first named a fifth that reddens NOTHING ("clear
+//     directModeError in the .silent branch"): no check here reads that branch.
+//     Predicting a sabotage is not running one — see the twelfth instance in
+//     feedback_tests_must_be_seen_to_fail.
+do {
+    let adv = source("VKTurnProxy/VKTurnProxy/AdvancedView.swift")
+    let tm = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+
+    check(adv.contains("tunnel.directModeError"),
+          "🚨 the DIRECT switch RENDERS its own error — a @Published nobody shows is not a report")
+    check(tm.contains("@Published private(set) var directModeError"),
+          "and routing has its OWN error field, not the shared errorMessage")
+    check(!tm.contains("errorMessage = \"Could not switch routing"),
+          "🚨 routing failures no longer write to the shared errorMessage, which unrelated flows clear")
+
+    // The reconnect fallback exists and is reached only for the unsafe direction.
+    let fn = tm.range(of: "private func directChangeUnconfirmed")
+    check(fn != nil, "the unconfirmed-change handler exists")
+    let body = fn.map { String(tm[$0.lowerBound...].prefix(1400)) } ?? ""
+    check(body.contains("guard !direct else { return }"),
+          "🚨 an unconfirmed ON is left to the user — it cannot leak, and a reconnect would end DIRECT")
+    check(body.contains("switchAndReconnect"),
+          "🚨 but an unconfirmed OFF REBUILDS the tunnel — the only repair that cannot itself be unconfirmed")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")
