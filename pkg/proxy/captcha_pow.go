@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -689,11 +690,11 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	// This GETs the redirect_uri (typically id.vk.ru/not_robot_captcha?session_token=...)
 	// and accumulates session cookies (remixlang/remixstid/remixstlid) in the jar.
 	// These cookies are required for subsequent captchaNotRobot.* calls.
-	powInput, difficulty, scriptURL, htmlSettings, err := fetchPoW(ctx, client, redirectURI)
+	powInput, difficulty, powPrefix, scriptURL, htmlSettings, err := fetchPoW(ctx, client, redirectURI)
 	if err != nil {
 		return "", "", fmt.Errorf("fetch PoW: %w", err)
 	}
-	log.Printf("pow: input=%s difficulty=%d htmlSettings=%v scriptURL=%s", powInput, difficulty, htmlSettings != nil, scriptURL)
+	log.Printf("pow: input=%s difficulty=%d prefix=%q htmlSettings=%v scriptURL=%s", powInput, difficulty, powPrefix, htmlSettings != nil, scriptURL)
 
 	// Phase 6: Pull the version-specific debug_info constant from the
 	// captcha JS bundle. Falls back to hardcoded value if the bundle URL
@@ -739,7 +740,7 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 		return "", "", fmt.Errorf("PoW: no solution found within 10M iterations")
 	}
 	durationMs := time.Since(powStart).Milliseconds()
-	hash := buildPowResultV2(hexHash, nonce, durationMs)
+	hash := buildPowResult(powPrefix, hexHash, nonce, durationMs)
 	if os.Getenv("VK_POW_V1") == "1" {
 		// Diagnostic: send the pre-2026-07 bare hex digest, to establish
 		// whether the v2 envelope is actually load-bearing or merely correct.
@@ -847,10 +848,10 @@ func fetchAndCacheDebugInfo(ctx context.Context, client tls_client.HttpClient, s
 // 1.1.1331/not_robot_captcha.js), used by fetchAndCacheDebugInfo to
 // extract the version-specific debug_info constant. Empty if extraction
 // fails (caller falls back to hardcodedDebugInfo).
-func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI string) (powInput string, difficulty int, scriptURL string, htmlSettings map[string]interface{}, err error) {
+func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI string) (powInput string, difficulty int, powPrefix string, scriptURL string, htmlSettings map[string]interface{}, err error) {
 	req, err := fhttp.NewRequestWithContext(ctx, "GET", redirectURI, nil)
 	if err != nil {
-		return "", 0, "", nil, err
+		return "", 0, "", "", nil, err
 	}
 	// Headers calibrated for Safari iOS 17 mobile (see vkReq for full
 	// rationale). For the document GET we keep navigate-mode Sec-Fetch
@@ -874,7 +875,7 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", 0, "", nil, fmt.Errorf("HTTP GET failed: %w", err)
+		return "", 0, "", "", nil, fmt.Errorf("HTTP GET failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -882,7 +883,7 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 
 	body, err := io.ReadAll(resp.Body) // bogdanfinn auto-decompresses gzip
 	if err != nil {
-		return "", 0, "", nil, fmt.Errorf("read body (Content-Encoding=%q): %w",
+		return "", 0, "", "", nil, fmt.Errorf("read body (Content-Encoding=%q): %w",
 			resp.Header.Get("Content-Encoding"), err)
 	}
 	// Phase 3 diagnostic: log cookies the jar received from the page GET.
@@ -894,26 +895,47 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 	logCookiesForURL(client, "https://id.vk.ru", "fetchPoW post-GET (id.vk.ru)")
 	html := string(body)
 
-	powRe := regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)
-	m := powRe.FindStringSubmatch(html)
-	if len(m) < 2 {
+	// 🔧 `VK_DUMP_POW_HTML=<path>` saves the page verbatim. Every captcha page
+	// costs a real VK session token, so a parser developed by re-running against
+	// live VK burns a session per iteration and rate-limits us for the privilege.
+	// One capture becomes a test fixture, and the parser is then written offline
+	// against the page it actually has to match — which is also the only way the
+	// regex can be checked BEFORE it ships. *(Same reason `testdata/
+	// slider_puzzle.json` exists for the slider.)*
+	if p := os.Getenv("VK_DUMP_POW_HTML"); p != "" {
+		if err := os.WriteFile(p, body, 0600); err != nil {
+			log.Printf("pow: 🚨 VK_DUMP_POW_HTML=%s: %v", p, err)
+		} else {
+			log.Printf("pow: page saved to %s (%d bytes)", p, len(body))
+		}
+	}
+
+	params, perr := parsePowPage(html)
+	if perr != nil {
 		preview := html
 		if len(preview) > 500 {
 			preview = preview[:500]
 		}
 		log.Printf("pow: HTML preview: %s", preview)
-		return "", 0, "", nil, fmt.Errorf("powInput not found in HTML (%d bytes)", len(html))
+		// 🚨 THE PREVIEW ABOVE CANNOT ANSWER WHY, and that is the whole point
+		// of the line below. A parse failure has TWO very different causes and
+		// they need opposite fixes:
+		//
+		//   (a) VK still challenges us but the page format moved. Then
+		//       `captchaPowResult` IS on the page and our patterns are stale.
+		//   (b) VK served a page with NO PoW at all, which is what it does to
+		//       an identity it has already decided about (it likewise refuses
+		//       the slider — `show_captcha_type` comes back empty). Then the
+		//       page format is innocent and the problem is the identity.
+		//
+		// The discriminator is one string: `captchaPowResult` is what the
+		// vkid bundle reads (`getPowResult(){return window.captchaPowResult}`,
+		// verified identical in bundles 1.1.1387 and 1.1.1395), so its
+		// presence means a PoW was expected of us.
+		powSnippet(html)
+		return "", 0, "", "", nil, fmt.Errorf("%w (%d bytes)", perr, len(html))
 	}
-	powInput = m[1]
-
-	diffRe := regexp.MustCompile(`startsWith\('0'\.repeat\((\d+)\)\)`)
-	dm := diffRe.FindStringSubmatch(html)
-	difficulty = 2
-	if len(dm) >= 2 {
-		if d, e := strconv.Atoi(dm[1]); e == nil {
-			difficulty = d
-		}
-	}
+	powInput, difficulty, powPrefix = params.Input, params.Difficulty, params.Prefix
 
 	// Also extract captcha_settings from window.init (for slider solver)
 	initRe := regexp.MustCompile(`(?s)window\.init\s*=\s*(\{.*?\})\s*;\s*window\.lang`)
@@ -939,7 +961,7 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 		log.Printf("pow: captcha script URL not found in HTML — debug_info will use hardcoded fallback")
 	}
 
-	return powInput, difficulty, scriptURL, htmlSettings, nil
+	return powInput, difficulty, powPrefix, scriptURL, htmlSettings, nil
 }
 
 
@@ -1683,4 +1705,133 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// powSnippet says WHY fetchPoW's regex missed, by looking for the one string
+// that decides it. Diagnostic only — it never changes control flow.
+//
+// It prints a window around `captchaPowResult` rather than the whole page: the
+// page is ~34 KB, a full dump is unreadable in a device log, and everything
+// that identifies the new format (the IIFE arguments and the envelope's version
+// prefix) sits within a few hundred bytes of that name.
+func powSnippet(html string) {
+	// The bundle version tells us which page we are looking at; our byte-level
+	// wire reference was captured from 1.1.1387.
+	if m := regexp.MustCompile(`vkid/([0-9.]+)/`).FindStringSubmatch(html); len(m) >= 2 {
+		log.Printf("pow: page bundle version = %s", m[1])
+	}
+	i := strings.Index(html, "captchaPowResult")
+	if i < 0 {
+		log.Printf("pow: 🚨 `captchaPowResult` is ABSENT from the page — VK did not ask us for " +
+			"a PoW at all. That is an IDENTITY verdict, not a format change; the parser is innocent.")
+		return
+	}
+	start := max(i-500, 0)
+	end := min(i+500, len(html))
+	log.Printf("pow: 🚨 `captchaPowResult` IS present at offset %d, so a PoW WAS expected and our "+
+		"regex is what is stale. Window around it:\n%s", i, html[start:end])
+}
+
+// powPageParams is what the captcha page's inline PoW script is driven by.
+//
+// 🚨 THE PAGE IS OBFUSCATED AS OF BUNDLE 1.1.1395 (measured 2026-08-18), and
+// that killed BOTH of our previous patterns at once:
+//
+//	was: const powInput = "…"                → the input is now a variable
+//	was: startsWith('0'.repeat(N))           → now h['startsWith']('0'['repeat'](v))
+//
+// Identifiers are regenerated per release (`_0x421042`, `_0x543e3e`, …) and
+// every member access is a string literal, so nothing named survives. What DOES
+// survive is the shape of the call that starts the whole thing: the script is
+// one IIFE and its three arguments are the session's input, the difficulty and
+// an error label, spelled out at the very end of the block:
+//
+//	}("gMbKzMjN77r4NVrv",2,"pow_timeout"));
+//
+// Parse the ARGUMENTS, not the names.
+type powPageParams struct {
+	Input      string
+	Difficulty int
+	// Prefix is the envelope version taken FROM THE PAGE (`v2.` today). Read
+	// rather than hardcoded: it is the one field VK bumps when the envelope
+	// changes shape, so hardcoding it guarantees we send the old shape under
+	// the new name on the day it moves.
+	Prefix string
+}
+
+var (
+	// The obfuscated IIFE's arguments. The input is base64-ish (VK's is 16
+	// chars); the third argument is the error label, matched but discarded.
+	rePowIIFEArgs = regexp.MustCompile(`\}\(\s*["']([A-Za-z0-9+/=_-]{8,})["']\s*,\s*(\d+)\s*,\s*["'][^"']*["']\s*\)\s*\)`)
+	// The pre-obfuscation form, kept because VK serves different pages to
+	// different identities and a rollback must not need a new build.
+	rePowLegacyInput = regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)
+	rePowLegacyDiff  = regexp.MustCompile(`startsWith\('0'\.repeat\((\d+)\)\)|const\s+difficulty\s*=\s*(\d+)`)
+	// `window['captchaPowResult']='v2.'+…` and the old `captchaPowResult = "v2." +`.
+	rePowPrefix = regexp.MustCompile(`captchaPowResult["'\]]{0,3}\s*=\s*["']([A-Za-z0-9._-]{0,8})["']\s*\+`)
+)
+
+// powPrefixFallback is used only when the page carries no readable prefix.
+const powPrefixFallback = "v2."
+
+func parsePowPage(html string) (powPageParams, error) {
+	p := powPageParams{Prefix: powPrefixFallback}
+	if m := rePowPrefix.FindStringSubmatch(html); len(m) >= 2 {
+		p.Prefix = m[1]
+	}
+
+	if m := rePowIIFEArgs.FindStringSubmatch(html); len(m) >= 3 {
+		d, err := strconv.Atoi(m[2])
+		if err != nil || d <= 0 || d > 8 {
+			// A difficulty we cannot honour is worse than no answer: the loop
+			// would run to its 10M ceiling and report a timeout as a solve.
+			return powPageParams{}, fmt.Errorf("captcha pow difficulty %q out of range", m[2])
+		}
+		p.Input, p.Difficulty = m[1], d
+		return p, nil
+	}
+
+	if m := rePowLegacyInput.FindStringSubmatch(html); len(m) >= 2 {
+		p.Input, p.Difficulty = m[1], 2
+		if dm := rePowLegacyDiff.FindStringSubmatch(html); len(dm) >= 2 {
+			raw := dm[1]
+			if raw == "" && len(dm) >= 3 {
+				raw = dm[2]
+			}
+			if d, err := strconv.Atoi(raw); err == nil && d > 0 && d <= 8 {
+				p.Difficulty = d
+			}
+		}
+		return p, nil
+	}
+
+	return powPageParams{}, errors.New("captcha pow parameters not found in HTML")
+}
+
+// buildPowResult wraps a solved PoW in the envelope the page builds today.
+//
+//	prefix + btoa(JSON.stringify({hash, nonce, duration_ms, telemetry, tel_hash}))
+//
+// 🚨 THE TWO NEW FIELDS ARE VK'S ANTI-AUTOMATION PROBES, and we deliberately
+// send them EMPTY. That is not a guess at a shape: the page computes telemetry
+// inside a try/catch and, when the collector throws, carries `telemetry:{}` and
+// `tel_hash:''` into the very same success envelope — so an empty pair is a
+// form real browsers produce, not one we invented. Sending it is the cheapest
+// way to learn whether the PARSE was the only thing between us and a verdict;
+// filling the probes truthfully is a much larger job (they must agree with the
+// device JSON we already send, which is the whole point of them) and is not
+// worth doing before we know it is the remaining blocker.
+//
+// Key order is the page's own success branch — hash, nonce, duration_ms,
+// telemetry, tel_hash — with no whitespace, and standard base64 WITH padding
+// (the page's encoder is a plain btoa wrapper), so the caller must form-escape
+// the result.
+func buildPowResult(prefix, hexHash string, nonce int, durationMs int64) string {
+	if prefix == "" {
+		prefix = powPrefixFallback
+	}
+	payload := fmt.Sprintf(
+		`{"hash":"%s","nonce":%d,"duration_ms":%d,"telemetry":{},"tel_hash":""}`,
+		hexHash, nonce, durationMs)
+	return prefix + base64.StdEncoding.EncodeToString([]byte(payload))
 }

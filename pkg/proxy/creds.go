@@ -607,15 +607,25 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 
 				log.Printf("vk: PoW attempt %d/%d failed (show_captcha_type=%q): %v", powTry, maxPoWRetries, showType, powErr)
 
-				// Track consecutive empty show_captcha_type — a non-empty
-				// "slider" hint means VK is about to hand us an actual slider
-				// (next attempt has a real chance); a persistently empty hint
-				// means the slider isn't ready and retries are futile.
-				if showType == "" {
-					consecutiveEmptyShow++
-				} else {
-					consecutiveEmptyShow = 0
-				}
+				// 🚨 `showType` IS ONLY VK'S ANSWER WHEN WE GOT FAR ENOUGH TO
+				// BE ANSWERED. `solveCaptchaPoW` returns ("", "", err) on every
+				// early failure — including a page it could not PARSE, where
+				// `htmlSettings` is never even extracted — so on those paths the
+				// empty string is OUR zero value, not a statement by VK.
+				//
+				// Reading it as one cost real time: when VK obfuscated the PoW
+				// script (bundle 1.1.1395) every attempt died at the parse, and
+				// this counter dutifully reported "VK has no slider ready" and
+				// SKIPPED the third attempt — so the log accused VK's identity
+				// verdict of a defect that was entirely ours, and the device log
+				// and my own first reading both believed it.
+				// *(2026-08-18; the same shape as every entry in
+				// reference_instruments_that_lie: a zero value quoted as a
+				// measurement.)*
+				//
+				// So the hint counts only when the attempt actually reached VK's
+				// answer, which is exactly when there is no error to report.
+				consecutiveEmptyShow = nextEmptyShowHint(powErr, showType, consecutiveEmptyShow)
 				if consecutiveEmptyShow >= 2 {
 					log.Printf("vk: %d consecutive attempts with show_captcha_type=\"\" — VK has no slider ready, skipping remaining attempts", consecutiveEmptyShow)
 					break
@@ -2996,4 +3006,27 @@ func extractCaptcha(resp map[string]interface{}) (sid, captchaURL string, captch
 	}
 
 	return sid, captchaURL, captchaTs, captchaAttempt
+}
+
+// nextEmptyShowHint moves the "VK has no slider ready" counter, and exists as
+// its own function so the rule can be TESTED — it is a silent property, and it
+// was silently wrong.
+//
+// 🚨 `showType` is only VK's answer when the attempt got far enough to be
+// answered. `solveCaptchaPoW` returns ("", "", err) on every early failure,
+// including a page it could not PARSE — and there `htmlSettings` is never even
+// extracted, so the empty string is OUR zero value. Counting it accused VK of a
+// verdict it never gave, and skipped the third attempt on top.
+//
+//	powErr != nil            → the attempt says NOTHING about VK's intent: hold
+//	powErr == nil, show ""   → VK answered, and answered "no slider": count it
+//	show non-empty           → VK named a challenge: reset
+func nextEmptyShowHint(powErr error, showType string, consecutive int) int {
+	if showType != "" {
+		return 0
+	}
+	if powErr != nil {
+		return consecutive
+	}
+	return consecutive + 1
 }
