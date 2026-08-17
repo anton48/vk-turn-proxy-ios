@@ -38,6 +38,7 @@ SOURCES=(
     "$S/UplinkPace.swift"
     "$S/UplinkPaceSync.swift"
     "$S/UplinkSynth.swift"
+    "$S/DirectRouteSync.swift"
 )
 
 require_tracked "$0" "${SOURCES[@]}"

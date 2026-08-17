@@ -432,6 +432,138 @@ do {
           "and UplinkChunk.swift is gone rather than dormant")
 }
 
+print("DirectRouteSync — one apply at a time, last intent wins")
+
+// 18. 🚨🚨 THE DEFECT THIS TYPE EXISTS FOR, AND IT IS THE ONE A FLAG CANNOT SEE.
+//     Build 308-309 kept a single `routesAreDirect` Bool, read at the top of the
+//     applier and written in its completion. Everything between is a window in
+//     which the flag still reads the OLD value, so an OFF arriving while ON is in
+//     flight compared false != false, called itself a no-op, and returned — then
+//     ON completed and the routes were DIRECT while the profile and the switch
+//     both said OFF, with nothing left to reconcile them.
+//
+//     SABOTAGE SEEN TO FAIL: make `finish` return nil instead of
+//     `startIfNeeded()`. Compiles, and it is the OLD CODE EXACTLY — the
+//     completion writes the state it finished with and nothing reconciles what
+//     arrived meanwhile — so the queued OFF is never applied and the machine
+//     settles at ON with the profile saying OFF.
+//
+//     ⚠️ AND THE SABOTAGE I FIRST WROTE HERE DOES NOT REDDEN THIS SECTION: with
+//     the `guard inFlight == nil` dropped, `intend(false)` still returns nil
+//     because at that instant `desired == applied == false`, so every assertion
+//     below stays green. That guard is what section 19 tests; this one tests the
+//     completion. Two properties, two sabotages — a section validated by the
+//     wrong one is a section validated by nothing. *(Caught by running it.)*
+do {
+    var s = DirectRouteSync(applied: false)
+
+    let first = s.intend(true)
+    check(first == true, "an intent on an idle machine starts that apply")
+
+    let second = s.intend(false)
+    check(second == nil, "a flip WHILE ONE IS IN FLIGHT starts nothing…")
+    check(s.desired == false, "…but is recorded as the desired state")
+    check(s.inFlight == true, "and the running apply is still the old one")
+
+    let queued = s.finish(ok: true)
+    check(queued == false, "🚨 the LATE completion hands the queued flip straight on")
+    check(s.applied == true, "the routes are momentarily what the finished apply left")
+
+    check(s.finish(ok: true) == nil, "and when that one lands there is nothing owed")
+    check(s.applied == false && s.isSettled,
+          "🚨 ON in flight → OFF → late ON completion ends at OFF, which is the whole point")
+}
+
+// 19. 🚨 ONE TAP, TWO PATHS, ONE APPLY. DIRECT is delivered by KVO on the profile
+//     AND by the `set_direct:` message, which normally carry the SAME state. With
+//     the old flag both passed the guard while the first apply was in flight, so a
+//     single toggle started two concurrent `setTunnelNetworkSettings`.
+//
+//     SABOTAGE SEEN TO FAIL: the same one as above — dropping the in-flight guard
+//     makes the second path return `true` here instead of nil.
+do {
+    var s = DirectRouteSync(applied: false)
+    check(s.intend(true) == true, "the first path starts the apply")
+    check(s.intend(true) == nil, "🚨 the second path with the SAME state starts nothing")
+    check(s.finish(ok: true) == nil, "and the single completion settles it")
+    check(s.applied == true && s.isSettled, "routes DIRECT, nothing outstanding")
+}
+
+// 20. A FAILED APPLY MUST NOT MOVE `applied`, must be retried, and the retry must
+//     be BOUNDED — the retry is self-driving (a completion starts the next apply),
+//     so an unbounded one would spin for the life of the session against a
+//     provider that will never accept the settings.
+//
+//     SABOTAGE SEEN TO FAIL: set `applied = value` unconditionally in `finish`
+//     (drop the `if ok`). Compiles; the machine then believes a failed apply
+//     worked, settles immediately, and reports DIRECT to the app.
+do {
+    var s = DirectRouteSync(applied: false)
+
+    // Count the applies the machine actually STARTS, driving it exactly as the
+    // provider does: `intend` returns the first, every `finish` returns the next.
+    // ⚠️ The first version of this loop counted them by hand and was one short —
+    // my arithmetic, not the code's, which is why the expectation prints the
+    // value it got. (Same slip as build 284's; the fix is the same.)
+    var started = 0
+    var next = s.intend(true)
+    while next != nil {
+        started += 1
+        check(s.applied == false, "🚨 a FAILED apply never moves `applied`")
+        next = s.finish(ok: false)
+    }
+
+    check(started == DirectRouteSync.maxAttempts,
+          "a failing apply is retried and STOPS at maxAttempts "
+          + "(\(DirectRouteSync.maxAttempts)); started \(started)")
+    check(s.isStuck, "🚨 and it SAYS it is stuck — the old code failed silently")
+    check(!s.isSettled, "a stuck machine is not a settled one")
+    check(s.desired == true && s.applied == false,
+          "the intent stays unmet rather than being forgotten")
+
+    check(s.intend(true) == true, "a fresh intent gets a fresh budget")
+}
+
+// 21. THE STATE THE APP IS TOLD IS `applied`, NEVER `desired`. The whole reason
+//     the reply carries a value at all is that build 309 answered "ok" for the
+//     attempt and the app then displayed the profile it had just written.
+do {
+    var s = DirectRouteSync(applied: false)
+    _ = s.intend(true)
+    check(s.desired == true && s.applied == false,
+          "🚨 mid-flight the two disagree, and only `applied` describes the routes")
+    _ = s.finish(ok: false)
+    check(s.applied == false, "a failure keeps them disagreeing rather than papering over it")
+}
+
+// 22. 🚨 THE STARTUP MODE IS A CONSTRUCTOR ARGUMENT, NOT A SECOND APPLY. iOS can
+//     restart the extension alone, and 309 then applied FULL routes, declared the
+//     tunnel ready and re-applied DIRECT — a second ~420 ms
+//     `setTunnelNetworkSettings`, a window of tunnelled traffic the user believed
+//     was going around, and a fresh chance for the TUN fd to move.
+do {
+    var s = DirectRouteSync(applied: true)
+    check(s.isSettled && s.applied == true,
+          "a tunnel that came up DIRECT is already settled — nothing to apply")
+    check(s.intend(true) == nil, "and the profile agreeing with it starts no apply at all")
+    check(s.intend(false) == false, "while a genuine change still does")
+}
+
+// 23. THE PROVIDER'S REPLY IS PARSED STRICTLY BY THE APP — an unreadable answer is
+//     NOT a confirmation, because "no answer" and "yes" must never be the same
+//     thing. Mirrors TunnelManager.parseDirectReply.
+do {
+    check(DirectRouteSync.parseReply("direct=1") == true, "a bare reply parses")
+    check(DirectRouteSync.parseReply("direct=0 want=0 busy=0") == false,
+          "and so does the get_direct form with extra fields")
+    check(DirectRouteSync.parseReply("direct=1 want=0 busy=1") == true,
+          "the APPLIED field is the one read, not want")
+    check(DirectRouteSync.parseReply("ok") == nil, "🚨 the old 'ok' reply is not a state")
+    check(DirectRouteSync.parseReply("") == nil && DirectRouteSync.parseReply(nil) == nil,
+          "and silence is not a state either")
+    check(DirectRouteSync.parseReply("direct=yes") == nil, "a malformed value is refused, not guessed")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

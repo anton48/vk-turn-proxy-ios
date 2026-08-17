@@ -175,6 +175,21 @@ extension TunnelConfig {
     }
 }
 
+/// A one-shot claim, so a checked continuation is resumed exactly once when a
+/// reply and a deadline race. Resuming twice is a crash, not a warning, and both
+/// arms run on threads we do not choose — hence the lock rather than a Bool.
+private final class DirectReplyOnce {
+    private let lock = NSLock()
+    private var used = false
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if used { return false }
+        used = true
+        return true
+    }
+}
+
 @MainActor
 class TunnelManager: ObservableObject {
     /// One instance for the whole process. The Live Activity intents run in the
@@ -1128,39 +1143,115 @@ class TunnelManager: ObservableObject {
                 note("protocolConfiguration is not an NETunnelProviderProtocol — aborting")
                 return
             }
+            // 🚨 `proto` IS A CLASS, so the two assignments below mutate the very
+            // object `manager.protocolConfiguration` — and `refreshDirectMode()`
+            // — will read back. If the save fails, that object still carries a
+            // change the system never accepted, and reading it reports the
+            // FAILURE AS A SUCCESS. Keep the old pair so the mutation can be
+            // undone before anything reads it. *(User-caught.)*
+            let previousIAN = proto.includeAllNetworks
+            var previousEnforce = false
+            if #available(iOS 14.2, *) { previousEnforce = proto.enforceRoutes }
+
             proto.includeAllNetworks = !direct
             if #available(iOS 14.2, *) { proto.enforceRoutes = direct }
             manager.protocolConfiguration = proto
-            try await manager.saveToPreferences()
+            do {
+                try await manager.saveToPreferences()
+            } catch {
+                proto.includeAllNetworks = previousIAN
+                if #available(iOS 14.2, *) { proto.enforceRoutes = previousEnforce }
+                manager.protocolConfiguration = proto
+                throw error
+            }
             note("profile saved (\(direct ? "DIRECT" : "tunnelled")) in "
                 + "\(Int(Date().timeIntervalSince(t0) * 1000)) ms")
         } catch {
             note("🚨 could not save the profile: \(error.localizedDescription)")
             errorMessage = "Could not switch routing: \(error.localizedDescription)"
+            // The in-memory restore above fixes the object we hold; re-reading
+            // fixes anything else that moved. Only then may the switch refresh.
+            try? await manager.loadFromPreferences()
             refreshDirectMode()
             return
         }
 
         // 🎯 THE EXTENSION ALSO WATCHES THE PROFILE ITSELF (KVO on
         // protocolConfiguration — measured firing on device), so the routes
-        // would follow even if this message were lost. It is sent anyway
-        // because KVO's timing is not ours to rely on, and the handler is
-        // idempotent: it re-applies only when the mode actually differs.
-        if let session = manager.connection as? NETunnelProviderSession,
-           let data = "set_direct:\(direct ? 1 : 0)".data(using: .utf8) {
+        // would follow even if this message were lost. That is exactly why a
+        // lost REPLY must not roll the profile back: the change may well have
+        // landed, and undoing it would switch the routes a second time. So the
+        // message is sent, its answer is WAITED for, and when it does not come
+        // the extension is ASKED what the routes actually are.
+        let ack = await confirmDirectApplied(direct)
+        refreshDirectMode()
+        switch ack {
+        case .applied(let actual) where actual == direct:
+            note("confirmed by the extension: routes are "
+                + (actual ? "DIRECT — traffic goes around the tunnel" : "tunnelled"))
+        case .applied(let actual):
+            note("🚨 the extension reports the routes are \(actual ? "DIRECT" : "tunnelled") "
+                + "while the profile now asks for \(direct ? "DIRECT" : "tunnelled")")
+            errorMessage = direct
+                ? "Routing did not switch: traffic is still going through the tunnel."
+                : "Routing did not switch back: traffic is still going around the tunnel."
+        case .silent:
+            note("⚠️ the extension did not answer — the profile is saved and KVO should carry it, "
+                + "but this switch is showing the profile, not a confirmation")
+        }
+    }
+
+    /// What the extension said about the routes, as opposed to what we asked for.
+    private enum DirectAck {
+        /// The extension reported the state its routes are ACTUALLY in.
+        case applied(Bool)
+        /// Nothing answered, twice. `sendProviderMessage` can accept a message
+        /// and never call back — the same failure the stats watchdog exists for.
+        case silent
+    }
+
+    /// Sends `set_direct:` and waits for the extension's report of the state it
+    /// actually applied; if that is lost, asks again with `get_direct` rather
+    /// than guessing.
+    private func confirmDirectApplied(_ want: Bool) async -> DirectAck {
+        // ~420 ms measured per apply on device, and a request that arrives while
+        // one is in flight is applied after it — so two applies plus slack. Past
+        // this the reply is not slow, it is gone.
+        if let applied = DirectRouteSync.parseReply(
+            await directRoundTrip("set_direct:\(want ? 1 : 0)", timeout: 5.0)) {
+            return .applied(applied)
+        }
+        SharedLogger.shared.log("[App] direct: no reply to set_direct — asking what the routes are")
+        if let applied = DirectRouteSync.parseReply(await directRoundTrip("get_direct", timeout: 2.0)) {
+            return .applied(applied)
+        }
+        return .silent
+    }
+
+    /// One provider-message round trip with a deadline. Returns nil when the
+    /// send throws or nothing answers in time.
+    private func directRoundTrip(_ message: String, timeout: TimeInterval) async -> String? {
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let data = message.data(using: .utf8) else { return nil }
+        return await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            // The reply and the deadline race, and resuming a checked
+            // continuation twice is a crash, so exactly one of them may win.
+            let once = DirectReplyOnce()
             do {
                 try session.sendProviderMessage(data) { reply in
-                    let r = reply.flatMap { String(data: $0, encoding: .utf8) } ?? "<no reply>"
-                    note("routes: \(r)")
+                    guard once.claim() else { return }
+                    cont.resume(returning: reply.flatMap { String(data: $0, encoding: .utf8) } ?? "")
                 }
             } catch {
-                note("routes: send failed (\(error.localizedDescription)) — KVO should still carry it")
+                if once.claim() { cont.resume(returning: nil) }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                if once.claim() { cont.resume(returning: nil) }
             }
         }
-
-        refreshDirectMode()
-        note("now \(directMode ? "DIRECT — traffic goes around the tunnel" : "tunnelled")")
     }
+
 
     /// A NEW intent: the user changed the switch, or the app is re-asserting the
     /// stored value against a tunnel it did not start.

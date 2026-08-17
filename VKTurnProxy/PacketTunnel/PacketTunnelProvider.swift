@@ -216,7 +216,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let direct = !p.includeAllNetworks && enforce
             self.logMsg("KVO protocolConfiguration: includeAllNetworks=\(p.includeAllNetworks) "
                 + "enforceRoutes=\(enforce) ⇒ \(direct ? "DIRECT" : "tunnelled")")
-            self.applyDirectRoutes(direct, reason: "KVO") { _ in }
+            // Record the intent only. Whether an apply starts, waits behind one
+            // already running, or is unnecessary is the machine's decision — a
+            // source that could start an apply itself could start a second.
+            self.requestDirect(direct, reason: "KVO")
         }
 
         // ------------------------------------------------------------------
@@ -393,12 +396,35 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // captive networks, traffic to serverAddress, and — on
             // iOS 16.4+ with our flags — APNs/CellularServices as
             // configured on the main-app side).
+            // 🚨 COME UP IN THE MODE THE PROFILE ALREADY ASKS FOR — decided
+            // HERE, before the settings are built, not by a second apply after
+            // the tunnel is live. iOS can restart this extension on its own
+            // (jetsam, which this project has a history of) and then startTunnel
+            // runs against whatever the profile says. Build 309 handled that by
+            // applying the FULL routes, declaring the tunnel ready, and only
+            // then re-applying DIRECT — which costs a second
+            // `setTunnelNetworkSettings` (~420 ms and a fresh chance for the TUN
+            // fd to move) and opens a window in which traffic the user believes
+            // is going around the tunnel is going through it.
+            // *(User-caught, reading the 309 startup path.)*
+            let startupProto = self.protocolConfiguration
+            var startupEnforce = false
+            if #available(iOS 14.2, *) { startupEnforce = startupProto.enforceRoutes }
+            let initialDirect = !startupProto.includeAllNetworks && startupEnforce
+
             let finalSettings = self.createTunnelSettings(
                 address: effAddress,
                 dns: effDNS,
                 mtu: effMTU,
-                tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP
+                tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP,
+                includeDefaultRoute: !initialDirect
             )
+            if initialDirect {
+                // Same reason as the live switch: a resolver reachable only
+                // through the tunnel would make "outside the tunnel" mean
+                // "nowhere".
+                finalSettings.dnsSettings = nil
+            }
             // Remember what this was built from, so DIRECT can rebuild it live.
             self.lastSettingsAddress = effAddress
             self.lastSettingsDNS = effDNS
@@ -406,7 +432,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.lastSettingsRemote = turnIP.isEmpty ? "10.0.0.1" : turnIP
 
             DispatchQueue.main.async {
-                self.logMsg("setTunnelNetworkSettings: applying full routes (single shot)")
+                self.logMsg("setTunnelNetworkSettings: applying "
+                    + (initialDirect ? "DIRECT routes (the profile says so)" : "full routes")
+                    + " (single shot)")
                 self.setTunnelNetworkSettings(finalSettings) { error in
                     if let error = error {
                         self.logMsg("setTunnelNetworkSettings ERROR: \(error)")
@@ -443,26 +471,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.logMsg("wgAttachWireGuard OK — tunnel fully up")
                     completionHandler(nil)
 
-                    // 🚨 AND NOW HONOUR A PROFILE THAT ALREADY SAYS DIRECT.
-                    // The bootstrap above always applies the FULL routes, which
-                    // is right for a user-driven connect: the app rewrites the
-                    // profile with includeAllNetworks=true on its way in. But
-                    // iOS can restart this extension on its own — after a
-                    // jetsam kill, which this project has a history of — and
-                    // then startTunnel runs against whatever the profile says.
-                    // Without this, the switch in the app would read DIRECT
-                    // (it derives from the profile) while every packet went
-                    // through the tunnel: a split-brain nobody would see until
-                    // they wondered why DIRECT stopped working.
-                    // *(User-caught by asking how "survives an app restart" and
-                    // "a reconnect returns to normal" can both be true.)*
-                    let p = self.protocolConfiguration
-                    var enforce = false
-                    if #available(iOS 14.2, *) { enforce = p.enforceRoutes }
-                    if !p.includeAllNetworks && enforce {
-                        self.logMsg("direct: the profile says DIRECT at startup — applying it, "
-                            + "because this start did not come through the app's connect()")
-                        self.applyDirectRoutes(true, reason: "startup") { _ in }
+                    // Hand the machine the mode the tunnel actually came up in.
+                    // Anything KVO recorded during startup is applied from here.
+                    DispatchQueue.main.async {
+                        self.directBecameReady(initial: initialDirect)
                     }
                 }
             }
@@ -550,9 +562,27 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // flips both profile properties before sending this; what this
             // handler measures is whether the SESSION survives the pair —
             // the TUN fd above all, because Go is holding it.
+            // 🚨 THE REPLY CARRIES WHAT THE ROUTES ARE, NOT WHETHER WE TRIED.
+            // The app used to treat the profile it had just saved as the applied
+            // state and cleared its "busy" flag the moment the message was
+            // queued, so a lost or failed apply left the switch showing a mode
+            // the tunnel was not in. Answering with `directSync.applied` — after
+            // the machine settles — is what lets the app tell the difference.
             let on = msg.hasSuffix("1")
-            applyDirectRoutes(on, reason: "message") { ok in
-                completionHandler?((ok ? "ok" : "bad").data(using: .utf8))
+            requestDirect(on, reason: "message") { applied in
+                completionHandler?("direct=\(applied ? 1 : 0)".data(using: .utf8))
+            }
+        } else if msg == "get_direct" {
+            // The app's reconcile path. `sendProviderMessage` can be accepted
+            // and never answered, and a blind rollback would be wrong because
+            // KVO may have applied the change while the reply was lost — so the
+            // app asks what actually happened instead of guessing.
+            DispatchQueue.main.async {
+                let s = self.directSync
+                let applied = s.applied ? 1 : 0
+                let want = s.desired ? 1 : 0
+                let busy = s.inFlight != nil ? 1 : 0
+                completionHandler?("direct=\(applied) want=\(want) busy=\(busy)".data(using: .utf8))
             }
         } else if msg.hasPrefix("set_uplink_pace:") {
             // The uplink pacer (Settings › Advanced), applied to the RUNNING
@@ -966,43 +996,72 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - DIRECT mode (DIAGNOSTIC, issue #72)
 
     /// Re-applies the tunnel settings on a RUNNING session: DIRECT strips the
-    /// default route and the tunnel DNS, and back again restores both.
+    /// default route and the tunnel DNS, and back again restores both. The 30
+    /// VK connections and the TUN descriptor are untouched, which is the whole
+    /// point — a reconnect cannot give that.
     ///
-    /// 🚨 WHAT THIS IS ACTUALLY TESTING, and it is not "does the toggle work":
-    ///
-    ///   1. **Does the TUN fd survive a second `setTunnelNetworkSettings`?**
-    ///      Go was handed the descriptor once, at attach. If iOS builds a new
-    ///      utun, wireguard-go holds a dead fd and the tunnel is silently
-    ///      finished — so the fd is logged before AND after, and a change is
-    ///      shouted rather than mentioned.
-    ///   2. **Does the TURN pool survive?** The whole point of the feature is
-    ///      that the 30 VK connections are NOT rebuilt, which is the part a
-    ///      reconnect cannot give.
-    ///   3. **Does the session stay `.connected`?**
-    ///
-    /// ⚠️ It deliberately does NOT touch `includeAllNetworks` — that lives on
-    /// the profile, in the app process. Routes alone cannot deliver DIRECT
-    /// while IAN is true; this half only has to prove it costs nothing.
-    /// Tracks what the ROUTES are currently set to, so a repeat request is a
-    /// no-op instead of a second ~420 ms `setTunnelNetworkSettings`. The
-    /// diagnostic had no such guard, and the first field run duly applied the
-    /// same mode four times because the buttons gave no feedback.
-    private var routesAreDirect = false
+    /// 🚨 EVERY MUTATION BELOW HAPPENS ON THE MAIN QUEUE, and that is load
+    /// bearing rather than tidy. DIRECT has TWO sources — KVO on
+    /// `protocolConfiguration` and the `set_direct:` provider message — which
+    /// normally carry the SAME desired state by two paths, and they arrive on
+    /// whatever thread iOS chooses. Serialising them is what makes "one apply at
+    /// a time" true; [[DirectRouteSync]] is what makes the last intent win.
+    private var directSync = DirectRouteSync(applied: false)
 
-    private func applyDirectRoutes(_ direct: Bool, reason: String,
-                                   completion: @escaping (Bool) -> Void) {
-        guard direct != routesAreDirect else {
-            logMsg("direct: routes already \(direct ? "DIRECT" : "tunnelled") (\(reason)) — no-op")
-            completion(true)
-            return
+    /// False until the first `setTunnelNetworkSettings` has succeeded and the
+    /// machine has been told which mode the tunnel came up in. Before that there
+    /// is nothing to re-apply and `lastSettings*` is empty.
+    private var directReady = false
+
+    /// A desired state that arrived during startup. Recorded rather than
+    /// dropped: KVO is registered before the settings exist, so a flip in that
+    /// window is real and would otherwise vanish.
+    private var directPendingBeforeReady: Bool?
+
+    /// Reply handlers waiting for the machine to come to rest. They are answered
+    /// with what the routes ACTUALLY are, never with what was asked for.
+    private var directWaiters: [(Bool) -> Void] = []
+
+    /// Records a desired DIRECT state from any source and drives the applier.
+    /// `completion` is called once the machine settles, with the APPLIED value.
+    private func requestDirect(_ direct: Bool, reason: String,
+                               completion: ((Bool) -> Void)? = nil) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { completion?(false); return }
+            if let completion = completion { self.directWaiters.append(completion) }
+
+            guard self.directReady else {
+                self.directPendingBeforeReady = direct
+                self.logMsg("direct: \(direct ? "ON" : "OFF") via \(reason) arrived before the tunnel "
+                    + "had settings — recorded, honoured once it is up")
+                return
+            }
+            self.logMsg("direct: \(direct ? "ON" : "OFF") requested via \(reason) "
+                + "(routes are \(self.directSync.applied ? "DIRECT" : "tunnelled"))")
+
+            if let next = self.directSync.intend(direct) {
+                self.performDirectApply(next, reason: reason)
+            } else if self.directSync.inFlight != nil {
+                // 🎯 NOT a dropped request: it is in `desired`, and the running
+                // apply's completion will pick it up. This is the case the old
+                // `routesAreDirect` flag got wrong by deciding it was a no-op.
+                self.logMsg("direct: an apply is already in flight — it will pick this up")
+            } else {
+                self.settleDirect()
+            }
         }
+    }
+
+    /// Applies one state. Main queue only, and only ever called by the machine.
+    private func performDirectApply(_ direct: Bool, reason: String) {
         guard !lastSettingsAddress.isEmpty else {
-            logMsg("direct: no settings recorded yet — the tunnel never finished starting; ignored")
-            completion(false)
+            logMsg("direct: 🚨 no settings recorded — the tunnel never finished starting; intent dropped")
+            _ = directSync.finish(ok: false)
+            settleDirect()
             return
         }
         let fdBefore = findTunFileDescriptor() ?? -1
-        logMsg("direct: \(direct ? "ON" : "OFF") via \(reason); re-applying settings; "
+        logMsg("direct: applying \(direct ? "ON" : "OFF") (\(reason)); "
             + "fd before=\(fdBefore) attached=\(attachedTunFd)")
 
         let settings = createTunnelSettings(
@@ -1021,21 +1080,74 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let t0 = Date()
         setTunnelNetworkSettings(settings) { [weak self] error in
             guard let self = self else { return }
-            let ms = Int(Date().timeIntervalSince(t0) * 1000)
-            if let error = error {
-                self.logMsg("direct: 🚨 setTunnelNetworkSettings FAILED after \(ms) ms: \(error)")
-                completion(false)
-                return
+            DispatchQueue.main.async {
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                if let error = error {
+                    self.logMsg("direct: 🚨 setTunnelNetworkSettings FAILED after \(ms) ms: \(error)")
+                    self.afterDirectApply(ok: false)
+                    return
+                }
+                // 🚨 A MOVED DESCRIPTOR IS A FAILURE, NOT A FOOTNOTE. Go was
+                // handed the fd once, at attach. If iOS built a new utun,
+                // wireguard-go is writing into a dead one and the datapath is
+                // gone while every status still reads healthy — so this must
+                // never be reported as a successful switch. Measured 5 → 5
+                // across seven applies on device, so this is the branch that
+                // should never run; if it ever does, a reconnect is the only
+                // thing that can rebuild the descriptor.
+                let fdAfter = self.findTunFileDescriptor() ?? -1
+                if fdAfter != self.attachedTunFd {
+                    self.logMsg("direct: 🚨🚨 THE TUN FD MOVED (attached=\(self.attachedTunFd), "
+                        + "now \(fdAfter)) after \(ms) ms — wireguard-go holds a dead descriptor. "
+                        + "Reporting failure and reconnecting rather than claiming success.")
+                    self.afterDirectApply(ok: false)
+                    self.cancelTunnelWithError(VPNError.tunDescriptorMoved)
+                    return
+                }
+                self.logMsg("direct: \(direct ? "ON" : "OFF") applied in \(ms) ms; "
+                    + "fd \(fdAfter) unchanged ✅ Go's descriptor is still valid")
+                self.afterDirectApply(ok: true)
             }
-            let fdAfter = self.findTunFileDescriptor() ?? -1
-            let moved = fdAfter != self.attachedTunFd
-            self.routesAreDirect = direct
-            self.logMsg("direct: \(direct ? "ON" : "OFF") applied in \(ms) ms; fd after=\(fdAfter) "
-                + (moved
-                   ? "🚨 THE TUN FD MOVED (attached=\(self.attachedTunFd)) — wireguard-go is holding a "
-                     + "dead descriptor and this design is DEAD"
-                   : "✅ same fd as attach — Go's descriptor is still valid"))
-            completion(true)
+        }
+    }
+
+    /// The completion half of the machine: either start what is still owed, or
+    /// come to rest and answer everyone waiting. Main queue only.
+    private func afterDirectApply(ok: Bool) {
+        if let next = directSync.finish(ok: ok) {
+            logMsg("direct: still owed \(next ? "ON" : "OFF") — applying it now"
+                + (ok ? " (the profile moved while the last apply was in flight)" : " (retry)"))
+            performDirectApply(next, reason: ok ? "queued" : "retry")
+        } else {
+            settleDirect()
+        }
+    }
+
+    /// Answers every pending reply with the state the routes are ACTUALLY in.
+    private func settleDirect() {
+        if directSync.isStuck {
+            logMsg("direct: 🚨 GIVING UP after \(DirectRouteSync.maxAttempts) attempts — the profile "
+                + "says \(directSync.desired ? "DIRECT" : "tunnelled") but the routes are "
+                + "\(directSync.applied ? "DIRECT" : "tunnelled"). The app is told the ROUTES.")
+        }
+        let applied = directSync.applied
+        let waiters = directWaiters
+        directWaiters.removeAll()
+        for waiter in waiters { waiter(applied) }
+    }
+
+    /// Called once, from the successful first `setTunnelNetworkSettings`, with
+    /// the mode the tunnel actually came up in.
+    private func directBecameReady(initial: Bool) {
+        directSync = DirectRouteSync(applied: initial)
+        directReady = true
+        logMsg("direct: the tunnel came up \(initial ? "DIRECT" : "tunnelled") "
+            + "in its FIRST settings — no second apply needed")
+        if let pending = directPendingBeforeReady {
+            directPendingBeforeReady = nil
+            requestDirect(pending, reason: "deferred-from-startup")
+        } else {
+            settleDirect()
         }
     }
 
@@ -1064,6 +1176,11 @@ enum VPNError: Error, LocalizedError {
     case noTunDevice
     case backendFailed(code: Int32)
     case bootstrapTimeout
+    /// A re-apply of the tunnel settings left a DIFFERENT utun behind, so the
+    /// descriptor wireguard-go was handed at attach is dead. Not observed on
+    /// device (fd 5 → 5 across seven applies), and fatal if it ever is: the
+    /// datapath is gone while every status still reads healthy.
+    case tunDescriptorMoved
 
     var errorDescription: String? {
         switch self {
@@ -1072,6 +1189,7 @@ enum VPNError: Error, LocalizedError {
         case .noTunDevice: return "Could not find TUN file descriptor"
         case .backendFailed(let code): return "WireGuard backend failed with code \(code)"
         case .bootstrapTimeout: return "VK bootstrap did not complete within 120s (captcha may be required)"
+        case .tunDescriptorMoved: return "Switching routing replaced the tunnel interface — reconnecting"
         }
     }
 }
