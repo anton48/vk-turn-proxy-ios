@@ -31,22 +31,16 @@ struct VKTurnProxyApp: App {
         // 🚨 RETIRE THE STATE THAT REMOVED UIs LEFT BEHIND, BEFORE ANYTHING READS
         // IT. Both of these ran on this device with no screen showing them:
         //
-        //   - `uplinkChunkK` was written by an Advanced picker deleted on
-        //     2026-08-12 when the chunking sweep closed. The VALUE stayed, and the
-        //     tunnel ran K=64 for three days — invisible, because chunking is
-        //     inert while the send queue is shallow and only wakes under real
-        //     traffic, i.e. silent in the control runs and alive in the measured
-        //     ones.
-        //   - `uplinkPaceOn` was the pacer's test switch in builds 296-298, where
-        //     it deliberately defaulted to ON. Production ships the pacer OFF, and
-        //     a retired key that outvotes the shipped default is the same defect
-        //     wearing the other hat.
+        //   - the pacer: builds 296-298 wrote the Bool `uplinkPaceOn` and 299-302
+        //     wrote RATES into `uplinkPaceKiB` itself, both ON for measurement.
+        //     BOTH are zeroed, behind a marker no diagnostic build ever set —
+        //     reusing one would skip exactly the device that ran the sweep.
+        //   - the synthetic load generator: no UI at all.
         //
         // Both run once, shout when they fire, and leave the documented backup
         // field as the deliberate way back in. Removing a UI does not remove the
         // state it wrote.
-        UplinkChunk.clearStaleValueOnce { SharedLogger.shared.log("[App] \($0)") }
-        UplinkPace.clearRetiredTestKeyOnce { SharedLogger.shared.log("[App] \($0)") }
+        UplinkPace.resetToProductionDefaultOnce { SharedLogger.shared.log("[App] \($0)") }
         UplinkSynth.clearStaleValueOnce { SharedLogger.shared.log("[App] \($0)") }
 
         // Instantiate the named-server store: first-launch migration captures the

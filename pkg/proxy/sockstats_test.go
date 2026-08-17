@@ -199,7 +199,7 @@ func TestEveryTURNDialIsRegisteredForSampling(t *testing.T) {
 //
 // ⚠️ RESHAPED BY UPLINK CHUNKING. The four transports used to time their own
 // writes, and this scanned proxy.go for four `w0 := time.Now()` sites. They now
-// share ONE write path — writeChunk in uplinkchunk.go — so scanning proxy.go
+// share ONE write path — writePacket in writepacket.go — so scanning proxy.go
 // found zero and the guard went red on correct code, the same brittleness the
 // `sockStats.register` scan window hit. The property is unchanged, so the guard
 // follows the code instead of being deleted, and it still has two ways to fail:
@@ -212,14 +212,14 @@ func TestEveryWriteIsTimed(t *testing.T) {
 		t.Fatalf("read proxy.go: %v", err)
 	}
 	// Every transport writer reaches the timed path.
-	if writers := strings.Count(string(src), "p.writeChunk("); writers < 4 {
-		t.Fatalf("found %d transports delegating to writeChunk, want at least 4 (DTLS, "+
+	if writers := strings.Count(string(src), "p.writePacket("); writers < 4 {
+		t.Fatalf("found %d transports delegating to writePacket, want at least 4 (DTLS, "+
 			"direct, WRAP-A, SRTP) — a transport writing on its own is not timed", writers)
 	}
 
-	chunkSrc, err := os.ReadFile("uplinkchunk.go")
+	chunkSrc, err := os.ReadFile("writepacket.go")
 	if err != nil {
-		t.Fatalf("read uplinkchunk.go: %v", err)
+		t.Fatalf("read writepacket.go: %v", err)
 	}
 	lines := strings.Split(string(chunkSrc), "\n")
 	timed := 0
@@ -238,16 +238,16 @@ func TestEveryWriteIsTimed(t *testing.T) {
 			}
 		}
 		if !wrote {
-			t.Errorf("uplinkchunk.go:%d starts the write clock but no write follows it "+
+			t.Errorf("writepacket.go:%d starts the write clock but no write follows it "+
 				"within 4 lines — the clock is not bracketing the write", i+1)
 		}
 		if !read {
-			t.Errorf("uplinkchunk.go:%d starts a write clock that nothing reads — "+
+			t.Errorf("writepacket.go:%d starts a write clock that nothing reads — "+
 				"`conn-write` is blind for EVERY transport, not just one", i+1)
 		}
 	}
 	if timed != 1 {
-		t.Fatalf("found %d timed write paths in uplinkchunk.go, want exactly 1 — "+
+		t.Fatalf("found %d timed write paths in writepacket.go, want exactly 1 — "+
 			"if the helper grew a second write, both must be timed and this guard updated", timed)
 	}
 }

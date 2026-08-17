@@ -66,8 +66,8 @@ import (
 // 🚨 WHY THE RESERVATION HAPPENS BEFORE THE DEQUEUE, AND IT IS THE WHOLE
 // CORRECTNESS ARGUMENT. A writer that takes a packet and THEN discovers it has
 // no budget holds that packet inside its goroutine where work-stealing cannot
-// see it — the run-20 pathology, and the same reason `writeChunk` writes each
-// packet before taking the next. Reserving first means a writer without tokens
+// see it — the run-20 pathology, and the same reason `writePacket` writes its
+// packet before this goroutine takes another. Reserving first means a writer without tokens
 // sleeps while the packet is still in the shared queue, where any other writer
 // may take it. Nothing is ever stranded.
 //

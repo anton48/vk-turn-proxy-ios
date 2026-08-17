@@ -171,13 +171,6 @@ struct AppSettings: Codable {
     /// above, for the same reason: a preference lost on restore is its own
     /// debugging session.
     var liveActivityCompactClock: Bool? = nil
-    /// Uplink chunking K (Settings › Advanced, EXPERIMENT). `0`/absent means
-    /// "never set" and resolves to 1 = today's behaviour. Round-trips for the
-    /// same reason as memstatsFastTicks: a measurement setup that silently
-    /// resets on a restore is one nobody can rely on mid-investigation — and an
-    /// import-without-export asymmetry is the `forceLegacyCaptcha` trap.
-    /// Expected to be removed with the setting once the sweep has answered.
-    var uplinkChunkK: Int? = nil
     /// The uplink pacer's rate in KiB/s, 0 = off (Settings › Advanced). Absent in
     /// an older backup means "never set", which resolves to OFF — the shipped
     /// default — rather than to the 247 a device might be running, because a

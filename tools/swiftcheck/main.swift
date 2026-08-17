@@ -19,18 +19,21 @@
 //
 // WHAT IT GUARDS, and every one of these fails SILENTLY on a device:
 //
-//   • the three retirements of state that removed UIs left behind — each must
-//     fire, must fire exactly ONCE (or a deliberate re-arm through the backup
-//     field is undone at the next launch), and must not fire on a clean install;
+//   • the two retirements of state that removed UIs left behind — each must fire,
+//     must fire exactly ONCE (so the user's own later choice survives), must not
+//     fire on a clean install, and must cover EVERY representation the diagnostic
+//     builds wrote (the pacer had two: a Bool and a rate);
 //   • the pacer's setting reads back as the one shipped rate, and OFF stays off;
 //   • the two ENDS of the live-toggle message agree — a mismatch there is the
 //     worst failure mode in the feature, because the toggle then does nothing on
 //     a running tunnel and works perfectly after the next reconnect;
 //   • the pacer's @AppStorage key is not observed by the navigation HOST, which
 //     is how build 177 and issue #65 popped a pushed screen;
-//   • the retirements are actually CALLED at launch. Guarding the function and
-//     not its call site is the shape that once bought a green suite and an empty
-//     log.
+//   • EACH retirement is actually CALLED at launch, and ordered before the first
+//     reader of its keys. Guarding the function and not its call site is the shape
+//     that once bought a green suite and an empty log;
+//   • the chunking machinery stays removed — it cannot coexist with a pacer that
+//     reserves once per dequeue.
 
 import Foundation
 
@@ -63,72 +66,19 @@ func source(_ path: String) -> String {
     return s
 }
 
-print("UplinkChunk — the stale K left by a deleted picker")
+print("UplinkPace — the production reset, and the shipped rate")
 
-// 1. A device that had touched the deleted picker: the value is cleared, once,
-//    and the clearing is announced rather than silent.
-do {
-    let d = freshDefaults("chunkcheck.stale")
-    d.set(64, forKey: UplinkChunk.key)
-
-    var logged: [String] = []
-    let fired = UplinkChunk.clearStaleValueOnce(in: d, log: { logged.append($0) })
-
-    check(fired, "a stale K is cleared")
-    check(UplinkChunk.stored(in: d) == UplinkChunk.off, "K reads as off after the reset")
-    check(logged.count == 1 && logged[0].contains("64"),
-          "the reset is announced and names the value it removed")
-}
-
-// 2. It must not fire twice. A deliberate re-arm through the backup field is the
-//    only remaining way to drive this machinery, and a migration that ran every
-//    launch would silently undo it.
-do {
-    let d = freshDefaults("chunkcheck.rearm")
-    d.set(64, forKey: UplinkChunk.key)
-    _ = UplinkChunk.clearStaleValueOnce(in: d)
-
-    d.set(32, forKey: UplinkChunk.key) // a deliberate re-arm, after the migration
-    let firedAgain = UplinkChunk.clearStaleValueOnce(in: d)
-
-    check(!firedAgain, "the migration does not fire a second time")
-    check(UplinkChunk.stored(in: d) == 32, "a deliberate re-arm survives")
-}
-
-// 3. A device that never touched the picker is left alone — and still gets the
-//    marker, so the migration cannot fire later against a deliberate value.
-do {
-    let d = freshDefaults("chunkcheck.clean")
-    let fired = UplinkChunk.clearStaleValueOnce(in: d)
-
-    check(!fired, "nothing to clear on a clean install")
-    check(UplinkChunk.stored(in: d) == UplinkChunk.off, "K is off on a clean install")
-
-    d.set(64, forKey: UplinkChunk.key)
-    check(!UplinkChunk.clearStaleValueOnce(in: d), "the marker was set even with nothing to clear")
-    check(UplinkChunk.stored(in: d) == 64, "so a value set afterwards is left alone")
-}
-
-// 4. K = 1 stored explicitly is not "stale" — it is production, and clearing it
-//    would be a no-op that still burns the one-shot marker.
-do {
-    let d = freshDefaults("chunkcheck.explicit-off")
-    d.set(UplinkChunk.off, forKey: UplinkChunk.key)
-    check(!UplinkChunk.clearStaleValueOnce(in: d), "an explicit K=1 is not treated as stale")
-}
-
-print("UplinkPace — the retired test switch, and the shipped rate")
-
-// 5. Builds 296-298 shipped `uplinkPaceOn` as a Bool that defaulted to ON for
-//    measurement. Production ships OFF, so the key is DELETED and its value is
-//    deliberately NOT carried over: migrating `true` into 247 would make the
-//    shipped default a lie on exactly the devices that took the measurements.
+// 5. 🚨 TWO DIAGNOSTIC REPRESENTATIONS, NOT ONE. Builds 296-298 wrote the Bool
+//    `uplinkPaceOn` (defaulting to ON for measurement) and 299-302 wrote RATES
+//    into `uplinkPaceKiB` itself. Both must be zeroed, and neither may be carried
+//    over: migrating either would make the shipped default a lie on exactly the
+//    devices that took the measurements. *(The first port cleared only the Bool.)*
 do {
     let d = freshDefaults("pacecheck.retired-on")
     d.set(true, forKey: UplinkPace.retiredBoolKey)
 
     var logged: [String] = []
-    let fired = UplinkPace.clearRetiredTestKeyOnce(in: d, log: { logged.append($0) })
+    let fired = UplinkPace.resetToProductionDefaultOnce(in: d, log: { logged.append($0) })
 
     check(fired, "the retired test switch is cleared")
     check(d.object(forKey: UplinkPace.retiredBoolKey) == nil,
@@ -138,15 +88,34 @@ do {
     check(logged.count == 1, "the retirement is announced")
 }
 
+// 5b. 🚨 AND THE REPRESENTATION THE FIRST PORT MISSED: a device that ran the RATE
+//     SWEEP (builds 299-302) has no Bool at all — it has 247/260/270 sitting in
+//     the production key itself. Clearing only the Bool returns early there, and
+//     `stored()` turns whatever is left into 247, so the one device that measured
+//     the feature would enter production with the pacer ON.
+do {
+    let d = freshDefaults("pacecheck.sweep-rate")
+    d.set(270, forKey: UplinkPace.key)          // left by the sweep; no Bool anywhere
+
+    var logged: [String] = []
+    let fired = UplinkPace.resetToProductionDefaultOnce(in: d, log: { logged.append($0) })
+
+    check(fired, "a diagnostic RATE is reset even with no retired Bool present")
+    check(UplinkPace.stored(in: d) == UplinkPace.off,
+          "🚨 the sweep device comes up OFF — this is the case the first port shipped wrong")
+    check(logged.count == 1 && logged[0].contains("270"),
+          "and the reset names the rate it removed")
+}
+
 // 6. Once only, for the same reason as the chunk key: whatever the user chooses
 //    afterwards has to survive the next launch.
 do {
     let d = freshDefaults("pacecheck.once")
     d.set(true, forKey: UplinkPace.retiredBoolKey)
-    _ = UplinkPace.clearRetiredTestKeyOnce(in: d)
+    _ = UplinkPace.resetToProductionDefaultOnce(in: d)
 
     d.set(UplinkPace.onKiB, forKey: UplinkPace.key) // the user turns it on
-    check(!UplinkPace.clearRetiredTestKeyOnce(in: d), "the retirement does not fire twice")
+    check(!UplinkPace.resetToProductionDefaultOnce(in: d), "the retirement does not fire twice")
     check(UplinkPace.stored(in: d) == UplinkPace.onKiB, "and the user's own choice survives")
 }
 
@@ -154,7 +123,7 @@ do {
 //    tunnel.
 do {
     let d = freshDefaults("pacecheck.clean")
-    check(!UplinkPace.clearRetiredTestKeyOnce(in: d), "nothing to clear on a clean install")
+    check(!UplinkPace.resetToProductionDefaultOnce(in: d), "nothing to clear on a clean install")
     check(UplinkPace.stored(in: d) == UplinkPace.off, "the pacer is OFF by default")
     check(!UplinkPace.isOn(in: d), "and isOn agrees with stored")
 }
@@ -294,25 +263,38 @@ do {
           "🚨 and NOT in ContentView, which hosts the NavigationView")
 }
 
-// 12. The retirements must be CALLED, and at launch. Guarding the function while
-//     its call site is missing is the shape that buys a green suite and an empty
-//     log — this project has paid for it before.
+// 12. 🚨 THE RETIREMENTS MUST BE CALLED, AT LAUNCH, AND **EACH** OF THEM MUST BE
+//     ORDERED — the first version of this section compared only the FIRST call
+//     against the reader, so moving either of the others below it left the suite
+//     green while the commit message claimed otherwise. A loop over the calls that
+//     checks only existence is not a check on order. *(User-caught, 2026-08-17.)*
 do {
     let app = source("VKTurnProxy/VKTurnProxy/VKTurnProxyApp.swift")
-    for call in ["UplinkChunk.clearStaleValueOnce",
-                 "UplinkPace.clearRetiredTestKeyOnce",
-                 "UplinkSynth.clearStaleValueOnce"] {
-        check(app.contains(call), "\(call) is called at launch")
-    }
-    // Before the store and the UI: `currentConfig()` reads these keys, so a
-    // retirement that runs after the first read has already lost the race.
-    if let retire = app.range(of: "UplinkChunk.clearStaleValueOnce"),
-       let store = app.range(of: "_ = ServerStore.shared") {
-        check(retire.lowerBound < store.lowerBound,
-              "the retirements run BEFORE anything that reads the keys")
-    } else {
+    guard let store = app.range(of: "_ = ServerStore.shared") else {
         check(false, "could not locate the launch sequence to order the retirements against")
+        exit(1)
     }
+    for call in ["UplinkPace.resetToProductionDefaultOnce",
+                 "UplinkSynth.clearStaleValueOnce"] {
+        guard let r = app.range(of: call) else {
+            check(false, "\(call) is called at launch")
+            continue
+        }
+        check(r.lowerBound < store.lowerBound,
+              "\(call) runs BEFORE anything that reads its keys")
+    }
+}
+
+// 13. 🚫 THE CHUNKING MACHINERY MUST STAY REMOVED ON THE SWIFT SIDE TOO. It was
+//     deleted because packets 2..K of a chunk were written after a SINGLE pace
+//     reservation, so the bucket metered one packet in K while reporting ENGAGED.
+//     The Go guard covers the core; this one covers the config the app builds.
+do {
+    let tm = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(!tm.contains("uplink_chunk_k") && !tm.contains("UplinkChunk"),
+          "the app no longer sends a chunk size to the tunnel")
+    check(!FileManager.default.fileExists(atPath: "VKTurnProxy/VKTurnProxy/UplinkChunk.swift"),
+          "and UplinkChunk.swift is gone rather than dormant")
 }
 
 print("")

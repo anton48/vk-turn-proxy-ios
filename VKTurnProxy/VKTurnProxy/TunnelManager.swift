@@ -155,7 +155,6 @@ extension TunnelConfig {
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
             memstatsFastTicks: d.bool(forKey: "memstatsFastTicks"),
-            uplinkChunkK: UplinkChunk.stored(in: d),
             uplinkPaceKiB: UplinkPace.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
@@ -988,13 +987,53 @@ class TunnelManager: ObservableObject {
     /// shape of the re-signed-IPA App Group defect (#59), where
     /// `UserDefaults(suiteName:)` does not return nil, it just answers wrongly.
     ///
-    /// No-op when the tunnel is down; the value is read again at the next start.
+    /// 🚨 AND IT MUST NOT BE FIRE-AND-FORGET, WHICH IS WHAT IT WAS FIRST WRITTEN AS.
+    /// `try? session.sendProviderMessage(msg) { _ in }` swallows BOTH the send
+    /// error and the extension's own `"bad"` reply. Flip the switch while the
+    /// tunnel is `.connecting`, or before `manager` has finished loading, or
+    /// through a momentary IPC failure, and: the message is dropped, the config
+    /// for the RUNNING session still holds the old value, nothing re-syncs at
+    /// `.connected` — and the UI shows the new state. The tunnel then keeps the
+    /// old shaping until the next reconnect, which reads as *"it works,
+    /// sometimes"*. *(User-caught, 2026-08-17.)*
+    ///
+    /// ⇒ Deliver only when the session is actually up, believe only an explicit
+    /// `ok`, and otherwise mark the sync PENDING so the `.connected` transition
+    /// re-sends it. Every outcome is logged, because the failure this replaces was
+    /// invisible.
+    ///
+    /// ⚠️ Its sibling `applyMemstatsFastTicks` is deliberately left fire-and-forget:
+    /// losing it costs log resolution, not traffic shaping.
+    private var uplinkPaceSyncPending = false
+
     func applyUplinkPaceFromSettings() {
         let kib = UplinkPace.stored(in: .standard)
+        let msg = "set_uplink_pace:\(kib),\(UplinkPace.burstKiB)"
         guard let session = manager?.connection as? NETunnelProviderSession,
-              let msg = "set_uplink_pace:\(kib),\(UplinkPace.burstKiB)".data(using: .utf8)
-        else { return }
-        try? session.sendProviderMessage(msg) { _ in }
+              session.status == .connected,
+              let data = msg.data(using: .utf8)
+        else {
+            uplinkPaceSyncPending = true
+            SharedLogger.shared.log("[App] uplink-pace: \(kib) KiB/s NOT delivered — the tunnel "
+                + "is not connected; queued for the next .connected transition")
+            return
+        }
+        do {
+            try session.sendProviderMessage(data) { [weak self] reply in
+                let ok = reply.flatMap { String(data: $0, encoding: .utf8) } == "ok"
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    self.uplinkPaceSyncPending = !ok
+                    SharedLogger.shared.log("[App] uplink-pace: the extension "
+                        + "\(ok ? "acknowledged" : "REFUSED or did not answer") \(kib) KiB/s"
+                        + (ok ? "" : " — queued for the next .connected transition"))
+                }
+            }
+        } catch {
+            uplinkPaceSyncPending = true
+            SharedLogger.shared.log("[App] uplink-pace: send failed (\(error.localizedDescription))"
+                + " — queued for the next .connected transition")
+        }
     }
 
     /// Send debug log message to extension (appears in vpn.log).
@@ -1335,6 +1374,16 @@ class TunnelManager: ObservableObject {
                     }
                     // (Re)start polling, preserving captcha state across reconnects
                     self.startStatsPolling(reset: false)
+                    // A pace change made while the tunnel was down, connecting,
+                    // or through a failed IPC never reached the extension. The
+                    // session that just came up carries the value in its config,
+                    // so this is belt-and-braces for the case where it did not —
+                    // and it is the only thing standing between a lost message
+                    // and a switch that lies until the next reconnect.
+                    if self.uplinkPaceSyncPending {
+                        self.uplinkPaceSyncPending = false
+                        self.applyUplinkPaceFromSettings()
+                    }
                     // Once the tunnel is actually up, any error message left
                     // over from a captcha-limit exhaustion or other transient
                     // failure is stale — clear it so the user isn't told
@@ -1859,7 +1908,6 @@ class TunnelManager: ObservableObject {
             "uplink_synth_mbit": config.uplinkSynthMbit,
             "uplink_synth_sec": config.uplinkSynthSec,
             "memstats_fast_ticks": config.memstatsFastTicks,
-            "uplink_chunk_k": config.uplinkChunkK,
             // The rate rides the config so the choice survives a reconnect; 0 = off,
             // which is exactly what the Go side's PaceOff means. The burst is not a
             // setting — it is settled at 16 KiB — but it travels with the rate so
@@ -2402,10 +2450,6 @@ struct TunnelConfig {
     // Carried here so it survives a reconnect; the live path that avoids one is
     // TunnelManager.applyMemstatsFastTicks(). Default false.
     var memstatsFastTicks: Bool = false
-    /// Uplink chunking K (EXPERIMENT, Settings › Advanced). 1 = today's
-    /// behaviour. See UplinkChunk.swift; expected to be removed with the
-    /// setting once the sweep has answered.
-    var uplinkChunkK: Int = UplinkChunk.off
     /// The uplink pacer's rate in KiB/s of counted bytes per allocation, 0 = off
     /// (Settings › Advanced). DEFAULT OFF — and the default lives here as well as
     /// in `UplinkPace.off`, because a config built without going through

@@ -70,6 +70,14 @@ enum UplinkPace {
     /// the same defect that once ran a removed chunking picker for three days.
     static let retiredBoolKey = "uplinkPaceOn"
 
+    /// 🚨 THE MARKER FOR THE PRODUCTION RESET, AND IT IS DELIBERATELY A NEW NAME.
+    /// A marker set by a diagnostic build cannot guard a production reset: the
+    /// device that most needs resetting is exactly the one that ran those builds
+    /// and already has their marker. Reusing one is how a guard passes for the
+    /// worst-case device. *(User-caught, 2026-08-17 — the first port shipped that
+    /// mistake in the chunking retirement.)*
+    static let productionResetKey = "uplinkPaceResetToProductionDefault"
+
     /// What the tunnel should run: 0, or the one shipped rate. Anything else in
     /// the store — a hand-edited backup, or one of the sweep rates written by a
     /// diagnostic build — reads as "on" and snaps to 247, because the sweep
@@ -88,21 +96,38 @@ enum UplinkPace {
     /// silently make the shipped default a lie on exactly the devices that
     /// measured it.
     ///
-    /// Runs once, says so when it fires, and never touches the new key.
+    /// 🚨 AND THERE ARE **TWO** DIAGNOSTIC REPRESENTATIONS TO UNDO, NOT ONE.
+    /// Builds 299-302 wrote **this very key** as a rate — the sweep's picker stored
+    /// 247 / 260 / 270 under `uplinkPaceKiB`. Clearing only the Bool leaves that
+    /// value in place, and `stored()` turns any non-zero into 247, so the one
+    /// device that ran the rate sweep would enter production with the pacer ON
+    /// while the setting claims to ship off. *(User-caught, 2026-08-17.)*
+    ///
+    /// ⇒ Both representations are zeroed exactly ONCE, behind a marker no
+    /// diagnostic build has ever set. After it, the user's choice is theirs and
+    /// survives every launch — this must never become a switch that resets itself.
+    ///
+    /// ⚠️ It deliberately does not READ the old values to decide anything: carrying
+    /// `true` or `247` across would make "default OFF" a lie on precisely the
+    /// devices that measured the feature.
     @discardableResult
-    static func clearRetiredTestKeyOnce(in d: UserDefaults = .standard,
-                                        log: ((String) -> Void)? = nil) -> Bool {
-        let marker = "uplinkPaceOnCleared"
-        guard !d.bool(forKey: marker) else { return false }
-        d.set(true, forKey: marker)
-        guard d.object(forKey: retiredBoolKey) != nil else { return false }
+    static func resetToProductionDefaultOnce(in d: UserDefaults = .standard,
+                                             log: ((String) -> Void)? = nil) -> Bool {
+        guard !d.bool(forKey: productionResetKey) else { return false }
+        d.set(true, forKey: productionResetKey)
 
-        let was = d.bool(forKey: retiredBoolKey)
+        let hadBool = d.object(forKey: retiredBoolKey) != nil
+        let hadRate = (d.object(forKey: key) as? Int) ?? 0
         d.removeObject(forKey: retiredBoolKey)
-        log?("uplink-pace: cleared the retired test switch \(retiredBoolKey)=\(was) left by "
-            + "builds 296-298, which defaulted it ON for measurement. The shipped setting is "
-            + "\(key) and its default is OFF; turn the pacer on in Settings › Advanced if you "
-            + "want it.")
+        d.removeObject(forKey: key)
+        guard hadBool || hadRate != 0 else { return false }
+
+        log?("uplink-pace: reset to the production default (OFF). This device carried "
+            + (hadBool ? "the retired test switch \(retiredBoolKey) " : "")
+            + (hadBool && hadRate != 0 ? "and " : "")
+            + (hadRate != 0 ? "a diagnostic rate \(key)=\(hadRate) " : "")
+            + "from builds 296-302, where the pacer was ON for measurement. Neither value is "
+            + "carried over — turn it on in Settings › Advanced if you want it.")
         return true
     }
 }

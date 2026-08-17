@@ -7,7 +7,8 @@
 // counts what arrives.
 //
 // 🚨 WHAT THIS FILE IS FOR, AND IT IS NOT THE GENERATOR. It retires a stored
-// value that no screen can show, for exactly the reason `UplinkChunk` had to:
+// value that no screen can show, for the same reason the pacer's own retirement
+// exists:
 // a key written during a measurement session outlives the session, and this one
 // arms a generator that PUSHES TRAFFIC. A device left with `uplinkSynthMbit`
 // set would send tens of Mbit/s of synthetic packets on every connect, on the
@@ -25,7 +26,8 @@ enum UplinkSynth {
     static let secKey = "uplinkSynthSec"
 
     /// Runs the retirement exactly once, so a deliberate re-arm survives the next
-    /// launch. Same contract as `UplinkChunk.clearedKey`.
+    /// launch — the documented way back in is importing a backup that carries the
+    /// field, and a retirement that ran every launch would undo it.
     static let clearedKey = "uplinkSynthStaleCleared"
 
     @discardableResult

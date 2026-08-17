@@ -155,13 +155,13 @@ func TestSendPacketStampsTheEnqueueInstant(t *testing.T) {
 // uninstrumented. Validated by sabotage: delete any one observe call and it goes
 // red, naming the line.
 //
-// ⚠️ UPDATED WITH UPLINK CHUNKING. The four sites no longer call observe
-// inline — they hand the packet to `p.writeChunk`, which prices every packet it
-// writes (uplinkchunk.go). The property is unchanged, the indirection is new, so
+// ⚠️ UPDATED WHEN THE FOUR SITES STOPPED CALLING observe INLINE: they hand the
+// packet to `p.writePacket`, which prices every packet it writes
+// (writepacket.go). The property is unchanged, the indirection is new, so
 // a site now satisfies this guard EITHER way. That widening is only safe because
-// of the second half below, which follows the delegation into uplinkchunk.go and
+// of the second half below, which follows the delegation into writepacket.go and
 // checks the instrument is still fed there; without it, routing a transport
-// through a writeChunk that had lost its observe call would pass silently. Same
+// through a writePacket that had lost its observe call would pass silently. Same
 // brittleness as the `sockStats.register` scan window: a guard that scans for a
 // call near a line goes red on correct code the moment the call moves, and the
 // fix is to follow the code, never to delete the guard.
@@ -186,14 +186,14 @@ func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 		// is that a dequeue and its instrument stay in the same breath.
 		for j := i; j < i+8 && j < len(lines); j++ {
 			if strings.Contains(lines[j], "p.sendWait.observe(") ||
-				strings.Contains(lines[j], "p.writeChunk(") {
+				strings.Contains(lines[j], "p.writePacket(") {
 				fed = true
 				break
 			}
 		}
 		if !fed {
 			t.Errorf("proxy.go:%d dequeues sendCh without calling p.sendWait.observe "+
-				"or p.writeChunk within 5 lines — that transport's packets are invisible "+
+				"or p.writePacket within 8 lines — that transport's packets are invisible "+
 				"to the residence histogram:\n\t%s", i+1, strings.TrimSpace(ln))
 		}
 	}
@@ -203,18 +203,18 @@ func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 			"vacuously", sites)
 	}
 
-	// Follow the delegation: whatever writeChunk writes, it must also price.
-	chunkSrc, err := os.ReadFile("uplinkchunk.go")
+	// Follow the delegation: whatever writePacket writes, it must also price.
+	chunkSrc, err := os.ReadFile("writepacket.go")
 	if err != nil {
-		t.Fatalf("read uplinkchunk.go: %v", err)
+		t.Fatalf("read writepacket.go: %v", err)
 	}
 	if !strings.Contains(string(chunkSrc), "p.sendWait.observe(") {
-		t.Fatal("writeChunk no longer calls p.sendWait.observe — every transport now " +
+		t.Fatal("writePacket no longer calls p.sendWait.observe — every transport now " +
 			"delegates to it, so this one deletion makes the residence histogram blind " +
 			"for the whole uplink while the per-site scan above still passes")
 	}
 	if !strings.Contains(string(chunkSrc), "p.writeWait.observe(") {
-		t.Fatal("writeChunk no longer calls p.writeWait.observe — `conn-write` has gone " +
+		t.Fatal("writePacket no longer calls p.writeWait.observe — `conn-write` has gone " +
 			"blind for every transport")
 	}
 }

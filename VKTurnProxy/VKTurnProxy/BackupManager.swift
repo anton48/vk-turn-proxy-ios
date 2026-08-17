@@ -98,11 +98,6 @@ enum BackupManager {
         // switch above: a diagnostic that silently resets on a restore is one
         // nobody can rely on mid-investigation.
         let fastTicks = (d.object(forKey: "memstatsFastTicks") as? Bool) ?? false
-        // Uplink chunking K (experiment). Snapped on the way out as well as in:
-        // the picker can only show supported values, so exporting an unsnapped
-        // one would produce a backup whose restore shows a different number
-        // than the tunnel uses.
-        let chunkK = UplinkChunk.clamp((d.object(forKey: "uplinkChunkK") as? Int) ?? UplinkChunk.off)
         // The uplink pacer. Exported as the RATE, snapped the same way the tunnel
         // snaps it, so a backup can never describe a rate the app does not offer.
         let paceKiB = UplinkPace.stored(in: d)
@@ -130,7 +125,6 @@ enum BackupManager {
             vkAuth: vkAuth,
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,
-            uplinkChunkK: chunkK,
             uplinkPaceKiB: paceKiB,
             tunnelMTU: mtu
         )
@@ -254,10 +248,6 @@ enum BackupManager {
         // Clamped on the way in: a hand-edited backup is an untrusted source,
         // and an out-of-range MTU would otherwise reach the network settings.
         if let v = s.tunnelMTU { d.set(TunnelMTU.clamp(v), forKey: "tunnelMTU") }
-        // Snapped on import for the same reason as the MTU above: a hand-edited
-        // backup is untrusted, and a K the picker cannot display would leave the
-        // screen showing something other than what the tunnel runs.
-        if let v = s.uplinkChunkK { d.set(UplinkChunk.clamp(v), forKey: "uplinkChunkK") }
         // Same snapping on the way in, and for the stronger reason: this key arms a
         // shaper. A hand-edited backup carrying an arbitrary number would otherwise
         // set a rate nobody measured — non-zero means ON at the one shipped rate.

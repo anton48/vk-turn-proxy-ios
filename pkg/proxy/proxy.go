@@ -242,12 +242,6 @@ type Proxy struct {
 	// the packet still waits.
 	writeWait sendWaitStats
 
-	// chunkStats: the uplink-chunking experiment's own instrument — it answers
-	// "did the knob engage", because a configured K that never materialises
-	// (shallow queue) is a run that tested nothing. K itself is process-global
-	// and live-settable, in the idiom of memstatsFastTicks; see uplinkchunk.go.
-	chunkStats chunkStats
-
 	// sockStats (build 233): the kernel's own view of the 30 outer TCP sockets.
 	// See sockstats.go for why, and for the field whose SDK comment must be read
 	// before it is quoted.
@@ -2805,9 +2799,8 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			case item := <-p.sendCh:
 				p.paceSettle(ticket, len(item.buf))
 				// -1: this site has never maintained the per-conn TX counters,
-				// and writeChunk must not quietly start. That is what keeps
-				// K=1 byte-for-byte identical to the pre-chunking code here.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
+				// and writePacket must not quietly start.
+				if err := p.writePacket(item, -1, writeOne); err != nil {
 					log.Printf("proxy: [conn %d] DTLS send goroutine: write error: %v", connIdx, err)
 					return
 				}
@@ -3066,7 +3059,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			case item := <-p.sendCh:
 				p.paceSettle(ticket, len(item.buf))
 				// -1: no per-conn TX accounting at this site today.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
+				if err := p.writePacket(item, -1, writeOne); err != nil {
 					return
 				}
 			}
@@ -3263,7 +3256,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			case item := <-p.sendCh:
 				p.paceSettle(ticket, len(item.buf))
 				// -1: no per-conn TX accounting at this site today.
-				if err := p.writeChunk(item, -1, writeOne); err != nil {
+				if err := p.writePacket(item, -1, writeOne); err != nil {
 					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)
 					return
 				}
@@ -4127,7 +4120,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
 			label,
 			rssStr,
 			internalStr,
@@ -4169,12 +4162,6 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// Consecutive with the above, never additive with it — and blind to
 			// what happens after Write returns, which is what `sock=` measures.
 			p.writeWait.summaryAs("conn-write"),
-			// How many packets each chunk actually carried. Empty unless
-			// chunking wrote something; at K=1 it reads 1.00/1, which is the
-			// control arm saying so out loud. 🚨 Read it BEFORE believing a
-			// null: a configured K that never materialised (shallow queue)
-			// means the run tested nothing. See uplinkchunk.go.
-			p.chunkStats.summary(),
 			// Whether the uplink pacer engaged this interval, and how hard.
 			// EMPTY unless the setting is on, so an unpaced tunnel's line is
 			// unchanged. `waited=` near zero is the ordinary case under light
@@ -5145,14 +5132,14 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				log.Printf("proxy: [conn %d] SRTP send goroutine: ctx cancelled", connIdx)
 				return
 			// connIdx (not -1) below because this site keeps the per-conn TX
-			// counters, which writeChunk maintains per packet: the pre-SRTP
+			// counters, which writePacket maintains per packet: the pre-SRTP
 			// payload bytes — the WireGuard records that came out of sendCh —
 			// not the wire bytes after RTP+SRTP framing. That matches what an
 			// external observer counting WG throughput sees, and keeps the
 			// conn-stats tick reading the same regardless of transport mode.
 			case item := <-p.sendCh:
 				p.paceSettle(ticket, len(item.buf))
-				if err := p.writeChunk(item, connIdx, writeOne); err != nil {
+				if err := p.writePacket(item, connIdx, writeOne); err != nil {
 					log.Printf("proxy: [conn %d] SRTP send error: %v", connIdx, err)
 					return
 				}

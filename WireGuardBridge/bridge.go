@@ -226,28 +226,12 @@ type ProxyConfig struct {
 	UplinkSynthMbit float64 `json:"uplink_synth_mbit,omitempty"`
 	UplinkSynthSec  int     `json:"uplink_synth_sec,omitempty"`
 
-	// UplinkChunkK is the uplink-chunking experiment, now RETIRED to a
-	// diagnostic: how many consecutive WireGuard packets one writer hands to ONE
-	// relay connection before going back to compete for the shared queue. 1 (and
-	// 0, meaning unset) is exactly today's behaviour.
-	//
-	// 🚫 SWEPT AND CLOSED 2026-08-12 — do not re-run the sweep. 14 arms
-	// (F = 8/16/32 x K = 1..64) moved nothing, because the lever cannot ENGAGE:
-	// the mean chunk was 1.86 even at K=64, since ~30 writer goroutines compete
-	// for a queue whose mean depth is only ~2.8 packets, and filling a chunk of
-	// K needs roughly N*K queued. The Settings screen entry was removed with the
-	// result; this field survives in the idiom of UplinkSynthMbit above — an
-	// undocumented backup-JSON knob, default off, kept so the machinery can be
-	// re-driven if the fan-out architecture ever changes. See
-	// pkg/proxy/uplinkchunk.go for the full finding.
-	UplinkChunkK int `json:"uplink_chunk_k,omitempty"`
-
 	// UplinkPaceKiB arms the per-allocation uplink token bucket — the client
 	// pacer — at connect time, in KiB/s of COUNTED bytes per allocation. 0 (and
 	// an absent field) is OFF, which is the shipped default and byte-for-byte
 	// the behaviour this tunnel has always had.
 	//
-	// 🎯 UNLIKE UplinkChunkK ABOVE, THIS ONE HAS A SETTING BEHIND IT
+	// 🎯 THIS ONE HAS A SETTING BEHIND IT
 	// (Settings › Advanced), so the value here is a projection of the switch and
 	// not an undocumented knob. It rides the config so the choice survives a
 	// reconnect; the live setter below is what makes the switch take effect
@@ -314,7 +298,6 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
-	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
 	// The pacer is applied at BOTH connect sites, because a tunnel that comes up
 	// through the bootstrap path is the same tunnel: applying it at one site only
 	// would make the setting depend on how the session happened to start.
@@ -457,7 +440,6 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
-	proxy.SetUplinkChunkK(pcfg.UplinkChunkK)
 	// The pacer is applied at BOTH connect sites, because a tunnel that comes up
 	// through the bootstrap path is the same tunnel: applying it at one site only
 	// would make the setting depend on how the session happened to start.
