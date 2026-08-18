@@ -744,14 +744,36 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 		return "", "", false, fmt.Errorf("PoW: no solution found within 10M iterations")
 	}
 	durationMs := time.Since(powStart).Milliseconds()
-	hash := buildPowResult(powParams, hexHash, nonce, durationMs)
+
+	// VK_POW_BOGUS=1 is the NEGATIVE CONTROL for the two switches below, and
+	// nothing they measure means anything without it: "VK accepted our hash"
+	// is only informative if VK would have REFUSED a wrong one. It corrupts
+	// the digest AFTER the solve, so the shape stays exactly right — 64 lower
+	// hex chars, same nonce, same envelope — and only the one property under
+	// test (the leading zeros / the digest matching input+nonce) is broken.
+	// Expect status != OK. If OK comes back anyway, the field is not verified
+	// at all and every other result here is about something else.
+	sentHex := hexHash
+	if os.Getenv("VK_POW_BOGUS") == "1" {
+		sentHex = "ff" + hexHash[2:]
+		log.Printf("pow: 🚨 VK_POW_BOGUS — sending a DELIBERATELY WRONG digest (%s… for %s…); status=OK here means VK does not verify the PoW",
+			sentHex[:8], hexHash[:8])
+	}
+
+	hash := buildPowResult(powParams, sentHex, nonce, durationMs)
+	form := "v2 envelope"
 	if os.Getenv("VK_POW_V1") == "1" {
 		// Diagnostic: send the pre-2026-07 bare hex digest, to establish
 		// whether the v2 envelope is actually load-bearing or merely correct.
-		hash = hexHash
+		hash = sentHex
+		form = "BARE HEX (VK_POW_V1)"
 	}
-	log.Printf("pow: solved hash=%s...%s nonce=%d duration=%dms (sent as v2 envelope, %d chars)",
-		hexHash[:8], hexHash[len(hexHash)-8:], nonce, durationMs, len(hash))
+	// The form is DERIVED, never asserted: this line used to say "sent as v2
+	// envelope" unconditionally, which was false under VK_POW_V1 — an arm's
+	// label reported as its setting. `len(hash)` discriminates them anyway
+	// (64 bare vs ~179 enveloped) and stays as the cross-check.
+	log.Printf("pow: solved hash=%s...%s nonce=%d duration=%dms (sent as %s, %d chars)",
+		hexHash[:8], hexHash[len(hexHash)-8:], nonce, durationMs, form, len(hash))
 
 	// Brief pause after PoW (simulate browser JS execution time)
 	time.Sleep(time.Duration(200+mathrand.Intn(300)) * time.Millisecond)
