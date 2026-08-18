@@ -9,6 +9,16 @@
 #
 # `swiftcheck/` is deliberately NOT here: it is tracked, and `run.sh` refuses to
 # run if any of its inputs — itself included — is missing from the index.
+#
+# 🚨 2026-08-18: `turn_srtp_test/` LEFT this list, and the reason is the one this
+# header already warns about — it stopped being a scratch tool. It is the load
+# generator for the N=60 blackhole investigation, and it took three correctness
+# fixes (a barrier that was not one, a worker that could hang forever inside
+# Write, and an arm whose label could not be checked against the wire) that would
+# otherwise have lived on one laptop. Only its SOURCE is tracked; the binary
+# built beside it stays ignored.
+# ⚠️ Its sink, `turn_srtp_server/`, is still ignored — so a fresh clone has half
+# the system. Track it too the moment anyone needs to run the pair elsewhere.
 
 apppass_test/
 captcha_test/
@@ -19,5 +29,5 @@ turn_bw_server/
 turn_bw_test/
 turn_quota_test/
 turn_srtp_server/
-turn_srtp_test/
+turn_srtp_test/turn_srtp_test
 wrapa_test/
