@@ -102,10 +102,21 @@ func main() {
 		burst         = flag.Int("burst", 1, "packets written back-to-back per -spacing tick; offered rate ≈ burst/spacing. Needed to overload the policer at small -pkt-size, where time.Sleep granularity caps -spacing alone at ~900 pkt/s.")
 		transport     = flag.String("transport", "udp", "TURN control transport: udp or tcp (relayed data is always UDP via Allocate())")
 		readyTimeout  = flag.Duration("ready-timeout", 180*time.Second, "how long to wait for ALL workers to reach READY (allocation+permission+handshake) before refusing to start")
+		grace         = flag.Duration("grace", 20*time.Second, "how long after -duration to wait for workers to unwind before cancelling them. Measured from the barrier release, so a fast barrier does not append its unused slack to the run.")
 		arm           = flag.String("arm", "", "which leg this run measures: uplink (server -echo=0) or downlink (server -echo=4). Sets nothing by itself — it declares the EXPECTED return ratio so the run can refuse to be scored as the arm it is not. Empty = no check.")
 		verbose       = flag.Bool("v", false, "enable pion debug logs")
 	)
 	flag.Parse()
+
+	// Reject an unknown -arm HERE, before a single allocation is made. The check
+	// used to live in checkArm, i.e. after the whole run — so a typo cost the
+	// entire test and was reported once the data it was meant to label had
+	// already been collected.
+	switch *arm {
+	case "", "uplink", "downlink":
+	default:
+		log.Fatalf("unknown -arm=%q (want uplink, downlink, or empty for no check)", *arm)
+	}
 
 	if *credsPath == "" || *dstIP == "" || *dstPort == 0 {
 		log.Fatal("required flags: -creds, -dst-ip, -dst-port")
@@ -226,6 +237,16 @@ BARRIER:
 	close(startBarrier)
 	testStart := time.Now()
 
+	// 🚨 The teardown deadline must be measured from HERE, not from process
+	// start. The up-front ctx has to be generous enough for a slow barrier
+	// (readyTimeout + duration + slack), and the barrier is usually FAST — so on
+	// a blackhole, where every worker is parked in Write and only ctx
+	// cancellation frees it, that leftover slack becomes dead time appended to
+	// the run: minutes of it, with no bytes moving, before the final report
+	// appears. Re-arming from testStart bounds the tail at exactly one grace
+	// period however long the barrier took.
+	time.AfterFunc(*duration+*grace, cancel)
+
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 	doneCh := make(chan struct{})
@@ -241,10 +262,22 @@ PRINT:
 		}
 	}
 
+	// Average over the LOAD WINDOW, not over wall time to teardown. Each worker
+	// stops sending at exactly -duration after the barrier, so any time spent
+	// unwinding afterwards — a grace period, a blocked Write being cancelled —
+	// carries no bytes and would deflate every rate it were divided into. If the
+	// run ended EARLY (cancelled, or every worker died) the elapsed time is the
+	// shorter one and is the honest window, so take the smaller of the two.
+	window := time.Since(testStart)
+	if window > *duration {
+		window = *duration
+	}
 	fmt.Println()
 	fmt.Println("=== FINAL ===")
-	printRate(stats, time.Since(testStart))
-	printSummary(stats, time.Since(testStart))
+	fmt.Printf("(rates averaged over the %s load window; wall time to teardown was %s)\n",
+		window.Round(time.Second), time.Since(testStart).Round(time.Second))
+	printRate(stats, window)
+	printSummary(stats, window)
 	checkArm(stats, *arm)
 }
 
