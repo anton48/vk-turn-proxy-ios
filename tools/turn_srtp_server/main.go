@@ -238,6 +238,20 @@ func main() {
 	defer srv.Close()
 	log.Printf("listening on %s (DTLS-SRTP)", srv.Addr())
 
+	// 🚨 `-listen 0.0.0.0:P` lands on the IPv6 wildcard here, because
+	// ResolveUDPAddr+ListenUDP with network "udp" opens a dual-stack socket.
+	// On Linux that is fine (net.ipv6.bindv6only=0); on FreeBSD, where
+	// net.inet6.ip6.v6only defaults to 1, the socket receives NO IPv4 TRAFFIC
+	// AT ALL — and nothing says so. Cost one full test cycle on 2026-08-18: the
+	// server printed `listening on [::]:56002` and sat at "0 sources" while all
+	// 60 clients died on `dtls client handshake: context deadline exceeded`.
+	// The startup line was TRUE and read as reassurance; the tell was `[::]`
+	// where the operator had typed 0.0.0.0.
+	if ua, ok := srv.Addr().(*net.UDPAddr); ok && ua.IP.IsUnspecified() && ua.IP.To4() == nil {
+		log.Printf("🚨 bound to the IPv6 wildcard %s — on FreeBSD (net.inet6.ip6.v6only=1) this socket receives NO IPv4 traffic", srv.Addr())
+		log.Printf("🚨 the server will look healthy and every IPv4 client will time out. Pass -listen <explicit IPv4>:%d instead.", la.Port)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	if *duration > 0 {
 		var cancelTimer context.CancelFunc
