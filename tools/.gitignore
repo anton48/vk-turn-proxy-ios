@@ -17,8 +17,10 @@
 # Write, and an arm whose label could not be checked against the wire) that would
 # otherwise have lived on one laptop. Only its SOURCE is tracked; the binary
 # built beside it stays ignored.
-# ⚠️ Its sink, `turn_srtp_server/`, is still ignored — so a fresh clone has half
-# the system. Track it too the moment anyone needs to run the pair elsewhere.
+# Its sink, `turn_srtp_server/`, followed the same day and for the same reason:
+# the generator and the sink are ONE system, and half of it in the repo is the
+# failure this header describes, just slower. Its source is UNCHANGED by that
+# move — only its visibility. Both binaries stay ignored.
 
 apppass_test/
 captcha_test/
@@ -28,6 +30,6 @@ rtpopus_interop/
 turn_bw_server/
 turn_bw_test/
 turn_quota_test/
-turn_srtp_server/
+turn_srtp_server/turn_srtp_server
 turn_srtp_test/turn_srtp_test
 wrapa_test/
