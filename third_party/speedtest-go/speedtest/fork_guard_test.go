@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// The two fork changes cannot be guarded by their VALUES, and finding that out
-// cost two vacuous tests on 2026-08-20:
+// None of the THREE fork changes (see ../FORK.md) can be guarded by their
+// VALUES, and finding that out cost two vacuous tests on 2026-08-20:
 //
 //   - restoring the adaptive controller changes nothing in a unit test, because
 //     with no confirmed bytes flowing its `delta <= 0` branch continues and it
@@ -16,10 +16,12 @@ import (
 //   - restoring upstream's NumCPU clamp changes nothing on a host with 8 or more
 //     cores, because the clamp is min(NumCPU, maxWorkers) and maxWorkers <= 8 is
 //     its own precondition. It is invisible on this laptop and bites on a
-//     6-core phone — the machine that cannot run this test.
+//     6-core phone — the machine that cannot run this test;
+//   - restoring early stop shows up only as a DURATION, which needs a real
+//     network phase (~10 s against ~20 s) — not something a unit test may hold.
 //
 // So the guard is a source scan, which is host-independent and targets exactly
-// what a future upstream bump would put back. Both assertions were seen RED
+// what a future upstream bump would put back. All three assertions were seen RED
 // under the edits they name before being committed.
 func TestForkChangesAreStillApplied(t *testing.T) {
 	src, err := os.ReadFile("data_manager.go")
