@@ -67,6 +67,7 @@ static go_vm_stats_t go_get_vm_stats(void) {
 import "C"
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -83,6 +84,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/cacggghp/vk-turn-proxy/pkg/proxy"
+	speedtestpkg "github.com/cacggghp/vk-turn-proxy/pkg/speedtest"
 	"github.com/cacggghp/vk-turn-proxy/pkg/turnbind"
 
 	"golang.zx2c4.com/wireguard/device"
@@ -1474,3 +1476,57 @@ func init() {
 }
 
 func main() {}
+
+// ─── In-app speed test ──────────────────────────────────────────────────────
+//
+// These four run in the APP process, never in the extension: a 32-flow load
+// generator next to the extension's ~50 MB jetsam budget is what builds 130-146
+// were about. They are also POLLED rather than callback-driven — the app already
+// polls stats, and it keeps this surface to four plain C functions with no
+// callback lifetime to get wrong across the boundary.
+//
+// 🚨 The engine is the VENDORED fork at third_party/speedtest-go, and both
+// go.mod files carry a `replace` onto it. Upstream turns the thread count into a
+// ceiling for a controller that was measured cutting 16 workers to 1 in five
+// seconds; if a build ever resolves upstream instead, the "Threads" knob stops
+// meaning threads and every fixed-t comparison becomes noise.
+
+//export wgSpeedtestServers
+func wgSpeedtestServers() *C.char {
+	list, err := speedtestpkg.Servers(context.Background())
+	if err != nil {
+		out, _ := json.Marshal(map[string]string{"error": err.Error()})
+		return C.CString(string(out))
+	}
+	out, err := json.Marshal(list)
+	if err != nil {
+		return C.CString(`{"error":"marshal server list"}`)
+	}
+	return C.CString(string(out))
+}
+
+//export wgSpeedtestStart
+func wgSpeedtestStart(cfgJSON *C.char) *C.char {
+	var cfg speedtestpkg.Config
+	if err := json.Unmarshal([]byte(C.GoString(cfgJSON)), &cfg); err != nil {
+		return C.CString("bad config: " + err.Error())
+	}
+	if err := speedtestpkg.Start(cfg); err != nil {
+		return C.CString(err.Error())
+	}
+	return C.CString("")
+}
+
+//export wgSpeedtestPoll
+func wgSpeedtestPoll() *C.char {
+	out, err := json.Marshal(speedtestpkg.Snapshot())
+	if err != nil {
+		return C.CString(`{"state":"error","error":"marshal snapshot"}`)
+	}
+	return C.CString(string(out))
+}
+
+//export wgSpeedtestCancel
+func wgSpeedtestCancel() {
+	speedtestpkg.Cancel()
+}

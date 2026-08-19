@@ -310,6 +310,9 @@ private struct MainNavigationLinks: View {
             NavigationLink(destination: LogsView(tunnel: tunnel)) {
                 Label("Logs", systemImage: "doc.text")
             }
+            NavigationLink(destination: SpeedTestView(tunnel: tunnel)) {
+                Label("Speed test", systemImage: "speedometer")
+            }
             NavigationLink(destination: SettingsView()) {
                 Label("Settings", systemImage: "gear")
             }

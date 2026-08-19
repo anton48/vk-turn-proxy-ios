@@ -31,6 +31,7 @@ require (
 	github.com/pion/turn/v5 v5.0.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/refraction-networking/utls v1.8.2 // indirect
+	github.com/showwin/speedtest-go v1.7.11
 	github.com/tam7t/hpkp v0.0.0-20160821193359-2b70b4024ed5 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.47.0 // indirect
@@ -40,3 +41,5 @@ require (
 )
 
 replace github.com/cacggghp/vk-turn-proxy => ..
+
+replace github.com/showwin/speedtest-go => ../third_party/speedtest-go

@@ -221,6 +221,35 @@ const char *wgProbeVKCreds(const char *linkID, const char *vkHostIPsJSON,
 /// @return Version string
 const char *wgVersion(void);
 
+/// ─── In-app speed test ──────────────────────────────────────────────────────
+///
+/// These run in the APP process, not the extension. All four are POLLED rather
+/// than callback-driven, so there is no callback lifetime to manage across the
+/// boundary; the caller starts a run and then reads snapshots.
+///
+/// Every returned string is a C string the CALLER MUST free().
+
+/// Fetch the selectable server list as a JSON array, or {"error": "..."}.
+/// NOTE: the list is built from this device's APPARENT address, so with the
+/// tunnel up it describes servers near the EXIT and with it down servers near
+/// the user. Say which in the UI — the same "auto" otherwise measures two
+/// different paths without telling anyone.
+/// @return JSON, caller frees
+const char *wgSpeedtestServers(void);
+
+/// Start a run. Takes the config as JSON (server_id, threads, direction,
+/// duration_sec, research, debug).
+/// @return empty string on success, an error message otherwise; caller frees
+const char *wgSpeedtestStart(const char *cfgJSON);
+
+/// Read the current snapshot as JSON: state, stage, per-direction library and
+/// raw figures, actual duration, backlog, confirmation ratio and warnings.
+/// @return JSON, caller frees
+const char *wgSpeedtestPoll(void);
+
+/// Cancel a run in progress. Idempotent.
+void wgSpeedtestCancel(void);
+
 /// Set logging callback.
 typedef void (*logger_fn_t)(int level, const char *msg);
 void wgSetLogger(logger_fn_t fn);
