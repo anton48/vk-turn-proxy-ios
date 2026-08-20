@@ -162,10 +162,20 @@ type Phase struct {
 	// rate measured over 15 — two numbers on one line that could not both be
 	// true. A quantity derived in two places is this project's recurring defect,
 	// so the split is computed once, here, and shipped.
-	WarmupSec  float64 `json:"warmup_sec"`
-	WindowSec  float64 `json:"window_sec"`
-	ImpliedSec float64 `json:"implied_sec"`
-	Consistent bool    `json:"consistent"`
+	WarmupSec float64 `json:"warmup_sec"`
+	WindowSec float64 `json:"window_sec"`
+
+	// WindowBytes is what RawMbps was computed from. Bytes is the WHOLE phase,
+	// warm-up included.
+	//
+	// 🚨 IN RESEARCH MODE THOSE ARE DIFFERENT NUMBERS, and without this field a
+	// reader checking `Bytes / WindowSec` against RawMbps gets a mismatch and
+	// concludes the tool is lying — the arithmetic that is supposed to VERIFY a
+	// line instead condemns a correct one. Shipping both is what keeps a result
+	// self-checkable in either mode.
+	WindowBytes int64   `json:"window_bytes"`
+	ImpliedSec  float64 `json:"implied_sec"`
+	Consistent  bool    `json:"consistent"`
 
 	// ConnsUsed is how many distinct TCP connections CARRIED THIS PHASE'S DATA;
 	// Dials is how many were newly opened for it.
@@ -879,6 +889,7 @@ func phaseErr(ctx context.Context, err error) error {
 func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes int64) Phase {
 	if !s.ok {
 		p.WindowSec = p.ActualSec
+		p.WindowBytes = p.Bytes
 		if s.warmup > 0 {
 			p.Warnings = append(p.Warnings, fmt.Sprintf(
 				"the phase ended before the %.0fs warm-up did, so no measurement window opened — "+
@@ -888,7 +899,8 @@ func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes int64) Ph
 	}
 	p.WarmupSec = s.at.Sub(start).Seconds()
 	p.WindowSec = end.Sub(s.at).Seconds()
-	return setRaw(p, endBytes-s.bytes, p.WindowSec)
+	p.WindowBytes = endBytes - s.bytes
+	return setRaw(p, p.WindowBytes, p.WindowSec)
 }
 
 // setRaw is the single writer of RawMbps.

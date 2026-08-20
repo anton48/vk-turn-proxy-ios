@@ -1320,19 +1320,39 @@ do {
     let run = SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
                                  threads: 32, direction: "both", durationSec: 15)
 
-    let started = SpeedTestLog.start(run, path: .vpnOff, build: "331")
+    let started = SpeedTestLog.start(run, research: true, path: .vpnOff, build: "331")
     for want in ["threads=32", "direction=both", "duration=15s", "31551", "build=331"] {
         check(started.contains(want), "the START line carries \(want)")
     }
+    // 🚨 The engine's `mode` arrives only WITH THE RESULT, so for a run that
+    // hangs or never reports this is the only record of which methodology was
+    // asked for — a fixed window or an early stop, which are not comparable.
+    check(started.contains("research=true"),
+          "🚨 START records the REQUESTED research mode, which no later line can supply")
+
+    // 🚨 Remote text in a one-line, quote-delimited format. A newline in a
+    // sponsor name splits a record; a quote closes a field early. Both produce a
+    // log that PARSES and says something that never happened.
+    let nasty = "MEO \"pwn\"\nspeedtest: DONE server=0 ping=0ms\u{0007}  x"
+    let cleaned = SpeedTestLog.clean(nasty)
+    check(!cleaned.contains("\n") && !cleaned.contains("\u{0007}"),
+          "🚨 newlines and control characters are stripped — one of them forges a whole line")
+    check(!cleaned.contains("\""),
+          "🚨 and quotes cannot close a field early")
+    check(SpeedTestLog.clean(String(repeating: "x", count: 400)).count <= 120,
+          "an unbounded remote string cannot flood the line")
 
     var progress = SpeedTestProgress()
     progress.serverID = "31551"
     progress.serverDesc = "MEO · Funchal"
     progress.pingMs = 4
     progress.engine = "speedtest-go v1.7.11+fork.5 / vkturn-method.5"
+    progress.estimator = "EWMA5"
+    progress.ooklaSeesISP = "MEO"
     var down = SpeedTestPhase()
     down.rawMbps = 312.8; down.libraryMbps = 296.2; down.actualSec = 12.3
     down.windowSec = 12.3; down.bytes = 480_100_000; down.connsUsed = 32; down.dials = 31
+    down.windowBytes = 480_100_000
     down.consistent = true
     down.warnings = ["only 87% of uploaded bytes were confirmed by the server"]
     progress.download = down
@@ -1340,6 +1360,20 @@ do {
     let lines = SpeedTestLog.result(run, progress: progress,
                                     path: SpeedTestPathTrace(.vpnOff))
     let all = lines.joined(separator: "\n")
+
+    // 🚨 The rate covers the WINDOW; `bytes` covers the whole phase. In research
+    // mode they differ, and a reader checking bytes/window against raw on a
+    // CORRECT line would conclude the tool is lying. Log what the rate came from.
+    var research = SpeedTestPhase()
+    research.rawMbps = 16.0; research.actualSec = 20; research.windowSec = 15
+    research.warmupSec = 5; research.bytes = 40_000_000; research.windowBytes = 30_000_000
+    let researchLine = SpeedTestLog.result(run, progress: {
+        var p = SpeedTestProgress(); p.download = research; return p
+    }(), path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
+    check(researchLine.contains("window-bytes=30.0MB"),
+          "🚨 the line reports the bytes the RATE was computed from")
+    check(researchLine.contains("phase-bytes=40.0MB"),
+          "and the phase total beside it, so neither number has to be guessed")
 
     check(all.contains("312.8") && all.contains("296.2"),
           "🚨 BOTH figures are logged — they answer different questions and disagreeing is normal")
@@ -1350,6 +1384,8 @@ do {
           "be strictly worse than the screenshot")
     check(all.contains("window=12.3s") && all.contains("actual=12.3s"),
           "both durations, so a reader can tell which window the rate covers")
+    check(all.contains("EWMA5") || SpeedTestProgress().estimator.isEmpty,
+          "the estimator is logged when the engine reports one")
     check(all.contains("vkturn-method.5"),
           "🚨 the methodology revisions travel with the number — without them two runs weeks " +
           "apart cannot be compared at all")
@@ -1366,6 +1402,19 @@ do {
     check(SpeedTestLog.result(run, progress: SpeedTestProgress(),
                               path: SpeedTestPathTrace(.vpnOff)).isEmpty,
           "a run that produced no phase logs nothing, not a row of zeros")
+
+    // 🚨 A log kept so runs can be compared, which drops the line saying two of
+    // them CANNOT be, invites exactly the comparison it should prevent.
+    let movedChoice = SpeedTestServerChoice.automaticMoved(from: "31309", to: "60452")
+    let withWarning = SpeedTestLog.result(run, progress: progress,
+                                          path: SpeedTestPathTrace(.vpnOff),
+                                          serverChoice: movedChoice).joined(separator: "\n")
+    check(withWarning.contains("31309") && withWarning.contains("60452"),
+          "🚨 a moved automatic selection is logged, naming both servers")
+
+    check(runner.contains("speedtest: ERROR"),
+          "🚨 a decode failure is LOGGED — it is the one failure where no result line ever runs, " +
+          "so without it the log ends at START and never says why")
 
     check(runner.contains("SpeedTestLog.start("),
           "🚨 the parameters are logged at START — a run that is stopped or fails still has to " +

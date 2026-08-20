@@ -23,6 +23,10 @@ struct SpeedTestPhase: Codable {
     var actualSec: Double = 0
     var warmupSec: Double = 0
     var windowSec: Double = 0
+    /// What rawMbps was computed from. `bytes` is the WHOLE phase, warm-up
+    /// included, so in research mode these differ and only this one checks out
+    /// against the rate.
+    var windowBytes: Int64 = 0
     var impliedSec: Double = 0
     var consistent: Bool = false
     var connsUsed: Int = 0
@@ -38,6 +42,7 @@ struct SpeedTestPhase: Codable {
         case actualSec = "actual_sec"
         case warmupSec = "warmup_sec"
         case windowSec = "window_sec"
+        case windowBytes = "window_bytes"
         case impliedSec = "implied_sec"
         case consistent
         case connsUsed = "conns_used"

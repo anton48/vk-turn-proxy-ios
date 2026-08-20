@@ -380,3 +380,43 @@ func TestIDLookupDoesNotCallEveryFailureNotFound(t *testing.T) {
 		t.Errorf("a successful lookup was reported as %v", err)
 	}
 }
+
+// TestWindowBytesMatchesTheRateItProduced: a logged line must be checkable by
+// arithmetic in BOTH modes.
+//
+// 🚨 Bytes is the WHOLE phase and RawMbps covers the measurement window, so in
+// research mode `Bytes / WindowSec` does not equal RawMbps — a reader doing the
+// obvious check on a correct line concludes the tool is lying. WindowBytes is
+// what the rate was actually computed from.
+//
+// Seen RED by leaving WindowBytes unset in applyWindow's research branch.
+func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
+	start := time.Now()
+	warmAt := start.Add(5 * time.Second)
+	end := start.Add(20 * time.Second)
+
+	p := measure(1e6, 40e6, start, end, false, 0, 0)
+	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true},
+		start, end, 40e6)
+
+	if p.WindowBytes != 30e6 {
+		t.Errorf("WindowBytes = %d, want 30000000 (40 MB total minus the 10 MB warm-up)", p.WindowBytes)
+	}
+	if p.Bytes == p.WindowBytes {
+		t.Error("Bytes and WindowBytes are equal in a research run — one of them is wrong, " +
+			"and the whole point is that they differ")
+	}
+	// The check a reader would do, on the right field.
+	implied := float64(p.WindowBytes) * 8 / p.WindowSec / 1e6
+	if implied < p.RawMbps-0.5 || implied > p.RawMbps+0.5 {
+		t.Errorf("WindowBytes/WindowSec = %.2f but RawMbps = %.2f — the line cannot be verified "+
+			"by the arithmetic it invites", implied, p.RawMbps)
+	}
+
+	// Outside research mode the two must agree, or the same check breaks there.
+	q := measure(1e6, 40e6, start, end, false, 0, 0)
+	q = applyWindow(q, warmSample{}, start, end, 40e6)
+	if q.WindowBytes != q.Bytes {
+		t.Errorf("outside research mode WindowBytes (%d) must equal Bytes (%d)", q.WindowBytes, q.Bytes)
+	}
+}

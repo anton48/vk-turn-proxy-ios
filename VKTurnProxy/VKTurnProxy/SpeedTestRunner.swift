@@ -237,6 +237,7 @@ final class SpeedTestRunner: ObservableObject {
         // never reports still has to leave its parameters behind — those are
         // exactly the runs someone comes back to the log for.
         SharedLogger.shared.log("[App] " + SpeedTestLog.start(config,
+                                                             research: research,
                                                              path: Self.currentPath(),
                                                              build: Self.appBuild))
         var p = SpeedTestProgress()
@@ -271,10 +272,16 @@ final class SpeedTestRunner: ObservableObject {
             // the screen on its last value, with the poller never invalidated and
             // the Run button never returning. A decode failure is a bug in the
             // pair of binaries and must say so.
+            // 🚨 LOGGED, not only shown. This is the failure a log is MOST needed
+            // for — the app and the engine disagreeing about the wire — and it
+            // is the one case where the result lines below never run, so
+            // without this the log ends at START and says nothing about why.
+            let message = "could not read the engine's progress (\(error)) — the app and the "
+                + "speed-test engine were built from different versions"
+            SharedLogger.shared.log("[App] speedtest: ERROR " + SpeedTestLog.clean(message))
             var p = progress
             p.state = "error"
-            p.error = "could not read the engine's progress (\(error)) — the app and the "
-                + "speed-test engine were built from different versions"
+            p.error = message
             progress = p
             stopPolling()
             return
@@ -284,7 +291,11 @@ final class SpeedTestRunner: ObservableObject {
         pathTrace.record(Self.currentPath())
         if decoded.state == "done" || decoded.state == "error" {
             if let run = startedRun {
-                for line in SpeedTestLog.result(run, progress: decoded, path: pathTrace) {
+                let choice = SpeedTestServerChoice.of(pinnedID: run.serverID,
+                                                      ranOn: decoded.serverID,
+                                                      previous: previousServerID)
+                for line in SpeedTestLog.result(run, progress: decoded,
+                                                path: pathTrace, serverChoice: choice) {
                     SharedLogger.shared.log("[App] " + line)
                 }
             }
