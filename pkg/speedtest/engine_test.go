@@ -1,8 +1,10 @@
 package speedtest
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -138,24 +140,89 @@ func TestUserAgentSurvivesOurTransport(t *testing.T) {
 	}
 }
 
-// TestConnCounterCountsEachConnectionOnce guards the accounting itself: a
-// double-counted Close would make live go negative and hide a real peak.
-func TestConnCounterCountsEachConnectionOnce(t *testing.T) {
+// TestConnCounterCountsUseNotPresence is the guard for a FALSE NEGATIVE that
+// was live in the shipped counter, and that no other check here could see.
+//
+// The old counter counted connections OPEN during a phase and started its peak
+// at whatever was already live. Server discovery leaves a pool full of idle
+// sockets, so a phase that actually ran on ONE multiplexed HTTP/2 connection
+// reported a healthy "8 of 8" — measured exactly:
+//
+//	7 idle discovery sockets + 1 measurement socket -> peak 8, dials 1, NO warning
+//
+// Counting USE removes it: an idle socket that carries nothing is not counted,
+// and h2 reads 1 whatever else is in the pool.
+//
+// Seen RED by restoring the old accounting (reset() setting peak = live, and
+// registration on dial instead of on first Read/Write).
+func TestConnCounterCountsUseNotPresence(t *testing.T) {
 	c := &connCounter{}
-	c.opened()
-	c.opened()
-	if peak, dials := c.stats(); peak != 2 || dials != 2 {
-		t.Fatalf("peak=%d dials=%d, want 2/2", peak, dials)
+	dial := c.wrapDial(func(context.Context, string, string) (net.Conn, error) {
+		return &fakeConn{}, nil
+	})
+
+	// Discovery opens seven connections and leaves them idle in the pool.
+	var idle []net.Conn
+	for i := 0; i < 7; i++ {
+		conn, err := dial(context.Background(), "tcp", "example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		idle = append(idle, conn)
 	}
-	cc := &countedConn{Conn: nil, c: c}
-	c.closed() // one real close
-	// A second Close on the same wrapper must not decrement twice.
-	cc.once.Do(c.closed)
-	cc.once.Do(c.closed)
+
+	// Phase boundary, then ONE connection carries the whole measurement.
 	c.reset()
-	if peak, dials := c.stats(); peak != 0 || dials != 0 {
-		t.Fatalf("after closing both: peak=%d dials=%d, want 0/0 — live went wrong", peak, dials)
+	work, _ := dial(context.Background(), "tcp", "target:443")
+	_, _ = work.Write([]byte("x"))
+	_, _ = work.Read(make([]byte, 1))
+
+	used, dials := c.stats()
+	if used != 1 {
+		t.Errorf("counted %d connections for a phase that used ONE; the idle pool is being "+
+			"counted as measurement capacity (dials=%d)", used, dials)
+	}
+	p := applyConnStats(Phase{}, used, dials, 8)
+	if len(p.Warnings) == 0 {
+		t.Error("🚨 8 threads on one connection passed WITHOUT a warning — this is the exact " +
+			"false negative that made every thread-count comparison meaningless")
+	}
+	for _, conn := range idle {
+		_ = conn.Close()
 	}
 }
+
+// A connection reused across a phase boundary must be counted again — it is
+// carrying THIS phase's data, whoever opened it.
+func TestConnCounterRecountsAReusedConnection(t *testing.T) {
+	c := &connCounter{}
+	dial := c.wrapDial(func(context.Context, string, string) (net.Conn, error) {
+		return &fakeConn{}, nil
+	})
+	conn, _ := dial(context.Background(), "tcp", "target:443")
+
+	c.reset()
+	_, _ = conn.Write([]byte("phase one"))
+	if used, _ := c.stats(); used != 1 {
+		t.Fatalf("phase one used %d, want 1", used)
+	}
+
+	c.reset()
+	if used, _ := c.stats(); used != 0 {
+		t.Fatalf("a fresh phase starts at %d, want 0 — the count describes THIS phase", used)
+	}
+	_, _ = conn.Write([]byte("phase two"))
+	if used, dials := c.stats(); used != 1 || dials != 0 {
+		t.Fatalf("phase two used=%d dials=%d, want 1/0 — a reused connection is still a flow", used, dials)
+	}
+}
+
+// fakeConn is a net.Conn that does nothing, so the counter can be exercised
+// without a network.
+type fakeConn struct{ net.Conn }
+
+func (f *fakeConn) Read(b []byte) (int, error)  { return len(b), nil }
+func (f *fakeConn) Write(b []byte) (int, error) { return len(b), nil }
+func (f *fakeConn) Close() error                { return nil }
 
 var _ = tls.VersionTLS12

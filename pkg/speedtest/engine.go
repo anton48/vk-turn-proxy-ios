@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	stgo "github.com/showwin/speedtest-go/speedtest"
@@ -104,17 +105,32 @@ func (u *userAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
 	return u.next.RoundTrip(r)
 }
 
-// connCounter counts the TCP connections a phase actually opens and how many
-// were open at once.
+// connCounter counts the TCP connections that CARRIED THIS PHASE'S DATA.
 //
-// Why both numbers: Dials answers "did the pool churn", PeakConns answers "did
-// Threads mean flows". Under HTTP/2 the peak is 1 however many workers run, so
-// the peak is the figure that catches the defect this package exists to prevent.
+// 🚨 IT COUNTS USE, NOT PRESENCE, AND THAT DISTINCTION IS THE WHOLE GUARD.
+// An earlier version counted connections OPEN during the phase and reset its
+// peak to whatever was already live. That reads as a healthy number built
+// entirely out of sockets the measurement never touched — reproduced directly:
+//
+//	7 idle sockets left by discovery + 1 multiplexed HTTP/2 measurement socket
+//	  -> peak = 8, dials = 1, and applyConnStats(threads: 8) said NOTHING.
+//
+// A false NEGATIVE, in the one guard whose entire job is to catch h2. The
+// comment there argued the overshoot could only ever look healthy "which it
+// cannot, because h2 drives the peak to 1" — asserted, never measured, and
+// wrong: h2 drives the MEASURED connections to 1 while the pool stays full.
+//
+// So a connection is counted the first time it moves a byte in the current
+// generation. Under h2 that is 1 however many workers run, whatever else is
+// lying idle in the pool.
 type connCounter struct {
-	mu    sync.Mutex
-	live  int
-	peak  int
-	dials int
+	gen atomic.Uint64 // bumped by reset(); a conn re-registers when it lags
+
+	mu     sync.Mutex
+	live   int // open, any generation — used only to decrement safely
+	active int // distinct connections that carried data in THIS generation
+	peak   int
+	dials  int
 }
 
 func (c *connCounter) wrapDial(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
@@ -123,17 +139,28 @@ func (c *connCounter) wrapDial(dial func(context.Context, string, string) (net.C
 		if err != nil {
 			return nil, err
 		}
-		c.opened()
+		c.mu.Lock()
+		c.live++
+		c.dials++
+		c.mu.Unlock()
 		return &countedConn{Conn: conn, c: c}, nil
 	}
 }
 
-func (c *connCounter) opened() {
+// touch registers a connection as carrying data in the current generation.
+// The atomic fast path keeps it off the lock on every Read and Write.
+func (c *connCounter) touch(cc *countedConn) {
+	g := c.gen.Load()
+	if cc.gen.Load() == g {
+		return
+	}
 	c.mu.Lock()
-	c.live++
-	c.dials++
-	if c.live > c.peak {
-		c.peak = c.live
+	if cc.gen.Load() != g {
+		cc.gen.Store(g)
+		c.active++
+		if c.active > c.peak {
+			c.peak = c.active
+		}
 	}
 	c.mu.Unlock()
 }
@@ -146,37 +173,47 @@ func (c *connCounter) closed() {
 	c.mu.Unlock()
 }
 
-// reset starts a new phase's accounting.
+// reset starts a new phase's accounting from ZERO.
 //
-// 🚨 peak starts at the number of connections ALREADY OPEN, not at zero: an idle
-// connection kept alive from the previous phase is a real connection this phase
-// can reuse, and zeroing would under-report a phase that reuses the whole pool.
-// The converse is a known, accepted overshoot — connections still tearing down
-// from the previous phase are counted too, which inflates the peak and can only
-// ever hide a defect by making the number LOOK healthy... which it cannot,
-// because the defect this catches (h2) drives the peak to 1.
+// Zero is right precisely because the count is of USE: a connection kept alive
+// from the previous phase is counted again the moment this phase sends a byte
+// over it, and never counted at all if it just sits there. That is what makes
+// the figure answer the only question it is asked — did N threads become N
+// flows — rather than describing the pool.
 //
 // 🚫 It deliberately does NOT call CloseIdleConnections: emptying the pool
-// manufactures a fresh dial per worker and would make the peak assertion pass
-// even under a transport that multiplexes.
+// manufactures a fresh dial per worker and would make the assertion pass even
+// under a transport that multiplexes.
 func (c *connCounter) reset() {
 	c.mu.Lock()
-	c.peak = c.live
-	c.dials = 0
+	c.active, c.peak, c.dials = 0, 0, 0
 	c.mu.Unlock()
+	c.gen.Add(1)
 }
 
-func (c *connCounter) stats() (peak, dials int) {
+func (c *connCounter) stats() (used, dials int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.peak, c.dials
 }
 
-// countedConn decrements exactly once, however many times Close is called.
+// countedConn registers itself on first use per generation, and decrements
+// exactly once however many times Close is called.
 type countedConn struct {
 	net.Conn
 	c    *connCounter
+	gen  atomic.Uint64
 	once sync.Once
+}
+
+func (c *countedConn) Read(b []byte) (int, error) {
+	c.c.touch(c)
+	return c.Conn.Read(b)
+}
+
+func (c *countedConn) Write(b []byte) (int, error) {
+	c.c.touch(c)
+	return c.Conn.Write(b)
 }
 
 func (c *countedConn) Close() error {

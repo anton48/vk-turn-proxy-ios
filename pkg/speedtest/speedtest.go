@@ -135,12 +135,16 @@ type Phase struct {
 	ImpliedSec float64 `json:"implied_sec"`
 	Consistent bool    `json:"consistent"`
 
-	// PeakConns is the most TCP connections open at once during this phase and
-	// Dials is how many were newly opened. PeakConns is the one that matters:
-	// under HTTP/2 it is 1 no matter how many workers run, which is precisely
-	// the state every thread-count comparison was silently taken in until
-	// 2026-08-20.
-	PeakConns int `json:"peak_conns"`
+	// ConnsUsed is how many distinct TCP connections CARRIED THIS PHASE'S DATA;
+	// Dials is how many were newly opened for it.
+	//
+	// 🚨 Used, not open. Counting open connections reads as healthy on a pool
+	// full of sockets the measurement never touched — measured: 7 idle sockets
+	// from server discovery plus 1 multiplexed HTTP/2 socket gave "8 of 8" and
+	// no warning. Under HTTP/2 the used count is 1 however many workers run,
+	// which is precisely the state every thread-count comparison was silently
+	// taken in until 2026-08-20.
+	ConnsUsed int `json:"conns_used"`
 	Dials     int `json:"dials"`
 
 	// UPLOAD ONLY. Confirmed bytes are counted after the server's response, so
@@ -206,12 +210,58 @@ type Progress struct {
 	Estimator string `json:"estimator"`
 }
 
-var (
-	mu      sync.Mutex
-	running bool
-	cancel  context.CancelFunc
-	snap    Progress
+// activity is what this package is doing, as ONE value.
+//
+// 🚨 IT REPLACED A BOOL, AND THE BOOL WAS NOT A GUARD. `running` was set only by
+// Start, and Servers merely READ it and let the lock go — so a fetch could begin
+// in the instant before a run claimed the flag, a run could start while a fetch
+// was already in flight, and nothing at all stopped two fetches. Reading a flag
+// is not taking a guard; only a state transition under one lock is.
+//
+// This matters because a server-list fetch is a LOAD GENERATOR: the engine pings
+// every server in the list concurrently. The founding rule of this package is
+// that two generators would measure each other.
+type activity int
+
+const (
+	idle activity = iota
+	loadingServers
+	runningTest
 )
+
+func (a activity) String() string {
+	switch a {
+	case loadingServers:
+		return "loading the server list"
+	case runningTest:
+		return "running a speed test"
+	}
+	return "idle"
+}
+
+var (
+	mu     sync.Mutex
+	state  activity
+	cancel context.CancelFunc
+	snap   Progress
+)
+
+// claim moves idle -> want atomically, or refuses and says what is in the way.
+func claim(want activity) error {
+	mu.Lock()
+	defer mu.Unlock()
+	if state != idle {
+		return fmt.Errorf("busy: %s — %s would measure it", state, want)
+	}
+	state = want
+	return nil
+}
+
+func release() {
+	mu.Lock()
+	state = idle
+	mu.Unlock()
+}
 
 func setSnap(f func(*Progress)) {
 	mu.Lock()
@@ -249,21 +299,15 @@ const serverListTimeout = 20 * time.Second
 // EXIT and with it down servers near the user. The caller must say which,
 // because the same "auto" otherwise measures two different paths silently.
 func Servers(ctx context.Context) ([]ServerInfo, error) {
-	// 🚨 THE ONE-RUN GUARD COVERS THIS TOO. Fetching the list is not a lookup:
-	// the engine pings EVERY server in it concurrently, under its own detached
-	// 4 s deadline, before returning. Doing that during a measurement puts a
-	// second load generator inside it — the exact condition this package's
-	// header calls its founding rule, and one the run guard did not cover
-	// because Servers never consulted it. The picker is reachable mid-run, so
-	// this was one tap away.
-	mu.Lock()
-	busy := running
-	mu.Unlock()
-	if busy {
-		return nil, fmt.Errorf(
-			"a speed test is running: the server list pings every server at once, " +
-				"so fetching it now would land inside the measurement")
+	// 🚨 THIS TAKES THE GUARD, it does not consult it. Fetching the list is not
+	// a lookup: the engine pings EVERY server in it concurrently, under its own
+	// detached 4 s deadline, before returning. Doing that during a measurement
+	// puts a second load generator inside it, and the picker is reachable
+	// mid-run — one tap away.
+	if err := claim(loadingServers); err != nil {
+		return nil, err
 	}
+	defer release()
 
 	ctx, cancel := context.WithTimeout(ctx, serverListTimeout)
 	defer cancel()
@@ -366,12 +410,10 @@ func Start(cfg Config) error {
 		return err
 	}
 
-	mu.Lock()
-	if running {
-		mu.Unlock()
-		return fmt.Errorf("a speed test is already running")
+	if err := claim(runningTest); err != nil {
+		return err
 	}
-	running = true
+	mu.Lock()
 	ctx, c := context.WithCancel(context.Background())
 	cancel = c
 	snap = Progress{
@@ -390,9 +432,9 @@ func Start(cfg Config) error {
 	go func() {
 		defer func() {
 			mu.Lock()
-			running = false
 			cancel = nil
 			mu.Unlock()
+			release()
 		}()
 		if err := run(ctx, cfg, pl); err != nil {
 			setSnap(func(p *Progress) {
@@ -417,9 +459,21 @@ type phaseSpec struct {
 }
 
 func run(ctx context.Context, cfg Config, pl runPlan) error {
-	client := newEngine(pl.threads, cfg.Debug)
+	// 🚨 TWO ENGINES, AND THE SEPARATION IS A CORRECTNESS REQUIREMENT.
+	//
+	// Discovery is not a lookup: FetchUserInfo, the server list and the list's
+	// fan-out ping open connections to a dozen hosts and leave them idle in the
+	// transport's pool. Sharing one transport with the measurement put those
+	// sockets inside the phase's connection accounting — measured as 7 control
+	// sockets plus 1 multiplexed HTTP/2 socket reading "8 of 8 threads", a false
+	// negative in the one guard that exists to catch h2.
+	//
+	// So discovery picks the endpoint and is then DONE. The measurement gets a
+	// transport of its own, whose pool holds nothing but connections to the
+	// target, primed by exactly one ping.
+	discovery := newEngine(1, cfg.Debug)
 
-	user, err := client.FetchUserInfoContext(ctx)
+	user, err := discovery.FetchUserInfoContext(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch user info: %w", err)
 	}
@@ -427,7 +481,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		p.OoklaSeesIP = user.IP
 		p.OoklaSeesISP = user.Isp
 	})
-	list, err := client.FetchServerListContext(ctx)
+	list, err := discovery.FetchServerListContext(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch server list: %w", err)
 	}
@@ -444,7 +498,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		// distant one — which is the normal case, since the point is to pin the
 		// same server across tunnel states — misses. Ask for it by id instead,
 		// and only fall back to scanning the list.
-		target, err = client.FetchServerByIDContext(ctx, cfg.ServerID)
+		target, err = discovery.FetchServerByIDContext(ctx, cfg.ServerID)
 		if err != nil || target == nil {
 			for _, s := range list {
 				if s.ID == cfg.ServerID {
@@ -467,11 +521,22 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		p.ServerURL = target.URL
 	})
 
-	client.SetCaptureTime(pl.capture)
-	client.SetEarlyStop(pl.earlyStop)
-	client.SetNThread(pl.threads)
+	// Hand the server over to a FRESH transport, so everything counted from here
+	// is the measurement and nothing else. target.Context is the *Speedtest that
+	// every measured request goes through, so this switch is what redirects them.
+	meas := newEngine(pl.threads, cfg.Debug)
+	target.Context = meas.Speedtest
+
+	meas.SetCaptureTime(pl.capture)
+	meas.SetEarlyStop(pl.earlyStop)
+	meas.SetNThread(pl.threads)
 
 	setSnap(func(p *Progress) { p.Stage = "ping" })
+	// This ping is also the PRIMING request, and it is load-bearing for the
+	// connection count: with an empty pool Go dials once per concurrent request
+	// even under HTTP/2 — the thundering herd — so a phase measured from cold
+	// reads N connections whatever the protocol. One reusable connection must
+	// exist before the workers start, or the guard cannot fail.
 	if err := target.PingTestContext(ctx, nil); err != nil {
 		return fmt.Errorf("ping: %w", err)
 	}
@@ -503,11 +568,11 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 
 		// 🚨 NOTHING MAY DIAL BETWEEN reset() AND stats(): anything that does is
 		// counted into this phase's connection figures.
-		client.conns.reset()
+		meas.conns.reset()
 		start := time.Now()
 		ws, err := runPhase(ctx, pl.warmup, spec.total, spec.run)
 		end := time.Now()
-		peak, dials := client.conns.stats()
+		used, dials := meas.conns.stats()
 		endBytes := spec.total()
 
 		// The gate comes AFTER the samples are taken and BEFORE anything is
@@ -523,7 +588,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		phase = applyWindow(phase, ws, start, end, endBytes)
 		// After the gate on purpose: a cancelled phase has peak < threads and
 		// would otherwise emit a spurious "the knob lied" warning on every Stop.
-		phase = applyConnStats(phase, peak, dials, pl.threads)
+		phase = applyConnStats(phase, used, dials, pl.threads)
 
 		done := phase
 		setSnap(func(p *Progress) {
@@ -690,12 +755,12 @@ func setRaw(p Phase, bytes int64, sec float64) Phase {
 }
 
 // applyConnStats records how many TCP connections the phase really used.
-func applyConnStats(p Phase, peak, dials, threads int) Phase {
-	p.PeakConns, p.Dials = peak, dials
-	if threads > 1 && peak > 0 && peak < threads {
+func applyConnStats(p Phase, used, dials, threads int) Phase {
+	p.ConnsUsed, p.Dials = used, dials
+	if threads > 1 && used > 0 && used < threads {
 		p.Warnings = append(p.Warnings, fmt.Sprintf(
-			"asked for %d threads but at most %d TCP connections were open at once — "+
-				"this is not a %d-flow measurement", threads, peak, threads))
+			"asked for %d threads but only %d TCP connections carried the data — "+
+				"this is not a %d-flow measurement", threads, used, threads))
 	}
 	return p
 }

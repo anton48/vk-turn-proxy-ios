@@ -193,3 +193,51 @@ func TestApplyConnStatsWarnsWhenThreadsDidNotBecomeConnections(t *testing.T) {
 		t.Errorf("healthy phase warned: %v", q.Warnings)
 	}
 }
+
+// TestOneActivityAtATime guards the mutual exclusion the previous `running`
+// bool did not provide.
+//
+// 🚨 READING A FLAG IS NOT TAKING A GUARD. Servers() used to read `running` and
+// release the lock, so a fetch could begin in the instant before a run claimed
+// it, a run could start while a fetch was in flight, and nothing stopped two
+// fetches at once. Every one of those puts the engine's concurrent
+// ping-every-server fan-out inside a measurement.
+//
+// Seen RED by replacing claim() with a read-then-set pair.
+func TestOneActivityAtATime(t *testing.T) {
+	defer release()
+
+	if err := claim(runningTest); err != nil {
+		t.Fatalf("claiming from idle: %v", err)
+	}
+	if err := claim(loadingServers); err == nil {
+		t.Error("🚨 a server-list fetch was allowed DURING a run — it pings every server at once")
+	}
+	if err := claim(runningTest); err == nil {
+		t.Error("a second run was allowed during the first")
+	}
+	release()
+
+	// And the other direction, which the bool never covered at all.
+	if err := claim(loadingServers); err != nil {
+		t.Fatalf("claiming from idle: %v", err)
+	}
+	if err := claim(runningTest); err == nil {
+		t.Error("🚨 a run was allowed while a server-list fetch was in flight")
+	}
+	if err := claim(loadingServers); err == nil {
+		t.Error("two concurrent server-list fetches were allowed")
+	}
+}
+
+// A refused Start must not leave the package busy, or the feature is dead for
+// the life of the process.
+func TestRefusedStartLeavesNoClaim(t *testing.T) {
+	if err := Start(Config{Threads: 10000, DurationSec: 15}); err == nil {
+		t.Fatal("an out-of-range config was accepted")
+	}
+	if err := claim(runningTest); err != nil {
+		t.Fatalf("🚨 the package is still busy after a REFUSED start: %v", err)
+	}
+	release()
+}

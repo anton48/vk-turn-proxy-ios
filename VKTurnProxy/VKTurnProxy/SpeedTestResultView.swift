@@ -84,9 +84,13 @@ struct SpeedTestResultView: View {
     }
 
     /// The figure that says whether "Threads" meant anything.
+    ///
+    /// 🚨 "carried data", not "were open". Counting open connections read as
+    /// healthy on a pool full of sockets the measurement never touched — 7 idle
+    /// discovery sockets plus one multiplexed HTTP/2 socket reported "8 of 8".
     static func connections(_ phase: SpeedTestPhase, threads: Int) -> String {
-        String(format: "%d threads · %d TCP connections at once · %d opened",
-               threads, phase.peakConns, phase.dials)
+        String(format: "%d threads · %d TCP connections carried data · %d opened",
+               threads, phase.connsUsed, phase.dials)
     }
 
     @ViewBuilder

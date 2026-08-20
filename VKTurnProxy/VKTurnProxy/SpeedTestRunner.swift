@@ -26,7 +26,7 @@ struct SpeedTestPhase: Codable {
     var windowSec: Double = 0
     var impliedSec: Double = 0
     var consistent: Bool = false
-    var peakConns: Int = 0
+    var connsUsed: Int = 0
     var dials: Int = 0
     var backlogBytes: Int64 = 0
     var confirmedRatio: Double = 0
@@ -41,7 +41,7 @@ struct SpeedTestPhase: Codable {
         case windowSec = "window_sec"
         case impliedSec = "implied_sec"
         case consistent
-        case peakConns = "peak_conns"
+        case connsUsed = "conns_used"
         case dials
         case backlogBytes = "backlog_bytes"
         case confirmedRatio = "confirmed_ratio"
