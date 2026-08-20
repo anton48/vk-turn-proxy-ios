@@ -1942,10 +1942,18 @@ struct LogsView: View {
     }
 
     private func loadLogs() {
-        let fileText = SharedLogger.shared.readLogs()
-        if !fileText.isEmpty {
+        let snapshot = SharedLogger.shared.readSnapshot()
+        if !snapshot.text.isEmpty {
             usingOSLogFallback = false
-            logText = truncated(fileText)
+            // A repaired sequence means a writer CLOBBERED part of a line, so
+            // say it above the log rather than leaving a lone U+FFFD to be
+            // read as a font problem. The surviving text around it is what
+            // identifies which writer did it.
+            let banner = snapshot.repairedSequences > 0
+                ? "[logdiag] \(snapshot.repairedSequences) invalid byte sequence(s) in this log were "
+                  + "replaced with \u{FFFD} so it could be shown — a writer overwrote part of a line\n\n"
+                : ""
+            logText = banner + truncated(snapshot.text)
             return
         }
         // Empty result. Distinguish "intentionally empty" (Clear was
@@ -1969,7 +1977,18 @@ struct LogsView: View {
             // mismatch means the main app and the PacketTunnel extension
             // resolved DIFFERENT App Group containers (provisioning skew), so
             // the extension's writes never reach the file the app reads.
-            logText = "(log is empty — waiting for new activity)\n\n" +
+            // 🚨 The headline must not claim the log is EMPTY over a file that
+            // holds bytes. On 2026-08-20 this screen said "waiting for new
+            // activity" over 829 072 bytes for the length of a whole sweep,
+            // because the reader threw the file away on one invalid character
+            // and the branch could not tell "nothing written" from "nothing
+            // read". The bytes were in `status` all along, one line below the
+            // sentence that contradicted them.
+            let headline = status.currentBytes > 0
+                ? "(NOT empty — the file holds \(status.currentBytes) bytes and NONE of them could be read: "
+                  + "this is a READ failure)"
+                : "(log is empty — waiting for new activity)"
+            logText = headline + "\n\n" +
                 "[logdiag] container = \(status.containerPath)\n" +
                 "[logdiag] vpn.log   exists=\(status.currentExists) bytes=\(status.currentBytes)\n" +
                 "[logdiag] vpn.log.1 exists=\(status.archivedExists) bytes=\(status.archivedBytes)"

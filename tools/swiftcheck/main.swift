@@ -71,6 +71,25 @@ func source(_ path: String) -> String {
     return s
 }
 
+/// `source()` with `//` line comments removed.
+///
+/// 🚨 A source scan that reads PROSE tests the documentation, not the code —
+/// this project has had a guard go red on a correct tree for exactly that
+/// reason. Section 38 scans for the strict `String(contentsOf` call, and the
+/// comment explaining why that call was removed names it, so the scan has to
+/// see the code alone.
+/// ⚠️ Naive by design: it also cuts inside a string literal containing `//`
+/// (a URL, say). None of the scans below depend on one.
+func codeWithoutComments(_ path: String) -> String {
+    source(path)
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map { line -> String in
+            if let r = line.range(of: "//") { return String(line[line.startIndex..<r.lowerBound]) }
+            return String(line)
+        }
+        .joined(separator: "\n")
+}
+
 print("UplinkPace — the production reset, and the shipped rate")
 
 // 5. 🚨 TWO DIAGNOSTIC REPRESENTATIONS, NOT ONE. Builds 296-298 wrote the Bool
@@ -1466,6 +1485,75 @@ do {
           "leave them behind, and those are the runs someone returns to the log for")
     check(runner.contains("SpeedTestLog.result("),
           "and the result is logged when the run reaches a terminal state")
+}
+
+
+print("SharedLogger — one bad byte must not cost the whole log")
+
+// 38. 🚨 THE READER MUST DEGRADE ONE CHARACTER AT A TIME.
+//     On 2026-08-20 the Logs screen reported "(log is empty — waiting for new
+//     activity)" over an 829 072-byte file — across app restarts and
+//     disconnect/reconnect, for the length of a whole VPN sweep — because the
+//     reader threw the ENTIRE file away on the first invalid byte and turned
+//     the failure into "". Share exported the empty text with it, so the log
+//     could not be taken off the device either.
+//
+//     The behavioural checks run over the PURE decode rule (extracted for that
+//     reason: inline in a file read, reaching it needed an App Group container
+//     and a corrupted file on disk). The scans keep the strict form from
+//     coming back, and keep the WRITER from re-introducing the corruption.
+do {
+    // ~800 KB of good lines with ONE invalid byte in the middle. The
+    // assertions demand the FIRST and the LAST line, so a decode that stops at
+    // the bad byte — the actual defect — cannot pass by returning a non-empty
+    // prefix. An assertion loose enough to accept the defect is not a guard.
+    var good = Data()
+    for i in 0..<20_000 {
+        good.append(Data("[2026-08-20 17:00:00.000] [App] line \(i)\n".utf8))
+    }
+    var corrupt = good
+    corrupt.insert(0xFF, at: corrupt.count / 2)
+
+    let dirty = SharedLogger.decode(archive: Data(), current: corrupt)
+    check(dirty.text.contains("[App] line 0\n"),
+          "🚨 the text BEFORE the invalid byte survives")
+    check(dirty.text.contains("[App] line 19999\n"),
+          "🚨 and the text AFTER it — the whole file, not a prefix")
+    check(dirty.repairedSequences == 1,
+          "the invalid sequence is COUNTED, so the screen can say a writer clobbered a line")
+    check(dirty.bytesOnDisk == corrupt.count,
+          "bytesOnDisk counts BYTES — the same quantity the empty-log diagnostic prints")
+
+    let clean = SharedLogger.decode(archive: Data(), current: good)
+    check(clean.repairedSequences == 0,
+          "🚨 a clean file reports ZERO repairs — a counter that always fires says nothing")
+    check(clean.text.hasPrefix("[2026-08-20") && clean.text.hasSuffix("line 19999\n"),
+          "and decodes unchanged end to end")
+
+    let both = SharedLogger.decode(archive: Data("[archive] older\n".utf8),
+                                   current: Data("[current] newer\n".utf8))
+    check(both.text == "[archive] older\n[current] newer\n",
+          "the archive is decoded separately and comes FIRST — one chronological stream")
+
+    let logger = codeWithoutComments("VKTurnProxy/VKTurnProxy/SharedLogger.swift")
+    check(!logger.contains("String(contentsOf"),
+          "🚨 no strict String(contentsOf:) survives in SharedLogger — that one call traded "
+          + "829 KB of log for an empty screen")
+    check(logger.contains("O_APPEND"),
+          "🚨 appendData opens the file with O_APPEND")
+    check(!logger.contains("seekToEndOfFile"),
+          "🚨 and does NOT seek-then-write: the extension appends to this same file, so a stale "
+          + "offset OVERWRITES the line it just wrote — losing it silently, and leaving an "
+          + "invalid sequence whenever the clobber lands inside a multi-byte character")
+
+    let logs = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+    check(logs.contains("readSnapshot()"),
+          "the Logs screen reads the snapshot, so it can tell 'nothing written' from 'nothing read'")
+    check(logs.contains("repairedSequences > 0"),
+          "🚨 and RENDERS the repair count — a lone U+FFFD in the text reads as a font problem")
+    check(logs.contains("status.currentBytes > 0"),
+          "🚨 the empty-log headline is conditioned on the byte count: it may not call the log "
+          + "EMPTY over a file that holds bytes, which is the sentence that hid this for a sweep")
 }
 
 print("")

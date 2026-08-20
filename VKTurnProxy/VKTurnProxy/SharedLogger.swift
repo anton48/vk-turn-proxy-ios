@@ -105,13 +105,64 @@ class SharedLogger {
         }
     }
 
+    /// What a read of the log actually found.
+    ///
+    /// `text` ALWAYS decodes — an invalid byte sequence becomes U+FFFD instead
+    /// of throwing the file away — and `repairedSequences` says how many there
+    /// were, which is the evidence that names the writer that corrupted it.
+    struct Snapshot {
+        let text: String
+        let bytesOnDisk: Int        // archive + current; -1 when there is no container
+        let repairedSequences: Int
+    }
+
     /// Read the full log: archived rotation first, then current — so
     /// the consumer sees a single chronological stream.
-    func readLogs() -> String {
-        guard let url = fileURL else { return "" }
-        let archived = (try? String(contentsOf: rotatedURL(for: url), encoding: .utf8)) ?? ""
-        let current = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        return archived + current
+    ///
+    /// 🚨 DECODED LENIENTLY, AND THAT IS THE WHOLE POINT OF THIS FUNCTION.
+    /// It used to be `(try? String(contentsOf:encoding:.utf8)) ?? ""`, which
+    /// throws on the FIRST invalid byte anywhere in the file — so ONE clobbered
+    /// character turned an 829 KB log into `""`, the Logs screen reported
+    /// "(log is empty — waiting for new activity)" while the file kept growing,
+    /// and Share exported an empty file (2026-08-20, device). It survived app
+    /// restarts and disconnect/reconnect because nothing about the file changed.
+    /// Measured: 848 891 bytes with a single 0xFF inserted read as
+    /// NSCocoaErrorDomain 259; the same bytes decoded leniently give every line
+    /// back plus one U+FFFD.
+    /// 🎯 **A log reader must degrade one character at a time, never all at
+    /// once** — it is the instrument you reach for when something else is
+    /// already broken.
+    func readLogs() -> String { readSnapshot().text }
+
+    func readSnapshot() -> Snapshot {
+        guard let url = fileURL else {
+            return Snapshot(text: "", bytesOnDisk: -1, repairedSequences: 0)
+        }
+        return SharedLogger.decode(
+            archive: (try? Data(contentsOf: rotatedURL(for: url))) ?? Data(),
+            current: (try? Data(contentsOf: url)) ?? Data()
+        )
+    }
+
+    /// The decoding rule, as a PURE function over bytes.
+    ///
+    /// Extracted so it can be tested without an App Group container: inline in
+    /// the file read, the only apparent way to reach it was to have a container
+    /// and a corrupted file on disk — the same shape that once made an id-lookup
+    /// test stand up an HTTP server to reach a rule that needed none.
+    static func decode(archive: Data, current: Data) -> Snapshot {
+        // Decoded SEPARATELY: they are two files, so a byte sequence never
+        // straddles the boundary and one corrupt archive cannot shift the
+        // current file's decoding.
+        let text = String(decoding: archive, as: UTF8.self)
+            + String(decoding: current, as: UTF8.self)
+        // U+FFFD in the decoded text means the FILE held an invalid sequence:
+        // neither writer ever emits that scalar, so its presence names a
+        // corrupted write and the text around it names the line that was lost.
+        let repaired = text.unicodeScalars.reduce(into: 0) { $0 += ($1 == "\u{FFFD}" ? 1 : 0) }
+        return Snapshot(text: text,
+                        bytesOnDisk: archive.count + current.count,
+                        repairedSequences: repaired)
     }
 
     /// Diagnostic snapshot of the log-file storage state. Used by the
@@ -204,10 +255,15 @@ class SharedLogger {
     func exportSnapshotURL() -> URL? {
         guard let url = fileURL else { return nil }
         queue.sync {} // flush pending appendData writes
-        let combined = readLogs() // archive + current concatenated
+        // 🚨 Export the RAW BYTES, not a decoded-and-re-encoded copy. If the
+        // file holds a corrupted sequence, this export is the only way to see
+        // it off-device, and re-encoding would silently replace the evidence
+        // with U+FFFD before anyone could look at it.
+        var combined = (try? Data(contentsOf: rotatedURL(for: url))) ?? Data()
+        combined.append((try? Data(contentsOf: url)) ?? Data())
         let dst = FileManager.default.temporaryDirectory
             .appendingPathComponent("vpn-export.log")
-        try? combined.write(to: dst, atomically: true, encoding: .utf8)
+        try? combined.write(to: dst, options: .atomic)
         return FileManager.default.fileExists(atPath: dst.path) ? dst : url
     }
 
@@ -231,10 +287,36 @@ class SharedLogger {
             FileManager.default.createFile(atPath: url.path, contents: nil)
         }
 
-        guard let handle = FileHandle(forWritingAtPath: url.path) else { return }
-        handle.seekToEndOfFile()
-        handle.write(data)
-        handle.closeFile()
+        // 🚨 O_APPEND, NOT seek-then-write. The EXTENSION's Go writer holds its
+        // own fd on this same file (`bridge.go` startLogWriter, O_APPEND), so
+        // "seek to the end, then write there" races it: Go appends between our
+        // seek and our write, and we then write at the STALE offset,
+        // OVERWRITING the line Go just appended. Two consequences, both real —
+        // the extension's line is silently LOST, and if our write ends inside a
+        // multi-byte character the file stops being valid UTF-8, which is what
+        // made the Logs screen read empty over an 829 KB file (2026-08-20).
+        // Demonstrated by clobbering one line at 60 different write lengths: 4
+        // of them left the file undecodable.
+        // O_APPEND makes "seek to end" and "write" ONE atomic step for writes
+        // up to PIPE_BUF, and every log line is far below it.
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        data.withUnsafeBytes { raw in
+            guard var p = raw.baseAddress else { return }
+            var left = raw.count
+            while left > 0 {
+                let n = write(fd, p, left)
+                if n > 0 {
+                    p = p.advanced(by: n)
+                    left -= n
+                } else if n < 0 && errno == EINTR {
+                    continue        // interrupted before any byte moved
+                } else {
+                    break           // real error: drop the line rather than spin
+                }
+            }
+        }
     }
 
     /// Rotation strategy: rename current → .1 (overwriting any existing
