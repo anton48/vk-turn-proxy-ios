@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	neturl "net/url"
+	"path"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,7 +62,30 @@ type engine struct {
 // reintroduce the very defect priming exists to fix, through a path nobody
 // looks at: an unprimed phase reads N connections whatever the protocol, and
 // the guard goes quietly green.
-func (e *engine) prime(ctx context.Context, url string) (warm bool) {
+// primeURL is the resource priming asks for: the same `latency.txt` the
+// library's own ping uses, derived the same way.
+//
+// 🚨 IT MUST NOT BE THE MEASUREMENT URL, and that cost a build to learn.
+// Priming first fetched target.URL — the upload endpoint — and MEASURED
+// against the real server:
+//
+//	GET .../speedtest/upload.php   -> 404 Not Found, Connection: Close
+//	GET .../speedtest/latency.txt  -> 200 OK,        Connection: Keep-Alive
+//
+// The 404 reused the connection the ping had left pooled and the server then
+// closed it, so priming did not warm the pool — it EMPTIED it, and the phase
+// went from 7 dials to 8. Worse than no priming at all.
+func primeURL(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	u.Path = path.Dir(u.Path)
+	return u.JoinPath("latency.txt").String()
+}
+
+func (e *engine) prime(ctx context.Context, rawURL string) (warm bool) {
+	url := primeURL(rawURL)
 	var pooled atomic.Bool
 	trace := &httptrace.ClientTrace{
 		// Fires when the connection is handed back to the idle pool. A non-nil

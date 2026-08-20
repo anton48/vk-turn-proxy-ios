@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -214,15 +215,61 @@ func TestUnprimedPhaseCannotSeeHTTP2(t *testing.T) {
 	}
 }
 
-// TestPrimeReportsAnEmptyPoolEvenWhenTheREQUESTSUCCEEDS.
+// TestPrimeAsksForSomethingTheServerActuallyServes reproduces a live defect and
+// its fix.
+//
+// 🚨 Priming used to GET the MEASUREMENT url. Measured against the real
+// endpoint on 2026-08-20:
+//
+//	GET .../speedtest/upload.php   -> 404 Not Found, Connection: Close
+//	GET .../speedtest/latency.txt  -> 200 OK,        Connection: Keep-Alive
+//
+// The 404 reused the connection the ping had already pooled and the server then
+// closed it, so priming EMPTIED the pool instead of warming it — the download
+// phase went from 7 dials on build 316 to 8 on 317, and both phases printed the
+// cold-pool disclaimer on a device.
+//
+// The test server below mimics exactly that pair, so the fix is verified against
+// behaviour that was observed rather than against a guess.
+//
+// 🎯 Note what found it: the disclaimer added one build earlier. Without it the
+// screen would have shown a healthy-looking "8 of 8" and the regression would
+// have been invisible.
+func TestPrimeAsksForSomethingTheServerActuallyServes(t *testing.T) {
+	srv := h2Server(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "latency.txt") {
+			_, _ = w.Write([]byte("test=test\n"))
+			return
+		}
+		// Everything else behaves like the real upload endpoint under a GET.
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	conns := &connCounter{}
+	e := &engine{
+		conns: conns,
+		doer:  &http.Client{Transport: trustingRoundTripper(t, srv, conns)},
+	}
+
+	measurementURL := srv.URL + "/speedtest/upload.php"
+	if !e.prime(context.Background(), measurementURL) {
+		t.Error("🚨 priming left the pool cold — it is asking the server for something it does " +
+			"not serve, so the phase cannot be read as a flow count at all")
+	}
+	if got := primeURL(measurementURL); strings.HasSuffix(got, "upload.php") {
+		t.Errorf("primeURL returned %q — priming the measurement endpoint is what killed the "+
+			"pooled connection", got)
+	}
+}
+
+// TestPrimeReportsAnEmptyPoolEvenWhenTheRequestSucceeds.
 //
 // 🚨 "The request worked" is NOT "the pool is warm". A server answering
 // `Connection: close` returns a perfectly good response and leaves nothing
-// behind — so priming must OBSERVE the pool, not the error. Checking only the
-// error would let an unprimed phase through silently, which is exactly the
-// defect priming exists to prevent.
+// behind — so priming must OBSERVE the pool, not the error.
 //
-// Seen RED by returning `err == nil` from prime instead of pooled() > 0.
+// Seen RED by returning `err == nil` from prime instead of the observation.
 func TestPrimeReportsAnEmptyPoolEvenWhenTheRequestSucceeds(t *testing.T) {
 	closing := h2Server(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "close")
@@ -244,11 +291,9 @@ func TestPrimeReportsAnEmptyPoolEvenWhenTheRequestSucceeds(t *testing.T) {
 			conns := &connCounter{}
 			e := &engine{
 				conns: conns,
-				doer:  &http.Client{Transport: trustingRoundTripper(t, closing, conns)},
+				doer:  &http.Client{Transport: trustingRoundTripper(t, keeping, conns)},
 			}
-			// Both test servers share a CA in httptest, so one transport serves both.
-			e.doer.Transport = trustingRoundTripper(t, keeping, conns)
-			if got := e.prime(context.Background(), tc.srv); got != tc.want {
+			if got := e.prime(context.Background(), tc.srv+"/speedtest/latency.txt"); got != tc.want {
 				t.Errorf("prime reported warm=%v, want %v", got, tc.want)
 			}
 		})
