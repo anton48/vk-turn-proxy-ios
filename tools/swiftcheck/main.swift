@@ -735,7 +735,11 @@ do {
 //       b. add a bogus `case ghost = "ghost"` key — "sent by Go" reddens.
 do {
     let goSrc = source("pkg/speedtest/speedtest.go")
-    let swiftSrc = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+    // 🚨 The Swift wire types moved to their own file so the harness could
+    // COMPILE them; a scan still pointed at the runner would find no CodingKeys
+    // and report every Go field as undecoded — on a correct tree. Read both.
+    let swiftSrc = source("VKTurnProxy/VKTurnProxy/SpeedTestWire.swift")
+        + source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
 
     // Every `json:"name"` tag inside one Go struct. Plain scanning, no regex
     // literals: a `"` cannot appear inside one.
@@ -1294,6 +1298,80 @@ do {
     check(widget.contains("context.state.direct ?? false"),
           "🚨 and the widget reads the Optional with a TUNNELLED default — never claiming the " +
           "kill switch is off when the card predates the field")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 37. THE SPEED TEST WRITES ITS RUN TO THE LOG.
+//
+//     🎯 These lines exist to REPLACE A SCREENSHOT, which is the bar they have
+//     to clear: everything the result screen shows, plus the two things it
+//     cannot — the app build and the engine's methodology revisions. A number
+//     without those cannot be compared with a number from another week, which is
+//     the entire reason both identifiers exist.
+//
+//     SABOTAGES RUN, each reddening exactly one check:
+//       a. drop the warnings from the phase line;
+//       b. print `path.seen[0]` instead of `path.label` — a changed route then
+//          claims one of the two;
+//       c. log the result only, not the parameters at START.
+do {
+    let runner = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+
+    let run = SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
+                                 threads: 32, direction: "both", durationSec: 15)
+
+    let started = SpeedTestLog.start(run, path: .vpnOff, build: "331")
+    for want in ["threads=32", "direction=both", "duration=15s", "31551", "build=331"] {
+        check(started.contains(want), "the START line carries \(want)")
+    }
+
+    var progress = SpeedTestProgress()
+    progress.serverID = "31551"
+    progress.serverDesc = "MEO · Funchal"
+    progress.pingMs = 4
+    progress.engine = "speedtest-go v1.7.11+fork.5 / vkturn-method.5"
+    var down = SpeedTestPhase()
+    down.rawMbps = 312.8; down.libraryMbps = 296.2; down.actualSec = 12.3
+    down.windowSec = 12.3; down.bytes = 480_100_000; down.connsUsed = 32; down.dials = 31
+    down.consistent = true
+    down.warnings = ["only 87% of uploaded bytes were confirmed by the server"]
+    progress.download = down
+
+    let lines = SpeedTestLog.result(run, progress: progress,
+                                    path: SpeedTestPathTrace(.vpnOff))
+    let all = lines.joined(separator: "\n")
+
+    check(all.contains("312.8") && all.contains("296.2"),
+          "🚨 BOTH figures are logged — they answer different questions and disagreeing is normal")
+    check(all.contains("conns=32/31"),
+          "🚨 and the connection count, which is what says whether the thread count meant flows")
+    check(all.contains("only 87%"),
+          "🚨 WARNINGS are logged — a log kept to replace a screenshot that dropped them would " +
+          "be strictly worse than the screenshot")
+    check(all.contains("window=12.3s") && all.contains("actual=12.3s"),
+          "both durations, so a reader can tell which window the rate covers")
+    check(all.contains("vkturn-method.5"),
+          "🚨 the methodology revisions travel with the number — without them two runs weeks " +
+          "apart cannot be compared at all")
+
+    // A run whose route changed must not be logged as belonging to one of them.
+    var moved = SpeedTestPathTrace(.throughVPN)
+    moved.record(.directMode)
+    let movedLines = SpeedTestLog.result(run, progress: progress, path: moved).joined(separator: "\n")
+    check(movedLines.contains("CHANGED"),
+          "🚨 a run whose route moved is logged as belonging to NEITHER path — printing one " +
+          "would invent an attribution the screen itself refuses to make")
+
+    // An empty result produces nothing rather than a line of zeros.
+    check(SpeedTestLog.result(run, progress: SpeedTestProgress(),
+                              path: SpeedTestPathTrace(.vpnOff)).isEmpty,
+          "a run that produced no phase logs nothing, not a row of zeros")
+
+    check(runner.contains("SpeedTestLog.start("),
+          "🚨 the parameters are logged at START — a run that is stopped or fails still has to " +
+          "leave them behind, and those are the runs someone returns to the log for")
+    check(runner.contains("SpeedTestLog.result("),
+          "and the result is logged when the run reaches a terminal state")
 }
 
 print("")

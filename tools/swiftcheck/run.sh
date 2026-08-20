@@ -42,6 +42,8 @@ SOURCES=(
     "$S/SpeedTestPath.swift"
     "$S/SpeedTestRunConfig.swift"
     "$S/SpeedTestServerList.swift"
+    "$S/SpeedTestWire.swift"
+    "$S/SpeedTestLog.swift"
 )
 
 require_tracked "$0" "${SOURCES[@]}"
