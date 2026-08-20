@@ -1101,15 +1101,27 @@ class TunnelManager: ObservableObject {
         guard let proto = manager?.protocolConfiguration else { return }
         var enforced = false
         if #available(iOS 14.2, *) { enforced = proto.enforceRoutes }
-        let wasDirect = directMode
-        directMode = !proto.includeAllNetworks && enforced
-        // 🚨 The Live Activity SHOWS this and offers to flip it, and nothing
-        // else pushes a state when routing changes — a DIRECT flip does not
-        // move the tunnel's status, which is what sync() is normally driven by.
-        // Without this, flipping the switch in Advanced would leave the card
-        // claiming the traffic is tunnelled while it is not: the one thing the
-        // routing feature must never do.
-        if directMode != wasDirect, #available(iOS 16.2, *) {
+        adoptDirectMode(!proto.includeAllNetworks && enforced)
+    }
+
+    /// The ONE place `directMode` is written, so that every surface showing it
+    /// is updated by the same act that changes it.
+    ///
+    /// 🚨 IT IS A FUNCTION BECAUSE THE ASYMMETRY BIT. `directMode` is
+    /// `@Published`, so the SwiftUI switch in Advanced follows any assignment for
+    /// free — while the Live Activity is a separate process that only learns
+    /// through an explicit push. A correction written straight into the property
+    /// therefore fixed the switch and left the CARD wrong, and only when the
+    /// change had come from the card did anything push afterwards. Two surfaces,
+    /// one of them updating itself, is exactly how a write gets forgotten.
+    ///
+    /// ⚖️ The push is not awaited here: this runs either in the foreground (the
+    /// Advanced switch) or from KVO. The Live Activity's own handler awaits its
+    /// publish separately, because that path is the one that ends in suspension.
+    private func adoptDirectMode(_ value: Bool) {
+        guard directMode != value else { return }
+        directMode = value
+        if #available(iOS 16.2, *) {
             LiveActivityController.shared.refreshNow()
         }
     }
@@ -1284,7 +1296,11 @@ class TunnelManager: ObservableObject {
             //
             // This is build 310's finding — the profile treated as the applied
             // state — arriving on a surface that did not exist then.
-            directMode = actual
+            //
+            // Through adoptDirectMode, so the CARD is corrected too: a plain
+            // assignment updates the @Published switch and leaves the other
+            // process showing the value the profile asked for.
+            adoptDirectMode(actual)
             await directChangeUnconfirmed(
                 wanted: direct,
                 message: direct

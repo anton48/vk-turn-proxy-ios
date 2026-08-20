@@ -1234,8 +1234,28 @@ do {
     let mismatch = tunnel.range(of: "case .applied(let actual):")
     let mismatchBody = mismatch.map { String(tunnel[$0.lowerBound...].prefix(1400)) } ?? ""
     check(!mismatchBody.isEmpty, "the mismatch branch was found — otherwise the check below is vacuous")
-    check(mismatchBody.contains("directMode = actual"),
+    check(mismatchBody.contains("adoptDirectMode(actual)"),
           "🚨 a confirmed mismatch adopts what the EXTENSION reports, not what the profile asked for")
+
+    // 🚨 ONE WRITER, AND IT PUSHES. `directMode` is @Published, so the SwiftUI
+    // switch follows any assignment for free while the Live Activity — another
+    // process — only learns through an explicit push. A correction written
+    // straight into the property therefore fixed the switch and left the CARD
+    // wrong, and only a change that had come FROM the card got a push after it.
+    // Two surfaces where one updates itself is how the other gets forgotten.
+    // Assignments only — the declaration `var directMode = false` is not one, and
+    // counting it made this check fail on a correct tree the first time it ran.
+    let writes = tunnel.components(separatedBy: "\n").filter {
+        $0.contains("directMode = ") && !$0.contains("var directMode")
+    }.count
+    check(writes == 1,
+          "🚨 `directMode` is assigned in exactly ONE place, found \(writes) — every write must " +
+          "go through adoptDirectMode or a surface is left behind")
+    let adopt = tunnel.range(of: "private func adoptDirectMode(")
+    let adoptBody = adopt.map { String(tunnel[$0.lowerBound...].prefix(400)) } ?? ""
+    check(adoptBody.contains("refreshNow()"),
+          "🚨 and that one place pushes the card, so the correction reaches BOTH surfaces " +
+          "however the change was started")
 
     // 🚨 PUBLISHES ARE CHAINED. Overwriting the handle let two race, so an older
     // state could land last — and awaiting the newest handle returned while the
@@ -1253,11 +1273,14 @@ do {
           "the app reads it and puts it on the wire — the widget is another process and " +
           "shares no App Group")
 
+    // The push moved out of refreshDirectMode and into the single writer, so this
+    // asks what it actually means: a routing change reaches the card. Checking
+    // the old location would now fail on a correct tree — which it did.
     let refresh = tunnel.range(of: "func refreshDirectMode()")
-    let refreshBody = refresh.map { String(tunnel[$0.lowerBound...].prefix(900)) } ?? ""
-    check(refreshBody.contains("refreshNow()"),
-          "🚨 a routing change PUSHES the card — nothing else would, since the tunnel's status " +
-          "does not move, and a stale card would claim traffic is tunnelled while it is not")
+    let refreshBody = refresh.map { String(tunnel[$0.lowerBound...].prefix(400)) } ?? ""
+    check(refreshBody.contains("adoptDirectMode("),
+          "🚨 a routing change goes through the single writer, which is what pushes the card — " +
+          "the tunnel's status does not move on a DIRECT flip, so nothing else would")
 
     // Rule (b) of the widget's own header: three buttons, and the region clips
     // the rest in silence.
