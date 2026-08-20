@@ -119,12 +119,13 @@ final class SpeedTestRunner: ObservableObject {
     /// this, never from the screen's live controls.
     @Published private(set) var startedRun: SpeedTestRunConfig?
 
-    /// The server the PREVIOUS completed run used, snapshotted when this one
-    /// started. It is what makes "automatic selection moved" answerable at all;
-    /// without it the screen can show which server was used but not that it
-    /// changed.
+    /// The server the previous successful AUTOMATIC run used, snapshotted when
+    /// this one started. It is what makes "automatic selection moved" answerable
+    /// at all; without it the screen can show which server was used but not that
+    /// it changed. See SpeedTestServerChoice.updatesBaseline for why all three
+    /// qualifiers are load-bearing.
     @Published private(set) var previousServerID: String?
-    private var lastCompletedServerID: String?
+    private var lastAutomaticServerID: String?
 
     /// Set when a start is refused because one run is already in flight. The Go
     /// side refuses too — this is the half that says so out loud instead of the
@@ -221,13 +222,17 @@ final class SpeedTestRunner: ObservableObject {
             }
         }
         if let startError {
-            var p = SpeedTestProgress()
-            p.state = "error"
-            p.error = startError
-            progress = p
+            // 🚨 A REFUSED START IS NOT A RESULT, and faking one made it
+            // invisible. The result section only renders when `startedRun` is
+            // set, so on the very first attempt this error appeared NOWHERE —
+            // the button simply did nothing — and once a previous run existed it
+            // rendered inside THAT run's section, reading as though the finished
+            // run had failed. `refusal` already exists for exactly this, is
+            // shown above the Run button, and leaves the last real result alone.
+            refusal = startError
             return
         }
-        previousServerID = lastCompletedServerID
+        previousServerID = lastAutomaticServerID
         startedRun = SpeedTestRunConfig(serverID: serverID, serverLabel: serverLabel,
                                         threads: threads, direction: direction,
                                         durationSec: durationSec)
@@ -275,11 +280,11 @@ final class SpeedTestRunner: ObservableObject {
         progress = decoded
         pathTrace.record(Self.currentPath())
         if decoded.state == "done" || decoded.state == "error" {
-            // Recorded only on completion, and only if a server was actually
-            // reached: a run that failed before selection must not become the
-            // baseline the NEXT run is compared against.
-            if !decoded.serverID.isEmpty {
-                lastCompletedServerID = decoded.serverID
+            if SpeedTestServerChoice.updatesBaseline(
+                state: decoded.state,
+                wasAutomatic: startedRun?.serverID.isEmpty ?? false,
+                ranOn: decoded.serverID) {
+                lastAutomaticServerID = decoded.serverID
             }
             stopPolling()
         }

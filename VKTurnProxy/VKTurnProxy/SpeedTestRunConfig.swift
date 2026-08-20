@@ -57,6 +57,22 @@ enum SpeedTestServerChoice: Equatable {
         return .automatic
     }
 
+    /// Whether a finished run may become the baseline the NEXT automatic run is
+    /// compared against.
+    ///
+    /// 🚨 THE BASELINE IS THE LAST SUCCESSFUL *AUTOMATIC* RUN, and each of those
+    /// three words excludes a false positive that was live:
+    ///
+    ///   - **automatic**: a PINNED run must not set it. Pin 31309, run, unpin,
+    ///     run — automatic selection then lands somewhere else and the screen
+    ///     accused it of moving, when the user had moved the pin themselves.
+    ///   - **successful**: a run that errored or was stopped produced no result
+    ///     to compare against, so it cannot be what the next one differs from.
+    ///   - **run**: one that never reached a server has no id to offer.
+    static func updatesBaseline(state: String, wasAutomatic: Bool, ranOn: String) -> Bool {
+        state == "done" && wasAutomatic && !ranOn.isEmpty
+    }
+
     /// True only for the case that actually costs the user something.
     var isWarning: Bool {
         if case .automaticMoved = self { return true }

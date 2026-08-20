@@ -890,6 +890,51 @@ do {
           "and it reads it from the bundle rather than duplicating a constant")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 32. THE BASELINE IS THE LAST SUCCESSFUL *AUTOMATIC* RUN, AND A REFUSED START
+//     IS NOT A RESULT.
+//
+//     Two false readings were live:
+//       - a PINNED run set the baseline, so pin 31309 → unpin → run auto → the
+//         screen accused automatic selection of moving when the USER had moved
+//         the pin;
+//       - a run that errored or was stopped set it too, though it produced
+//         nothing to compare against.
+//
+//     And a refused start faked a `progress` with state "error". The result
+//     section renders only when `startedRun` is set, so on the FIRST attempt
+//     that error appeared nowhere at all — the button did nothing — and once a
+//     previous run existed it rendered inside THAT run's section.
+//
+//     SABOTAGES RUN, each reddening exactly one check:
+//       a. drop `wasAutomatic` from updatesBaseline — the pinned check reddens;
+//       b. accept state "error" as well — the stopped-run check reddens;
+//       c. set `progress` instead of `refusal` on a start failure — the runner
+//          scan reddens.
+do {
+    let runner = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+
+    check(SpeedTestServerChoice.updatesBaseline(state: "done", wasAutomatic: true, ranOn: "31309"),
+          "a successful automatic run becomes the baseline")
+    check(!SpeedTestServerChoice.updatesBaseline(state: "done", wasAutomatic: false, ranOn: "31309"),
+          "🚨 a PINNED run does not — the user moving their own pin is not automatic selection moving")
+    check(!SpeedTestServerChoice.updatesBaseline(state: "error", wasAutomatic: true, ranOn: "31309"),
+          "🚨 a stopped or failed run does not — it produced nothing to compare against")
+    check(!SpeedTestServerChoice.updatesBaseline(state: "done", wasAutomatic: true, ranOn: ""),
+          "and a run that never reached a server has no id to offer")
+
+    // A refused start must reach the user through `refusal`, not through a
+    // fabricated result.
+    check(runner.contains("refusal = startError"),
+          "🚨 a start failure is reported as a REFUSAL, which is rendered whether or not a " +
+          "previous run exists")
+    check(!runner.contains("p.error = startError"),
+          "🚨 and it no longer fabricates a progress object, which the result section either " +
+          "hides entirely or attributes to the PREVIOUS run")
+    check(runner.contains("lastAutomaticServerID"),
+          "the baseline is named for what it holds")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")
