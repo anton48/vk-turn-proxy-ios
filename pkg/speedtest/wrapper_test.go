@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -841,21 +842,37 @@ func TestTheEngineRateAndConnsComeFromTheWindowEdge(t *testing.T) {
 	}
 	// And the sample closure must actually collect them, or the fields above are
 	// zero and the fallback silently wins.
-	if !strings.Contains(body, "libBps:    target.Context.GetEWMAUploadRate()") ||
-		!strings.Contains(body, "libBps:    target.Context.GetEWMADownloadRate()") ||
-		!strings.Contains(body, "connsUsed: used, dials: dials") {
-		t.Error("🚨 the boundary sample does not collect the LIVE rate and the connection " +
-			"counters — taking them from cs then yields zeros, and the code falls back to the " +
-			"end-of-phase values without saying so")
+	if !strings.Contains(body, "connsUsed: used, dials: dials") {
+		t.Error("🚨 the boundary sample does not collect the connection counters — taking them " +
+			"from cs then yields zeros, and the code falls back to the end-of-phase values")
 	}
-	// 🚨 AND IT MUST NOT READ THE POST-PHASE FIELDS. The library assigns
-	// s.DLSpeed / s.ULSpeed only after the phase function returns, so inside the
-	// phase they hold the PREVIOUS direction's figure — or zero on the first.
-	// The first version of this scan asserted exactly that wrong source, which
-	// is how it shipped: a guard can encode the defect as faithfully as the fix.
+
+	// 🚨 THIS ASSERTS THE CONTRACT, NOT THE SPELLING — twice now the previous
+	// version pinned whichever accessor the fix of the day happened to use, and
+	// both times that accessor was wrong: first the post-phase field (stale by a
+	// whole direction), then the live getter (an unsynchronised read of the
+	// engine's Welford, written every 50ms by its capture goroutine).
+	//
+	// The contract is: the rate is DELIVERED by the engine's own goroutine and
+	// never read out of its state.
 	if strings.Contains(body, "target.DLSpeed") || strings.Contains(body, "target.ULSpeed") {
-		t.Error("🚨 the post-phase speed fields are read somewhere — at any boundary inside a " +
-			"phase they are stale by a whole direction")
+		t.Error("🚨 a post-phase speed field is read — inside a phase it is stale by a whole " +
+			"direction")
+	}
+	if strings.Contains(body, "GetEWMADownloadRate()") || strings.Contains(body, "GetEWMAUploadRate()") {
+		t.Error("🚨 the engine's Welford is read directly — it has no synchronisation at all " +
+			"and its capture goroutine writes it every 50ms, so this is a data race")
+	}
+	if !strings.Contains(body, "SetCallbackDownload(") || !strings.Contains(body, "SetCallbackUpload(") {
+		t.Error("🚨 the rate is not delivered through the engine's own callback, which is the " +
+			"only place the value is produced on the goroutine that owns it")
+	}
+	if !strings.Contains(body, "libBps:    dlRate.get()") || !strings.Contains(body, "libBps:    ulRate.get()") {
+		t.Error("the boundary sample does not read the callback-fed holder")
+	}
+	if !strings.Contains(body, "spec.rate.reset()") {
+		t.Error("🚨 the holder is not reset per phase — the upload phase would open holding the " +
+			"DOWNLOAD's rate, which is the staleness this whole repair is about")
 	}
 	// The guard exists to win a race, not to be generous: every millisecond of
 	// it is traffic outside the measurement.
@@ -892,5 +909,49 @@ func TestNoEngineRateIsSaidPlainlyNotAsInconsistency(t *testing.T) {
 	}
 	if accused {
 		t.Errorf("the line accuses the measurement using a number it does not have: %q", p.Warnings)
+	}
+}
+
+// 🚨 THE HOLDER IS READ AND WRITTEN FROM DIFFERENT GOROUTINES BY DESIGN — the
+// engine's capture loop stores, the boundary sampler loads. That is the whole
+// reason it exists, so it has to be race-free itself; run under -race this fails
+// if the atomic is ever replaced with a plain field.
+func TestLiveRateIsSafeAcrossGoroutines(t *testing.T) {
+	var r liveRate
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() { // stands in for the engine's 50ms capture loop
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				r.set(float64(i))
+			}
+		}
+	}()
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20_000; j++ {
+				_ = r.get()
+			}
+		}()
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	r.set(123.456)
+	if got := r.get(); got != 123.456 {
+		t.Errorf("round trip through the float bits lost the value: %v", got)
+	}
+	r.reset()
+	if got := r.get(); got != 0 {
+		t.Errorf("reset left %v — the next phase would open holding the previous one's rate", got)
 	}
 }

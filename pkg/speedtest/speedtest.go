@@ -42,10 +42,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	stgo "github.com/showwin/speedtest-go/speedtest"
@@ -678,6 +680,9 @@ type phaseSpec struct {
 	// how the line stops being checkable.
 	sample func() warmSample
 	run    func(context.Context) error
+	// rate is fed by the engine's own capture goroutine through its callback
+	// and read at the boundary. See liveRate for why it is not read directly.
+	rate *liveRate
 	// 🚨 THERE IS DELIBERATELY NO `speed` CLOSURE HERE. It returned
 	// target.DLSpeed/ULSpeed, which the library only assigns AFTER the phase
 	// returns — so at a boundary inside the phase it is the previous
@@ -778,6 +783,12 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 	}
 	setSnap(func(p *Progress) { p.PingMs = float64(target.Latency.Milliseconds()) })
 
+	// Installed BEFORE any phase runs, so the write happens-before the capture
+	// goroutine that reads it exists at all.
+	var dlRate, ulRate liveRate
+	target.Context.SetCallbackDownload(func(r stgo.ByteRate) { dlRate.set(float64(r)) })
+	target.Context.SetCallbackUpload(func(r stgo.ByteRate) { ulRate.set(float64(r)) })
+
 	specs := map[string]phaseSpec{
 		"download": {
 			stage: "download",
@@ -793,11 +804,12 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 					// direction's figure on the second. GetEWMADownloadRate is
 					// the same estimator the library itself copies from, and it
 					// is readable while the phase runs.
-					libBps:    target.Context.GetEWMADownloadRate(),
+					libBps:    dlRate.get(),
 					connsUsed: used, dials: dials,
 				}
 			},
-			run: target.DownloadTestContext,
+			run:  target.DownloadTestContext,
+			rate: &dlRate,
 		},
 		"upload": {
 			stage: "upload",
@@ -808,11 +820,12 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 					backlog: target.Context.GetUploadBacklog(),
 					// The live estimator — see the download sample above for
 					// why target.ULSpeed is the wrong field to read here.
-					libBps:    target.Context.GetEWMAUploadRate(),
+					libBps:    ulRate.get(),
 					connsUsed: used, dials: dials,
 				}
 			},
 			run:    target.UploadTestContext,
+			rate:   &ulRate,
 			upload: true,
 		},
 	}
@@ -837,6 +850,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		// 🚨 NOTHING MAY DIAL BETWEEN reset() AND stats(): anything that does is
 		// counted into this phase's connection figures.
 		meas.conns.reset()
+		spec.rate.reset()
 		start := time.Now()
 		ws, cs, err := runPhase(ctx, start, pl.warmup, pl.closeWindow(), spec.sample, spec.run)
 		end := time.Now()
@@ -965,6 +979,31 @@ type warmSample struct {
 	connsUsed int     // distinct connections that carried data by then
 	dials     int
 }
+
+// liveRate mirrors the engine's own rate estimate so it can be read from another
+// goroutine.
+//
+// 🚨 THE OBVIOUS WAY IS A DATA RACE. `GetEWMAUploadRate()` reads the library's
+// Welford accumulator, which has no synchronisation of any kind (`grep -c sync.`
+// in internal/welford.go returns 0) and is written every 50 ms by the engine's
+// own capture goroutine. Reading it from the boundary sampler put an
+// unsynchronised read beside an unsynchronised write — the byte counters next to
+// it are atomics, which is exactly why they were safe and this was not.
+//
+// The library already hands the value out from the RIGHT goroutine: its capture
+// loop calls the callback immediately after Update, with the EWMA it just
+// computed. So the callback stores, the sampler loads, and the two never touch
+// the accumulator concurrently. ⚖️ Costs one 50 ms tick of staleness at the
+// boundary, which is a thousandth of a 30 s window.
+type liveRate struct{ bits atomic.Uint64 }
+
+func (l *liveRate) set(v float64) { l.bits.Store(math.Float64bits(v)) }
+func (l *liveRate) get() float64  { return math.Float64frombits(l.bits.Load()) }
+
+// reset before each phase: the holder is per direction, but leaving the previous
+// run's value in it would reproduce the very staleness that reading
+// target.ULSpeed did.
+func (l *liveRate) reset() { l.bits.Store(0) }
 
 // runPhase executes one direction and, when a warm-up is asked for, samples the
 // byte counter at the boundary so the raw figure covers the measurement window
