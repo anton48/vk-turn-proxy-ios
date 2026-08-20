@@ -210,6 +210,22 @@ type Phase struct {
 	// absent, warned about nowhere, and printed on no line.
 	ConfirmedKnown bool `json:"confirmed_known"`
 
+	// WindowStartedAt and WindowClosedAt bound the interval whose bytes produced
+	// RawMbps, as Unix seconds.
+	//
+	// 🚨 THEY EXIST SO THE APP CAN STOP BLAMING A RUN FOR SOMETHING THAT HAPPENED
+	// OUTSIDE IT. The path trace used to cover everything between the Run tap and
+	// the terminal poll being processed — wider than the measurement in both
+	// directions — so flipping the VPN after the window had closed, while the
+	// engine was still unwinding, condemned a result that was already complete.
+	// A route change matters exactly when it lands inside these two instants.
+	//
+	// ⚖️ Wall clock, because the app and this engine share a process and a clock.
+	// A clock STEP during a run would misalign the comparison; the failure mode
+	// is a mislabelled trace, never a wrong rate.
+	WindowStartedAt float64 `json:"window_started_at"`
+	WindowClosedAt  float64 `json:"window_closed_at"`
+
 	// GuardSec is the DELIBERATE part of the tail: the engine is given a
 	// deadline slightly later than the window so the two are not racing, and it
 	// keeps pushing for that long after the window has closed. Reported because
@@ -1102,6 +1118,9 @@ func applyWindow(p Phase, s, closed warmSample, start, end time.Time, endBytes, 
 		p.WindowSec = p.ActualSec
 		p.WindowBytes = p.Bytes
 		p.BacklogBytes = endBacklog
+		// No warm-up boundary was reached, so the window IS the phase.
+		p.WindowStartedAt = float64(start.UnixNano()) / 1e9
+		p.WindowClosedAt = float64(end.UnixNano()) / 1e9
 		p = consistency(p, p.Bytes, p.ActualSec)
 		if s.warmup > 0 {
 			p.Warnings = append(p.Warnings, fmt.Sprintf(
@@ -1146,6 +1165,12 @@ func applyWindow(p Phase, s, closed warmSample, start, end time.Time, endBytes, 
 	}
 	p.WindowSec = windowEnd.Sub(s.at).Seconds()
 	p.WindowBytes = windowBytes - s.bytes
+	// The two instants the rate above belongs to. Everything outside them —
+	// the warm-up before, the guard and the unwinding after — is not part of
+	// what was measured, and the app uses these to decide whether a route
+	// change touched the measurement or merely happened near it.
+	p.WindowStartedAt = float64(s.at.UnixNano()) / 1e9
+	p.WindowClosedAt = float64(windowEnd.UnixNano()) / 1e9
 	// 🚨 THE CONSISTENCY CHECK MOVES WITH EVERYTHING ELSE. It was computed in
 	// measure() from the WHOLE phase against the whole phase's duration, so
 	// after the window was split out it was the last field still speaking in a

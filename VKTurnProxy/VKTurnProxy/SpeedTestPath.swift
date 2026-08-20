@@ -30,6 +30,15 @@ enum SpeedTestPath: String, Codable {
     }
 }
 
+/// One observation of the route, with the instant it was made.
+///
+/// The route is piecewise constant, so an observation means *from `at` onward
+/// the route was `path`, until the next observation says otherwise*.
+struct SpeedTestPathObservation: Equatable {
+    let at: Date
+    let path: SpeedTestPath
+}
+
 /// Every path the run was observed on, in the order first seen.
 ///
 /// 🚨 A run outlives the screen and can outlive the route it started on. The
@@ -49,6 +58,73 @@ struct SpeedTestPathTrace: Equatable {
     /// VPN → DIRECT → VPN is two changes, not zero, and the run spanned both.
     mutating func record(_ path: SpeedTestPath) {
         if seen.last != path { seen.append(path) }
+    }
+
+    /// Builds the trace for ONE interval: the route in force when it opened,
+    /// plus every change inside it.
+    ///
+    /// 🚨 THE INTERVAL IS THE MEASUREMENT WINDOW, NOT THE RUN. The trace used to
+    /// cover everything from the Run tap to the terminal poll being processed,
+    /// which is wider than the measurement at both ends — so flipping the VPN
+    /// after the window had closed, while the engine was still unwinding,
+    /// condemned a result that was already complete. `PATH CHANGED` has to mean
+    /// *the route moved during the interval whose bytes produced this rate*.
+    ///
+    /// 🚫 And "just don't record on the terminal poll" is NOT the same fix: it
+    /// leaves the gap between the last running poll and the window's real close
+    /// unobserved, so a change in there would still be missed — in the direction
+    /// that hides a real defect rather than inventing one.
+    ///
+    /// ⚖️ Deliberately INCLUSIVE of the state in force at the open: that state
+    /// is what the first bytes were measured on. And a change landing exactly on
+    /// a boundary counts as inside — a rate cannot be attributed to a route that
+    /// was replaced at the instant it started.
+    static func over(_ window: ClosedRange<Date>,
+                     observations: [SpeedTestPathObservation]) -> SpeedTestPathTrace {
+        var trace = SpeedTestPathTrace()
+        let sorted = observations.sorted { $0.at < $1.at }
+        // The route in force when the window opened: the last observation at or
+        // before the open. Without it a window with no change inside it would
+        // have NO path at all, which reads as "path unknown" on a perfectly
+        // attributable run.
+        if let inForce = sorted.last(where: { $0.at <= window.lowerBound }) {
+            trace.record(inForce.path)
+        }
+        for o in sorted where o.at > window.lowerBound && o.at <= window.upperBound {
+            trace.record(o.path)
+        }
+        return trace
+    }
+
+
+    /// The trace over the measurement window(s) the ENGINE reported, rather than
+    /// over the run.
+    ///
+    /// 🚨 It lives here, on the type, and not on the runner: the runner cannot be
+    /// compiled without the bridge, so a rule kept there is reachable only
+    /// through a live poll timer — and this project has twice ended up testing a
+    /// COPY of a rule for exactly that reason.
+    ///
+    /// ⚖️ For a both-direction run the interval runs from the first window's open
+    /// to the last one's close, so a change in the GAP between the phases still
+    /// counts: the two phases would then have been measured on different routes,
+    /// and one label cannot describe both.
+    ///
+    /// ⚖️ Falls back to the wide trace when the engine reported no usable window
+    /// — an errored run has no phases at all. A fallback that is WIDER errs
+    /// toward flagging a result nobody can attribute, which is the safe
+    /// direction; the unsafe one is silently blessing a number.
+    static func overMeasurement(_ p: SpeedTestProgress,
+                                observations: [SpeedTestPathObservation],
+                                fallback: SpeedTestPathTrace) -> SpeedTestPathTrace {
+        let phases = [p.download, p.upload].compactMap { $0 }
+        let opens = phases.map(\.windowStartedAt).filter { $0 > 0 }
+        let closes = phases.map(\.windowClosedAt).filter { $0 > 0 }
+        guard let first = opens.min(), let last = closes.max(), last >= first else {
+            return fallback
+        }
+        return over(Date(timeIntervalSince1970: first)...Date(timeIntervalSince1970: last),
+                    observations: observations)
     }
 
     /// False when the run spanned more than one path, i.e. the figure cannot be

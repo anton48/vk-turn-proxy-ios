@@ -37,6 +37,10 @@ struct SpeedTestPhase: Codable {
     /// is the Frankfurt-307 answer — so presence cannot be inferred from the
     /// value being non-zero.
     var confirmedKnown: Bool = false
+    /// The instants bounding the interval whose bytes produced `rawMbps`, as
+    /// Unix seconds. A route change matters exactly when it falls between them.
+    var windowStartedAt: Double = 0
+    var windowClosedAt: Double = 0
     /// The DELIBERATE part of the tail: the engine is given a deadline slightly
     /// later than the window so the two do not race, and it keeps pushing for
     /// that long after the window closed.
@@ -68,6 +72,8 @@ struct SpeedTestPhase: Codable {
         case backlogBytes = "backlog_bytes"
         case confirmedRatio = "confirmed_ratio"
         case confirmedKnown = "confirmed_known"
+        case windowStartedAt = "window_started_at"
+        case windowClosedAt = "window_closed_at"
         case guardSec = "guard_sec"
         case cleanupSec = "cleanup_sec"
         case backlogTailBytes = "backlog_tail_bytes"

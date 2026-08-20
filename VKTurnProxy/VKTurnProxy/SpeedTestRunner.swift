@@ -38,7 +38,18 @@ final class SpeedTestRunner: ObservableObject {
     private var searchGeneration = 0
 
     /// Every path the run has been observed on — not just the one it started on.
+    ///
+    /// 🚨 WHILE THE RUN IS IN FLIGHT this is the WIDE trace, covering everything
+    /// since the Run tap, because that is all the screen can honestly say yet.
+    /// The moment the engine reports a terminal state it is REPLACED by the
+    /// trace over the measurement window alone — see the terminal branch below.
     @Published private(set) var pathTrace = SpeedTestPathTrace()
+
+    /// Every route observation with the instant it was taken, so the final trace
+    /// can be built over the measurement window instead of over the whole run.
+    /// ⚠️ Sampled by the 0.5s poll, so a flip and flip-back inside one interval
+    /// is invisible; that is the resolution of this instrument, not a claim.
+    private var pathObservations: [SpeedTestPathObservation] = []
 
     /// The parameters the run in hand was STARTED with. The result renders from
     /// this, never from the screen's live controls.
@@ -194,7 +205,9 @@ final class SpeedTestRunner: ObservableObject {
             return
         }
         refusal = nil
-        pathTrace = SpeedTestPathTrace(Self.currentPath())
+        let atStart = Self.currentPath()
+        pathTrace = SpeedTestPathTrace(atStart)
+        pathObservations = [SpeedTestPathObservation(at: Date(), path: atStart)]
 
         let cfg: [String: Any] = [
             "server_id": serverID,
@@ -288,8 +301,24 @@ final class SpeedTestRunner: ObservableObject {
         }
 
         progress = decoded
-        pathTrace.record(Self.currentPath())
+        let now = Self.currentPath()
+        if pathObservations.last?.path != now {
+            pathObservations.append(SpeedTestPathObservation(at: Date(), path: now))
+        }
+        pathTrace.record(now)
         if decoded.state == "done" || decoded.state == "error" {
+            // 🚨 NARROW THE TRACE TO WHAT WAS ACTUALLY MEASURED. Until here it
+            // covers the Run tap to this poll, which is wider than the
+            // measurement at BOTH ends: a route change before the window opened,
+            // or after it closed while the engine was still unwinding, would
+            // otherwise condemn a result that is complete and correct.
+            // ⚖️ For a both-direction run the interval spans from the first
+            // window's open to the last one's close, so a change in the gap
+            // between the phases still counts — the two phases would then have
+            // been measured on different routes, and one label cannot describe
+            // both.
+            pathTrace = SpeedTestPathTrace.overMeasurement(decoded, observations: pathObservations,
+                                                          fallback: pathTrace)
             if let run = startedRun {
                 let choice = SpeedTestServerChoice.of(pinnedID: run.serverID,
                                                       ranOn: decoded.serverID,

@@ -1703,6 +1703,100 @@ do {
           + "is read at the CUTOFF, so their final fate is something this side never observes")
 }
 
+
+print("The path trace — a route change counts when it lands in the MEASUREMENT window")
+
+// 40. 🚨 `PATH CHANGED` MUST MEAN "DURING THE INTERVAL WHOSE BYTES MADE THIS
+//     RATE". It used to mean "at any point between the Run tap and the terminal
+//     poll being processed", which is wider at BOTH ends — so flipping the VPN
+//     after the window closed, while the engine was still unwinding, condemned a
+//     finished result.
+//
+//     🚫 And "just skip the terminal poll" is not the same fix: it leaves the gap
+//     between the last running poll and the window's real close unobserved,
+//     missing a change in the direction that HIDES a defect.
+do {
+    let t0 = Date(timeIntervalSince1970: 1_000_000)
+    let open = t0.addingTimeInterval(5)    // the window opens after a warm-up
+    let close = t0.addingTimeInterval(35)  // and closes 30s later
+    let window = open...close
+    func obs(_ offset: TimeInterval, _ p: SpeedTestPath) -> SpeedTestPathObservation {
+        SpeedTestPathObservation(at: t0.addingTimeInterval(offset), path: p)
+    }
+
+    // BEFORE the window opens: the run started on VPN, went DIRECT during the
+    // warm-up, and every measured byte left through DIRECT.
+    let before = SpeedTestPathTrace.over(window, observations: [
+        obs(0, .throughVPN), obs(2, .directMode),
+    ])
+    check(before.isAttributable && before.label == SpeedTestPath.directMode.rawValue,
+          "🚨 a change BEFORE the window does not spoil the result — it decides which single "
+          + "path the measured bytes belong to (got \(before.label))")
+
+    // INSIDE: this is the case the label exists for.
+    let inside = SpeedTestPathTrace.over(window, observations: [
+        obs(0, .throughVPN), obs(20, .directMode),
+    ])
+    check(!inside.isAttributable && inside.label.contains("PATH CHANGED"),
+          "🚨 a change INSIDE the window flags the result")
+
+    // AFTER the close, before the terminal poll: the engine is unwinding, the
+    // measurement is over. This is the false positive that started this.
+    let after = SpeedTestPathTrace.over(window, observations: [
+        obs(0, .throughVPN), obs(37, .directMode),
+    ])
+    check(after.isAttributable && after.label == SpeedTestPath.throughVPN.rawValue,
+          "🚨 a change AFTER the window closed does NOT condemn a finished result (got "
+          + "\(after.label))")
+
+    // VPN → DIRECT → VPN inside the window is two changes, not zero: the run
+    // spanned both, whatever it ended on.
+    let thereAndBack = SpeedTestPathTrace.over(window, observations: [
+        obs(0, .throughVPN), obs(10, .directMode), obs(20, .throughVPN),
+    ])
+    check(!thereAndBack.isAttributable,
+          "🚨 VPN → DIRECT → VPN inside the window is a CHANGE — ending where it began is not "
+          + "the same as never having moved")
+
+    // A window with no change at all still knows its path: the state in force
+    // when it opened is what the bytes were measured on.
+    let quiet = SpeedTestPathTrace.over(window, observations: [obs(0, .vpnOff)])
+    check(quiet.isAttributable && quiet.label == SpeedTestPath.vpnOff.rawValue,
+          "the state in force at the open is carried, or a quiet run reads as 'path unknown'")
+
+    // And the boundaries come from the ENGINE's phases, spanning both of them.
+    var down = SpeedTestPhase(); down.windowStartedAt = 1_000_005; down.windowClosedAt = 1_000_035
+    var up = SpeedTestPhase(); up.windowStartedAt = 1_000_045; up.windowClosedAt = 1_000_075
+    var prog = SpeedTestProgress(); prog.download = down; prog.upload = up
+    let spanning = SpeedTestPathTrace.overMeasurement(prog, observations: [
+        obs(0, .throughVPN), obs(40, .directMode),   // in the GAP between the phases
+    ], fallback: SpeedTestPathTrace(.throughVPN))
+    check(!spanning.isAttributable,
+          "🚨 a change in the GAP between the two phases still counts — the phases were then "
+          + "measured on different routes and one label cannot describe both")
+
+    let outside = SpeedTestPathTrace.overMeasurement(prog, observations: [
+        obs(0, .throughVPN), obs(80, .directMode),   // after the LAST window closed
+    ], fallback: SpeedTestPathTrace(.throughVPN))
+    check(outside.isAttributable,
+          "and a change after the last window closed still does not")
+
+    // No usable window (an errored run has no phases): fall back to the wide
+    // trace, which errs toward flagging rather than toward blessing.
+    let wide = SpeedTestPathTrace.overMeasurement(SpeedTestProgress(), observations: [],
+                                                   fallback: SpeedTestPathTrace(.directMode))
+    check(wide.label == SpeedTestPath.directMode.rawValue,
+          "with no window reported the wide trace is kept — the fallback is the CAUTIOUS one")
+
+    let runner = codeWithoutComments("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+    check(runner.contains("SpeedTestPathTrace.overMeasurement("),
+          "🚨 and the runner NARROWS the trace on the terminal poll — the rule is worth nothing "
+          + "if the result still carries the run-wide one")
+    check(runner.contains("SpeedTestPathObservation(at: Date()"),
+          "route changes are recorded WITH their instant, which is what makes the interval "
+          + "comparison possible at all")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")
