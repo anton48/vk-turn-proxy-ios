@@ -1505,6 +1505,28 @@ func wgSpeedtestServers() *C.char {
 	return C.CString(string(out))
 }
 
+//export wgSpeedtestFindServers
+//
+// Asks OOKLA for servers matching a query, instead of filtering the nearby list.
+// A query of digits is looked up by id; anything else is a keyword search.
+//
+// 🚨 It exists because the nearby list is built from the APPARENT IP: a user
+// whom Ookla places on the wrong side of a sea never sees their own city's
+// server in it, however they spell the search. Same JSON shape as
+// wgSpeedtestServers, same {"error": ...} on failure.
+func wgSpeedtestFindServers(query *C.char) *C.char {
+	list, err := speedtestpkg.FindServers(context.Background(), C.GoString(query))
+	if err != nil {
+		out, _ := json.Marshal(map[string]string{"error": err.Error()})
+		return C.CString(string(out))
+	}
+	out, err := json.Marshal(list)
+	if err != nil {
+		return C.CString(`{"error":"marshal server list"}`)
+	}
+	return C.CString(string(out))
+}
+
 //export wgSpeedtestStart
 func wgSpeedtestStart(cfgJSON *C.char) *C.char {
 	var cfg speedtestpkg.Config

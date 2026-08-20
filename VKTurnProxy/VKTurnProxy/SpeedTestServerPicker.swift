@@ -43,6 +43,29 @@ struct SpeedTestServerPicker: View {
         }
     }
 
+    @ViewBuilder
+    private func row(_ server: SpeedTestServer) -> some View {
+        Button {
+            serverID = server.id
+            serverLabel = server.label
+            presentation.wrappedValue.dismiss()
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(server.label)
+                    // Latency first — it is the measured one. The distance is
+                    // Ookla's guess about where YOU are, and is labelled "est."
+                    // for that reason.
+                    Text("id \(server.id) · \(server.proximity)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                if serverID == server.id { Image(systemName: "checkmark") }
+            }
+        }
+    }
+
     var body: some View {
         List {
             Section {
@@ -77,26 +100,50 @@ struct SpeedTestServerPicker: View {
                         }
                     }
                     ForEach(filtered) { server in
+                        row(server)
+                    }
+                    // 🚨 The local filter can only narrow rows we already have,
+                    // and the nearby list is built from the apparent IP — so the
+                    // server in your own city may simply not be in it. This asks
+                    // Ookla.
+                    if !query.isEmpty {
                         Button {
-                            serverID = server.id
-                            serverLabel = server.label
-                            presentation.wrappedValue.dismiss()
+                            runner.searchServers(query)
                         } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(server.label)
-                                    Text(String(format: "id %@ · %.0f km", server.id, server.distanceKm))
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                if serverID == server.id { Image(systemName: "checkmark") }
-                            }
+                            Label(filtered.isEmpty
+                                  ? "Nothing here matches — search all Ookla servers for “\(query)”"
+                                  : "Search all Ookla servers for “\(query)”",
+                                  systemImage: "magnifyingglass.circle")
+                                .font(.caption)
                         }
                     }
                 }
             } header: {
                 Text(neighbourhood)
+            }
+
+            if let results = runner.searchResults {
+                Section {
+                    if results.isEmpty {
+                        Text("Ookla returned nothing for “\(runner.searchQuery)”.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    ForEach(results) { server in
+                        row(server)
+                    }
+                    Button("Clear search") { runner.clearSearch() }
+                        .font(.caption)
+                } header: {
+                    Text("Found by searching Ookla — NOT necessarily near you")
+                } footer: {
+                    Text("These came from a search of Ookla's whole list, so the distance is "
+                         + "Ookla's estimate from where it believes this device is, and it can "
+                         + "be wrong by a continent. The latency, where shown, was measured.")
+                }
+            }
+
+            Section {
+                EmptyView()
             } footer: {
                 Text("The list comes from the address the internet sees for this device, "
                      + "so it changes when the VPN does. Pin one server if you want to "

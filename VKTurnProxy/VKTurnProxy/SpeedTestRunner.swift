@@ -112,6 +112,11 @@ final class SpeedTestRunner: ObservableObject {
     @Published private(set) var serversLoading = false
     @Published private(set) var serversError: String?
 
+    /// Results of an explicit search against Ookla, kept apart from the nearby
+    /// list because they answer a different question and are NOT near you.
+    @Published private(set) var searchResults: [SpeedTestServer]?
+    @Published private(set) var searchQuery = ""
+
     /// Every path the run has been observed on — not just the one it started on.
     @Published private(set) var pathTrace = SpeedTestPathTrace()
 
@@ -187,6 +192,55 @@ final class SpeedTestRunner: ObservableObject {
                 self.serversLoading = false
             }
         }
+    }
+
+    /// 🚨 Asks OOKLA, instead of filtering rows we already hold. The local filter
+    /// cannot reach what the nearby list does not contain — and the nearby list
+    /// is built from the apparent IP, so a user whom Ookla places on the wrong
+    /// side of a sea never sees their own city's server in it, however they spell
+    /// it. Digits are looked up by id.
+    func searchServers(_ query: String) {
+        let q = query.trimmingCharacters(in: CharacterSet.whitespaces)
+        guard !q.isEmpty, !serversLoading else { return }
+        serversLoading = true
+        serversError = nil
+        searchQuery = q
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var found: [SpeedTestServer] = []
+            var failure: String?
+            q.withCString { cstr in
+                if let ptr = wgSpeedtestFindServers(cstr) {
+                    let json = String(cString: ptr)
+                    free(UnsafeMutableRawPointer(mutating: ptr))
+                    if let data = json.data(using: .utf8) {
+                        if let decoded = try? JSONDecoder().decode([SpeedTestServer].self, from: data) {
+                            found = decoded
+                        } else if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                                  let err = obj["error"] as? String {
+                            failure = err
+                        } else {
+                            failure = "could not read the search result"
+                        }
+                    }
+                } else {
+                    failure = "wgSpeedtestFindServers returned NULL"
+                }
+            }
+            let results = found
+            let err = failure
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.searchResults = err == nil ? results : nil
+                self.serversError = err
+                self.serversLoading = false
+            }
+        }
+    }
+
+    func clearSearch() {
+        searchResults = nil
+        searchQuery = ""
     }
 
     // MARK: Run

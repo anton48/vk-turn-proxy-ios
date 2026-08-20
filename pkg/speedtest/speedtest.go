@@ -113,12 +113,23 @@ type Config struct {
 
 // ServerInfo is one row of the picker.
 type ServerInfo struct {
-	ID       string  `json:"id"`
-	Name     string  `json:"name"`
-	Sponsor  string  `json:"sponsor"`
-	Country  string  `json:"country"`
-	Host     string  `json:"host"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Sponsor string `json:"sponsor"`
+	Country string `json:"country"`
+	Host    string `json:"host"`
+
+	// Distance is OOKLA'S ESTIMATE, computed from where Ookla believes this
+	// device is — which can be wrong by a continent. Measured 2026-08-20: a user
+	// in Funchal was placed at [40.851, -8.399] on the mainland, so their own
+	// city's server was reported 1186 km away and servers 249 km from nobody
+	// were listed as nearest.
 	Distance float64 `json:"distance_km"`
+
+	// LatencyMs is MEASURED — the list fetch pings every server it returns — so
+	// it is the honest answer to "which of these is actually near me" wherever
+	// the distance is not. Zero means the ping did not come back.
+	LatencyMs float64 `json:"latency_ms"`
 }
 
 // Phase carries one direction's outcome. Library and Raw are both kept on
@@ -343,18 +354,90 @@ func Servers(ctx context.Context) ([]ServerInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch server list: %w", err)
 	}
+	return describe(list), nil
+}
+
+// FindServers asks OOKLA rather than filtering the list we already hold.
+//
+// 🚨 THE LOCAL FILTER CANNOT REACH WHAT THE LIST DOES NOT CONTAIN, and that is
+// not a corner case. The nearby list is built from the apparent IP, so a user in
+// Funchal whom Ookla places on the mainland never sees the server in their own
+// city — the one with sub-millisecond latency — however they spell it in the
+// search box. `search=` is a query parameter on Ookla's own endpoint and finds
+// it; filtering rows we already have never can.
+//
+// A query of digits is looked up BY ID, because a user who knows the id should
+// not have to guess how its sponsor is spelled — and because the run path has
+// always accepted an arbitrary id, so the picker was the only thing standing
+// between them and it.
+func FindServers(ctx context.Context, query string) ([]ServerInfo, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("nothing to search for")
+	}
+	// 🚨 A keyword search performs the SAME fan-out ping as a plain list fetch,
+	// so it takes the same guard. It is a load generator, not a lookup.
+	if err := claim(loadingServers); err != nil {
+		return nil, err
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(ctx, serverListTimeout)
+	defer cancel()
+
+	if isServerID(query) {
+		client := newEngine(1, false)
+		defer client.close()
+		server, err := client.FetchServerByIDContext(ctx, query)
+		if err != nil || server == nil {
+			return nil, fmt.Errorf("no server with id %s", query)
+		}
+		return describe(stgo.Servers{server}), nil
+	}
+
+	client := newEngineWithKeyword(query)
+	defer client.close()
+	if _, err := client.FetchUserInfoContext(ctx); err != nil {
+		return nil, fmt.Errorf("fetch user info: %w", err)
+	}
+	list, err := client.FetchServerListContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("search %q: %w", query, err)
+	}
+	return describe(list), nil
+}
+
+func isServerID(q string) bool {
+	for _, r := range q {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// describe turns the library's servers into what the picker shows, in one place
+// so the nearby list and a search cannot describe the same server differently.
+func describe(list stgo.Servers) []ServerInfo {
 	out := make([]ServerInfo, 0, len(list))
 	for _, s := range list {
-		out = append(out, ServerInfo{
+		info := ServerInfo{
 			ID:       s.ID,
 			Name:     s.Name,
 			Sponsor:  s.Sponsor,
 			Country:  s.Country,
 			Host:     s.Host,
 			Distance: s.Distance,
-		})
+		}
+		// PingTimeout is the library's sentinel for "no answer", and it is a
+		// huge duration — reporting it as a latency would put an unreachable
+		// server at the bottom of a sort by a number that looks measured.
+		if s.Latency > 0 && s.Latency < time.Second {
+			info.LatencyMs = float64(s.Latency.Microseconds()) / 1000
+		}
+		out = append(out, info)
 	}
-	return out, nil
+	return out
 }
 
 // runPlan is everything the engine is configured with, decided in ONE place.

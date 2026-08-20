@@ -7,11 +7,31 @@ struct SpeedTestServer: Codable, Identifiable, Hashable {
     let sponsor: String
     let country: String
     let host: String
+
+    /// 🚨 OOKLA'S ESTIMATE, from where Ookla believes this device is — which can
+    /// be wrong by a sea. Measured: a user in Funchal was placed on the mainland,
+    /// so their own city's server read 1186 km and servers 249 km from nobody
+    /// were listed as "near you". The same server read 975 km when fetched by id.
+    /// Shown, but never as the reason a server is a good choice.
     let distanceKm: Double
+
+    /// MEASURED by the list fetch, which pings every server it returns. Where the
+    /// distance is a guess, this is not — and it is what actually answers "which
+    /// of these is near me". Zero means unknown: a lookup by id performs no ping.
+    let latencyMs: Double
 
     enum CodingKeys: String, CodingKey {
         case id, name, sponsor, country, host
         case distanceKm = "distance_km"
+        case latencyMs = "latency_ms"
+    }
+
+    /// Latency first, because it is the measured one. Never prints a zero as if
+    /// it were a sub-millisecond result.
+    var proximity: String {
+        latencyMs > 0
+            ? String(format: "%.0f ms · %.0f km est.", latencyMs, distanceKm)
+            : String(format: "%.0f km est.", distanceKm)
     }
 
     var label: String { sponsor.isEmpty ? name : "\(sponsor) · \(name)" }

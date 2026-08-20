@@ -237,6 +237,11 @@ const char *wgVersion(void);
 /// @return JSON, caller frees
 const char *wgSpeedtestServers(void);
 
+/* Ask Ookla for servers matching a query rather than filtering the nearby list.
+   Digits are looked up by id, anything else is a keyword search. The nearby list
+   comes from the apparent IP, so it can omit the server in your own city. */
+const char *wgSpeedtestFindServers(const char *query);
+
 /// Start a run. Takes the config as JSON (server_id, threads, direction,
 /// duration_sec, research, debug).
 /// @return empty string on success, an error message otherwise; caller frees

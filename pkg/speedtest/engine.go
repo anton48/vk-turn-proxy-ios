@@ -146,6 +146,13 @@ func closeIdle(rt http.RoundTripper) {
 	}
 }
 
+// newEngineWithKeyword is newEngine plus Ookla's server-side `search=` filter.
+// The keyword can only be set at construction, which is why this is a second
+// constructor rather than a setter.
+func newEngineWithKeyword(keyword string) *engine {
+	return newEngineConfig(1, false, keyword)
+}
+
 // newEngine wires the client so that every request goes through our transport.
 //
 // 🚨 OPTION ORDER IS LOAD-BEARING. WithUserConfig ends with
@@ -160,12 +167,16 @@ func closeIdle(rt http.RoundTripper) {
 // Proxy / DialerControl / DnsBindSource inert. Nothing sets them today; if
 // anything ever does, it has to move onto this transport.
 func newEngine(threads int, debug bool) *engine {
+	return newEngineConfig(threads, debug, "")
+}
+
+func newEngineConfig(threads int, debug bool, keyword string) *engine {
 	conns := &connCounter{}
 	rt := newRoundTripper(conns)
 	doer := &http.Client{Transport: rt}
 
 	client := stgo.New(
-		stgo.WithUserConfig(&stgo.UserConfig{MaxConnections: threads, Debug: debug}),
+		stgo.WithUserConfig(&stgo.UserConfig{MaxConnections: threads, Debug: debug, Keyword: keyword}),
 		stgo.WithDoer(doer), // LAST — see above
 	)
 	return &engine{Speedtest: client, conns: conns, doer: doer}

@@ -935,6 +935,54 @@ do {
           "the baseline is named for what it holds")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 33. THE PICKER CAN REACH A SERVER THE NEARBY LIST DOES NOT CONTAIN.
+//
+//     The nearby list is built from the APPARENT IP. Measured: a user in Funchal
+//     was placed by Ookla at [40.851, -8.399] on the mainland, so the list held
+//     Lisbon servers 249 km from nobody and NOT the server in their own city —
+//     the one with sub-millisecond latency. No amount of local filtering reaches
+//     it; `search=` on Ookla's own endpoint does, and so does an id.
+//
+//     And the distance shown is Ookla's estimate from that same wrong place: the
+//     Funchal server read 1186 km via search and 975 km via id. Latency is the
+//     measured one, so it leads.
+//
+//     SABOTAGES RUN, each reddening exactly one check:
+//       a. `proximity` printing latency even when it is 0 — the unknown check;
+//       b. drop the "est." from the distance — the labelling check;
+//       c. remove the searchServers call from the picker — the reach check.
+do {
+    let picker = source("VKTurnProxy/VKTurnProxy/SpeedTestServerPicker.swift")
+    let runner = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+
+    let measured = SpeedTestServer(id: "31551", name: "Funchal", sponsor: "MEO",
+                                   country: "Portugal", host: "h:8080",
+                                   distanceKm: 1186, latencyMs: 0.8)
+    check(measured.proximity.contains("1 ms") || measured.proximity.contains("0 ms"),
+          "a measured latency is shown")
+    check(measured.proximity.contains("est."),
+          "🚨 and the distance is labelled an ESTIMATE — Ookla computes it from where it " +
+          "believes you are, which was measured wrong by 1186 km")
+
+    // A lookup by id performs no ping, so there is no latency to show.
+    let byID = SpeedTestServer(id: "31551", name: "Funchal", sponsor: "MEO",
+                               country: "Portugal", host: "h:8080",
+                               distanceKm: 975, latencyMs: 0)
+    check(!byID.proximity.contains("ms"),
+          "🚨 an unmeasured latency is OMITTED, never printed as 0 ms — that would read as " +
+          "sub-millisecond, which is exactly the value this server really has and would be " +
+          "true by accident")
+
+    check(runner.contains("wgSpeedtestFindServers"),
+          "🚨 the runner can ask OOKLA, not only filter the rows it holds")
+    check(picker.contains("runner.searchServers(query)"),
+          "🚨 and the picker offers it — otherwise a server outside the nearby list is " +
+          "unreachable however it is spelled")
+    check(picker.contains("NOT necessarily near you"),
+          "search results are kept apart from the nearby list and say so")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")
