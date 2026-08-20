@@ -7,8 +7,12 @@ import (
 	"testing"
 )
 
-// None of the THREE fork changes (see ../FORK.md) can be guarded by their
-// VALUES, and finding that out cost two vacuous tests on 2026-08-20:
+// THIS FILE GUARDS DIVERGENCES 1-3 ONLY (see ../FORK.md, which now lists FIVE).
+//
+// Divergences 4 and 5 ARE guarded by their values — in fork_doer_test.go and
+// fork_cancel_test.go — and both were seen red on this machine. So the rule is
+// not "the fork cannot be value-tested"; it is that these three cannot, and
+// finding that out cost two vacuous tests on 2026-08-20:
 //
 //   - restoring the adaptive controller changes nothing in a unit test, because
 //     with no confirmed bytes flowing its `delta <= 0` branch continues and it
@@ -20,9 +24,14 @@ import (
 //   - restoring early stop shows up only as a DURATION, which needs a real
 //     network phase (~10 s against ~20 s) — not something a unit test may hold.
 //
-// So the guard is a source scan, which is host-independent and targets exactly
-// what a future upstream bump would put back. All three assertions were seen RED
-// under the edits they name before being committed.
+// So the guard for THESE three is a source scan, which is host-independent and
+// targets exactly what a future upstream bump would put back. All three
+// assertions were seen RED under the edits they name before being committed.
+//
+// 🚨 A scan finds only tokens somebody thought to name. What it cannot see —
+// a divergence nobody documented — is caught by
+// TestForkDivergesFromUpstreamExactlyHere, which diffs this tree against
+// pristine upstream.
 func TestForkChangesAreStillApplied(t *testing.T) {
 	src, err := os.ReadFile("data_manager.go")
 	if err != nil {

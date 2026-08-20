@@ -198,7 +198,7 @@ func (td *TestDirection) AddTotalReadVolume(delta int64) int64 {
 	return atomic.AddInt64(&td.totalReadVolume, delta)
 }
 
-func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerIndex int) {
+func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, mainRequestHandlerIndex int) {
 	if len(td.fns) == 0 {
 		panic("empty task stack")
 	}
@@ -253,6 +253,33 @@ func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerInde
 			dbg.Println("FuncGroup: Stop")
 		})
 	}
+
+	// FORK: stop the phase when the CALLER's context is cancelled — see ../FORK.md.
+	// Upstream ends a phase only through td.closeFunc, fired by the captureTime
+	// timer or by the early-stop path, so a cancelled context did not stop the
+	// workers at all: their requests failed instantly on the dead context and
+	// runWorker looped again at once. Measured on this fork before the fix —
+	// cancel at 0.70s, phase still returned at 4.00s of a 4s captureTime, and a
+	// download+upload run burned TWO full capture times.
+	//
+	// 🚨 closeFunc is the SINGLE shutdown path: it also drains and closes
+	// stopCapture (ending the rateCapture goroutine) and calls cancel(). Never
+	// end a phase by any other route — setting `running` directly or closing
+	// stopCapture here would break the once-wrapped double-send invariant.
+	//
+	// 🚨 AND THIS GOROUTINE MUST BE SPAWNED HERE, BELOW THE closeFunc
+	// ASSIGNMENT. td.closeFunc is written at that assignment while rateCapture,
+	// already running since the line above, reads it — spawning a second reader
+	// any earlier is a real data race (seen under -race), not a theoretical one.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			td.closeFunc()
+		case <-stopWatch:
+		}
+	}()
 
 	// FORK: adaptive upload concurrency is DISABLED — see ../FORK.md.
 	// Upstream turns the thread count into a ceiling for a controller that cut

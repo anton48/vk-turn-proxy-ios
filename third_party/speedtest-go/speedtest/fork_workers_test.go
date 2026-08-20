@@ -30,8 +30,8 @@ func TestForkThreadsMeansThreads(t *testing.T) {
 		dm.SetCaptureTime(80 * time.Millisecond)
 
 		td := dm.RegisterUploadHandler(func() { time.Sleep(time.Millisecond) })
-		_, cancel := context.WithCancel(context.Background())
-		td.Start(cancel, 0)
+		ctx, cancel := context.WithCancel(context.Background())
+		td.Start(ctx, cancel, 0)
 
 		if got := int(atomic.LoadInt32(&td.activeWorkers)); got != want {
 			t.Fatalf("SetNThread(%d): activeWorkers = %d, want %d (NumCPU=%d)",
@@ -52,8 +52,8 @@ func TestForkAdaptiveControllerIsNotStarted(t *testing.T) {
 	dm.SetCaptureTime(1200 * time.Millisecond) // long enough for >1 controller tick
 
 	td := dm.RegisterUploadHandler(func() { time.Sleep(5 * time.Millisecond) })
-	_, cancel := context.WithCancel(context.Background())
-	td.Start(cancel, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	td.Start(ctx, cancel, 0)
 
 	if got := int(atomic.LoadInt32(&td.activeWorkers)); got != 8 {
 		t.Fatalf("activeWorkers = %d after %v with no confirmed bytes; the adaptive controller appears to be running again",

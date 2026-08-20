@@ -210,7 +210,16 @@ func WithUserConfig(userConfig *UserConfig) Option {
 // New creates a new speedtest client.
 func New(opts ...Option) *Speedtest {
 	s := &Speedtest{
-		doer:    http.DefaultClient,
+		// FORK: an OWN client, not the process-wide http.DefaultClient — see
+		// ../FORK.md. NewUserConfig below ends with `s.doer.Transport = s`, so
+		// upstream's shared default made every construction re-point the
+		// transport of every EXISTING instance, and made merely importing this
+		// package hijack http.DefaultClient for the whole process (the
+		// package-level `var defaultClient = New()` fires at init). WithDoer
+		// does not save you: the default config is applied before the option
+		// loop, so the global is already rewired — and the private client is
+		// left with a nil Transport.
+		doer:    &http.Client{},
 		Manager: NewDataManager(),
 	}
 	// load default config
