@@ -63,14 +63,34 @@ import (
 // undocumented change -> that guard; documented but unnamed here -> this one.
 const forkRevision = 5
 
+// methodRevision is how THIS package measures — see METHOD.md.
+//
+// 🚨 THE FORK REVISION ALONE WAS NOT ENOUGH, and four builds proved it. Builds
+// 315-318 all reported the same version because the fork did not move, while the
+// wrapper changed what "8 threads" means, what the connection count counts, and
+// whether a phase was primed at all. Their results cannot go in one series and
+// the label said they could.
+//
+// Bump it when a change alters what a number MEANS — the load offered, the
+// window it is averaged over, the connections it runs on, or the conditions
+// under which a figure is published. Not for wording, UI or tests.
+// TestEngineVersionNamesEveryMethodRevision fails if this and METHOD.md
+// disagree.
+const methodRevision = 5
+
 // EngineVersion is reported beside every result so a number can be traced to the
-// code that produced it. The upstream half is READ FROM THE LIBRARY rather than
-// typed here, so a version bump cannot leave the label behind.
+// code that produced it. The upstream version is READ FROM THE LIBRARY rather
+// than typed here, so a bump cannot leave the label behind.
 //
 // On the upstream version itself: v1.7.10 counted ATTEMPTED upload bytes (added
 // as the transport read the request body, before the server confirmed); 1.7.11
 // splits that into a separate read-volume accumulator. Do not go back.
-var EngineVersion = fmt.Sprintf("speedtest-go v%s+vkturn.%d", stgo.Version(), forkRevision)
+//
+// ⚠️ It still does not identify the BINARY — two builds can share all three
+// numbers. The app puts its own build number beside this on screen, which is the
+// only thing that pins the exact code.
+var EngineVersion = fmt.Sprintf("speedtest-go v%s+fork.%d / vkturn-method.%d",
+	stgo.Version(), forkRevision, methodRevision)
 
 // Limits on what the C surface will accept. wgSpeedtestStart takes arbitrary
 // JSON, so these are enforced here rather than trusted from the caller: Swift
@@ -641,9 +661,16 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 // a different transport than the thing it configures is a trap waiting for the
 // first person who measures with it.
 func resolveUploadURL(ctx context.Context, raw string) string {
+	// Its own transport, and it is CLOSED afterwards: one probe leaves one
+	// connection idle for the transport's full 90 s timeout otherwise. The two
+	// measurement pools are released at the end of a run; this one was the
+	// straggler, and a straggler is exactly the kind of thing that survives a
+	// cleanup because it is only ever one.
+	rt := newRoundTripper(nil)
+	defer closeIdle(rt)
 	client := &http.Client{
 		Timeout:   15 * time.Second,
-		Transport: newRoundTripper(nil),
+		Transport: rt,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse // we want to SEE the 307, not chase it
 		},

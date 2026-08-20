@@ -98,6 +98,11 @@ struct SpeedTestResultView: View {
                threads, phase.connsUsed, phase.dials)
     }
 
+    /// CFBundleVersion — the same number the archive is verified against.
+    static var appBuild: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+    }
+
     @ViewBuilder
     private var metadata: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -135,7 +140,12 @@ struct SpeedTestResultView: View {
                 // this device's actual address by a whole address.
                 Text("seen by Ookla as \(progress.ooklaSeesIP) (\(progress.ooklaSeesISP))").font(.caption)
             }
-            Text(progress.engine).font(.caption)
+            // 🚨 The engine string names the METHODOLOGY (library + fork
+            // revision + wrapper method revision); the app build names the
+            // BINARY. Two builds can share all three numbers — 319 and 320 do —
+            // so this is the only line that pins the exact code a number came
+            // from, and it is the one a screenshot months later will be read by.
+            Text("\(progress.engine) · app build \(Self.appBuild)").font(.caption)
         }
         .foregroundColor(.secondary)
     }

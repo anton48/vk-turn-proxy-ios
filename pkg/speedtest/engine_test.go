@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // h2Server is a test server that OFFERS HTTP/2. A client that is merely
@@ -40,6 +41,55 @@ func trustingRoundTripper(t *testing.T, srv *httptest.Server, conns *connCounter
 	}
 	tr.TLSClientConfig = srv.Client().Transport.(*http.Transport).TLSClientConfig
 	return rt
+}
+
+// waitFor blocks until cond() is true, or FAILS the test.
+//
+// 🚨 It replaced two unbounded `for { ... }` busy-loops. Those spun forever when
+// a request failed — and the workers swallowed their errors, so the only symptom
+// was the whole suite sitting there until `go test` panicked at ten minutes,
+// naming a goroutine dump instead of the failure. A test that cannot fail
+// promptly is a test nobody will run.
+func waitFor(t *testing.T, werr *workerErrors, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			// 🚨 REPORT BEFORE FAILING. A first version pointed at "the collected
+			// worker errors above" and then called t.Fatalf, which aborts before
+			// anything prints them — a message naming evidence that does not
+			// exist is worse than no message, because the reader goes looking.
+			werr.report(t)
+			t.Fatalf("timed out after 5s waiting for %s — see the worker errors above "+
+				"(none listed means the requests succeeded and the count is simply wrong)", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// workerErrors collects what the concurrent requests hit, so a failure says why
+// instead of only that a count never arrived.
+type workerErrors struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (w *workerErrors) add(err error) {
+	if err == nil {
+		return
+	}
+	w.mu.Lock()
+	w.errs = append(w.errs, err)
+	w.mu.Unlock()
+}
+
+func (w *workerErrors) report(t *testing.T) {
+	t.Helper()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, err := range w.errs {
+		t.Errorf("worker request failed: %v", err)
+	}
 }
 
 // TestThreadsMeansTCPConnections is the guard for the defect this package was
@@ -78,6 +128,7 @@ func TestThreadsMeansTCPConnections(t *testing.T) {
 
 	conns.reset()
 	var wg sync.WaitGroup
+	var werr workerErrors
 	block := make(chan struct{})
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -86,6 +137,7 @@ func TestThreadsMeansTCPConnections(t *testing.T) {
 			req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
 			r, err := client.Do(req)
 			if err != nil {
+				werr.add(err)
 				return
 			}
 			<-block // hold the connection so the peak is observable
@@ -93,20 +145,19 @@ func TestThreadsMeansTCPConnections(t *testing.T) {
 		}()
 	}
 	// Let the requests reach the server and be counted before releasing them.
-	for {
+	waitFor(t, &werr, "all workers to reach the server", func() bool {
 		mu.Lock()
+		defer mu.Unlock()
 		n := 0
 		for _, c := range protos {
 			n += c
 		}
-		mu.Unlock()
-		if n >= workers+1 {
-			break
-		}
-	}
+		return n >= workers+1
+	})
 	peak, _ := conns.stats()
 	close(block)
 	wg.Wait()
+	werr.report(t)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -164,6 +215,7 @@ func TestUnprimedPhaseCannotSeeHTTP2(t *testing.T) {
 		conns.reset()
 
 		var wg sync.WaitGroup
+		var werr workerErrors
 		block := make(chan struct{})
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
@@ -171,23 +223,22 @@ func TestUnprimedPhaseCannotSeeHTTP2(t *testing.T) {
 				defer wg.Done()
 				r, err := client.Get(srv.URL)
 				if err != nil {
+					werr.add(err)
 					return
 				}
 				<-block
 				_ = r.Body.Close()
 			}()
 		}
-		for {
+		waitFor(t, &werr, "all workers to reach the server", func() bool {
 			mu.Lock()
-			n := served
-			mu.Unlock()
-			if n >= workers {
-				break
-			}
-		}
+			defer mu.Unlock()
+			return served >= workers
+		})
 		used, dials = conns.stats()
 		close(block)
 		wg.Wait()
+		werr.report(t)
 		return used, dials
 	}
 

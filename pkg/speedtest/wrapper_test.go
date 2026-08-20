@@ -19,6 +19,44 @@ import (
 // methodology cannot reach a user's screen under an unchanged label.
 //
 // Seen RED by adding a sixth "## Divergence 6:" section to FORK.md.
+// TestEngineVersionNamesEveryMethodRevision is the same loop as the fork's, for
+// the half the fork guard cannot see.
+//
+// 🚨 IT EXISTS BECAUSE THE FORK REVISION ALONE WAS NOT ENOUGH. Builds 315-318
+// reported one unchanging version while the wrapper changed what a thread is,
+// what the connection count counts, and whether a phase was primed — four
+// mutually incomparable methodologies under one label.
+//
+// Seen RED by adding a sixth "## Method 6" section to METHOD.md.
+func TestEngineVersionNamesEveryMethodRevision(t *testing.T) {
+	b, err := os.ReadFile("METHOD.md")
+	if err != nil {
+		t.Fatalf("read METHOD.md: %v", err)
+	}
+	found := regexp.MustCompile(`(?m)^## Method (\d+) `).FindAllStringSubmatch(string(b), -1)
+	if len(found) == 0 {
+		t.Fatal("no '## Method N ' sections found — the anchor is wrong and this check would " +
+			"pass on any tree")
+	}
+	if len(found) != methodRevision {
+		t.Errorf("METHOD.md documents %d method revisions but methodRevision is %d — bump the "+
+			"constant, or the next run will be labelled as comparable with runs it is not",
+			len(found), methodRevision)
+	}
+	for _, want := range []string{"+fork.", "vkturn-method."} {
+		if !strings.Contains(EngineVersion, want) {
+			t.Errorf("EngineVersion %q does not carry %q", EngineVersion, want)
+		}
+	}
+	// The User-Agent must carry them too: a server operator's log, or a capture
+	// read months later, is often the only surviving record of a run.
+	for _, want := range []string{"fork.", "vkturn-speedtest/"} {
+		if !strings.Contains(UserAgent, want) {
+			t.Errorf("UserAgent %q does not carry %q", UserAgent, want)
+		}
+	}
+}
+
 func TestEngineVersionNamesEveryForkDivergence(t *testing.T) {
 	const forkMD = "../../third_party/speedtest-go/FORK.md"
 	b, err := os.ReadFile(forkMD)
@@ -35,8 +73,8 @@ func TestEngineVersionNamesEveryForkDivergence(t *testing.T) {
 			"(EngineVersion is what traces a measurement to the methodology that produced it)",
 			len(found), forkRevision)
 	}
-	if want := "+vkturn."; !regexp.MustCompile(regexp.QuoteMeta(want)).MatchString(EngineVersion) {
-		t.Errorf("EngineVersion %q does not name the fork", EngineVersion)
+	if !strings.Contains(EngineVersion, "+fork.") {
+		t.Errorf("EngineVersion %q does not name the fork revision", EngineVersion)
 	}
 }
 

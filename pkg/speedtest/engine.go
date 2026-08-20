@@ -3,6 +3,7 @@ package speedtest
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -19,7 +20,11 @@ import (
 // UserAgent names US, not the library, because the run is ours: our transport,
 // our connection policy, our thread count. A server operator reading a log
 // should be able to tell this apart from the stock CLI.
-var UserAgent = "vkturn-speedtest/1 (showwin/speedtest-go " + stgo.Version() + ")"
+// The revisions travel in the User-Agent too, so a server operator's log — or a
+// capture taken months later — identifies the methodology and not merely the
+// library.
+var UserAgent = fmt.Sprintf("vkturn-speedtest/%d (showwin/speedtest-go %s+fork.%d)",
+	methodRevision, stgo.Version(), forkRevision)
 
 // engine is a speedtest client that measures over a transport WE control.
 //
@@ -34,8 +39,7 @@ type engine struct {
 
 	// doer is kept because priming needs to issue a request through the SAME
 	// client the measurement uses; the library's own handle to it is unexported.
-	doer      *http.Client
-	transport *http.Transport
+	doer *http.Client
 }
 
 // prime opens (or reuses) one connection to url so a phase does not start
@@ -125,7 +129,21 @@ func (e *engine) prime(ctx context.Context, rawURL string) (warm bool) {
 // for the full 90 s idle timeout, on a phone, across a few quick runs, is a
 // real cost for no benefit.
 func (e *engine) close() {
-	e.transport.CloseIdleConnections()
+	closeIdle(e.doer.Transport)
+}
+
+// closeIdle releases the idle connections of a round tripper built by
+// newRoundTripper, whatever it is wrapped in. Written as one function because
+// two call sites reached for it and the second nearly grew its own type
+// assertion.
+func closeIdle(rt http.RoundTripper) {
+	type idleCloser interface{ CloseIdleConnections() }
+	if u, ok := rt.(*userAgentRoundTripper); ok {
+		rt = u.next
+	}
+	if c, ok := rt.(idleCloser); ok {
+		c.CloseIdleConnections()
+	}
 }
 
 // newEngine wires the client so that every request goes through our transport.
@@ -150,12 +168,7 @@ func newEngine(threads int, debug bool) *engine {
 		stgo.WithUserConfig(&stgo.UserConfig{MaxConnections: threads, Debug: debug}),
 		stgo.WithDoer(doer), // LAST — see above
 	)
-	return &engine{
-		Speedtest: client,
-		conns:     conns,
-		doer:      doer,
-		transport: rt.(*userAgentRoundTripper).next.(*http.Transport),
-	}
+	return &engine{Speedtest: client, conns: conns, doer: doer}
 }
 
 // newRoundTripper builds the transport every measured request goes through.

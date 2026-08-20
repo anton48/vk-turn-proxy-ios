@@ -880,6 +880,14 @@ do {
           "the result view is given the previous run's server — without it 'moved' is unanswerable")
     check(result.contains("serverChoice.isWarning"),
           "🚨 and it renders the two cases differently, which is the whole point of the split")
+
+    // 🚨 The engine string names the METHODOLOGY; only the app build names the
+    // BINARY. Two builds can share every number in the engine string, so a
+    // result without this cannot be traced to the code that produced it.
+    check(result.contains("app build"),
+          "🚨 the result carries the app build, not only the engine version")
+    check(result.contains("CFBundleVersion"),
+          "and it reads it from the bundle rather than duplicating a constant")
 }
 
 print("")

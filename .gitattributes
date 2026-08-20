@@ -1,0 +1,11 @@
+# FORK.patch is a GENERATED unified diff of tab-indented Go source, and its
+# whitespace is not ours to fix: a unified diff prefixes every context line with
+# a space, so tab-indented code becomes " \t..." — space-before-tab — on every
+# single one. Measured on the commit that added it: 68 warnings from
+# `git diff --check`, 61 of them space-before-tab, purely structural.
+#
+# Left alone they would drown the real warnings that check exists to surface, in
+# release or CI. -whitespace turns the checks off for this path only; -diff is
+# deliberately NOT set, because the whole value of this file is that a human can
+# read what changed in it.
+third_party/speedtest-go/FORK.patch -whitespace
