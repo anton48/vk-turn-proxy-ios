@@ -1788,7 +1788,57 @@ do {
     check(wide.label == SpeedTestPath.directMode.rawValue,
           "with no window reported the wide trace is kept — the fallback is the CAUTIOUS one")
 
+    // 🚨 P2: PER PHASE, NOT OVER THEIR UNION. The union also covers the gap
+    // between the phases, where nothing is measured — so a DIRECT round trip
+    // that begins AND ends inside that gap flagged a run whose two phases were
+    // both measured on VPN and neither number touched.
+    var d2 = SpeedTestPhase(); d2.windowStartedAt = 1_000_005; d2.windowClosedAt = 1_000_035
+    var u2 = SpeedTestPhase(); u2.windowStartedAt = 1_000_045; u2.windowClosedAt = 1_000_075
+    var twoPhase = SpeedTestProgress(); twoPhase.download = d2; twoPhase.upload = u2
+
+    let roundTripInGap = SpeedTestPathTrace.overMeasurement(twoPhase, observations: [
+        obs(0, .throughVPN), obs(38, .directMode), obs(42, .throughVPN),
+    ], fallback: SpeedTestPathTrace(.throughVPN))
+    check(roundTripInGap.isAttributable
+          && roundTripInGap.label == SpeedTestPath.throughVPN.rawValue,
+          "🚨 a DIRECT round trip entirely inside the GAP between phases does NOT flag the run — "
+          + "both phases were measured on VPN and neither number was touched (got "
+          + "\(roundTripInGap.label))")
+
+    let persistsAcrossGap = SpeedTestPathTrace.overMeasurement(twoPhase, observations: [
+        obs(0, .throughVPN), obs(40, .directMode),
+    ], fallback: SpeedTestPathTrace(.throughVPN))
+    check(!persistsAcrossGap.isAttributable,
+          "🚨 but a change that PERSISTS across the gap does — the two phases were then measured "
+          + "on two routes, and one label cannot describe both")
+
+    let insideAPhase = SpeedTestPathTrace.overMeasurement(twoPhase, observations: [
+        obs(0, .throughVPN), obs(20, .directMode), obs(25, .throughVPN),
+    ], fallback: SpeedTestPathTrace(.throughVPN))
+    check(!insideAPhase.isAttributable,
+          "and a round trip INSIDE a phase's own window still flags it — that phase's bytes did "
+          + "leave by two routes")
+
+    // 🚨 P2: the label describes the interval it is now computed over.
+    check(insideAPhase.label.contains("DURING THE MEASUREMENT")
+          && !insideAPhase.label.contains("DURING THE RUN"),
+          "🚨 the label says DURING THE MEASUREMENT — it stopped meaning 'the run' one build ago "
+          + "and a sentence that lags its own rule is how the next reader is misled")
+
     let runner = codeWithoutComments("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+
+    // 🚨 P1: a poll timestamp is the instant of DETECTION. A change in the last
+    // 500ms of a window would be stamped after the close and dropped — a MISS,
+    // which hides a defect instead of inventing one.
+    check(runner.contains("Publishers.CombineLatest(tunnel.$status, tunnel.$directMode)"),
+          "🚨 the route is SUBSCRIBED to, so a change is stamped when it is published rather "
+          + "than when a timer next looks")
+    check(runner.contains("notePath(now, at: lastPathSampleAt)"),
+          "🚨 and a change the POLL discovers is stamped at the PREVIOUS look — the earliest "
+          + "instant it could have happened, because guessing early flags a run and guessing "
+          + "late hides one")
+    check(runner.contains("stopWatchingThePath()") && runner.contains("pathWatch.removeAll()"),
+          "the subscription is released when the run ends")
     check(runner.contains("SpeedTestPathTrace.overMeasurement("),
           "🚨 and the runner NARROWS the trace on the terminal poll — the rule is worth nothing "
           + "if the result still carries the run-wide one")

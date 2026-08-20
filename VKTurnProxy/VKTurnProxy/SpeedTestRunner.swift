@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import NetworkExtension
 
@@ -47,9 +48,21 @@ final class SpeedTestRunner: ObservableObject {
 
     /// Every route observation with the instant it was taken, so the final trace
     /// can be built over the measurement window instead of over the whole run.
-    /// ⚠️ Sampled by the 0.5s poll, so a flip and flip-back inside one interval
-    /// is invisible; that is the resolution of this instrument, not a claim.
+    ///
+    /// 🚨 STAMPED WHEN THE ROUTE MOVES, NOT WHEN A POLL NOTICES. Sampling at the
+    /// 0.5s poll records the instant of DETECTION, so a change in the window's
+    /// last half-second lands after the close and is dropped — a miss, which is
+    /// the direction that hides a defect rather than inventing one. The
+    /// subscription below fires when `TunnelManager` publishes the change.
+    /// ⚠️ It cannot beat the app's own knowledge: the extension applies routes
+    /// and the app is told afterwards, so this is "when the app learned", which
+    /// is the earliest instant anything here can honestly claim.
     private var pathObservations: [SpeedTestPathObservation] = []
+    private var pathWatch = Set<AnyCancellable>()
+    /// When the poll last looked. A change the POLL discovers is stamped here —
+    /// the earliest instant it could have happened — because guessing early
+    /// flags a run, and guessing late hides one.
+    private var lastPathSampleAt = Date()
 
     /// The parameters the run in hand was STARTED with. The result renders from
     /// this, never from the screen's live controls.
@@ -208,6 +221,8 @@ final class SpeedTestRunner: ObservableObject {
         let atStart = Self.currentPath()
         pathTrace = SpeedTestPathTrace(atStart)
         pathObservations = [SpeedTestPathObservation(at: Date(), path: atStart)]
+        lastPathSampleAt = Date()
+        watchThePath()
 
         let cfg: [String: Any] = [
             "server_id": serverID,
@@ -302,9 +317,11 @@ final class SpeedTestRunner: ObservableObject {
 
         progress = decoded
         let now = Self.currentPath()
-        if pathObservations.last?.path != now {
-            pathObservations.append(SpeedTestPathObservation(at: Date(), path: now))
-        }
+        // The BACKSTOP. If the subscription missed a change, this notices it up
+        // to one poll late, so it is stamped at the previous look — the earliest
+        // instant it could have happened.
+        notePath(now, at: lastPathSampleAt)
+        lastPathSampleAt = Date()
         pathTrace.record(now)
         if decoded.state == "done" || decoded.state == "error" {
             // 🚨 NARROW THE TRACE TO WHAT WAS ACTUALLY MEASURED. Until here it
@@ -339,6 +356,7 @@ final class SpeedTestRunner: ObservableObject {
     }
 
     private func stopPolling() {
+        stopWatchingThePath()
         poller?.invalidate()
         poller = nil
     }
@@ -348,4 +366,37 @@ final class SpeedTestRunner: ObservableObject {
         let tunnel = TunnelManager.shared
         return .current(connected: tunnel.status == .connected, directMode: tunnel.directMode)
     }
+}
+
+extension SpeedTestRunner {
+    /// Records a route observation, ignoring one that repeats the last.
+    ///
+    /// ⚖️ `at` is supplied rather than taken here, because the two callers know
+    /// different things: the subscription knows WHEN the change was published,
+    /// the poll only knows it happened since the previous look.
+    func notePath(_ path: SpeedTestPath, at when: Date) {
+        guard pathObservations.last?.path != path else { return }
+        pathObservations.append(SpeedTestPathObservation(at: when, path: path))
+    }
+
+    /// Subscribes to the route for the duration of a run.
+    ///
+    /// 🚨 This is what makes the timestamps mean "when it changed" instead of
+    /// "when a timer looked". Without it, a change in the last 500 ms of a
+    /// window is attributed to the period after the window and disappears.
+    func watchThePath() {
+        pathWatch.removeAll()
+        let tunnel = TunnelManager.shared
+        Publishers.CombineLatest(tunnel.$status, tunnel.$directMode)
+            .map { SpeedTestPath.current(connected: $0 == .connected, directMode: $1) }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] path in self?.notePath(path, at: Date()) }
+            .store(in: &pathWatch)
+    }
+
+    /// Dropped when the run ends: observations after the last window cannot
+    /// change any verdict, and a subscription outliving its run is a leak of the
+    /// same shape as a runner that outlives its screen.
+    func stopWatchingThePath() { pathWatch.removeAll() }
 }

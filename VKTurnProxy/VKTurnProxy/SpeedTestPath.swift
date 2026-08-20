@@ -105,10 +105,16 @@ struct SpeedTestPathTrace: Equatable {
     /// through a live poll timer — and this project has twice ended up testing a
     /// COPY of a rule for exactly that reason.
     ///
-    /// ⚖️ For a both-direction run the interval runs from the first window's open
-    /// to the last one's close, so a change in the GAP between the phases still
-    /// counts: the two phases would then have been measured on different routes,
-    /// and one label cannot describe both.
+    /// 🚨 PER PHASE, NOT OVER THEIR UNION. Spanning the first open to the last
+    /// close also covers the gap between the phases — time nothing is measured
+    /// in — so a DIRECT round trip that starts and ENDS inside that gap flagged
+    /// a run in which both phases were measured on the same route and neither
+    /// number was touched.
+    ///
+    /// What matters is: was each phase's own window quiet, and did the phases
+    /// agree with each other? A change that PERSISTS across the gap still shows
+    /// up, because the phases then disagree — one label cannot describe two
+    /// routes.
     ///
     /// ⚖️ Falls back to the wide trace when the engine reported no usable window
     /// — an errored run has no phases at all. A fallback that is WIDER errs
@@ -117,14 +123,22 @@ struct SpeedTestPathTrace: Equatable {
     static func overMeasurement(_ p: SpeedTestProgress,
                                 observations: [SpeedTestPathObservation],
                                 fallback: SpeedTestPathTrace) -> SpeedTestPathTrace {
-        let phases = [p.download, p.upload].compactMap { $0 }
-        let opens = phases.map(\.windowStartedAt).filter { $0 > 0 }
-        let closes = phases.map(\.windowClosedAt).filter { $0 > 0 }
-        guard let first = opens.min(), let last = closes.max(), last >= first else {
-            return fallback
+        let windows = [p.download, p.upload].compactMap { $0 }
+            .filter { $0.windowStartedAt > 0 && $0.windowClosedAt >= $0.windowStartedAt }
+            .map { Date(timeIntervalSince1970: $0.windowStartedAt)...Date(timeIntervalSince1970: $0.windowClosedAt) }
+        guard !windows.isEmpty else { return fallback }
+
+        var merged = SpeedTestPathTrace()
+        for w in windows {
+            let t = over(w, observations: observations)
+            // A phase whose own window saw a change settles it for the run.
+            guard t.isAttributable, let only = t.seen.first else { return t }
+            merged.record(only)
         }
-        return over(Date(timeIntervalSince1970: first)...Date(timeIntervalSince1970: last),
-                    observations: observations)
+        // Every phase was quiet on ONE path; the run is attributable only if
+        // they were all the SAME path. Otherwise the change fell in the gap and
+        // persisted, which leaves two phases on two routes.
+        return merged
     }
 
     /// False when the run spanned more than one path, i.e. the figure cannot be
@@ -139,7 +153,7 @@ struct SpeedTestPathTrace: Equatable {
         case 1: return seen[0].rawValue
         default:
             let names = seen.map(Self.short).joined(separator: " → ")
-            return "PATH CHANGED DURING THE RUN (\(names)) — this figure belongs to neither"
+            return "PATH CHANGED DURING THE MEASUREMENT (\(names)) — this figure belongs to neither"
         }
     }
 
