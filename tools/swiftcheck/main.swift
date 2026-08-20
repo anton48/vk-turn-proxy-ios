@@ -825,6 +825,63 @@ do {
           "🚨 and reported as what it is — the app and the engine disagreeing about the wire")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 31. AUTOMATIC SERVER SELECTION IS ANNOUNCED, AND IT SHOUTS ONLY WHEN IT MOVED.
+//
+//     Ookla selects from the apparent IP. Three runs on an unchanged path,
+//     minutes apart, picked 31309 / 31309 / 69521 — so the obvious use of this
+//     screen, pressing Run twice and comparing, can silently compare two
+//     different servers.
+//
+//     🚫 It deliberately does NOT warn on every automatic run: `auto` is the
+//     default, most people will never pin anything, and painting every result
+//     orange teaches them that orange means nothing. The loud case is the one
+//     that actually cost them a comparison.
+//
+//     SABOTAGES RUN, each reddening exactly one check:
+//       a. `isWarning` returning true for `.automatic` — the "quiet" check goes
+//          red, the moved one stays green;
+//       b. `of(...)` ignoring `pinnedID` — the pinned check goes red;
+//       c. dropping the `previous != ranOn` comparison — the moved check goes red.
+do {
+    let result = source("VKTurnProxy/VKTurnProxy/SpeedTestResultView.swift")
+
+    // A pinned run is comparable by construction and says nothing.
+    let pinned = SpeedTestServerChoice.of(pinnedID: "31309", ranOn: "31309", previous: "69521")
+    check(pinned == .pinned && pinned.note == nil && !pinned.isWarning,
+          "a pinned server produces no note at all — nothing about it is surprising")
+
+    // First automatic run: a quiet note, not a warning.
+    let first = SpeedTestServerChoice.of(pinnedID: "", ranOn: "31309", previous: nil)
+    check(first == .automatic && first.note != nil && !first.isWarning,
+          "🚫 the first automatic run explains itself QUIETLY — orange on every run trains " +
+          "people to ignore orange")
+
+    // Automatic, same server as before: still quiet.
+    let steady = SpeedTestServerChoice.of(pinnedID: "", ranOn: "31309", previous: "31309")
+    check(steady == .automatic && !steady.isWarning,
+          "automatic selection that stayed put is not a problem and is not reported as one")
+
+    // Automatic, and it MOVED — the case that cost a comparison.
+    let moved = SpeedTestServerChoice.of(pinnedID: "", ranOn: "69521", previous: "31309")
+    check(moved == .automaticMoved(from: "31309", to: "69521"),
+          "🚨 a moved automatic selection is recognised as such")
+    check(moved.isWarning,
+          "🚨 and it is the ONE case that warns — two runs on different servers are not comparable")
+    check(moved.note?.contains("31309") == true && moved.note?.contains("69521") == true,
+          "the warning names both servers, so the user can see what changed")
+
+    // A run that never reached a server must not become a baseline.
+    let noServer = SpeedTestServerChoice.of(pinnedID: "", ranOn: "", previous: "31309")
+    check(!noServer.isWarning,
+          "a run that selected no server at all does not accuse the next one of moving")
+
+    check(result.contains("previousServerID"),
+          "the result view is given the previous run's server — without it 'moved' is unanswerable")
+    check(result.contains("serverChoice.isWarning"),
+          "🚨 and it renders the two cases differently, which is the whole point of the split")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

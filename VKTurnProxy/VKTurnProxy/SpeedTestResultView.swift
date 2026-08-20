@@ -11,6 +11,11 @@ struct SpeedTestResultView: View {
     let run: SpeedTestRunConfig
     let progress: SpeedTestProgress
     let path: SpeedTestPathTrace
+    let previousServerID: String?
+
+    private var serverChoice: SpeedTestServerChoice {
+        .of(pinnedID: run.serverID, ranOn: progress.serverID, previous: previousServerID)
+    }
 
     var body: some View {
         // 🚨 The error and the rows are NOT exclusive. They used to be, so
@@ -106,6 +111,17 @@ struct SpeedTestResultView: View {
 
             if !progress.serverDesc.isEmpty {
                 Text("\(progress.serverDesc) · id \(progress.serverID)").font(.caption)
+            }
+            // Quiet when automatic selection behaved, loud only when it moved —
+            // see SpeedTestServerChoice for why it is not orange every time.
+            if let note = serverChoice.note {
+                if serverChoice.isWarning {
+                    Label(note, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                } else {
+                    Text(note).font(.caption)
+                }
             }
             if progress.pingMs > 0 {
                 Text(String(format: "ping %.0f ms · %@", progress.pingMs, progress.estimator))

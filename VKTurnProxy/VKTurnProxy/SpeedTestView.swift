@@ -34,7 +34,8 @@ struct SpeedTestView: View {
                 Section {
                     SpeedTestResultView(run: run,
                                         progress: runner.progress,
-                                        path: runner.pathTrace)
+                                        path: runner.pathTrace,
+                                        previousServerID: runner.previousServerID)
                 } header: {
                     Text("Result")
                 }

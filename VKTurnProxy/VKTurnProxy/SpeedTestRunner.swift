@@ -119,6 +119,13 @@ final class SpeedTestRunner: ObservableObject {
     /// this, never from the screen's live controls.
     @Published private(set) var startedRun: SpeedTestRunConfig?
 
+    /// The server the PREVIOUS completed run used, snapshotted when this one
+    /// started. It is what makes "automatic selection moved" answerable at all;
+    /// without it the screen can show which server was used but not that it
+    /// changed.
+    @Published private(set) var previousServerID: String?
+    private var lastCompletedServerID: String?
+
     /// Set when a start is refused because one run is already in flight. The Go
     /// side refuses too — this is the half that says so out loud instead of the
     /// button doing nothing.
@@ -220,6 +227,7 @@ final class SpeedTestRunner: ObservableObject {
             progress = p
             return
         }
+        previousServerID = lastCompletedServerID
         startedRun = SpeedTestRunConfig(serverID: serverID, serverLabel: serverLabel,
                                         threads: threads, direction: direction,
                                         durationSec: durationSec)
@@ -267,6 +275,12 @@ final class SpeedTestRunner: ObservableObject {
         progress = decoded
         pathTrace.record(Self.currentPath())
         if decoded.state == "done" || decoded.state == "error" {
+            // Recorded only on completion, and only if a server was actually
+            // reached: a run that failed before selection must not become the
+            // baseline the NEXT run is compared against.
+            if !decoded.serverID.isEmpty {
+                lastCompletedServerID = decoded.serverID
+            }
             stopPolling()
         }
     }
