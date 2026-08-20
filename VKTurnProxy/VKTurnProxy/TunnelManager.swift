@@ -785,6 +785,14 @@ class TunnelManager: ObservableObject {
     func switchAndReconnect(to serverId: UUID) async {
         guard let server = ServerStore.shared.servers.first(where: { $0.id == serverId }) else { return }
         SharedLogger.shared.log("[AppDebug] live-activity: switch → \"\(server.serverName)\" [\(server.modeLabel)]")
+        // 🚨 HOLD THE CARD FIRST. This passes through `.disconnected`, on which
+        // the controller ends the Live Activity — and ending it while the app is
+        // in the background is UNRECOVERABLE. It is done here rather than at each
+        // call site because one call site did not do it: the DIRECT repair,
+        // which reconnects precisely when a card is on screen showing routing.
+        if #available(iOS 16.2, *) {
+            LiveActivityController.shared.holdThroughReconnect()
+        }
 
         if status != .disconnected && status != .invalid {
             disconnect()
@@ -1258,29 +1266,37 @@ class TunnelManager: ObservableObject {
                 wanted: direct,
                 message: direct
                     ? "Routing did not switch — traffic is still going through the tunnel."
-                    : "Routing did not switch back — traffic was still going around the tunnel.")
+                    : "Routing did not switch back — traffic was still going around the tunnel.",
+                from: source)
         case .silent:
             note("⚠️ the extension did not answer, twice — the state of the routes is UNKNOWN")
             await directChangeUnconfirmed(
                 wanted: direct,
                 message: direct
                     ? "No answer from the tunnel — routing may not have switched."
-                    : "No answer from the tunnel — routing may still be bypassed.")
+                    : "No answer from the tunnel — routing may still be bypassed.",
+                from: source)
         }
     }
 
     /// A routing change that was not confirmed. Surfaces it under the switch,
     /// and for the dangerous direction repairs it the one way that cannot
     /// itself fail to be confirmed.
-    private func directChangeUnconfirmed(wanted direct: Bool, message: String) async {
+    private func directChangeUnconfirmed(wanted direct: Bool,
+                                        message: String,
+                                        from source: DirectChangeSource) async {
         directModeError = message
         // An unconfirmed ON is safe: at worst nothing changed and the tunnel is
         // still carrying everything. Leave the retry to the user rather than
         // charging them a reconnect — which would end DIRECT anyway.
         guard !direct else { return }
 
+        // The source belongs on THIS line above all others: it is the one that
+        // reports a possible leak, and the Live Activity path is where it is
+        // most likely — that repair runs on borrowed time inside perform().
         SharedLogger.shared.log("[App] direct: 🚨 an unconfirmed return to the tunnel may be a LEAK "
-            + "— reconnecting, which rebuilds the full-tunnel routes from scratch")
+            + "— reconnecting, which rebuilds the full-tunnel routes from scratch "
+            + "[asked from \(source.rawValue)]")
         directModeError = message + " Reconnecting to restore it."
         await switchAndReconnect(to: ServerStore.shared.activeServerId)
         refreshDirectMode()

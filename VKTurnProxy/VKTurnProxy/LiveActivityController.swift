@@ -202,6 +202,34 @@ final class LiveActivityController {
     /// thing: TunnelManager.refreshDirectMode calls it.
     func refreshNow() { pushNow() }
 
+    /// Re-publish and WAIT for ActivityKit to take it.
+    ///
+    /// 🚨 For callers running inside a Live Activity intent: perform() ends the
+    /// moment the handler returns and the app is suspended, so a publish left in
+    /// flight may simply never happen. Awaiting the routing change and not this
+    /// leaves the card describing the old state — the operation succeeds and the
+    /// user sees no evidence of it.
+    func refreshNowAndWait() async {
+        pushNow()
+        await publishInFlight?.value
+    }
+
+    /// Keep the card alive across a DELIBERATE reconnect.
+    ///
+    /// 🚨 A reconnect passes through `.disconnected`, and the controller ends the
+    /// activity on that — correctly, since a tunnel that went down should not
+    /// leave a card claiming otherwise. A switch or a routing repair is the one
+    /// case where the disconnect is a step rather than an outcome, and ending
+    /// the card there is UNRECOVERABLE while the app is in the background.
+    ///
+    /// It lives here and is called by `switchAndReconnect` itself, not by each
+    /// caller: the DIRECT repair path called that function without holding the
+    /// card, which would have destroyed it. A guard every caller must remember
+    /// is a guard the next caller forgets.
+    func holdThroughReconnect() {
+        switchDeadline = Date().addingTimeInterval(Self.switchWindow)
+    }
+
     private func pushNow() {
         let tunnel = TunnelManager.shared
         sync(status: tunnel.status,
@@ -270,13 +298,17 @@ final class LiveActivityController {
             // settled — refreshDirectMode(), which every one of those paths
             // calls, pushes the state that is actually true.
             await TunnelManager.shared.setDirectMode(direct, from: .liveActivity)
-            pushNow()
+            // AWAITED, not pushNow(): see refreshNowAndWait. The routing change
+            // being awaited buys nothing if the card update is detached.
+            await refreshNowAndWait()
 
         case .selectServer(let idString):
             guard let id = UUID(uuidString: idString) else { return }
             picker?.busyServerId = idString
             pushNow()
-            switchDeadline = Date().addingTimeInterval(Self.switchWindow)
+            // The deadline is set by switchAndReconnect itself now, so every
+            // caller of it is covered — including the DIRECT repair, which was
+            // not.
             await tunnel.switchAndReconnect(to: id)
             // switchDeadline is deliberately NOT cleared here — see its doc.
             picker = nil
@@ -316,10 +348,20 @@ final class LiveActivityController {
         }
     }
 
+    /// The publish in flight, so a caller that must not return before the card
+    /// has actually changed can wait for it.
+    ///
+    /// 🚨 THIS IS WHY `await setDirectMode` WAS NOT ENOUGH. The routing change
+    /// was awaited and then the card update was handed to a detached Task — so
+    /// perform() returned, the app was suspended, and the visible half of the
+    /// operation might never happen. Awaiting the work and then detaching the
+    /// last step of it is the same defect as not awaiting at all, one level down.
+    private var publishInFlight: Task<Void, Never>?
+
     private func update(_ state: VPNActivityAttributes.ContentState) {
         guard let activity else { return }
         lastPushed = (state, Date())
-        Task {
+        publishInFlight = Task {
             await activity.update(ActivityContent(state: state, staleDate: staleDate(for: state.status)))
         }
     }

@@ -1195,6 +1195,35 @@ do {
           "the card declares itself")
     check(source("VKTurnProxy/VKTurnProxy/AdvancedView.swift").contains("from: .advancedSwitch"),
           "and so does the Advanced switch")
+
+    // 🚨 AWAITING THE WORK AND DETACHING ITS LAST STEP IS NOT AWAITING. The
+    // routing change was awaited and the card update handed to a Task, so
+    // perform() returned and the app was suspended with the publish possibly
+    // never happening — the operation succeeds and the user sees no evidence.
+    check(caseBody.contains("await refreshNowAndWait()"),
+          "🚨 the handler waits for the CARD too, not only the routing change")
+    check(controller.contains("await publishInFlight?.value"),
+          "and that wait reaches ActivityKit's own update, which is the detached part")
+
+    // 🚨 A reconnect passes through .disconnected, on which the card is ENDED —
+    // unrecoverably, while the app is in the background. The DIRECT repair
+    // reconnects precisely when a card is on screen showing routing, and it did
+    // not hold it. The hold belongs INSIDE switchAndReconnect: a guard every
+    // caller must remember is one the next caller forgets.
+    check(controller.contains("func holdThroughReconnect()"),
+          "the card can be held across a deliberate reconnect")
+    let switchFn = tunnel.range(of: "func switchAndReconnect(")
+    let switchBody = switchFn.map { String(tunnel[$0.lowerBound...].prefix(900)) } ?? ""
+    check(switchBody.contains("holdThroughReconnect()"),
+          "🚨 and switchAndReconnect holds it ITSELF, so every caller is covered — including " +
+          "the DIRECT repair, which was not")
+
+    // The line that reports a possible leak is the one that most needs a source.
+    let unconfirmed = tunnel.range(of: "an unconfirmed return to the tunnel may be a LEAK")
+    let leakLine = unconfirmed.map { String(tunnel[$0.lowerBound...].prefix(400)) } ?? ""
+    check(leakLine.contains("[asked from "),
+          "🚨 the LEAK warning names where the change was asked from — the Live Activity path " +
+          "is both the likeliest and the one running on borrowed time")
     check(controller.contains("state.direct = TunnelManager.shared.directMode"),
           "the app reads it and puts it on the wire — the widget is another process and " +
           "shares no App Group")
