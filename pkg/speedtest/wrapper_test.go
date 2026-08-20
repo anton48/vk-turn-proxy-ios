@@ -166,7 +166,7 @@ func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
 	const warm = 30 * time.Millisecond
 	for i := 0; i < 200; i++ {
 		s, err := runPhase(context.Background(), warm,
-			func() int64 { return counter.Load() },
+			func() (int64, int64) { return counter.Load(), 0 },
 			// Ends AT the boundary: the goroutine is racing us to send.
 			func(context.Context) error { time.Sleep(warm); return nil })
 		if err != nil {
@@ -186,7 +186,7 @@ func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
 // A phase shorter than its own warm-up must not produce a rate.
 func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
 	s, err := runPhase(context.Background(), 500*time.Millisecond,
-		func() int64 { return 0 },
+		func() (int64, int64) { return 0, 0 },
 		func(context.Context) error { time.Sleep(20 * time.Millisecond); return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +195,7 @@ func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
 		t.Fatal("claims a warm-up boundary that never came")
 	}
 	start := time.Now().Add(-20 * time.Millisecond)
-	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, start, time.Now(), 1234)
+	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, start, time.Now(), 1234, 0)
 	if p.RawMbps != 0 {
 		t.Errorf("stated %v Mbit/s from a 0.02s window", p.RawMbps)
 	}
@@ -211,8 +211,8 @@ func TestWindowSplitSumsToActual(t *testing.T) {
 	warmAt := start.Add(5 * time.Second)
 	end := start.Add(20 * time.Second)
 
-	p := measure(1e6, 40e6, start, end, false, 0, 0)
-	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, start, end, 40e6)
+	p := measure(1e6, 40e6, start, end, false)
+	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, start, end, 40e6, 0)
 
 	if got := p.WarmupSec + p.WindowSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
 		t.Errorf("warmup %.3f + window %.3f = %.3f, but actual is %.3f",
@@ -395,9 +395,9 @@ func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
 	warmAt := start.Add(5 * time.Second)
 	end := start.Add(20 * time.Second)
 
-	p := measure(1e6, 40e6, start, end, false, 0, 0)
+	p := measure(1e6, 40e6, start, end, false)
 	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true},
-		start, end, 40e6)
+		start, end, 40e6, 0)
 
 	if p.WindowBytes != 30e6 {
 		t.Errorf("WindowBytes = %d, want 30000000 (40 MB total minus the 10 MB warm-up)", p.WindowBytes)
@@ -414,9 +414,64 @@ func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
 	}
 
 	// Outside research mode the two must agree, or the same check breaks there.
-	q := measure(1e6, 40e6, start, end, false, 0, 0)
-	q = applyWindow(q, warmSample{}, start, end, 40e6)
+	q := measure(1e6, 40e6, start, end, false)
+	q = applyWindow(q, warmSample{}, start, end, 40e6, 0)
 	if q.WindowBytes != q.Bytes {
 		t.Errorf("outside research mode WindowBytes (%d) must equal Bytes (%d)", q.WindowBytes, q.Bytes)
+	}
+}
+
+// TestConfirmedRatioIsScopedToTheWindow.
+//
+// 🚨 The ratio exists to qualify the RATE, and the rate covers the measurement
+// window — so a phase-scoped ratio qualifies a number that appears nowhere, and
+// printed beside window figures it makes a CORRECT line fail its own arithmetic.
+// Measured on a research run before this: reported 98.0% while the window bytes
+// beside it implied 97.5%.
+//
+// Seen RED by computing the ratio from the phase totals instead.
+func TestConfirmedRatioIsScopedToTheWindow(t *testing.T) {
+	start := time.Now()
+	warmAt := start.Add(5 * time.Second)
+	end := start.Add(20 * time.Second)
+
+	// ⚠️ THE FIXTURE IS CHOSEN SO THE TWO ANSWERS DIFFER. A first version used
+	// 400/10 and 1000/25, where the window ratio 600/615 and the phase ratio
+	// 1000/1025 are BOTH 40/41 — so the discriminating check could not
+	// discriminate. The test caught it; the numbers below do not coincide.
+	//
+	// Warm-up: 400 MB confirmed with 20 MB outstanding.
+	// Whole phase: 1000 MB confirmed with 25 MB outstanding.
+	// ⇒ the window moved 600 MB and accumulated only 5 MB of backlog.
+	p := measure(1e6, 1000e6, start, end, true)
+	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 20e6,
+		at: warmAt, ok: true}, start, end, 1000e6, 25e6)
+
+	if p.WindowBytes != 600e6 {
+		t.Fatalf("WindowBytes = %d, want 600000000", p.WindowBytes)
+	}
+	if p.BacklogBytes != 5e6 {
+		t.Errorf("BacklogBytes = %d, want 5000000 — the backlog is a DELTA over the window, "+
+			"not the phase's outstanding total", p.BacklogBytes)
+	}
+	want := 600.0 / 605.0
+	if p.ConfirmedRatio < want-0.001 || p.ConfirmedRatio > want+0.001 {
+		t.Errorf("ConfirmedRatio = %.4f, want %.4f — it must be derivable from the two byte "+
+			"figures printed beside it, or a correct line fails its own check",
+			p.ConfirmedRatio, want)
+	}
+	// The phase-scoped answer, which is what it used to report.
+	phase := 1000.0 / 1025.0
+	if p.ConfirmedRatio > phase-0.001 && p.ConfirmedRatio < phase+0.001 {
+		t.Error("the ratio is still the PHASE's — it disagrees with the window bytes beside it")
+	}
+
+	// A server that caught up during the window must not produce a negative
+	// backlog: it is a level, and a delta of a level can go either way.
+	q := applyWindow(measure(1e6, 1000e6, start, end, true),
+		warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 40e6, at: warmAt, ok: true},
+		start, end, 1000e6, 25e6)
+	if q.BacklogBytes != 0 {
+		t.Errorf("backlog = %d after the server caught up, want 0", q.BacklogBytes)
 	}
 }

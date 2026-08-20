@@ -1375,6 +1375,21 @@ do {
     check(researchLine.contains("phase-bytes=40.0MB"),
           "and the phase total beside it, so neither number has to be guessed")
 
+    // 🚨 EVERY FIGURE ON THE LINE SHARES ONE SCOPE — the window — with
+    // phase-bytes the single marked exception. The confirmed ratio must be
+    // derivable from the two byte figures printed next to it, or a correct line
+    // fails the arithmetic it invites.
+    var scoped = SpeedTestPhase()
+    scoped.rawMbps = 100; scoped.windowSec = 15; scoped.actualSec = 20; scoped.warmupSec = 5
+    scoped.bytes = 1_000_000_000; scoped.windowBytes = 600_000_000
+    scoped.backlogBytes = 5_000_000; scoped.confirmedRatio = 600.0 / 605.0
+    let scopedLine = SpeedTestLog.result(run, progress: {
+        var p = SpeedTestProgress(); p.upload = scoped; return p
+    }(), path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
+    check(scopedLine.contains("confirmed=99.2%") && scopedLine.contains("backlog=5.0MB"),
+          "🚨 confirmed and backlog are the WINDOW's, so 600/(600+5) is what the line's own " +
+          "byte figures give — a phase-scoped ratio would read 97.6% beside them")
+
     check(all.contains("312.8") && all.contains("296.2"),
           "🚨 BOTH figures are logged — they answer different questions and disagreeing is normal")
     check(all.contains("conns=32/31"),

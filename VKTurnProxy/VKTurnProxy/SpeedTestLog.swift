@@ -111,6 +111,11 @@ enum SpeedTestLog {
             s += String(format: " phase-bytes=%.1fMB(incl. warm-up)", Double(p.bytes) / 1e6)
         }
         s += " threads=\(threads) conns=\(p.connsUsed)/\(p.dials)"
+        // 🚨 BOTH ARE SCOPED TO THE WINDOW, like every other figure on this line
+        // except the explicitly-marked phase-bytes. A phase-scoped ratio printed
+        // beside window bytes made a CORRECT line fail its own arithmetic —
+        // measured on a research run: 98.0% reported against 97.5% implied by
+        // the bytes next to it. One scope per line, one marked exception.
         if p.confirmedRatio > 0 { s += String(format: " confirmed=%.1f%%", p.confirmedRatio * 100) }
         if p.backlogBytes > 0 { s += String(format: " backlog=%.1fMB", Double(p.backlogBytes) / 1e6) }
         s += " consistent=\(p.consistent)"

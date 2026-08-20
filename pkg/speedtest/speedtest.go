@@ -591,8 +591,11 @@ func Start(cfg Config) error {
 // phaseSpec is one direction, so the two phases cannot drift apart by being
 // written twice.
 type phaseSpec struct {
-	stage  string
-	total  func() int64
+	stage string
+	// sample returns the confirmed-byte counter and the outstanding backlog, so
+	// the warm-up boundary can be taken for BOTH and every figure on a result
+	// describes the same window.
+	sample func() (bytes, backlog int64)
 	run    func(context.Context) error
 	speed  func() float64
 	upload bool
@@ -691,14 +694,16 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 
 	specs := map[string]phaseSpec{
 		"download": {
-			stage: "download",
-			total: target.Context.GetTotalDownload,
-			run:   target.DownloadTestContext,
-			speed: func() float64 { return float64(target.DLSpeed) },
+			stage:  "download",
+			sample: func() (int64, int64) { return target.Context.GetTotalDownload(), 0 },
+			run:    target.DownloadTestContext,
+			speed:  func() float64 { return float64(target.DLSpeed) },
 		},
 		"upload": {
-			stage:  "upload",
-			total:  target.Context.GetTotalUpload,
+			stage: "upload",
+			sample: func() (int64, int64) {
+				return target.Context.GetTotalUpload(), target.Context.GetUploadBacklog()
+			},
 			run:    target.UploadTestContext,
 			speed:  func() float64 { return float64(target.ULSpeed) },
 			upload: true,
@@ -726,10 +731,10 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		// counted into this phase's connection figures.
 		meas.conns.reset()
 		start := time.Now()
-		ws, err := runPhase(ctx, pl.warmup, spec.total, spec.run)
+		ws, err := runPhase(ctx, pl.warmup, spec.sample, spec.run)
 		end := time.Now()
 		used, dials := meas.conns.stats()
-		endBytes := spec.total()
+		endBytes, endBacklog := spec.sample()
 
 		// The gate comes AFTER the samples are taken and BEFORE anything is
 		// published: a stopped run is not a result. Without it the engine
@@ -739,9 +744,8 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 
-		phase := measure(spec.speed(), endBytes, start, end, spec.upload,
-			target.Context.GetUploadBacklog(), target.Context.GetUploadConfirmationRatio())
-		phase = applyWindow(phase, ws, start, end, endBytes)
+		phase := measure(spec.speed(), endBytes, start, end, spec.upload)
+		phase = applyWindow(phase, ws, start, end, endBytes, endBacklog)
 		// After the gate on purpose: a cancelled phase has peak < threads and
 		// would otherwise emit a spurious "the knob lied" warning on every Stop.
 		phase = applyConnStats(phase, used, dials, pl.threads, warm)
@@ -827,10 +831,11 @@ const minRateWindow = 1.0
 // warmSample is what the warm-up goroutine observed, carried back over a channel
 // rather than through shared variables.
 type warmSample struct {
-	warmup time.Duration // what was REQUESTED, for the message when ok is false
-	bytes  int64         // counter reading at the boundary
-	at     time.Time     // when the boundary was crossed
-	ok     bool          // false: the phase ended before the warm-up did
+	warmup  time.Duration // what was REQUESTED, for the message when ok is false
+	bytes   int64         // confirmed-byte counter at the boundary
+	backlog int64         // unconfirmed bytes outstanding at the boundary
+	at      time.Time     // when the boundary was crossed
+	ok      bool          // false: the phase ended before the warm-up did
 }
 
 // runPhase executes one direction and, when a warm-up is asked for, samples the
@@ -844,7 +849,7 @@ type warmSample struct {
 // receive (select with default) is no better in a different way: it compiles,
 // passes, and silently LOSES the sample when the goroutine has not sent yet,
 // which reads as a run with no warm-up.
-func runPhase(ctx context.Context, warmup time.Duration, total func() int64, run func(context.Context) error) (warmSample, error) {
+func runPhase(ctx context.Context, warmup time.Duration, sample func() (bytes, backlog int64), run func(context.Context) error) (warmSample, error) {
 	if warmup <= 0 {
 		return warmSample{}, phaseErr(ctx, run(ctx))
 	}
@@ -854,7 +859,8 @@ func runPhase(ctx context.Context, warmup time.Duration, total func() int64, run
 		s := warmSample{warmup: warmup}
 		select {
 		case <-time.After(warmup):
-			s.bytes, s.at, s.ok = total(), time.Now(), true
+			s.bytes, s.backlog = sample()
+			s.at, s.ok = time.Now(), true
 		case <-done:
 		case <-ctx.Done():
 		}
@@ -886,21 +892,50 @@ func phaseErr(ctx context.Context, err error) error {
 // wrapper timestamps as ActualSec — so WarmupSec + WindowSec == ActualSec
 // exactly, and the UI can print all three without deriving any of them a second
 // time.
-func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes int64) Phase {
+func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes, endBacklog int64) Phase {
 	if !s.ok {
 		p.WindowSec = p.ActualSec
 		p.WindowBytes = p.Bytes
+		p.BacklogBytes = endBacklog
 		if s.warmup > 0 {
 			p.Warnings = append(p.Warnings, fmt.Sprintf(
 				"the phase ended before the %.0fs warm-up did, so no measurement window opened — "+
 					"this figure covers the whole phase, warm-up included", s.warmup.Seconds()))
 		}
-		return setRaw(p, p.Bytes, p.WindowSec)
+		return confirmRatio(setRaw(p, p.Bytes, p.WindowSec))
 	}
 	p.WarmupSec = s.at.Sub(start).Seconds()
 	p.WindowSec = end.Sub(s.at).Seconds()
 	p.WindowBytes = endBytes - s.bytes
-	return setRaw(p, p.WindowBytes, p.WindowSec)
+	// 🚨 THE BACKLOG IS SCOPED TO THE WINDOW TOO, and that is not pedantry: the
+	// confirmation ratio exists to qualify the RATE, and the rate covers the
+	// window. A phase-scoped ratio qualifies a number that appears nowhere —
+	// and printed beside window figures it made a correct line fail its own
+	// arithmetic (measured on a research run: 98.0% reported, 97.5% implied by
+	// the window bytes beside it).
+	//
+	// It is a DELTA of an outstanding level, so it can be negative when the
+	// server caught up during the window; clamped, because a negative backlog is
+	// not a thing to report.
+	p.BacklogBytes = endBacklog - s.backlog
+	if p.BacklogBytes < 0 {
+		p.BacklogBytes = 0
+	}
+	return confirmRatio(setRaw(p, p.WindowBytes, p.WindowSec))
+}
+
+// confirmRatio derives the confirmation ratio from the window's own figures, so
+// it can never disagree with the bytes printed next to it.
+func confirmRatio(p Phase) Phase {
+	pushed := p.WindowBytes + p.BacklogBytes
+	if pushed > 0 && p.WindowBytes >= 0 {
+		p.ConfirmedRatio = float64(p.WindowBytes) / float64(pushed)
+	}
+	if p.ConfirmedRatio > 0 && p.ConfirmedRatio < 0.95 {
+		p.Warnings = append(p.Warnings, fmt.Sprintf(
+			"only %.0f%% of uploaded bytes were confirmed by the server", p.ConfirmedRatio*100))
+	}
+	return p
 }
 
 // setRaw is the single writer of RawMbps.
@@ -945,7 +980,7 @@ func applyConnStats(p Phase, used, dials, threads int, warm bool) Phase {
 
 // measure turns one phase into its figures, EXCEPT RawMbps — that belongs to
 // applyWindow, which knows the window. The library figure is taken as reported.
-func measure(libBytesPerSec float64, bytes int64, start, end time.Time, isUpload bool, backlog int64, ratio float64) Phase {
+func measure(libBytesPerSec float64, bytes int64, start, end time.Time, isUpload bool) Phase {
 	// ActualSec comes from the wrapper's own clock rather than the engine's
 	// TestDuration so that it shares one clock with the warm-up split. The two
 	// bracket the same call and agree to milliseconds.
@@ -973,16 +1008,10 @@ func measure(libBytesPerSec float64, bytes int64, start, end time.Time, isUpload
 		ImpliedSec:  implied,
 		Consistent:  consistent,
 	}
-	if isUpload {
-		p.BacklogBytes = backlog
-		p.ConfirmedRatio = ratio
-		if ratio > 0 && ratio < 0.95 {
-			p.Warnings = append(p.Warnings, fmt.Sprintf(
-				"only %.0f%% of uploaded bytes were confirmed by the server", ratio*100))
-		}
-		if bytes == 0 {
-			p.Warnings = append(p.Warnings, "the server confirmed NOTHING — the endpoint may be redirecting or rejecting uploads")
-		}
+	// The backlog and the confirmation ratio belong to applyWindow, which knows
+	// the window: see confirmRatio.
+	if isUpload && bytes == 0 {
+		p.Warnings = append(p.Warnings, "the server confirmed NOTHING — the endpoint may be redirecting or rejecting uploads")
 	}
 	// Two different failures, two different sentences. An empty phase is already
 	// explained by the warning above; adding "the estimator is weighted to the
