@@ -805,33 +805,92 @@ func TestConsistencyIsScopedToTheWindow(t *testing.T) {
 	}
 }
 
+// codeWithoutComments reads a source file with its `//` comments removed.
+//
+// 🚨 A SCAN THAT READS PROSE TESTS THE DOCUMENTATION. The check below forbids
+// reading target.DLSpeed/ULSpeed — and the comment explaining WHY names them
+// twice, so an un-stripped scan goes red on a correct tree. (Naive: it also cuts
+// inside a string literal containing "//". No scan here depends on one.)
+func codeWithoutComments(t *testing.T, path string) string {
+	t.Helper()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(string(src), "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // 🚨 THE ENGINE'S OWN RATE AND THE CONNECTION COUNTS MUST COME FROM THE WINDOW'S
 // EDGE. The close guard makes the engine push for a moment AFTER the window has
 // closed: its estimator is weighted to its last seconds, so read at the end it
 // partly describes the guard, and a connection first used in the guard — or
 // while the workers unwind — was never part of the measurement at all.
 func TestTheEngineRateAndConnsComeFromTheWindowEdge(t *testing.T) {
-	src, err := os.ReadFile("speedtest.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := string(src)
+	body := codeWithoutComments(t, "speedtest.go")
 
 	if !strings.Contains(body, "lib, used, dials = cs.libBps, cs.connsUsed, cs.dials") {
 		t.Error("the rate and the connection counts are not taken from the close sample")
 	}
 	// And the sample closure must actually collect them, or the fields above are
 	// zero and the fallback silently wins.
-	if !strings.Contains(body, "libBps:    float64(target.ULSpeed)") ||
+	if !strings.Contains(body, "libBps:    target.Context.GetEWMAUploadRate()") ||
+		!strings.Contains(body, "libBps:    target.Context.GetEWMADownloadRate()") ||
 		!strings.Contains(body, "connsUsed: used, dials: dials") {
-		t.Error("🚨 the boundary sample does not collect the engine's rate and the connection " +
+		t.Error("🚨 the boundary sample does not collect the LIVE rate and the connection " +
 			"counters — taking them from cs then yields zeros, and the code falls back to the " +
 			"end-of-phase values without saying so")
+	}
+	// 🚨 AND IT MUST NOT READ THE POST-PHASE FIELDS. The library assigns
+	// s.DLSpeed / s.ULSpeed only after the phase function returns, so inside the
+	// phase they hold the PREVIOUS direction's figure — or zero on the first.
+	// The first version of this scan asserted exactly that wrong source, which
+	// is how it shipped: a guard can encode the defect as faithfully as the fix.
+	if strings.Contains(body, "target.DLSpeed") || strings.Contains(body, "target.ULSpeed") {
+		t.Error("🚨 the post-phase speed fields are read somewhere — at any boundary inside a " +
+			"phase they are stale by a whole direction")
 	}
 	// The guard exists to win a race, not to be generous: every millisecond of
 	// it is traffic outside the measurement.
 	if closeGuard > time.Second {
 		t.Errorf("closeGuard is %v — it only has to cover the skew between two timers armed "+
 			"from the same clock, and the rest is unmeasured traffic on the link", closeGuard)
+	}
+}
+
+// 🚨 A MISSING RATE IS NOT AN INCONSISTENT ONE. With no engine figure, `implied`
+// is 0 and the consistency sentence would read "implies 0.0s of data but the
+// window was 30.0s" — an accusation about the measurement assembled out of an
+// absence. It is reachable: the estimator is only live while a phase runs.
+func TestNoEngineRateIsSaidPlainlyNotAsInconsistency(t *testing.T) {
+	start := time.Now()
+	end := start.Add(30 * time.Second)
+	p := applyWindow(measure(0, 400e6, start, end, false), warmSample{}, warmSample{},
+		start, end, 400e6, 0, false, 8, closeGuard)
+
+	if p.Consistent {
+		t.Error("a phase with no engine rate is reported as consistent")
+	}
+	var said, accused bool
+	for _, w := range p.Warnings {
+		if strings.Contains(w, "reported no rate for this window") {
+			said = true
+		}
+		if strings.Contains(w, "implies 0.0s of data") {
+			accused = true
+		}
+	}
+	if !said {
+		t.Errorf("the missing rate is not stated plainly: %q", p.Warnings)
+	}
+	if accused {
+		t.Errorf("the line accuses the measurement using a number it does not have: %q", p.Warnings)
 	}
 }

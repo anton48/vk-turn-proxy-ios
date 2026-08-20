@@ -678,7 +678,12 @@ type phaseSpec struct {
 	// how the line stops being checkable.
 	sample func() warmSample
 	run    func(context.Context) error
-	speed  func() float64
+	// 🚨 THERE IS DELIBERATELY NO `speed` CLOSURE HERE. It returned
+	// target.DLSpeed/ULSpeed, which the library only assigns AFTER the phase
+	// returns — so at a boundary inside the phase it is the previous
+	// direction's figure, or zero. The rate travels in the boundary sample
+	// instead; leaving the old accessor in place would leave the next reader a
+	// field that looks like the right one.
 	upload bool
 }
 
@@ -779,27 +784,35 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 			sample: func() warmSample {
 				used, dials := meas.conns.stats()
 				return warmSample{
-					bytes:     target.Context.GetTotalDownload(),
-					libBps:    float64(target.DLSpeed),
+					bytes: target.Context.GetTotalDownload(),
+					// 🚨 THE LIVE EWMA, NOT target.DLSpeed. The library assigns
+					// that field AFTER the phase function returns
+					// (request.go: `s.DLSpeed = ByteRate(...)` below `.Start`),
+					// so read at a boundary INSIDE the phase it is whatever it
+					// held before — zero on the first phase, and the OTHER
+					// direction's figure on the second. GetEWMADownloadRate is
+					// the same estimator the library itself copies from, and it
+					// is readable while the phase runs.
+					libBps:    target.Context.GetEWMADownloadRate(),
 					connsUsed: used, dials: dials,
 				}
 			},
-			run:   target.DownloadTestContext,
-			speed: func() float64 { return float64(target.DLSpeed) },
+			run: target.DownloadTestContext,
 		},
 		"upload": {
 			stage: "upload",
 			sample: func() warmSample {
 				used, dials := meas.conns.stats()
 				return warmSample{
-					bytes:     target.Context.GetTotalUpload(),
-					backlog:   target.Context.GetUploadBacklog(),
-					libBps:    float64(target.ULSpeed),
+					bytes:   target.Context.GetTotalUpload(),
+					backlog: target.Context.GetUploadBacklog(),
+					// The live estimator — see the download sample above for
+					// why target.ULSpeed is the wrong field to read here.
+					libBps:    target.Context.GetEWMAUploadRate(),
 					connsUsed: used, dials: dials,
 				}
 			},
 			run:    target.UploadTestContext,
-			speed:  func() float64 { return float64(target.ULSpeed) },
 			upload: true,
 		},
 	}
@@ -1273,7 +1286,16 @@ func consistency(p Phase, bytes int64, sec float64) Phase {
 	// already explained by the "confirmed NOTHING" warning; adding "the
 	// estimator is weighted to the last seconds" there would offer a true
 	// statement about the engine as if it were the reason nothing moved.
-	if !p.Consistent && bytes > 0 {
+	switch {
+	case p.LibraryMbps <= 0 && bytes > 0:
+		// 🚨 NO RATE IS NOT AN INCONSISTENT RATE. With the engine's figure
+		// missing, `implied` is 0 and the sentence below would read "implies
+		// 0.0s of data but the window was 30.0s" — an accusation about the
+		// measurement built out of an absence.
+		p.Warnings = append(p.Warnings,
+			"the engine reported no rate for this window, so the raw figure could not be "+
+				"cross-checked against it")
+	case !p.Consistent && bytes > 0:
 		p.Warnings = append(p.Warnings, fmt.Sprintf(
 			"the reported rate implies %.1fs of data but the measured window was %.1fs — the engine's estimator is weighted to the last seconds, so treat the raw figure as the average",
 			p.ImpliedSec, sec))

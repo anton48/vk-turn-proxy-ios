@@ -110,13 +110,20 @@ struct SpeedTestResultView: View {
     /// window, so a research run read "20.0s" next to a figure covering 15 —
     /// two numbers on one line that could not both be true.
     static func timing(_ phase: SpeedTestPhase, requested: Int) -> String {
-        // 🚨 The cleanup is NAMED, not absorbed. The window used to run until
-        // the engine returned, so blocked workers stretched a promised 30s to
-        // 35s and two research arms of different lengths were compared as if
-        // they were the same experiment.
-        let tail = phase.cleanupSec > 0.05
-            ? String(format: " + %.1fs to stop", phase.cleanupSec)
-            : ""
+        // 🚨 THE PARTS ON SCREEN MUST ACCOUNT FOR THE PHASE, like the log's do:
+        // warm-up + window + guard + cleanup == actual. The cleanup was named
+        // here first and the guard was not, so the moment the tail split in two
+        // the screen stopped adding up — and a duration that does not add up is
+        // the one thing a reader checks by hand.
+        // ⚖️ The guard is time we ASKED the engine to keep pushing past the
+        // window; the cleanup is what it took beyond its own deadline.
+        var tail = ""
+        if phase.guardSec > 0.05 {
+            tail += String(format: " + %.1fs guard", phase.guardSec)
+        }
+        if phase.cleanupSec > 0.05 {
+            tail += String(format: " + %.1fs to stop", phase.cleanupSec)
+        }
         if phase.warmupSec > 0 {
             return String(format: "%.1fs warm-up discarded + %.1fs measured (asked for %ds)",
                           phase.warmupSec, phase.windowSec, requested) + tail

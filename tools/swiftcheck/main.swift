@@ -1662,8 +1662,11 @@ do {
     // returned and the engine returns only after its blocked workers unwind.
     var slow = SpeedTestPhase()
     slow.rawMbps = 93.8; slow.actualSec = 40; slow.windowSec = 30; slow.warmupSec = 5
-    slow.cleanupSec = 5; slow.guardSec = 0.5
+    slow.cleanupSec = 4.5; slow.guardSec = 0.5
     slow.bytes = 400_000_000; slow.windowBytes = 351_000_000
+    // The fixture is internally consistent on purpose: 5 + 30 + 0.5 + 4.5 = 40,
+    // so an assertion about the parts adding up is testing the code and not the
+    // fixture's own arithmetic.
     slow.connsUsed = 16; slow.dials = 15
     let slowLine = SpeedTestLog.result(SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
                                                           threads: 16, direction: "upload",
@@ -1673,16 +1676,24 @@ do {
     check(slowLine.contains("guard=0.5s"),
           "🚨 the guard is printed separately — it is time WE asked the engine to keep pushing "
           + "after the window, and folded into cleanup it reads as the engine being slow")
-    check(slowLine.contains("window=30.0s") && slowLine.contains("cleanup=5.0s"),
+    check(slowLine.contains("window=30.0s") && slowLine.contains("cleanup=4.5s"),
           "🚨 the log separates the WINDOW from the tail spent stopping — folded together they "
           + "made a fixed-window experiment produce arms of 30.0s and 35.0s")
     check(slowLine.contains("actual=40.0s"),
           "and the phase's whole length is still there, so warm-up + window + cleanup can be "
           + "checked against it")
 
-    check(SpeedTestResultView.timing(slow, requested: 30).contains("to stop"),
+    let onScreen = SpeedTestResultView.timing(slow, requested: 30)
+    check(onScreen.contains("to stop"),
           "🚨 and the SCREEN names it too — a 35s arm that reads as 30s is how two different "
           + "experiments get compared as one")
+    check(onScreen.contains("0.5s guard"),
+          "🚨 and the guard as well: warm-up + window + guard + cleanup must account for the "
+          + "phase ON SCREEN too, or the durations a reader adds up come out short")
+    // The parts named on screen must sum to the phase — checked by construction
+    // rather than by reading the sentence.
+    check(abs((slow.warmupSec + slow.windowSec + slow.guardSec + slow.cleanupSec) - slow.actualSec) < 0.01,
+          "the four parts account for the whole phase")
 
     check(view.contains("backlogTailBytes") && view.contains("still in flight when the window closed"),
           "🚨 and it EXPLAINS a shortfall the in-flight chunks account for, instead of showing a "
