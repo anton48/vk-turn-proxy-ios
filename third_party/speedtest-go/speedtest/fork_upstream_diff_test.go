@@ -15,9 +15,29 @@ const upstreamVersion = "v1.7.11"
 
 // What ../FORK.md documents. Every entry here is a divergence with a re-apply
 // recipe in that file.
+//
+// 🚨 THE SIZE OF EACH DIVERGENCE IS PART OF THE CONTRACT, NOT DECORATION.
+// Listing only the FILE SET lets any further edit hide inside a file that is
+// already permitted — and data_manager.go is permitted, so a second change there
+// would pass unnoticed.
+//
+// 🚫 IT COUNTS CHANGED LINES, NOT HUNKS, AND THAT WAS MEASURED THE HARD WAY: a
+// hunk count is blind to an edit ADJACENT to an existing divergence, because
+// diff merges it into the neighbouring hunk. Sabotaged with one comment line
+// added above `func (td *TestDirection) Start(` — still 7 hunks, still green.
+// Changed lines catch it; hunks are kept only in the failure message, where they
+// help locate the change.
+//
+// The counts are MEASURED: `diff -u <upstream> <ours> | grep -cE '^[-+]([^-+]|$)'`.
+// They are meant to be brittle. A change that moves one is a change somebody has
+// to acknowledge in FORK.md.
 var (
-	wantChangedFiles = []string{"data_manager.go", "request.go", "speedtest.go"}
-	wantAddedFiles   = []string{
+	wantChangedFiles = map[string]int{
+		"data_manager.go": 76, // divergences 1, 2, 3, 5
+		"request.go":      8,  // divergence 5's four Start call sites
+		"speedtest.go":    11, // divergence 4
+	}
+	wantAddedFiles = []string{
 		"fork_cancel_test.go",
 		"fork_doer_test.go",
 		"fork_guard_test.go",
@@ -40,6 +60,7 @@ var (
 //   - append a line to server.go            -> "UNDOCUMENTED divergence ... [server.go]"
 //   - add an unlisted zz_unlisted.go        -> "added ... without being listed"
 //   - copy upstream's speedtest.go over ours-> "claims a divergence ... but they are IDENTICAL"
+//   - one extra line inside data_manager.go -> "diverges ... in 77 changed lines, want 76"
 //
 // The fourth arm (an upstream file DELETED) is deliberately not sabotage-tested:
 // removing any upstream .go file breaks compilation before this test can run, so
@@ -66,14 +87,35 @@ func TestForkDivergesFromUpstreamExactlyHere(t *testing.T) {
 
 	changed, added, removed := diffTrees(t, upstream, ".")
 
-	if d := difference(changed, wantChangedFiles); len(d) > 0 {
+	wantNames := make([]string, 0, len(wantChangedFiles))
+	for name := range wantChangedFiles {
+		wantNames = append(wantNames, name)
+	}
+	sort.Strings(wantNames)
+
+	if d := difference(changed, wantNames); len(d) > 0 {
 		t.Errorf("UNDOCUMENTED divergence — these files differ from upstream %s and are not in "+
 			"../FORK.md: %v\nEither revert them, or add a Divergence section with a re-apply recipe "+
 			"and list the file here.", upstreamVersion, d)
 	}
-	if d := difference(wantChangedFiles, changed); len(d) > 0 {
+	if d := difference(wantNames, changed); len(d) > 0 {
 		t.Errorf("../FORK.md claims a divergence in %v but they are IDENTICAL to upstream — "+
 			"the fork was lost (an upstream bump overwrote it?) or FORK.md is stale", d)
+	}
+
+	// And within each permitted file, the SIZE of the divergence.
+	for _, name := range changed {
+		want, ok := wantChangedFiles[name]
+		if !ok {
+			continue // already reported above
+		}
+		lines, hunks := diffSize(t, filepath.Join(upstream, name), name)
+		if lines != want {
+			t.Errorf("%s diverges from upstream in %d changed lines across %d hunks, want %d — "+
+				"an edit was made inside a file that was already permitted to differ, which the "+
+				"file set alone cannot see. If it is deliberate, document it in ../FORK.md and "+
+				"update the count here.", name, lines, hunks, want)
+		}
 	}
 	if d := difference(added, wantAddedFiles); len(d) > 0 {
 		t.Errorf("files added to the vendored tree without being listed here: %v", d)
@@ -82,6 +124,33 @@ func TestForkDivergesFromUpstreamExactlyHere(t *testing.T) {
 		t.Errorf("upstream files DELETED from the vendored tree: %v — the fork is not a "+
 			"superset of upstream any more", removed)
 	}
+}
+
+// diffSize returns the number of changed lines and of hunks between two files.
+//
+// It shells out to diff(1) rather than reimplementing an LCS: the numbers have to
+// mean what a human gets from `diff -u`, and a hand-rolled approximation that
+// disagrees with the tool is worse than no check. diff exits 1 when the files
+// differ, which is the expected case here.
+func diffSize(t *testing.T, upstreamPath, ourPath string) (lines, hunks int) {
+	t.Helper()
+	out, err := exec.Command("diff", "-u", upstreamPath, ourPath).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 1 {
+			t.Fatalf("diff -u %s %s: %v", upstreamPath, ourPath, err)
+		}
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "@@"):
+			hunks++
+		case strings.HasPrefix(line, "---"), strings.HasPrefix(line, "+++"):
+			// file headers, not content
+		case strings.HasPrefix(line, "-"), strings.HasPrefix(line, "+"):
+			lines++
+		}
+	}
+	return lines, hunks
 }
 
 // diffTrees compares two flat directories of .go files.

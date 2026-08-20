@@ -35,6 +35,27 @@ run() {
 goflags=(-count=1)
 [ "$RACE" = "1" ] && goflags+=(-race)
 
+# 🚨 MAKE THE MACHINE READY, DO NOT ASSUME IT IS. The fork's
+# TestForkDivergesFromUpstreamExactlyHere diffs the vendored tree against
+# PRISTINE upstream, which it reads from the module cache. On a clean checkout
+# that cache is cold and the test t.Fatals -- correctly, because a guard that
+# SKIPS itself when its input is missing is green on every machine nobody set
+# up. Fetching it here is what makes this script self-sufficient.
+#
+# The `@version` form fetches real upstream despite the `replace` in go.mod that
+# points the module at ./third_party/speedtest-go -- which is exactly the point:
+# the guard needs the original to compare against. Checksum-verified against the
+# public sumdb (this repo's go.sum has no showwin entry, again because of the
+# replace).
+UPSTREAM=github.com/showwin/speedtest-go@v1.7.11
+echo "== fetching pristine $UPSTREAM for the fork's upstream-diff guard"
+if go mod download "$UPSTREAM"; then
+    echo "   ready"
+else
+    echo "   FAIL: could not fetch $UPSTREAM -- the fork's divergence guard cannot run" >&2
+    fail=1
+fi
+
 run "root module — go test ${goflags[*]} ./..." \
     go test "${goflags[@]}" ./...
 
