@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -118,6 +119,156 @@ func TestThreadsMeansTCPConnections(t *testing.T) {
 	}
 }
 
+// TestUnprimedPhaseCannotSeeHTTP2 is a guard on the GUARD.
+//
+// It asserts the limitation that makes priming mandatory, so that nobody
+// "simplifies" engine.prime away on the reasoning that the connection count
+// would catch h2 anyway. It would not:
+//
+//	primed   + h2 -> 1 connection used, warning fires
+//	unprimed + h2 -> 8 connections used, NOTHING fires
+//
+// Found by the first run on a device, where download printed "8 carried data ·
+// 7 opened" (primed by the ping) and upload printed 8 and 8 from a pool the
+// download had torn down — a number h2 would have produced identically.
+func TestUnprimedPhaseCannotSeeHTTP2(t *testing.T) {
+	const workers = 8
+
+	run := func(primed bool) (used, dials int) {
+		t.Helper()
+		var mu sync.Mutex
+		served := 0
+		srv := h2Server(t, func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			served++
+			mu.Unlock()
+			_, _ = w.Write([]byte("ok"))
+		})
+		conns := &connCounter{}
+		rt := trustingRoundTripper(t, srv, conns).(*userAgentRoundTripper)
+		// h2 ALLOWED — the defect state the counter is supposed to expose.
+		tr := rt.next.(*http.Transport)
+		tr.ForceAttemptHTTP2 = true
+		tr.TLSNextProto = nil
+		client := &http.Client{Transport: rt}
+
+		if primed {
+			r, err := client.Get(srv.URL)
+			if err != nil {
+				t.Fatalf("priming: %v", err)
+			}
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = r.Body.Close()
+		}
+		conns.reset()
+
+		var wg sync.WaitGroup
+		block := make(chan struct{})
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r, err := client.Get(srv.URL)
+				if err != nil {
+					return
+				}
+				<-block
+				_ = r.Body.Close()
+			}()
+		}
+		for {
+			mu.Lock()
+			n := served
+			mu.Unlock()
+			if n >= workers {
+				break
+			}
+		}
+		used, dials = conns.stats()
+		close(block)
+		wg.Wait()
+		return used, dials
+	}
+
+	usedPrimed, _ := run(true)
+	if usedPrimed != 1 {
+		t.Errorf("primed under h2: %d connections used, want 1 — the guard has stopped working", usedPrimed)
+	}
+	if len(applyConnStats(Phase{}, usedPrimed, 0, workers, true).Warnings) == 0 {
+		t.Error("primed under h2 raised no warning — the whole guard is inert")
+	}
+
+	usedCold, _ := run(false)
+	if usedCold != workers {
+		t.Errorf("unprimed under h2: %d used, want %d — if this changed, re-read "+
+			"engine.prime's comment; the reason it exists may have gone away", usedCold, workers)
+	}
+	// warm=true on purpose: this isolates the NUMERIC question — can the counts
+	// alone tell an unprimed h2 phase from an unprimed HTTP/1.1 one? They cannot,
+	// which is why the `warm` flag exists and why priming is mandatory rather
+	// than nice to have. TestUnprimedPhaseIsNotReadableAsAFlowCount covers what
+	// happens once the flag says the pool was cold.
+	if len(applyConnStats(Phase{}, usedCold, usedCold, workers, true).Warnings) != 0 {
+		t.Error("unprimed under h2 DID warn from the numbers alone — good news, but then " +
+			"engine.prime's stated reason is wrong and both must be revisited together")
+	}
+}
+
+// TestPrimeReportsAnEmptyPoolEvenWhenTheREQUESTSUCCEEDS.
+//
+// 🚨 "The request worked" is NOT "the pool is warm". A server answering
+// `Connection: close` returns a perfectly good response and leaves nothing
+// behind — so priming must OBSERVE the pool, not the error. Checking only the
+// error would let an unprimed phase through silently, which is exactly the
+// defect priming exists to prevent.
+//
+// Seen RED by returning `err == nil` from prime instead of pooled() > 0.
+func TestPrimeReportsAnEmptyPoolEvenWhenTheRequestSucceeds(t *testing.T) {
+	closing := h2Server(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		_, _ = w.Write([]byte("ok"))
+	})
+	keeping := h2Server(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	for _, tc := range []struct {
+		name string
+		srv  string
+		want bool
+	}{
+		{"a server that closes the connection leaves the pool cold", closing.URL, false},
+		{"a server that keeps it alive leaves the pool warm", keeping.URL, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conns := &connCounter{}
+			e := &engine{
+				conns: conns,
+				doer:  &http.Client{Transport: trustingRoundTripper(t, closing, conns)},
+			}
+			// Both test servers share a CA in httptest, so one transport serves both.
+			e.doer.Transport = trustingRoundTripper(t, keeping, conns)
+			if got := e.prime(context.Background(), tc.srv); got != tc.want {
+				t.Errorf("prime reported warm=%v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUnprimedPhaseIsNotReadableAsAFlowCount: when the pool was cold, the
+// connection figure must be disclaimed rather than presented.
+func TestUnprimedPhaseIsNotReadableAsAFlowCount(t *testing.T) {
+	cold := applyConnStats(Phase{}, 8, 8, 8, false)
+	if len(cold.Warnings) == 0 {
+		t.Error("🚨 a phase that started on an empty pool reported 8 of 8 threads without a word — " +
+			"that number is what HTTP/2 prints too")
+	}
+	warm := applyConnStats(Phase{}, 8, 7, 8, true)
+	if len(warm.Warnings) != 0 {
+		t.Errorf("a healthy primed phase was disclaimed: %v", warm.Warnings)
+	}
+}
+
 // TestUserAgentSurvivesOurTransport: bypassing Speedtest.RoundTrip drops the
 // header it used to add, which would otherwise be a silent change in what the
 // endpoint sees.
@@ -182,7 +333,7 @@ func TestConnCounterCountsUseNotPresence(t *testing.T) {
 		t.Errorf("counted %d connections for a phase that used ONE; the idle pool is being "+
 			"counted as measurement capacity (dials=%d)", used, dials)
 	}
-	p := applyConnStats(Phase{}, used, dials, 8)
+	p := applyConnStats(Phase{}, used, dials, 8, true)
 	if len(p.Warnings) == 0 {
 		t.Error("🚨 8 threads on one connection passed WITHOUT a warning — this is the exact " +
 			"false negative that made every thread-count comparison meaningless")

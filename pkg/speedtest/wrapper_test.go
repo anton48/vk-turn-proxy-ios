@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -184,12 +185,12 @@ func TestWindowSplitSumsToActual(t *testing.T) {
 }
 
 func TestApplyConnStatsWarnsWhenThreadsDidNotBecomeConnections(t *testing.T) {
-	p := applyConnStats(Phase{}, 1, 1, 8)
+	p := applyConnStats(Phase{}, 1, 1, 8, true)
 	if len(p.Warnings) == 0 {
 		t.Error("8 threads on 1 connection passed without a word — that is the HTTP/2 state " +
 			"every thread-count comparison was taken in before 2026-08-20")
 	}
-	if q := applyConnStats(Phase{}, 8, 8, 8); len(q.Warnings) != 0 {
+	if q := applyConnStats(Phase{}, 8, 8, 8, true); len(q.Warnings) != 0 {
 		t.Errorf("healthy phase warned: %v", q.Warnings)
 	}
 }
@@ -240,4 +241,53 @@ func TestRefusedStartLeavesNoClaim(t *testing.T) {
 		t.Fatalf("🚨 the package is still busy after a REFUSED start: %v", err)
 	}
 	release()
+}
+
+// TestEveryPhaseIsPrimedBeforeItCounts guards an ORDERING, and it is a source
+// scan because run() needs a live server list to execute.
+//
+// The order is the whole point: priming must open a connection BEFORE the
+// counter is reset, so the phase starts with a reusable connection and a clean
+// count. Prime after the reset and the priming connection is counted as
+// measurement; omit it and the phase cannot detect HTTP/2 at all
+// (TestUnprimedPhaseCannotSeeHTTP2 measures that).
+//
+// 🚨 THE SABOTAGE FOR AN ORDERING GUARD IS A REORDERING, NOT A DELETION —
+// deleting the prime call reddens the "exists" half for a different reason, and
+// a red run for the wrong reason is how this project has fooled itself before.
+// Both were run: swapping the two lines reddens the order check alone.
+func TestEveryPhaseIsPrimedBeforeItCounts(t *testing.T) {
+	src, err := os.ReadFile("speedtest.go")
+	if err != nil {
+		t.Fatalf("read speedtest.go: %v", err)
+	}
+	body := string(src)
+
+	start := strings.Index(body, "for _, name := range order {")
+	if start < 0 {
+		t.Fatal("the phase loop was not found — this scan would pass vacuously; fix the anchor")
+	}
+	loop := body[start:]
+	if end := strings.Index(loop, "\n\treturn nil"); end > 0 {
+		loop = loop[:end]
+	}
+
+	prime := strings.Index(loop, "meas.prime(ctx,")
+	reset := strings.Index(loop, "meas.conns.reset()")
+	stats := strings.Index(loop, "meas.conns.stats()")
+
+	if prime < 0 {
+		t.Fatal("🚨 the phase does not prime a connection — an unprimed phase reads N connections " +
+			"whatever the protocol, so the HTTP/2 guard is inert")
+	}
+	if reset < 0 || stats < 0 {
+		t.Fatal("the counter is no longer reset or read inside the phase loop")
+	}
+	if prime > reset {
+		t.Error("🚨 priming happens AFTER the counter is reset, so the primed connection is " +
+			"counted as measurement capacity — the figure reads one too high")
+	}
+	if reset > stats {
+		t.Error("the counter is read before it is reset")
+	}
 }

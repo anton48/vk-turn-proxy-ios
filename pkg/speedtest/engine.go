@@ -3,8 +3,10 @@ package speedtest
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +29,78 @@ var UserAgent = "vkturn-speedtest/1 (showwin/speedtest-go " + stgo.Version() + "
 type engine struct {
 	*stgo.Speedtest
 	conns *connCounter
+
+	// doer is kept because priming needs to issue a request through the SAME
+	// client the measurement uses; the library's own handle to it is unexported.
+	doer      *http.Client
+	transport *http.Transport
+}
+
+// prime opens (or reuses) one connection to url so a phase does not start
+// counting from an empty pool.
+//
+// 🚨 THE HTTP/2 GUARD DOES NOT WORK WITHOUT THIS, and the first run on a device
+// is what showed it. Go dials once per concurrent request when the pool is empty
+// — the thundering herd — so an unprimed phase reads N connections whatever the
+// protocol. Measured against a server offering h2, with h2 ALLOWED:
+//
+//	primed   -> 1 connection used, dials 0, warning FIRES
+//	unprimed -> 8 connections used, dials 8, NOTHING fires
+//
+// No predicate can recover this: unprimed-under-h2 and unprimed-under-HTTP/1.1
+// produce identical numbers. Priming is the only fix.
+//
+// The response body MUST be drained, or the connection does not return to the
+// pool and the priming does nothing.
+//
+// 🚨 IT REPORTS WHETHER THE POOL IS ACTUALLY WARM, and that is not the same as
+// "the request succeeded". A server answering `Connection: close` gives a
+// perfectly successful response and leaves the pool EMPTY — so the check is an
+// observation of the pool, not of the error. Silently ignoring this would
+// reintroduce the very defect priming exists to fix, through a path nobody
+// looks at: an unprimed phase reads N connections whatever the protocol, and
+// the guard goes quietly green.
+func (e *engine) prime(ctx context.Context, url string) (warm bool) {
+	var pooled atomic.Bool
+	trace := &httptrace.ClientTrace{
+		// Fires when the connection is handed back to the idle pool. A non-nil
+		// err means it was not pooled — the server closed it, or there was no
+		// room. This is the DIRECT observation: counting open sockets is not the
+		// same question, because a socket the peer has closed still counts as
+		// open until the client notices, which is lazily.
+		PutIdleConn: func(err error) {
+			if err == nil {
+				pooled.Store(true)
+			}
+		},
+	}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := e.doer.Do(req)
+	if err != nil {
+		return false
+	}
+	// The body must be drained AND closed before the connection can be pooled —
+	// PutIdleConn does not fire otherwise, so skipping this would report a cold
+	// pool on a perfectly good connection.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return pooled.Load()
+}
+
+// close returns this engine's idle connections to the operating system.
+//
+// 🚫 NOT the same thing as the deliberate refusal to call
+// CloseIdleConnections between PHASES: emptying the pool mid-run manufactures a
+// fresh dial per worker and makes the connection guard pass even under a
+// transport that multiplexes. Here the run is OVER, so there is nothing left to
+// measure and nothing to fool — and holding up to MaxIdleConnsPerHost sockets
+// for the full 90 s idle timeout, on a phone, across a few quick runs, is a
+// real cost for no benefit.
+func (e *engine) close() {
+	e.transport.CloseIdleConnections()
 }
 
 // newEngine wires the client so that every request goes through our transport.
@@ -44,13 +118,19 @@ type engine struct {
 // anything ever does, it has to move onto this transport.
 func newEngine(threads int, debug bool) *engine {
 	conns := &connCounter{}
-	doer := &http.Client{Transport: newRoundTripper(conns)}
+	rt := newRoundTripper(conns)
+	doer := &http.Client{Transport: rt}
 
 	client := stgo.New(
 		stgo.WithUserConfig(&stgo.UserConfig{MaxConnections: threads, Debug: debug}),
 		stgo.WithDoer(doer), // LAST — see above
 	)
-	return &engine{Speedtest: client, conns: conns}
+	return &engine{
+		Speedtest: client,
+		conns:     conns,
+		doer:      doer,
+		transport: rt.(*userAgentRoundTripper).next.(*http.Transport),
+	}
 }
 
 // newRoundTripper builds the transport every measured request goes through.

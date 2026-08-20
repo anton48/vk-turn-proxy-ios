@@ -313,6 +313,9 @@ func Servers(ctx context.Context) ([]ServerInfo, error) {
 	defer cancel()
 
 	client := newEngine(1, false)
+	// A list fetch opens a connection to every server it pings. None of them is
+	// wanted afterwards.
+	defer client.close()
 	if _, err := client.FetchUserInfoContext(ctx); err != nil {
 		return nil, fmt.Errorf("fetch user info: %w", err)
 	}
@@ -472,6 +475,9 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 	// transport of its own, whose pool holds nothing but connections to the
 	// target, primed by exactly one ping.
 	discovery := newEngine(1, cfg.Debug)
+	// Discovery's pool is dead weight the moment the endpoint is chosen, and it
+	// is the larger of the two: one connection per server in the list.
+	defer discovery.close()
 
 	user, err := discovery.FetchUserInfoContext(ctx)
 	if err != nil {
@@ -525,6 +531,10 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 	// is the measurement and nothing else. target.Context is the *Speedtest that
 	// every measured request goes through, so this switch is what redirects them.
 	meas := newEngine(pl.threads, cfg.Debug)
+	// Up to MaxIdleConnsPerHost sockets would otherwise sit for the full 90 s
+	// idle timeout after the run — several quick runs in a row would hold
+	// hundreds at once, on a phone.
+	defer meas.close()
 	target.Context = meas.Speedtest
 
 	meas.SetCaptureTime(pl.capture)
@@ -566,6 +576,15 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		spec := specs[name]
 		setSnap(func(p *Progress) { p.Stage = spec.stage })
 
+		// 🚨 PRIME BEFORE RESETTING, EVERY PHASE. The download phase used to be
+		// primed only incidentally, by the ping above; the upload phase started
+		// from a pool the download had torn down, and an unprimed phase cannot
+		// detect HTTP/2 at all — see engine.prime. Seen on the first device run:
+		// download reported "8 carried data · 7 opened" (7 dials plus the primed
+		// connection, exactly as designed) while upload reported 8 and 8, which
+		// is what h2 would have printed too.
+		warm := meas.prime(ctx, target.URL)
+
 		// 🚨 NOTHING MAY DIAL BETWEEN reset() AND stats(): anything that does is
 		// counted into this phase's connection figures.
 		meas.conns.reset()
@@ -588,7 +607,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		phase = applyWindow(phase, ws, start, end, endBytes)
 		// After the gate on purpose: a cancelled phase has peak < threads and
 		// would otherwise emit a spurious "the knob lied" warning on every Stop.
-		phase = applyConnStats(phase, used, dials, pl.threads)
+		phase = applyConnStats(phase, used, dials, pl.threads, warm)
 
 		done := phase
 		setSnap(func(p *Progress) {
@@ -755,8 +774,21 @@ func setRaw(p Phase, bytes int64, sec float64) Phase {
 }
 
 // applyConnStats records how many TCP connections the phase really used.
-func applyConnStats(p Phase, used, dials, threads int) Phase {
+func applyConnStats(p Phase, used, dials, threads int, warm bool) Phase {
 	p.ConnsUsed, p.Dials = used, dials
+
+	// 🚨 AN UNPRIMED PHASE CANNOT BE READ AS A FLOW COUNT AT ALL. Go dials once
+	// per concurrent request from an empty pool — the thundering herd — so it
+	// reports N connections whether the transport multiplexes or not. Measured
+	// against a server offering HTTP/2: primed reads 1 and warns, unprimed reads
+	// 8 and says nothing. Staying silent here would be the same defect priming
+	// exists to fix, arriving down a path nobody watches.
+	if !warm {
+		p.Warnings = append(p.Warnings,
+			"the connection pool was empty when this phase started, so the connection count "+
+				"below cannot tell one flow from many — do not read it as a flow count")
+		return p
+	}
 	if threads > 1 && used > 0 && used < threads {
 		p.Warnings = append(p.Warnings, fmt.Sprintf(
 			"asked for %d threads but only %d TCP connections carried the data — "+
