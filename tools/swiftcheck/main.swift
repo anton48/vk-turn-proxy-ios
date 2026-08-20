@@ -1858,12 +1858,22 @@ do {
     // invariant itself — an earlier version compared the index of a two-line
     // anchor, and moving the call simply made that anchor vanish, so the
     // sabotage reddened the "I cannot find it" branch instead of the claim.
+    // ⚖️ TWO CHECKS, because the negative one alone is blind: "not installed too
+    // early" is satisfied just as well by not installing it AT ALL, and the
+    // whole mechanism would then be silently gone.
+    let watchCalls = runner.components(separatedBy: "watchThePath()").count - 1
+    let watchDecls = runner.components(separatedBy: "func watchThePath()").count - 1
+    check(watchCalls - watchDecls == 1,
+          "the route subscription is installed exactly once — a negative check on WHERE it is "
+          + "installed passes just as happily when it is nowhere (found \(watchCalls - watchDecls))")
+
     if let start = runner.range(of: "func start(serverID"),
        let engineCall = runner.range(of: "wgSpeedtestStart(cstr)") {
         let beforeTheEngineIsAsked = runner[start.lowerBound..<engineCall.lowerBound]
         check(!beforeTheEngineIsAsked.contains("watchThePath()"),
-              "🚨 the route subscription is installed BEFORE the engine has been asked to start — "
-              + "every early exit then leaves a watcher recording for a run that does not exist")
+              "the route subscription is installed only AFTER the engine has accepted the start "
+              + "— installed before it, every early exit leaves a watcher recording for a run "
+              + "that does not exist")
     } else {
         check(false, "start() or the engine call could not be found — the scan is inert")
     }
