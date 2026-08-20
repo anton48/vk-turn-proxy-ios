@@ -1178,6 +1178,23 @@ do {
     check(!caseBody.contains("Task {"),
           "🚨 and it does not hand the work to a detached Task, which outlives perform() only " +
           "by luck — the app is suspended the moment it returns")
+
+    // 🚨 EVERY SURFACE NAMES ITSELF IN THE LOG. Both reach one function and used
+    // to write identical lines, so a round trip verified from a log could not be
+    // told apart from the Advanced switch being flipped twice — and a failure
+    // that only happens from the CARD would not say so. The parameter is
+    // REQUIRED rather than defaulted: a default is what a new call site forgets.
+    check(tunnel.contains("from source: DirectChangeSource"),
+          "🚨 the routing change carries WHERE it was asked from")
+    // Fragment only: the real line contains a string interpolation, which cannot
+    // be written literally here without becoming one — and `source` is this
+    // harness's own file-reading function, so it compiles into nonsense.
+    check(tunnel.contains("[asked from "),
+          "and that reaches the log line, not only the call site")
+    check(controller.contains("from: .liveActivity"),
+          "the card declares itself")
+    check(source("VKTurnProxy/VKTurnProxy/AdvancedView.swift").contains("from: .advancedSwitch"),
+          "and so does the Advanced switch")
     check(controller.contains("state.direct = TunnelManager.shared.directMode"),
           "the app reads it and puts it on the wire — the widget is another process and " +
           "shares no App Group")

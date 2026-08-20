@@ -1137,8 +1137,28 @@ class TunnelManager: ObservableObject {
     ///
     /// ⚠️ Changing IAN also re-prompts iOS for VPN permission on the NEXT
     /// connect (recorded above, where the profile is built).
-    func setDirectMode(_ direct: Bool) async {
-        func note(_ s: String) { SharedLogger.shared.log("[App] direct: \(s)") }
+    /// Where a routing change was asked for.
+    ///
+    /// 🚨 It is in the LOG, not just for tidiness. Both surfaces reach this one
+    /// function and wrote identical lines, so a round trip verified from a log
+    /// could not be told apart from the Advanced switch being flipped twice —
+    /// and if something ever goes wrong from the CARD specifically, the log
+    /// would not say the card was involved. The Live Activity path is also the
+    /// riskier one: it runs while the app is in the background, on borrowed
+    /// time inside perform().
+    enum DirectChangeSource: String {
+        case advancedSwitch = "the Advanced switch"
+        case liveActivity = "the Live Activity"
+    }
+
+    /// 🚨 `from` is REQUIRED, deliberately. A defaulted parameter is a parameter
+    /// call sites forget, and the whole point is that every call site says which
+    /// surface it is — a compile error at each of them is the only thing that
+    /// keeps that true as sites are added.
+    func setDirectMode(_ direct: Bool, from source: DirectChangeSource) async {
+        func note(_ s: String) {
+            SharedLogger.shared.log("[App] direct: \(s) [asked from \(source.rawValue)]")
+        }
 
         guard let manager = self.manager else {
             note("no VPN manager loaded — ignored")

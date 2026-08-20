@@ -174,7 +174,7 @@ struct AdvancedView: View {
             Section {
                 Toggle("Send traffic around the tunnel", isOn: Binding(
                     get: { tunnel.directMode },
-                    set: { on in Task { await tunnel.setDirectMode(on) } }
+                    set: { on in Task { await tunnel.setDirectMode(on, from: .advancedSwitch) } }
                 ))
                 .disabled(tunnel.directModeBusy || tunnel.status != .connected)
 

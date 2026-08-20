@@ -269,7 +269,7 @@ final class LiveActivityController {
             // happens to stay alive. So the card must not imply routing is
             // settled — refreshDirectMode(), which every one of those paths
             // calls, pushes the state that is actually true.
-            await TunnelManager.shared.setDirectMode(direct)
+            await TunnelManager.shared.setDirectMode(direct, from: .liveActivity)
             pushNow()
 
         case .selectServer(let idString):
