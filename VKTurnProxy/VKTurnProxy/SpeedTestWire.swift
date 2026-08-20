@@ -33,6 +33,11 @@ struct SpeedTestPhase: Codable {
     var dials: Int = 0
     var backlogBytes: Int64 = 0
     var confirmedRatio: Double = 0
+    /// How much of the backlog a NORMAL end of phase explains: one in-flight
+    /// chunk per worker, cancelled when the capture time expires. Travels with
+    /// the phase so the line can qualify its own backlog instead of leaving it
+    /// to read as bytes the server refused.
+    var backlogTailBytes: Int64 = 0
     var warnings: [String]?
 
     enum CodingKeys: String, CodingKey {
@@ -49,6 +54,7 @@ struct SpeedTestPhase: Codable {
         case dials
         case backlogBytes = "backlog_bytes"
         case confirmedRatio = "confirmed_ratio"
+        case backlogTailBytes = "backlog_tail_bytes"
         case warnings
     }
 

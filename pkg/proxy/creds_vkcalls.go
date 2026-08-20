@@ -370,6 +370,15 @@ func parseTURNAddressesFromResp(resp map[string]interface{}) []string {
 // The cap stays in BYTES (it exists to bound the log line), so this backs off
 // at most 3 bytes rather than converting to runes.
 func truncate(s string, n int) string {
+	// 🚨 REPAIR FIRST, THEN CUT. Cutting on a rune boundary only guarantees
+	// that WE do not create an invalid sequence; it does nothing about input
+	// that arrives invalid already, and everything routed here is a network
+	// body we do not control (a truncated response, a binary payload, an
+	// encoding VK never promised). Passing those bytes through is the same
+	// defect one step upstream, and ONE of them anywhere in vpn.log was enough
+	// to cost a whole sweep.
+	// ⚖️ ToValidUTF8 is a no-op on valid input, so the common path is unchanged.
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= n {
 		return s
 	}

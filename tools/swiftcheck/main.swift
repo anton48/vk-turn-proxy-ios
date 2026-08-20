@@ -1554,6 +1554,84 @@ do {
     check(logs.contains("status.currentBytes > 0"),
           "🚨 the empty-log headline is conditioned on the byte count: it may not call the log "
           + "EMPTY over a file that holds bytes, which is the sentence that hid this for a sweep")
+
+    // 🚨 ITEM 4 OF THE REVIEW: the repair count must come from the BYTES.
+    // Counting U+FFFD in the decoded text cannot tell a sequence we repaired
+    // from one that belongs there — and since build 336 the Go side writes
+    // U+FFFD deliberately, as its marker for remote text it had to repair. A
+    // healthy log now CONTAINS that scalar.
+    let legitimate = Data("[Go] vk: name=\u{FFFD}\u{FFFD} (repaired upstream)\n".utf8)
+    check(SharedLogger.decode(archive: Data(), current: legitimate).repairedSequences == 0,
+          "🚨 a literal U+FFFD in a VALID file counts as ZERO repairs — otherwise the banner "
+          + "accuses a writer of overwriting nothing, on a file nobody damaged")
+    check(SharedLogger.invalidSequences(in: legitimate) == 0,
+          "and the byte-level counter agrees, which is where the count now comes from")
+    check(SharedLogger.invalidSequences(in: Data([0x41, 0xFF, 0x42, 0xC3])) == 2,
+          "🚨 two separate invalid sequences are counted as two — a boolean 'is it dirty' "
+          + "cannot tell one clobbered line from a file full of them")
+
+    // 🚨 ITEM 5: the banner may not name a cause. It said "a writer overwrote
+    // part of a line" — my hypothesis, refuted by the export for this very
+    // incident, which was a byte-indexed truncation instead.
+    check(!logs.contains("a writer overwrote part of a line"),
+          "🚨 the banner no longer asserts an overwrite — 2f18b1a established a different "
+          + "cause, and a banner that names one sends the next reader to the wrong file")
+    check(logs.contains("names the writer"),
+          "it points at the evidence (the raw export and the text around each U+FFFD) instead")
+}
+
+print("SpeedTestLog — confirmed is upload-only, and a cancelled tail is not refusal")
+
+// 39. 🚨 REVIEW ITEMS 1 AND 2, on the side that renders them.
+do {
+    var down = SpeedTestPhase()
+    down.rawMbps = 400; down.windowSec = 15; down.actualSec = 15
+    down.bytes = 750_000_000; down.windowBytes = 750_000_000
+    down.connsUsed = 32; down.dials = 31
+    // What Go now sends for a download: no ratio, no backlog.
+    let downLine = SpeedTestLog.result(SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
+                                                          threads: 32, direction: "both",
+                                                          durationSec: 30),
+                                       progress: { var p = SpeedTestProgress(); p.download = down; return p }(),
+                                       path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
+    check(!downLine.contains("confirmed="),
+          "🚨 a DOWNLOAD line carries no confirmed= — the field is upload-only and 100.0% by "
+          + "construction reads as a verdict about the server")
+    check(!downLine.contains("backlog="),
+          "and no backlog= either")
+
+    // Upload, the measured 32-thread shape: the backlog is entirely the tail.
+    var up = SpeedTestPhase()
+    up.rawMbps = 201; up.windowSec = 18; up.actualSec = 18
+    up.bytes = 452_800_000; up.windowBytes = 452_800_000
+    up.backlogBytes = 29_500_000; up.confirmedRatio = 0.939
+    up.backlogTailBytes = 32 * 999_490
+    up.connsUsed = 32; up.dials = 31
+    let upLine = SpeedTestLog.result(SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
+                                                        threads: 32, direction: "both",
+                                                        durationSec: 30),
+                                     progress: { var p = SpeedTestProgress(); p.upload = up; return p }(),
+                                     path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
+    check(upLine.contains("confirmed=93.9%"),
+          "an UPLOAD still reports the ratio — it is a fact, and 0% against a large backlog is "
+          + "what identified the 307 endpoint")
+    check(upLine.contains("tail of 32 cancelled uploads"),
+          "🚨 and the backlog QUALIFIES ITSELF: 29.5MB is under the 32.0MB ceiling of one "
+          + "in-flight chunk per worker, so it is a normal end of phase, not refusal")
+
+    // Beyond the tail, the qualifier must NOT appear — otherwise it would
+    // explain away the very case the field exists for.
+    var broken = up
+    broken.backlogBytes = 45_800_000
+    broken.backlogTailBytes = 8 * 999_490
+    let brokenLine = SpeedTestLog.result(SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
+                                                            threads: 8, direction: "both",
+                                                            durationSec: 30),
+                                         progress: { var p = SpeedTestProgress(); p.upload = broken; return p }(),
+                                         path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
+    check(!brokenLine.contains("tail of"),
+          "🚨 a backlog the tail CANNOT explain is not qualified away — 45.8MB against 8 workers "
+          + "is the Frankfurt 307 shape, and that is the case the field was added for")
 }
 
 print("")

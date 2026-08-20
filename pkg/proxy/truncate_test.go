@@ -63,3 +63,33 @@ func TestTruncateLeavesASCIICutsWhereTheyWere(t *testing.T) {
 		t.Fatalf("a string under the cap must come back untouched, got %q", got)
 	}
 }
+
+// 🚨 REMOTE INPUT CAN ARRIVE ALREADY INVALID, and cutting on a rune boundary
+// does nothing about that. Everything routed through truncate() is a network
+// body: a response cut short by the peer, a binary payload, an encoding VK
+// never promised. One bad byte reaching vpn.log costs the same as one we create
+// ourselves.
+func TestTruncateRepairsInputThatWasAlreadyInvalid(t *testing.T) {
+	// A body whose 0xFF is nowhere near the cut point, so a boundary-only fix
+	// cannot pass this by accident.
+	body := "ok=" + string([]byte{0xFF}) + "=" + strings.Repeat("y", 400)
+
+	if utf8.ValidString(body) {
+		t.Fatal("precondition failed: the fixture is valid UTF-8, so it tests nothing")
+	}
+	got := truncate(body, 300)
+	if !utf8.ValidString(got) {
+		t.Fatalf("invalid input passed straight through: %q", got[:12])
+	}
+	if !strings.Contains(got, "�") {
+		t.Errorf("the bad byte was dropped rather than MARKED — a reader cannot tell the "+
+			"log lost something: %q", got[:12])
+	}
+
+	// And a short invalid body is repaired too: the early return must not skip
+	// the repair.
+	short := "a" + string([]byte{0xC3}) + "b"
+	if got := truncate(short, 999); !utf8.ValidString(got) {
+		t.Errorf("a body UNDER the cap skipped the repair: %q", got)
+	}
+}

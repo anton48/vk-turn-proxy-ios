@@ -122,8 +122,24 @@ enum SpeedTestLog {
         // beside window bytes made a CORRECT line fail its own arithmetic —
         // measured on a research run: 98.0% reported against 97.5% implied by
         // the bytes next to it. One scope per line, one marked exception.
+        // 🚨 UPLOAD ONLY, and absent means ABSENT. Download used to print
+        // `confirmed=100.0%` on every line — 1.0 by construction, since a GET
+        // has no pushed-but-unconfirmed bytes at all — which reads as a verdict
+        // about the server rather than as a field that does not apply.
         if p.confirmedRatio > 0 { s += String(format: " confirmed=%.1f%%", p.confirmedRatio * 100) }
-        if p.backlogBytes > 0 { s += String(format: " backlog=%.1fMB", Double(p.backlogBytes) / 1e6) }
+        if p.backlogBytes > 0 {
+            s += String(format: " backlog=%.1fMB", Double(p.backlogBytes) / 1e6)
+            // 🚨 THE NUMBER QUALIFIES ITSELF. When the phase ends every worker
+            // is mid-chunk and those bytes are cancelled, so a backlog up to
+            // threads × one chunk is what a HEALTHY run produces — every
+            // backlog ever measured here has been under that ceiling. Without
+            // this clause the figure grows with the thread count and reads as
+            // the server refusing more and more.
+            if p.backlogTailBytes > 0 && p.backlogBytes <= p.backlogTailBytes {
+                s += String(format: "(≤%.1fMB tail of %d cancelled uploads)",
+                            Double(p.backlogTailBytes) / 1e6, threads)
+            }
+        }
         s += " consistent=\(p.consistent)"
         // 🚨 Warnings LAST and always: they are the reason a figure above them
         // may not mean what it looks like, and a log kept to replace a

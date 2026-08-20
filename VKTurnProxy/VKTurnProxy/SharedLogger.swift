@@ -144,6 +144,26 @@ class SharedLogger {
         )
     }
 
+    /// How many byte sequences in `data` are not valid UTF-8 — i.e. how many
+    /// U+FFFD the lenient decode had to invent. Pure, so the harness can drive
+    /// it with bytes it builds itself.
+    static func invalidSequences(in data: Data) -> Int {
+        var iterator = data.makeIterator()
+        var codec = UTF8()
+        var count = 0
+        decoding: while true {
+            switch codec.decode(&iterator) {
+            case .scalarValue:
+                continue
+            case .emptyInput:
+                break decoding
+            case .error:
+                count += 1
+            }
+        }
+        return count
+    }
+
     /// The decoding rule, as a PURE function over bytes.
     ///
     /// Extracted so it can be tested without an App Group container: inline in
@@ -156,10 +176,15 @@ class SharedLogger {
         // current file's decoding.
         let text = String(decoding: archive, as: UTF8.self)
             + String(decoding: current, as: UTF8.self)
-        // U+FFFD in the decoded text means the FILE held an invalid sequence:
-        // neither writer ever emits that scalar, so its presence names a
-        // corrupted write and the text around it names the line that was lost.
-        let repaired = text.unicodeScalars.reduce(into: 0) { $0 += ($1 == "\u{FFFD}" ? 1 : 0) }
+        // 🚨 COUNTED FROM THE BYTES, NOT FROM THE TEXT. Counting U+FFFD in the
+        // decoded string cannot tell a sequence WE repaired from one that was
+        // legitimately in the file — and since build 336 the Go side writes
+        // U+FFFD deliberately, as its marker for remote text it had to repair
+        // before logging. A healthy log now contains that scalar, so the
+        // text-side count would report corruption on a perfectly good file and
+        // the banner would accuse a writer of overwriting nothing.
+        let repaired = SharedLogger.invalidSequences(in: archive)
+            + SharedLogger.invalidSequences(in: current)
         return Snapshot(text: text,
                         bytesOnDisk: archive.count + current.count,
                         repairedSequences: repaired)

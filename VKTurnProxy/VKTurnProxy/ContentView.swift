@@ -1945,13 +1945,17 @@ struct LogsView: View {
         let snapshot = SharedLogger.shared.readSnapshot()
         if !snapshot.text.isEmpty {
             usingOSLogFallback = false
-            // A repaired sequence means a writer CLOBBERED part of a line, so
-            // say it above the log rather than leaving a lone U+FFFD to be
-            // read as a font problem. The surviving text around it is what
-            // identifies which writer did it.
+            // 🚨 STATES THE FACT, NAMES NO CAUSE. The first version said "a
+            // writer overwrote part of a line" — my hypothesis at the time, and
+            // the wrong one: the byte that actually did this came from a
+            // byte-indexed truncation of remote text (2f18b1a), not from the
+            // writer race. A banner that asserts a cause sends the next reader
+            // to the wrong file, and it is the one line they will believe
+            // without checking.
             let banner = snapshot.repairedSequences > 0
                 ? "[logdiag] \(snapshot.repairedSequences) invalid byte sequence(s) in this log were "
-                  + "replaced with \u{FFFD} so it could be shown — a writer overwrote part of a line\n\n"
+                  + "replaced with \u{FFFD} so it could be shown. The RAW bytes are in the Share "
+                  + "export; the text around each \u{FFFD} is what names the writer.\n\n"
                 : ""
             logText = banner + truncated(snapshot.text)
             return

@@ -77,7 +77,7 @@ const forkRevision = 5
 // under which a figure is published. Not for wording, UI or tests.
 // TestEngineVersionNamesEveryMethodRevision fails if this and METHOD.md
 // disagree.
-const methodRevision = 5
+const methodRevision = 6
 
 // EngineVersion is reported beside every result so a number can be traced to the
 // code that produced it. The upstream version is READ FROM THE LIBRARY rather
@@ -199,6 +199,13 @@ type Phase struct {
 	// that keeps growing means requests are going out and not coming back.
 	BacklogBytes   int64   `json:"backlog_bytes"`
 	ConfirmedRatio float64 `json:"confirmed_ratio"`
+
+	// BacklogTailBytes is how much of the backlog a NORMAL end of phase
+	// explains: every worker has one chunk in flight when the phase stops, and
+	// those bytes are pushed and never confirmed through no fault of the
+	// server. Printed beside the backlog so the number qualifies itself
+	// instead of reading as refusal — see confirmRatio.
+	BacklogTailBytes int64 `json:"backlog_tail_bytes"`
 
 	// Warnings is what the UI shows instead of a bare number when the figure
 	// cannot be trusted. Empty means nothing was detected — not that the number
@@ -745,7 +752,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		}
 
 		phase := measure(spec.speed(), endBytes, start, end, spec.upload)
-		phase = applyWindow(phase, ws, start, end, endBytes, endBacklog)
+		phase = applyWindow(phase, ws, start, end, endBytes, endBacklog, spec.upload, pl.threads)
 		// After the gate on purpose: a cancelled phase has peak < threads and
 		// would otherwise emit a spurious "the knob lied" warning on every Stop.
 		phase = applyConnStats(phase, used, dials, pl.threads, warm)
@@ -892,7 +899,7 @@ func phaseErr(ctx context.Context, err error) error {
 // wrapper timestamps as ActualSec — so WarmupSec + WindowSec == ActualSec
 // exactly, and the UI can print all three without deriving any of them a second
 // time.
-func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes, endBacklog int64) Phase {
+func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes, endBacklog int64, upload bool, threads int) Phase {
 	if !s.ok {
 		p.WindowSec = p.ActualSec
 		p.WindowBytes = p.Bytes
@@ -902,7 +909,7 @@ func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes, endBackl
 				"the phase ended before the %.0fs warm-up did, so no measurement window opened — "+
 					"this figure covers the whole phase, warm-up included", s.warmup.Seconds()))
 		}
-		return confirmRatio(setRaw(p, p.Bytes, p.WindowSec))
+		return confirmRatio(setRaw(p, p.Bytes, p.WindowSec), upload, threads)
 	}
 	p.WarmupSec = s.at.Sub(start).Seconds()
 	p.WindowSec = end.Sub(s.at).Seconds()
@@ -921,19 +928,66 @@ func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes, endBackl
 	if p.BacklogBytes < 0 {
 		p.BacklogBytes = 0
 	}
-	return confirmRatio(setRaw(p, p.WindowBytes, p.WindowSec))
+	return confirmRatio(setRaw(p, p.WindowBytes, p.WindowSec), upload, threads)
 }
 
 // confirmRatio derives the confirmation ratio from the window's own figures, so
 // it can never disagree with the bytes printed next to it.
-func confirmRatio(p Phase) Phase {
+// uploadChunkBytes is the size of ONE upload chunk, and therefore how much a
+// single worker can have in flight when the phase ends.
+//
+// It is not a guess: the measurement loop posts `uploadRequest(ctx, s, 4)`
+// (third_party/speedtest-go/speedtest/request.go:151) and the size table there
+// is `ulSizes[4] = 1000` kB, giving `(1000*100-51)*10` bytes.
+const uploadChunkBytes = (1000*100 - 51) * 10 // 999 490 B
+
+func confirmRatio(p Phase, upload bool, threads int) Phase {
+	// 🚨 DOWNLOAD HAS NOTHING TO CONFIRM. A GET's bytes are counted as they
+	// ARRIVE, so there is no pushed-but-unaccepted quantity at all — yet this
+	// ran for both directions and published `confirmed=100.0%` on every
+	// download line (16 of them in 20.08/vpn.wifi.6.log). A ratio that is 1.0
+	// by construction reads as "the server accepted everything" when what it
+	// means is "this field does not apply", and the struct comment above has
+	// said UPLOAD ONLY the whole time.
+	if !upload {
+		p.BacklogBytes = 0
+		p.ConfirmedRatio = 0
+		return p
+	}
+
 	pushed := p.WindowBytes + p.BacklogBytes
 	if pushed > 0 && p.WindowBytes >= 0 {
 		p.ConfirmedRatio = float64(p.WindowBytes) / float64(pushed)
 	}
-	if p.ConfirmedRatio > 0 && p.ConfirmedRatio < 0.95 {
+
+	// 🚨 A NORMAL END OF PHASE LOOKS EXACTLY LIKE REFUSED BYTES. When the
+	// capture time expires every worker is mid-chunk; those requests are
+	// cancelled, their bytes were read out of our body and will never be
+	// confirmed, and they land in the backlog. The tail is therefore
+	// threads × one chunk — which is the whole backlog we have ever measured:
+	//
+	//   threads   worst backlog seen   threads × chunk
+	//        4          3.5 MB              4.0 MB
+	//        8          7.3 MB              8.0 MB
+	//       16         13.2 MB             16.0 MB
+	//       32         29.5 MB             32.0 MB
+	//
+	// So `only 94% of uploaded bytes were confirmed by the server` fired on
+	// every 32-thread run and was FALSE every time: at a fixed rate the tail
+	// grows with the thread count while the window's bytes do not, so the
+	// warning was really a function of the knob.
+	//
+	// ⚖️ The ratio itself is still reported — it is a fact, and it is what
+	// caught the Frankfurt 307 endpoint (45.8 MB of backlog against ZERO
+	// confirmed, a ratio no cancellation tail can explain). Only the VERDICT
+	// is gated, on backlog the tail cannot account for.
+	p.BacklogTailBytes = int64(threads) * uploadChunkBytes
+	unexplained := p.BacklogBytes - p.BacklogTailBytes
+	if p.ConfirmedRatio > 0 && p.ConfirmedRatio < 0.95 && unexplained > 0 {
 		p.Warnings = append(p.Warnings, fmt.Sprintf(
-			"only %.0f%% of uploaded bytes were confirmed by the server", p.ConfirmedRatio*100))
+			"only %.0f%% of uploaded bytes were confirmed by the server — %.1f MB more backlog "+
+				"than %d cancelled chunks can explain", p.ConfirmedRatio*100,
+			float64(unexplained)/1e6, threads))
 	}
 	return p
 }

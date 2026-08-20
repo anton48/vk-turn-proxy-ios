@@ -195,7 +195,7 @@ func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
 		t.Fatal("claims a warm-up boundary that never came")
 	}
 	start := time.Now().Add(-20 * time.Millisecond)
-	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, start, time.Now(), 1234, 0)
+	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, start, time.Now(), 1234, 0, false, 8)
 	if p.RawMbps != 0 {
 		t.Errorf("stated %v Mbit/s from a 0.02s window", p.RawMbps)
 	}
@@ -212,7 +212,7 @@ func TestWindowSplitSumsToActual(t *testing.T) {
 	end := start.Add(20 * time.Second)
 
 	p := measure(1e6, 40e6, start, end, false)
-	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, start, end, 40e6, 0)
+	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, start, end, 40e6, 0, false, 8)
 
 	if got := p.WarmupSec + p.WindowSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
 		t.Errorf("warmup %.3f + window %.3f = %.3f, but actual is %.3f",
@@ -397,7 +397,7 @@ func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
 
 	p := measure(1e6, 40e6, start, end, false)
 	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true},
-		start, end, 40e6, 0)
+		start, end, 40e6, 0, false, 8)
 
 	if p.WindowBytes != 30e6 {
 		t.Errorf("WindowBytes = %d, want 30000000 (40 MB total minus the 10 MB warm-up)", p.WindowBytes)
@@ -415,7 +415,7 @@ func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
 
 	// Outside research mode the two must agree, or the same check breaks there.
 	q := measure(1e6, 40e6, start, end, false)
-	q = applyWindow(q, warmSample{}, start, end, 40e6, 0)
+	q = applyWindow(q, warmSample{}, start, end, 40e6, 0, false, 8)
 	if q.WindowBytes != q.Bytes {
 		t.Errorf("outside research mode WindowBytes (%d) must equal Bytes (%d)", q.WindowBytes, q.Bytes)
 	}
@@ -445,7 +445,7 @@ func TestConfirmedRatioIsScopedToTheWindow(t *testing.T) {
 	// ⇒ the window moved 600 MB and accumulated only 5 MB of backlog.
 	p := measure(1e6, 1000e6, start, end, true)
 	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 20e6,
-		at: warmAt, ok: true}, start, end, 1000e6, 25e6)
+		at: warmAt, ok: true}, start, end, 1000e6, 25e6, true, 8)
 
 	if p.WindowBytes != 600e6 {
 		t.Fatalf("WindowBytes = %d, want 600000000", p.WindowBytes)
@@ -470,8 +470,89 @@ func TestConfirmedRatioIsScopedToTheWindow(t *testing.T) {
 	// backlog: it is a level, and a delta of a level can go either way.
 	q := applyWindow(measure(1e6, 1000e6, start, end, true),
 		warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 40e6, at: warmAt, ok: true},
-		start, end, 1000e6, 25e6)
+		start, end, 1000e6, 25e6, true, 8)
 	if q.BacklogBytes != 0 {
 		t.Errorf("backlog = %d after the server caught up, want 0", q.BacklogBytes)
+	}
+}
+
+// 🚨 DOWNLOAD HAS NOTHING TO CONFIRM, and for five method revisions it said it
+// had confirmed everything. The ratio came out 1.0 by construction (no backlog
+// exists on a GET), which reads as a verdict about the server.
+func TestDownloadPublishesNoConfirmationFigure(t *testing.T) {
+	start := time.Now()
+	end := start.Add(15 * time.Second)
+	p := applyWindow(measure(1e6, 400e6, start, end, false), warmSample{},
+		start, end, 400e6, 0, false, 32)
+
+	if p.ConfirmedRatio != 0 {
+		t.Errorf("ConfirmedRatio = %.3f on a DOWNLOAD — the field is upload-only and a "+
+			"figure of 1.0 reads as 'the server accepted everything'", p.ConfirmedRatio)
+	}
+	if p.BacklogBytes != 0 {
+		t.Errorf("BacklogBytes = %d on a download", p.BacklogBytes)
+	}
+	for _, w := range p.Warnings {
+		if strings.Contains(w, "confirmed") {
+			t.Errorf("a download carries a confirmation warning: %q", w)
+		}
+	}
+}
+
+// 🚨 THE TAIL OF A NORMAL PHASE IS NOT REFUSAL. Every worker is mid-chunk when
+// the capture time expires, so a backlog of threads×chunk is what a HEALTHY run
+// produces — and the old rule called it a server refusing bytes on every
+// 32-thread run we ever took.
+func TestCancellationTailIsNotReportedAsRefusal(t *testing.T) {
+	start := time.Now()
+	end := start.Add(15 * time.Second)
+
+	// The measured 32-thread shape: 452.8 MB in the window, 29.5 MB backlog —
+	// a ratio of 93.9%, and every byte of that backlog explained by 32
+	// cancelled chunks.
+	p := applyWindow(measure(1e6, 452.8e6, start, end, true), warmSample{},
+		start, end, 452.8e6, 29.5e6, true, 32)
+
+	if p.ConfirmedRatio > 0.95 {
+		t.Fatalf("precondition failed: ratio %.3f is above the warning threshold, so this "+
+			"fixture cannot exercise the rule at all", p.ConfirmedRatio)
+	}
+	if p.BacklogTailBytes != 32*uploadChunkBytes {
+		t.Errorf("BacklogTailBytes = %d, want %d — the line cannot qualify its own backlog "+
+			"without it", p.BacklogTailBytes, 32*uploadChunkBytes)
+	}
+	for _, w := range p.Warnings {
+		if strings.Contains(w, "confirmed by the server") {
+			t.Errorf("warned about the cancellation tail: %q\n"+
+				"backlog %.1f MB against a %.1f MB ceiling of in-flight chunks",
+				w, 29.5, float64(32*uploadChunkBytes)/1e6)
+		}
+	}
+}
+
+// ...and the endpoint the field exists for must still be caught: the Frankfurt
+// 307 host confirmed NOTHING while 45.8 MB piled up, which no tail explains.
+func TestABrokenEndpointStillWarns(t *testing.T) {
+	start := time.Now()
+	end := start.Add(15 * time.Second)
+	p := applyWindow(measure(1e6, 1e6, start, end, true), warmSample{},
+		start, end, 1e6, 45.8e6, true, 8)
+
+	if p.ConfirmedRatio >= 0.95 {
+		t.Fatalf("precondition failed: ratio %.3f — the fixture is not broken enough to test",
+			p.ConfirmedRatio)
+	}
+	found := false
+	for _, w := range p.Warnings {
+		if strings.Contains(w, "confirmed by the server") {
+			found = true
+			if !strings.Contains(w, "more backlog") {
+				t.Errorf("the warning does not say how much is UNEXPLAINED: %q", w)
+			}
+		}
+	}
+	if !found {
+		t.Error("45.8 MB of backlog against 8 workers is 5.7x what cancellation can explain, " +
+			"and nothing warned — this is the case the field was added for")
 	}
 }
