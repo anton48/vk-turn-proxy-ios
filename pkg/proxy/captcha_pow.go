@@ -938,11 +938,13 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 
 	parsed, perr := parsePowPage(html)
 	if perr != nil {
-		preview := html
-		if len(preview) > 500 {
-			preview = preview[:500]
-		}
-		log.Printf("pow: HTML preview: %s", preview)
+		// Through truncate(), not a raw slice: this is a VK page, so the
+		// 500th byte routinely lands inside a Cyrillic character and a raw
+		// cut writes an invalid sequence into vpn.log (see truncate's own
+		// comment for what one such byte cost on 2026-08-20). It also gains
+		// the "..." marker, so a reader can tell a cut preview from a short
+		// page.
+		log.Printf("pow: HTML preview: %s", truncate(html, 500))
 		// 🚨 THE PREVIEW ABOVE CANNOT ANSWER WHY, and that is the whole point
 		// of the line below. A parse failure has TWO very different causes and
 		// they need opposite fixes:

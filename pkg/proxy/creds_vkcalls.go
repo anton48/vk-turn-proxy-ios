@@ -50,6 +50,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"unicode/utf8"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/google/uuid"
@@ -354,9 +355,26 @@ func parseTURNAddressesFromResp(resp map[string]interface{}) []string {
 
 // truncate trims s to at most n characters, appending "..." if shortened.
 // Used for compact error messages from large JSON bodies.
+// truncate caps s at n BYTES for a log line, cutting only on a rune boundary.
+//
+// 🚨 The rune-boundary back-off is the whole point. `s[:n]` cuts wherever byte
+// n lands, and everything routed through here is REMOTE text that is not
+// ASCII: on 2026-08-20 a VK error response carrying the name "Русл|ан" was cut
+// inside the "а" (0xD0 0xB0) and left a lone 0xD0 in vpn.log. One such byte is
+// enough — the in-app reader decoded the whole 829 KB file strictly and showed
+// "(log is empty)" for a whole sweep. That reader is lenient now, but a LOGGER
+// that emits invalid UTF-8 stays a defect on its own: the same file is read by
+// grep, by python scorers and by whatever reads it next, and each of them gets
+// to decide separately how badly one bad byte hurts.
+//
+// The cap stays in BYTES (it exists to bound the log line), so this backs off
+// at most 3 bytes rather than converting to runes.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }
