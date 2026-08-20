@@ -122,17 +122,39 @@ struct SpeedTestServerPicker: View {
                 Text(neighbourhood)
             }
 
-            if let results = runner.searchResults {
+            if runner.search != .idle {
                 Section {
-                    if results.isEmpty {
-                        Text("Ookla returned nothing for “\(runner.searchQuery)”.")
-                            .font(.caption).foregroundColor(.secondary)
+                    // Every branch names the query it is about, because the
+                    // state carries it — the heading cannot describe one search
+                    // while the rows below answer another.
+                    switch runner.search {
+                    case .idle:
+                        EmptyView()
+                    case let .searching(query):
+                        HStack {
+                            ProgressView()
+                            Text("Searching Ookla for “\(query)”…").foregroundColor(.secondary)
+                        }
+                    case let .failed(query, message):
+                        Label("Search for “\(query)” failed: \(message)",
+                              systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                        Button("Search again") { runner.searchServers(query) }
+                            .font(.caption)
+                    case let .results(query, servers):
+                        if servers.isEmpty {
+                            Text("Ookla returned nothing for “\(query)”.")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                        ForEach(servers) { server in
+                            row(server)
+                        }
                     }
-                    ForEach(results) { server in
-                        row(server)
+                    if !runner.search.isSearching {
+                        Button("Clear search") { runner.clearSearch() }
+                            .font(.caption)
                     }
-                    Button("Clear search") { runner.clearSearch() }
-                        .font(.caption)
                 } header: {
                     Text("Found by searching Ookla — NOT necessarily near you")
                 } footer: {

@@ -28,10 +28,17 @@ struct SpeedTestServer: Codable, Identifiable, Hashable {
 
     /// Latency first, because it is the measured one. Never prints a zero as if
     /// it were a sub-millisecond result.
+    ///
+    /// 🚨 BELOW 10 ms IT KEEPS A DECIMAL. A whole-millisecond format turned a
+    /// real 0.3 ms into "0 ms" — indistinguishable from the sentinel this code
+    /// uses for "not measured", on exactly the servers worth finding. The user's
+    /// own city's server measures 844 µs.
     var proximity: String {
-        latencyMs > 0
-            ? String(format: "%.0f ms · %.0f km est.", latencyMs, distanceKm)
-            : String(format: "%.0f km est.", distanceKm)
+        guard latencyMs > 0 else { return String(format: "%.0f km est.", distanceKm) }
+        let latency = latencyMs < 10
+            ? String(format: "%.1f ms", latencyMs)
+            : String(format: "%.0f ms", latencyMs)
+        return String(format: "%@ · %.0f km est.", latency, distanceKm)
     }
 
     var label: String { sponsor.isEmpty ? name : "\(sponsor) · \(name)" }
@@ -67,5 +74,39 @@ struct SpeedTestServerList: Equatable {
         guard isStale(now: now) else { return nil }
         return "This list was fetched while the route was \"\(fetchedOn.rawValue)\". "
             + "Reload it to see servers near where you are now — your pinned server is unaffected."
+    }
+}
+
+/// The state of a search against Ookla, as ONE value.
+///
+/// 🚨 IT IS ONE VALUE ON PURPOSE. The query and the results used to be two
+/// separate published properties, which made two wrong screens reachable: from
+/// the moment a new search started until it finished, the OLD results were shown
+/// under the NEW query's heading; and a late completion could resurrect results
+/// after the user had cleared them. Neither is expressible here — a result
+/// carries the query it answers, and there is no state that holds one without
+/// the other.
+///
+/// 🚫 It is also kept apart from the nearby list's loading and error state. They
+/// are different operations: a failed search used to blank a perfectly good
+/// nearby list and offer a "Try again" that retried the OTHER one.
+enum SpeedTestSearchState: Equatable {
+    case idle
+    case searching(query: String)
+    case results(query: String, servers: [SpeedTestServer])
+    case failed(query: String, message: String)
+
+    var isSearching: Bool {
+        if case .searching = self { return true }
+        return false
+    }
+
+    /// The query this state is about, if any — so a heading can never name a
+    /// query the rows below it did not answer.
+    var query: String? {
+        switch self {
+        case .idle: return nil
+        case let .searching(q), let .results(q, _), let .failed(q, _): return q
+        }
     }
 }

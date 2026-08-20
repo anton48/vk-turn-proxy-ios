@@ -112,10 +112,18 @@ final class SpeedTestRunner: ObservableObject {
     @Published private(set) var serversLoading = false
     @Published private(set) var serversError: String?
 
-    /// Results of an explicit search against Ookla, kept apart from the nearby
-    /// list because they answer a different question and are NOT near you.
-    @Published private(set) var searchResults: [SpeedTestServer]?
-    @Published private(set) var searchQuery = ""
+    /// An explicit search against Ookla, kept apart from the nearby list's own
+    /// loading and error state because they are different operations — a failed
+    /// search must not blank a perfectly good list, nor offer to retry the
+    /// wrong one.
+    @Published private(set) var search: SpeedTestSearchState = .idle
+
+    /// 🚨 Bumped by every start AND by clearing. A completion that does not carry
+    /// the current generation is DROPPED, which is what stops a slow search from
+    /// resurrecting itself after the user moved on or cleared it. The state type
+    /// makes a mismatched query unrepresentable; this makes a stale one
+    /// unapplicable.
+    private var searchGeneration = 0
 
     /// Every path the run has been observed on — not just the one it started on.
     @Published private(set) var pathTrace = SpeedTestPathTrace()
@@ -201,10 +209,12 @@ final class SpeedTestRunner: ObservableObject {
     /// it. Digits are looked up by id.
     func searchServers(_ query: String) {
         let q = query.trimmingCharacters(in: CharacterSet.whitespaces)
-        guard !q.isEmpty, !serversLoading else { return }
-        serversLoading = true
-        serversError = nil
-        searchQuery = q
+        guard !q.isEmpty, !search.isSearching else { return }
+        searchGeneration += 1
+        let generation = searchGeneration
+        // One assignment: from here the screen cannot show results under a
+        // query they do not answer.
+        search = .searching(query: q)
 
         DispatchQueue.global(qos: .userInitiated).async {
             var found: [SpeedTestServer] = []
@@ -230,17 +240,16 @@ final class SpeedTestRunner: ObservableObject {
             let results = found
             let err = failure
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.searchResults = err == nil ? results : nil
-                self.serversError = err
-                self.serversLoading = false
+                guard let self, generation == self.searchGeneration else { return }
+                self.search = err.map { .failed(query: q, message: $0) }
+                    ?? .results(query: q, servers: results)
             }
         }
     }
 
     func clearSearch() {
-        searchResults = nil
-        searchQuery = ""
+        searchGeneration += 1 // any search still in flight can no longer apply
+        search = .idle
     }
 
     // MARK: Run

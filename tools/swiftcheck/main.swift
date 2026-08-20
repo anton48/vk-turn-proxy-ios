@@ -959,8 +959,15 @@ do {
     let measured = SpeedTestServer(id: "31551", name: "Funchal", sponsor: "MEO",
                                    country: "Portugal", host: "h:8080",
                                    distanceKm: 1186, latencyMs: 0.8)
-    check(measured.proximity.contains("1 ms") || measured.proximity.contains("0 ms"),
-          "a measured latency is shown")
+    // 🚨 THIS CHECK USED TO ACCEPT "0 ms" — the exact rendering that later turned
+    // out to be the defect: a real 0.3 ms printed as 0 and became
+    // indistinguishable from "not measured". An assertion loose enough to pass
+    // on the broken output is not a guard. It now demands the VALUE.
+    check(measured.proximity.contains("0.8 ms"),
+          "🚨 a sub-millisecond latency is shown WITH its decimal, not rounded to 0 ms")
+    check(SpeedTestServer(id: "1", name: "n", sponsor: "s", country: "c", host: "h",
+                          distanceKm: 10, latencyMs: 24).proximity.contains("24 ms"),
+          "and an ordinary latency keeps whole milliseconds")
     check(measured.proximity.contains("est."),
           "🚨 and the distance is labelled an ESTIMATE — Ookla computes it from where it " +
           "believes you are, which was measured wrong by 1186 km")
@@ -981,6 +988,70 @@ do {
           "unreachable however it is spelled")
     check(picker.contains("NOT necessarily near you"),
           "search results are kept apart from the nearby list and say so")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 34. THE SEARCH HAS ITS OWN STATE, AND IT IS ONE VALUE.
+//
+//     Three defects, all from splitting one thing into several:
+//       - the search shared serversLoading/serversError with the nearby list, so
+//         a failed search blanked a perfectly good list and offered a "Try
+//         again" that retried the OTHER operation;
+//       - query and results were separate @Published properties, so from the
+//         start of a new search until it finished the OLD results were shown
+//         under the NEW heading;
+//       - a late completion could resurrect results after Clear search.
+//
+//     The state type makes a mismatched query UNREPRESENTABLE — a result carries
+//     the query it answers — and a generation counter makes a stale completion
+//     unapplicable.
+//
+//     SABOTAGES RUN, each reddening exactly one check:
+//       a. give `.results` no query — the pairing check stops compiling, so
+//          instead: make `query` return nil for `.results`;
+//       b. drop the generation bump from clearSearch;
+//       c. write serversError from the search path again.
+do {
+    let runner = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+    let picker = source("VKTurnProxy/VKTurnProxy/SpeedTestServerPicker.swift")
+
+    // A result cannot exist apart from the query it answers.
+    let found = SpeedTestSearchState.results(query: "Funchal", servers: [])
+    check(found.query == "Funchal",
+          "🚨 results carry the query they answer — the heading cannot describe another search")
+    check(SpeedTestSearchState.searching(query: "Funchal").isSearching,
+          "a search in flight is distinguishable from one that finished")
+    check(SpeedTestSearchState.idle.query == nil,
+          "idle is about no query at all")
+    check(SpeedTestSearchState.failed(query: "x", message: "boom").query == "x",
+          "a failure names the query that failed, so 'Search again' retries THAT one")
+
+    check(runner.contains("searchGeneration"),
+          "🚨 a generation counter exists — otherwise a slow search resurrects itself after Clear")
+    check(runner.contains("generation == self.searchGeneration"),
+          "🚨 and the completion is DROPPED unless it is the current one")
+    let clear = runner.range(of: "func clearSearch()")
+    let clearBody = clear.map { String(runner[$0.lowerBound...].prefix(220)) } ?? ""
+    check(clearBody.contains("searchGeneration += 1"),
+          "🚨 clearing bumps it too — a search in flight when the user clears must not come back")
+
+    // The two operations do not share their failure channel.
+    // Scoped to searchServers: loadServers legitimately writes serversError, and
+    // an unscoped scan would just be asserting that the nearby list has no error
+    // path at all.
+    let fn = runner.range(of: "func searchServers(")
+    let searchBody = fn.map { String(runner[$0.lowerBound...].prefix(2000)) } ?? ""
+    check(!searchBody.isEmpty, "searchServers was found — otherwise the check below is vacuous")
+    check(!searchBody.contains("serversError"),
+          "🚨 the search does not write the NEARBY list's error, which would blank a good list")
+    check(!searchBody.contains("serversLoading"),
+          "🚨 nor its loading flag, which would hide the list behind the wrong spinner")
+    // Fragment only: the source contains a string interpolation, which cannot be
+    // written literally here without becoming one.
+    check(picker.contains("Search for ") && picker.contains("failed:"),
+          "and the search reports its own failure, naming its own query")
+    check(picker.contains("runner.searchServers(query)"),
+          "🚨 'Search again' retries the SEARCH, not the nearby-list fetch")
 }
 
 print("")
