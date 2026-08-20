@@ -94,6 +94,24 @@ struct VPNActivityAttributes: ActivityAttributes {
         /// existed" and reads as off — same reasoning as the Optional fields in
         /// AppSettings, and the same trap that once wiped ServerProfile.
         var compactClock: Bool?
+
+        // ── build 326: DIRECT from the card ───────────────────────────────
+        /// Whether traffic is currently routed AROUND the tunnel (Settings ›
+        /// Advanced › "send traffic around the tunnel"). The card both shows it
+        /// and offers to flip it, which is the whole point: stepping around the
+        /// VPN for one site and back should not require the app, Settings and
+        /// two more taps.
+        ///
+        /// 🚨 **Optional for the same reason as `compactClock`**, and it is not
+        /// a formality: an activity started by an older build was encoded
+        /// without this key, and after an app update the NEW widget decodes that
+        /// OLD payload. A non-Optional `Bool` throws `.keyNotFound` there and
+        /// breaks a card nobody can refresh until the app next runs.
+        ///
+        /// ⚠️ `nil` means "published before this existed" and renders as
+        /// tunnelled — which is the safe reading: it never claims the kill
+        /// switch is off when it might not be.
+        var direct: Bool?
     }
 
     /// When the activity itself was started. Informational — the session clock

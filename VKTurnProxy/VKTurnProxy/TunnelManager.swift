@@ -1082,7 +1082,17 @@ class TunnelManager: ObservableObject {
         guard let proto = manager?.protocolConfiguration else { return }
         var enforced = false
         if #available(iOS 14.2, *) { enforced = proto.enforceRoutes }
+        let wasDirect = directMode
         directMode = !proto.includeAllNetworks && enforced
+        // 🚨 The Live Activity SHOWS this and offers to flip it, and nothing
+        // else pushes a state when routing changes — a DIRECT flip does not
+        // move the tunnel's status, which is what sync() is normally driven by.
+        // Without this, flipping the switch in Advanced would leave the card
+        // claiming the traffic is tunnelled while it is not: the one thing the
+        // routing feature must never do.
+        if directMode != wasDirect, #available(iOS 16.2, *) {
+            LiveActivityController.shared.refreshNow()
+        }
     }
 
     /// DIRECT mode (issue #72): route traffic around the tunnel WITHOUT tearing

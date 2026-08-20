@@ -1124,6 +1124,84 @@ do {
           "🚨 and the SEARCH results carry the notice too, not only the nearby list")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 36. DIRECT FROM THE LIVE ACTIVITY (build 326).
+//
+//     The point of the button is to step around the VPN for one site and back
+//     without opening the app, Settings and Advanced — and without tearing the
+//     tunnel down, which is what makes DIRECT worth having at all.
+//
+//     Four things have to hold, and each has a recorded reason:
+//       - the field is OPTIONAL on the wire. A card started by an older build
+//         is decoded by the NEW widget; a non-Optional Bool throws .keyNotFound
+//         and breaks a card nobody can refresh until the app next runs. This is
+//         the same trap as compactClock and as the ServerProfile wipe.
+//       - a routing change PUSHES the card. Nothing else does: a DIRECT flip
+//         does not move the tunnel's status, which is what sync() is driven by,
+//         so without this the card would claim traffic is tunnelled while it is
+//         not.
+//       - the intent is AWAITED in the handler. perform() ends and the app is
+//         suspended; an un-awaited change would leave the card stale.
+//       - THREE buttons, never four. The island's expanded .bottom region
+//         silently CLIPS the rest — a fourth would not fail to build, it would
+//         simply not be there.
+//
+//     SABOTAGES RUN, each reddening exactly one check:
+//       a. make `direct` non-Optional in ContentState;
+//       b. drop the refreshNow() call from refreshDirectMode;
+//       c. drop the `await` in the .setDirect handler.
+do {
+    let attrs = source("VKTurnProxy/VKTurnProxy/VPNActivityAttributes.swift")
+    let intents = source("VKTurnProxy/VKTurnProxy/LiveActivityIntents.swift")
+    let controller = source("VKTurnProxy/VKTurnProxy/LiveActivityController.swift")
+    let tunnel = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    let widget = source("VKTurnProxy/VKTurnProxyWidget/VPNLiveActivity.swift")
+
+    check(attrs.contains("var direct: Bool?"),
+          "🚨 the routing state on the wire is OPTIONAL — a non-Optional Bool breaks every card " +
+          "started by an older build, and no one can refresh it")
+    check(intents.contains("case setDirect(Bool)") && intents.contains("struct SetDirectIntent"),
+          "the action and its intent exist")
+    // 🚨 SCOPED TO THE CASE BODY, AND IT CHECKS FOR THE ESCAPE TOO. A first
+    // version asserted only that the string "await ...setDirectMode" appeared
+    // anywhere — which `Task { await ... }` satisfies perfectly, and that is
+    // exactly the defect: a Task detaches the work from perform(), the app is
+    // suspended, and the change may never finish. The sabotage passed. Third
+    // time today an assertion of mine was loose enough to accept the thing it
+    // was written to forbid.
+    let caseStart = controller.range(of: "case .setDirect(let direct):")
+    let caseBody = caseStart.map { String(controller[$0.lowerBound...].prefix(1400)) } ?? ""
+    check(!caseBody.isEmpty, "the .setDirect case was found — otherwise the checks below are vacuous")
+    check(caseBody.contains("await TunnelManager.shared.setDirectMode"),
+          "🚨 the handler AWAITS the change — perform() ends and the app is suspended, so an " +
+          "un-awaited flip leaves the card describing the old routing")
+    check(!caseBody.contains("Task {"),
+          "🚨 and it does not hand the work to a detached Task, which outlives perform() only " +
+          "by luck — the app is suspended the moment it returns")
+    check(controller.contains("state.direct = TunnelManager.shared.directMode"),
+          "the app reads it and puts it on the wire — the widget is another process and " +
+          "shares no App Group")
+
+    let refresh = tunnel.range(of: "func refreshDirectMode()")
+    let refreshBody = refresh.map { String(tunnel[$0.lowerBound...].prefix(900)) } ?? ""
+    check(refreshBody.contains("refreshNow()"),
+          "🚨 a routing change PUSHES the card — nothing else would, since the tunnel's status " +
+          "does not move, and a stale card would claim traffic is tunnelled while it is not")
+
+    // Rule (b) of the widget's own header: three buttons, and the region clips
+    // the rest in silence.
+    let controls = widget.range(of: "private func controls(")
+    let controlsBody = controls.map { String(widget[$0.lowerBound...].prefix(2200)) } ?? ""
+    check(!controlsBody.isEmpty, "the control row was found — otherwise the count below is vacuous")
+    let buttons = controlsBody.components(separatedBy: "Button(intent:").count - 1
+    check(buttons == 3,
+          "🚨 exactly THREE buttons in the row, found \(buttons) — the island's expanded .bottom " +
+          "region silently CLIPS anything after the third, so a fourth is invisible rather than broken")
+    check(widget.contains("context.state.direct ?? false"),
+          "🚨 and the widget reads the Optional with a TUNNELLED default — never claiming the " +
+          "kill switch is off when the card predates the field")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

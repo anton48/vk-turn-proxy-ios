@@ -24,6 +24,7 @@ enum LiveActivityAction {
     case exitPicker
     case nextPage
     case selectServer(id: String)
+    case setDirect(Bool)
 }
 
 /// App-installed sink for Live Activity button taps. See the file header.
@@ -88,6 +89,33 @@ struct NextPageIntent: LiveActivityIntent {
     init() {}
     func perform() async throws -> some IntentResult {
         await LiveActivityActionRouter.shared.handle(.nextPage)
+        return .result()
+    }
+}
+
+/// Route traffic around the tunnel, or put it back.
+///
+/// 🚨 A BUTTON, NOT A TOGGLE, and for a different reason than Disconnect: both
+/// positions here ARE reachable, but a Toggle in a Live Activity flips its own
+/// appearance the instant it is tapped, before the app has done anything. This
+/// change takes a profile save, an extension round-trip and a confirmation, and
+/// it can fail — a control that says "done" before any of that has happened
+/// would be lying for as long as it takes, which is exactly where routing must
+/// not be trusted. The label states what the tap DOES; the state comes back from
+/// the confirmation.
+@available(iOS 17.0, *)
+struct SetDirectIntent: LiveActivityIntent {
+    static var title: LocalizedStringResource = "Route around the tunnel"
+    static var isDiscoverable: Bool = false
+
+    @Parameter(title: "Direct")
+    var direct: Bool
+
+    init() {}
+    init(direct: Bool) { self.direct = direct }
+
+    func perform() async throws -> some IntentResult {
+        await LiveActivityActionRouter.shared.handle(.setDirect(direct))
         return .result()
     }
 }

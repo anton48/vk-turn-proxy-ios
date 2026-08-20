@@ -213,7 +213,35 @@ struct VPNLiveActivity: Widget {
                     .font(.caption)
             }
             .buttonStyle(.bordered)
+
+            // 🚨 THE THIRD AND LAST BUTTON. Rule (b) in this file's header: the
+            // island's expanded .bottom region fits THREE and silently CLIPS
+            // anything after. A fourth would not fail to build, it would simply
+            // not be there.
+            //
+            // The label says what the TAP DOES, like its neighbours — so it reads
+            // "DIRECT" while tunnelled and "Via VPN" while bypassed. The tint
+            // carries the state as well, because a user who leaves this on has
+            // turned the kill switch off.
+            Button(intent: SetDirectIntent(direct: !isDirect(context))) {
+                Label(isDirect(context) ? "Via VPN" : "DIRECT",
+                      systemImage: "arrow.triangle.branch")
+                    .font(.caption)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            .tint(isDirect(context) ? .orange : nil)
+            // Mid-teardown the routing change would be pointless: the profile is
+            // rebuilt on the next connect and puts the kill switch back.
+            .disabled(context.state.status != .connected)
         }
+    }
+
+    /// nil means "published before this field existed" and reads as tunnelled —
+    /// the safe direction: it never claims the kill switch is off when it may
+    /// not be.
+    private func isDirect(_ context: ActivityViewContext<VPNActivityAttributes>) -> Bool {
+        context.state.direct ?? false
     }
 
     @available(iOS 17.0, *)

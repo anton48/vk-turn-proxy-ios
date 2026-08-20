@@ -162,6 +162,9 @@ final class LiveActivityController {
             connectedSince: mapped == .connected ? connectedAt : nil
         )
         state.compactClock = compactClockEnabled
+        // Read here, not in the widget: the widget is a separate process and
+        // shares no App Group with the app. Same reasoning as compactClock.
+        state.direct = TunnelManager.shared.directMode
         applyPicker(to: &state)
         if activity == nil {
             start(state)
@@ -194,6 +197,11 @@ final class LiveActivityController {
 
     /// Publish immediately — no throttle, no "unchanged" check. A button tap has
     /// to land now; `sync` is for the tunnel's own chatter.
+    /// Re-publish the card because something it SHOWS changed, without the
+    /// tunnel's status having moved. Public because routing is the one such
+    /// thing: TunnelManager.refreshDirectMode calls it.
+    func refreshNow() { pushNow() }
+
     private func pushNow() {
         let tunnel = TunnelManager.shared
         sync(status: tunnel.status,
@@ -211,6 +219,9 @@ final class LiveActivityController {
                                                        serverName: serverName,
                                                        connectedSince: connectedAt)
         state.compactClock = compactClockEnabled
+        // Read here, not in the widget: the widget is a separate process and
+        // shares no App Group with the app. Same reasoning as compactClock.
+        state.direct = TunnelManager.shared.directMode
         applyPicker(to: &state)
         return state
     }
@@ -242,6 +253,23 @@ final class LiveActivityController {
             let pages = max(1, Int(ceil(Double(ServerStore.shared.servers.count) / Double(serversPerPage))))
             p.page = (p.page + 1) % pages
             picker = p
+            pushNow()
+
+        case .setDirect(let direct):
+            // 🚨 AWAITED, like .disconnect and for the same reason: after
+            // perform() returns the app is suspended, and this change is not
+            // instant — a profile save, then a round-trip to the extension for
+            // the confirmation. Returning early would leave the card showing the
+            // old routing until something else happened to push a state.
+            //
+            // ⚠️ WHAT CANNOT BE AWAITED TO COMPLETION is the repair an
+            // UNCONFIRMED change triggers: an unconfirmed OFF rebuilds the
+            // tunnel, which takes about a hundred seconds, and perform() does
+            // not live that long. It starts here and continues only if the app
+            // happens to stay alive. So the card must not imply routing is
+            // settled — refreshDirectMode(), which every one of those paths
+            // calls, pushes the state that is actually true.
+            await TunnelManager.shared.setDirectMode(direct)
             pushNow()
 
         case .selectServer(let idString):
