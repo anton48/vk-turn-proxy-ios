@@ -22,8 +22,20 @@ are source scans; 4 and 5 can, and are — a scan for them would be ceremony.
 🚨 **A scan can only find a token somebody thought to name, so it cannot see a
 divergence nobody documented.** That is what
 `TestForkDivergesFromUpstreamExactlyHere` is for: it diffs this tree against
-pristine upstream in the module cache and fails on any file or hunk not listed
-here.
+pristine upstream in the module cache and compares the result to **`FORK.patch`**
+— a generated golden file that IS this fork, in full, 187 lines.
+
+That file is the only check on CONTENT. Counting changed files, hunks or lines
+each miss something: hunks merge an adjacent edit into a neighbour, and the same
+number of changed lines can be a completely different set of lines. Both were
+measured, not assumed. Regenerate it — after documenting the change here —
+with:
+
+```
+cd third_party/speedtest-go && UPDATE_FORK_PATCH=1 go test ./speedtest/ -run TestForkDiverges
+```
+
+and READ the result before committing: it is the whole divergence in one place.
 
 **Where to run it** — the fork is a separate module, so `go test ./...` from the
 repo root does NOT reach it:

@@ -1,0 +1,187 @@
+=== data_manager.go ===
+@@ -44,6 +44,7 @@
+ 	Snapshots() *Snapshots
+ 
+ 	SetNThread(n int) Manager
++	SetEarlyStop(enabled bool) Manager
+ }
+ 
+ type Chunk interface {
+@@ -90,6 +91,8 @@
+ 	rateCaptureFrequency time.Duration
+ 	nThread              int
+ 	uploadMaxWorkers     int
++	// FORK: see SetEarlyStop.
++	noEarlyStop bool
+ 
+ 	running   bool
+ 	runningRW sync.RWMutex
+@@ -195,7 +198,7 @@
+ 	return atomic.AddInt64(&td.totalReadVolume, delta)
+ }
+ 
+-func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerIndex int) {
++func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, mainRequestHandlerIndex int) {
+ 	if len(td.fns) == 0 {
+ 		panic("empty task stack")
+ 	}
+@@ -223,16 +226,15 @@
+ 	wg := sync.WaitGroup{}
+ 	td.manager.running = true
+ 	stopCapture := td.rateCapture()
++	// FORK: upstream clamped the INITIAL upload worker count to runtime.NumCPU()
++	// whenever uploadMaxWorkers <= 8, leaving the adaptive controller to grow it
++	// back. With that controller removed (see ../FORK.md) the clamp would be
++	// permanent, so `Threads = 8` would run 6 workers forever on a 6-core phone
++	// while `Threads = 16` ran 16 — a knob that is not monotonic in its own
++	// value. The default is unchanged: for implicit configuration workerLimit is
++	// already min(NumCPU, 8).
+ 	td.maxWorkers = int32(workerLimit)
+ 	initialWorkers := td.maxWorkers
+-	if td.TestType == typeUpload {
+-		if td.manager.uploadMaxWorkers <= 8 {
+-			initialWorkers = int32(runtime.NumCPU())
+-			if initialWorkers > td.maxWorkers {
+-				initialWorkers = td.maxWorkers
+-			}
+-		}
+-	}
+ 	atomic.StoreInt32(&td.activeWorkers, initialWorkers)
+ 	if td.TestType == typeUpload {
+ 		dbg.Printf("Upload workers: %d/%d\n", initialWorkers, td.maxWorkers)
+@@ -252,9 +254,39 @@
+ 		})
+ 	}
+ 
+-	if td.TestType == typeUpload && td.maxWorkers > 1 {
+-		go td.adaptUploadWorkers()
+-	}
++	// FORK: stop the phase when the CALLER's context is cancelled — see ../FORK.md.
++	// Upstream ends a phase only through td.closeFunc, fired by the captureTime
++	// timer or by the early-stop path, so a cancelled context did not stop the
++	// workers at all: their requests failed instantly on the dead context and
++	// runWorker looped again at once. Measured on this fork before the fix —
++	// cancel at 0.70s, phase still returned at 4.00s of a 4s captureTime, and a
++	// download+upload run burned TWO full capture times.
++	//
++	// 🚨 closeFunc is the SINGLE shutdown path: it also drains and closes
++	// stopCapture (ending the rateCapture goroutine) and calls cancel(). Never
++	// end a phase by any other route — setting `running` directly or closing
++	// stopCapture here would break the once-wrapped double-send invariant.
++	//
++	// 🚨 AND THIS GOROUTINE MUST BE SPAWNED HERE, BELOW THE closeFunc
++	// ASSIGNMENT. td.closeFunc is written at that assignment while rateCapture,
++	// already running since the line above, reads it — spawning a second reader
++	// any earlier is a real data race (seen under -race), not a theoretical one.
++	stopWatch := make(chan struct{})
++	defer close(stopWatch)
++	go func() {
++		select {
++		case <-ctx.Done():
++			td.closeFunc()
++		case <-stopWatch:
++		}
++	}()
++
++	// FORK: adaptive upload concurrency is DISABLED — see ../FORK.md.
++	// Upstream turns the thread count into a ceiling for a controller that cut
++	// 16 workers to 1 in five seconds on a measured run, each cut justifying the
++	// next. We expose this number to users as "Threads"; it has to mean that.
++	// adaptUploadWorkers is left in the file, unused, so the diff against
++	// upstream stays small and re-applying after a bump is a one-line edit.
+ 	time.AfterFunc(td.manager.captureTime, td.closeFunc)
+ 	for i := 0; i < mainN; i++ {
+ 		wg.Add(1)
+@@ -403,7 +435,7 @@
+ 					// cumulative rate to avoid reporting a zero/spike sawtooth.
+ 					rateSample = globalAvg * td.manager.rateCaptureFrequency.Seconds()
+ 				}
+-				if td.welford.Update(globalAvg, rateSample) {
++				if td.welford.Update(globalAvg, rateSample) && !td.manager.noEarlyStop {
+ 					go td.closeFunc()
+ 				}
+ 				// reports the current rate at the given rate
+@@ -484,6 +516,24 @@
+ 	return dm
+ }
+ 
++// SetEarlyStop turns the engine's stability cut-off on or off. FORK addition.
++//
++// Upstream ends a phase as soon as the rate has been stable for a third of a
++// 5 s window, with a floor of minSteps = 2 x windowSize. In practice that means
++// EVERY phase ends at ~10 s no matter what capture time was asked for — measured
++// on 2026-08-19/20, where a requested 15 s produced an actual 10.1 s in seven
++// runs out of seven.
++//
++// That is fine for "how fast is my line right now" and fatal for a comparison:
++// a fixed measurement window is exactly what makes runs at different thread
++// counts comparable, and it cannot be had while the engine decides for itself
++// when it has seen enough. Research mode turns the cut-off off; ordinary runs
++// leave it on, because for them stopping early is a feature.
++func (dm *DataManager) SetEarlyStop(enabled bool) Manager {
++	dm.noEarlyStop = !enabled
++	return dm
++}
++
+ func (dm *DataManager) SetNThread(n int) Manager {
+ 	if n < 1 {
+ 		dm.nThread = runtime.NumCPU()
+
+=== request.go ===
+@@ -57,7 +57,7 @@
+ 	if td == nil {
+ 		return ErrorUninitializedManager
+ 	}
+-	td.Start(cancel, mainIDIndex) // block here
++	td.Start(_context, cancel, mainIDIndex) // block here
+ 	s.DLSpeed = ByteRate(td.manager.GetEWMADownloadRate())
+ 	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
+ 		s.DLSpeed = -1 // N/A
+@@ -92,7 +92,7 @@
+ 	if td == nil {
+ 		return ErrorUninitializedManager
+ 	}
+-	td.Start(cancel, mainIDIndex) // block here
++	td.Start(_context, cancel, mainIDIndex) // block here
+ 	s.ULSpeed = ByteRate(td.manager.GetEWMAUploadRate())
+ 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
+ 		s.ULSpeed = -1 // N/A
+@@ -120,7 +120,7 @@
+ 		if err := downloadRequest(_context, s, 3); err != nil {
+ 			atomic.AddInt64(&errorTimes, 1)
+ 		}
+-	}).Start(cancel, 0)
++	}).Start(_context, cancel, 0)
+ 	duration := time.Since(start)
+ 	s.DLSpeed = ByteRate(s.Context.GetEWMADownloadRate())
+ 	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
+@@ -151,7 +151,7 @@
+ 		if err := uploadRequest(_context, s, 4); err != nil {
+ 			atomic.AddInt64(&errorTimes, 1)
+ 		}
+-	}).Start(cancel, 0)
++	}).Start(_context, cancel, 0)
+ 	duration := time.Since(start)
+ 	s.ULSpeed = ByteRate(s.Context.GetEWMAUploadRate())
+ 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
+
+=== speedtest.go ===
+@@ -210,7 +210,16 @@
+ // New creates a new speedtest client.
+ func New(opts ...Option) *Speedtest {
+ 	s := &Speedtest{
+-		doer:    http.DefaultClient,
++		// FORK: an OWN client, not the process-wide http.DefaultClient — see
++		// ../FORK.md. NewUserConfig below ends with `s.doer.Transport = s`, so
++		// upstream's shared default made every construction re-point the
++		// transport of every EXISTING instance, and made merely importing this
++		// package hijack http.DefaultClient for the whole process (the
++		// package-level `var defaultClient = New()` fires at init). WithDoer
++		// does not save you: the default config is applied before the option
++		// loop, so the global is already rewired — and the private client is
++		// left with a nil Transport.
++		doer:    &http.Client{},
+ 		Manager: NewDataManager(),
+ 	}
+ 	// load default config
+
