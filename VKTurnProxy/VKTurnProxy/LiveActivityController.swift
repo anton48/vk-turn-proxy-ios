@@ -309,7 +309,7 @@ final class LiveActivityController {
             // The deadline is set by switchAndReconnect itself now, so every
             // caller of it is covered — including the DIRECT repair, which was
             // not.
-            await tunnel.switchAndReconnect(to: id)
+            await tunnel.switchAndReconnect(to: id, because: .userPickedServer)
             // switchDeadline is deliberately NOT cleared here — see its doc.
             picker = nil
             pushNow()
@@ -361,7 +361,18 @@ final class LiveActivityController {
     private func update(_ state: VPNActivityAttributes.ContentState) {
         guard let activity else { return }
         lastPushed = (state, Date())
+        // 🚨 CHAINED, NOT REPLACED. Each publish waits for the one before it, so
+        // ActivityKit receives them in the order they were produced. Overwriting
+        // the handle let two publishes race: an OLDER state could land LAST and
+        // leave the card describing something that had already been superseded —
+        // and `await publishInFlight?.value` would have returned while that
+        // older Task was still pending, so waiting for it proved nothing.
+        //
+        // The chain is also what makes the wait meaningful: awaiting the newest
+        // link awaits every link behind it.
+        let previous = publishInFlight
         publishInFlight = Task {
+            await previous?.value
             await activity.update(ActivityContent(state: state, staleDate: staleDate(for: state.status)))
         }
     }

@@ -782,9 +782,20 @@ class TunnelManager: ObservableObject {
     ///  3. Start and return WITHOUT waiting: bootstrap can take up to 120s, far
     ///     past the intent budget, and the extension does it under the system's
     ///     watch anyway.
-    func switchAndReconnect(to serverId: UUID) async {
+    /// Why a reconnect is happening. 🚨 The log line used to say
+    /// `live-activity: switch` unconditionally — true for the picker and FALSE
+    /// for the routing repair, which can be triggered from the Advanced switch
+    /// with no card involved at all. A log that names the wrong cause is worse
+    /// than one that names none: it sends the next reader to the wrong feature.
+    enum ReconnectReason: String {
+        case userPickedServer = "server picked on the Live Activity"
+        case directRepair = "repairing an unconfirmed routing change"
+    }
+
+    func switchAndReconnect(to serverId: UUID, because reason: ReconnectReason) async {
         guard let server = ServerStore.shared.servers.first(where: { $0.id == serverId }) else { return }
-        SharedLogger.shared.log("[AppDebug] live-activity: switch → \"\(server.serverName)\" [\(server.modeLabel)]")
+        SharedLogger.shared.log("[AppDebug] reconnect → \"\(server.serverName)\" "
+            + "[\(server.modeLabel)] — \(reason.rawValue)")
         // 🚨 HOLD THE CARD FIRST. This passes through `.disconnected`, on which
         // the controller ends the Live Activity — and ending it while the app is
         // in the background is UNRECOVERABLE. It is done here rather than at each
@@ -1262,6 +1273,18 @@ class TunnelManager: ObservableObject {
         case .applied(let actual):
             note("🚨 the extension reports the routes are \(actual ? "DIRECT" : "tunnelled") "
                 + "while the profile now asks for \(direct ? "DIRECT" : "tunnelled")")
+            // 🚨 BELIEVE THE EXTENSION, NOT THE PROFILE. refreshDirectMode()
+            // above derives the state from the saved profile — which holds what
+            // was REQUESTED — so after a confirmed mismatch every surface would
+            // report the change as done. On the Live Activity that is not merely
+            // cosmetic: the button's label is derived from it, so a DIRECT that
+            // demonstrably did NOT happen was offering "Via VPN", i.e. to undo
+            // something that never occurred, while what the user needs is to try
+            // DIRECT again.
+            //
+            // This is build 310's finding — the profile treated as the applied
+            // state — arriving on a surface that did not exist then.
+            directMode = actual
             await directChangeUnconfirmed(
                 wanted: direct,
                 message: direct
@@ -1298,7 +1321,7 @@ class TunnelManager: ObservableObject {
             + "— reconnecting, which rebuilds the full-tunnel routes from scratch "
             + "[asked from \(source.rawValue)]")
         directModeError = message + " Reconnecting to restore it."
-        await switchAndReconnect(to: ServerStore.shared.activeServerId)
+        await switchAndReconnect(to: ServerStore.shared.activeServerId, because: .directRepair)
         refreshDirectMode()
         if directMode {
             // The rebuilt profile should be full-tunnel; if it is not, say so

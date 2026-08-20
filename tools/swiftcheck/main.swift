@@ -1224,6 +1224,31 @@ do {
     check(leakLine.contains("[asked from "),
           "🚨 the LEAK warning names where the change was asked from — the Live Activity path " +
           "is both the likeliest and the one running on borrowed time")
+
+    // 🚨 THE EXTENSION'S CONFIRMATION BEATS THE PROFILE. refreshDirectMode
+    // derives the state from the SAVED profile, which holds what was REQUESTED —
+    // so after a confirmed mismatch the card's button offered to undo a change
+    // that demonstrably had not happened, when what the user needs is to retry
+    // it. Build 310's finding (the profile treated as the applied state) on a
+    // surface that did not exist then.
+    let mismatch = tunnel.range(of: "case .applied(let actual):")
+    let mismatchBody = mismatch.map { String(tunnel[$0.lowerBound...].prefix(1400)) } ?? ""
+    check(!mismatchBody.isEmpty, "the mismatch branch was found — otherwise the check below is vacuous")
+    check(mismatchBody.contains("directMode = actual"),
+          "🚨 a confirmed mismatch adopts what the EXTENSION reports, not what the profile asked for")
+
+    // 🚨 PUBLISHES ARE CHAINED. Overwriting the handle let two race, so an older
+    // state could land last — and awaiting the newest handle returned while the
+    // older Task was still pending, which made the wait prove nothing.
+    check(controller.contains("await previous?.value"),
+          "🚨 each publish waits for the one before it, so ActivityKit gets them in order")
+
+    // A log that names the wrong cause is worse than one that names none.
+    check(tunnel.contains("enum ReconnectReason"),
+          "a reconnect declares why it is happening")
+    check(!tunnel.contains("live-activity: switch →"),
+          "🚨 and no longer claims the Live Activity did it — the routing repair reconnects " +
+          "from the Advanced switch too, with no card involved")
     check(controller.contains("state.direct = TunnelManager.shared.directMode"),
           "the app reads it and puts it on the wire — the widget is another process and " +
           "shares no App Group")
