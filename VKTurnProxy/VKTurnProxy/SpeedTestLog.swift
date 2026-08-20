@@ -126,7 +126,10 @@ enum SpeedTestLog {
         // `confirmed=100.0%` on every line — 1.0 by construction, since a GET
         // has no pushed-but-unconfirmed bytes at all — which reads as a verdict
         // about the server rather than as a field that does not apply.
-        if p.confirmedRatio > 0 { s += String(format: " confirmed=%.1f%%", p.confirmedRatio * 100) }
+        // 🚨 `confirmedKnown`, not `> 0`: a ratio of 0.0 is the Frankfurt-307 answer
+        // — nothing accepted at all — and gating on the value made exactly that
+        // case print on no line.
+        if p.confirmedKnown { s += String(format: " confirmed=%.1f%%", p.confirmedRatio * 100) }
         if p.backlogBytes > 0 {
             s += String(format: " backlog=%.1fMB", Double(p.backlogBytes) / 1e6)
             // 🚨 THE NUMBER QUALIFIES ITSELF. When the phase ends every worker

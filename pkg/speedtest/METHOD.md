@@ -111,5 +111,13 @@ that the VERDICT is gated on backlog the cancellation tail cannot explain, and
 `backlog_tail_bytes` now travels with the phase so the line can qualify its own
 number.
 
+*And zero was unrepresentable.* Presence was inferred from `ConfirmedRatio > 0`,
+so the one endpoint this field exists for — Frankfurt's 307 host, which confirms
+NOTHING — came out as exactly 0.000 and was therefore treated as *not measured*:
+it printed on no line, showed on no screen and warned nowhere. `ConfirmedKnown`
+now carries presence, and the ratio carries only the value. ⚠️ This is a
+REPORTING fix, not a measurement one — no figure changes, a hidden one appears —
+so it is part of Method 6 rather than a revision of its own.
+
 ⇒ **Do not compare a `confirmed` figure across this line**: before Method 6 a
 download's is meaningless and an upload's warning is thread-count noise.

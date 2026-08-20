@@ -1432,6 +1432,7 @@ do {
     scoped.rawMbps = 100; scoped.windowSec = 15; scoped.actualSec = 20; scoped.warmupSec = 5
     scoped.bytes = 1_000_000_000; scoped.windowBytes = 600_000_000
     scoped.backlogBytes = 5_000_000; scoped.confirmedRatio = 600.0 / 605.0
+    scoped.confirmedKnown = true
     let scopedLine = SpeedTestLog.result(run, progress: {
         var p = SpeedTestProgress(); p.upload = scoped; return p
     }(), path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
@@ -1604,7 +1605,7 @@ do {
     var up = SpeedTestPhase()
     up.rawMbps = 201; up.windowSec = 18; up.actualSec = 18
     up.bytes = 452_800_000; up.windowBytes = 452_800_000
-    up.backlogBytes = 29_500_000; up.confirmedRatio = 0.939
+    up.backlogBytes = 29_500_000; up.confirmedRatio = 0.939; up.confirmedKnown = true
     up.backlogTailBytes = 32 * 999_490
     up.connsUsed = 32; up.dials = 31
     let upLine = SpeedTestLog.result(SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
@@ -1632,6 +1633,33 @@ do {
     check(!brokenLine.contains("tail of"),
           "🚨 a backlog the tail CANNOT explain is not qualified away — 45.8MB against 8 workers "
           + "is the Frankfurt 307 shape, and that is the case the field was added for")
+
+    // 🚨 ZERO IS A REAL ANSWER, AND IT IS THE ONE THIS FIELD EXISTS FOR. The
+    // Frankfurt 307 endpoint confirms NOTHING, so its ratio is exactly 0.000 —
+    // and while presence was inferred from `> 0`, that case printed on no line
+    // at all. The value cannot double as the presence test.
+    var dead = SpeedTestPhase()
+    dead.rawMbps = 0; dead.windowSec = 15; dead.actualSec = 15
+    dead.bytes = 0; dead.windowBytes = 0
+    dead.backlogBytes = 45_800_000; dead.confirmedRatio = 0; dead.confirmedKnown = true
+    dead.backlogTailBytes = 8 * 999_490
+    let deadLine = SpeedTestLog.result(SpeedTestRunConfig(serverID: "35692", serverLabel: "Clouvider · Frankfurt",
+                                                          threads: 8, direction: "upload",
+                                                          durationSec: 15),
+                                        progress: { var p = SpeedTestProgress(); p.upload = dead; return p }(),
+                                        path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
+    check(deadLine.contains("confirmed=0.0%"),
+          "🚨 a measured ZERO is PRINTED — an endpoint that accepts nothing is the whole reason "
+          + "this field exists, and gating on the value made exactly that case invisible")
+
+    // And the screen must carry the explanation the log carries, because the
+    // person looking at 93.9% on a phone is the one who needs it.
+    let view = codeWithoutComments("VKTurnProxy/VKTurnProxy/SpeedTestResultView.swift")
+    check(view.contains("phase.confirmedKnown"),
+          "🚨 the result view tests confirmedKnown, not the value — same reason as the log line")
+    check(view.contains("backlogTailBytes") && view.contains("still in flight when the phase ended"),
+          "🚨 and it EXPLAINS a shortfall the cancellation tail accounts for, instead of showing a "
+          + "bare 93.9% whose reason lives only in a log and a memory file")
 }
 
 print("")

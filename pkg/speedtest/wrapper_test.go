@@ -532,15 +532,25 @@ func TestCancellationTailIsNotReportedAsRefusal(t *testing.T) {
 
 // ...and the endpoint the field exists for must still be caught: the Frankfurt
 // 307 host confirmed NOTHING while 45.8 MB piled up, which no tail explains.
+//
+// 🚨 THE FIXTURE IS EXACTLY ZERO CONFIRMED, and the first version of this test
+// was not: it pushed 1 MB through, giving a ratio of 0.021, so it exercised a
+// shape ADJACENT to the one its own comment claimed. That mattered — with
+// `ConfirmedRatio > 0` as the presence test, the real Frankfurt case (0.000) was
+// rendered as ABSENT and warned about nowhere, and this test could not see it.
 func TestABrokenEndpointStillWarns(t *testing.T) {
 	start := time.Now()
 	end := start.Add(15 * time.Second)
-	p := applyWindow(measure(1e6, 1e6, start, end, true), warmSample{},
-		start, end, 1e6, 45.8e6, true, 8)
+	p := applyWindow(measure(1e6, 0, start, end, true), warmSample{},
+		start, end, 0, 45.8e6, true, 8)
 
-	if p.ConfirmedRatio >= 0.95 {
-		t.Fatalf("precondition failed: ratio %.3f — the fixture is not broken enough to test",
-			p.ConfirmedRatio)
+	if p.ConfirmedRatio != 0 {
+		t.Fatalf("precondition failed: ratio %.4f — this fixture must be the EXACT zero, "+
+			"which is the value the old presence test could not represent", p.ConfirmedRatio)
+	}
+	if !p.ConfirmedKnown {
+		t.Fatal("a measured zero is reported as UNKNOWN — the one case the field exists for " +
+			"would print on no line and warn nowhere")
 	}
 	found := false
 	for _, w := range p.Warnings {

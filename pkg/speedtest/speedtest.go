@@ -200,6 +200,14 @@ type Phase struct {
 	BacklogBytes   int64   `json:"backlog_bytes"`
 	ConfirmedRatio float64 `json:"confirmed_ratio"`
 
+	// ConfirmedKnown separates "this phase measured a confirmation ratio" from
+	// "the field does not apply". 🚨 WITHOUT IT, ZERO IS UNREPRESENTABLE: the
+	// ratio is a fraction, so `> 0` was doing double duty as "present", and the
+	// ONE case this whole field exists for — the Frankfurt 307 endpoint, which
+	// confirms NOTHING — came out as exactly 0.0 and was therefore rendered as
+	// absent, warned about nowhere, and printed on no line.
+	ConfirmedKnown bool `json:"confirmed_known"`
+
 	// BacklogTailBytes is how much of the backlog a NORMAL end of phase
 	// explains: every worker has one chunk in flight when the phase stops, and
 	// those bytes are pushed and never confirmed through no fault of the
@@ -958,6 +966,8 @@ func confirmRatio(p Phase, upload bool, threads int) Phase {
 	pushed := p.WindowBytes + p.BacklogBytes
 	if pushed > 0 && p.WindowBytes >= 0 {
 		p.ConfirmedRatio = float64(p.WindowBytes) / float64(pushed)
+		// Present even when it is zero — ESPECIALLY when it is zero.
+		p.ConfirmedKnown = true
 	}
 
 	// 🚨 A NORMAL END OF PHASE LOOKS EXACTLY LIKE REFUSED BYTES. When the
@@ -983,7 +993,7 @@ func confirmRatio(p Phase, upload bool, threads int) Phase {
 	// is gated, on backlog the tail cannot account for.
 	p.BacklogTailBytes = int64(threads) * uploadChunkBytes
 	unexplained := p.BacklogBytes - p.BacklogTailBytes
-	if p.ConfirmedRatio > 0 && p.ConfirmedRatio < 0.95 && unexplained > 0 {
+	if p.ConfirmedKnown && p.ConfirmedRatio < 0.95 && unexplained > 0 {
 		p.Warnings = append(p.Warnings, fmt.Sprintf(
 			"only %.0f%% of uploaded bytes were confirmed by the server — %.1f MB more backlog "+
 				"than %d cancelled chunks can explain", p.ConfirmedRatio*100,

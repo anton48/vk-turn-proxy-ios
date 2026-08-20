@@ -61,8 +61,15 @@ struct SpeedTestResultView: View {
                 .font(.caption.monospacedDigit())
                 .foregroundColor(.secondary)
 
-            if phase.confirmedRatio > 0 && phase.confirmedRatio < 0.999 {
-                Text(String(format: "confirmed %.1f%%", phase.confirmedRatio * 100))
+            // 🚨 THE SCREEN HAS TO CARRY THE EXPLANATION TOO. A healthy
+            // 32-thread run reads `confirmed 93.9%` and the reason — one
+            // in-flight chunk per worker, cancelled when the phase ends — used
+            // to exist only in the log and in a memory file. Whoever is looking
+            // at the screen is the person who needs it.
+            // ⚖️ And the test is `confirmedKnown`, not `> 0`: zero is a real
+            // answer, and it is the one this field was added for.
+            if phase.confirmedKnown && phase.confirmedRatio < 0.999 {
+                Text(Self.confirmation(phase))
                     .font(.caption.monospacedDigit())
                     .foregroundColor(.secondary)
             }
@@ -73,6 +80,23 @@ struct SpeedTestResultView: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    /// The confirmation line: the ratio, and — when the shortfall is what a
+    /// normal end of phase produces — what accounts for it.
+    ///
+    /// 🚨 A shortfall INSIDE the tail is not the server refusing bytes: every
+    /// worker is mid-chunk when the capture time expires, so up to
+    /// `threads × one chunk` is pushed and never confirmed by construction. On
+    /// screen that showed as a bare 93.9% with nothing to read it against.
+    static func confirmation(_ p: SpeedTestPhase) -> String {
+        let pct = String(format: "confirmed %.1f%%", p.confirmedRatio * 100)
+        guard p.backlogBytes > 0 else { return pct }
+        let mb = String(format: "%.1f MB", Double(p.backlogBytes) / 1e6)
+        if p.backlogTailBytes > 0 && p.backlogBytes <= p.backlogTailBytes {
+            return pct + " — \(mb) was still in flight when the phase ended (normal)"
+        }
+        return pct + " — \(mb) pushed and never confirmed"
     }
 
     /// 🚨 NOTHING IS SUBTRACTED HERE. The warm-up and the window arrive already

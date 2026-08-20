@@ -33,6 +33,10 @@ struct SpeedTestPhase: Codable {
     var dials: Int = 0
     var backlogBytes: Int64 = 0
     var confirmedRatio: Double = 0
+    /// Whether a ratio was MEASURED at all. 🚨 Zero is a real answer here — it
+    /// is the Frankfurt-307 answer — so presence cannot be inferred from the
+    /// value being non-zero.
+    var confirmedKnown: Bool = false
     /// How much of the backlog a NORMAL end of phase explains: one in-flight
     /// chunk per worker, cancelled when the capture time expires. Travels with
     /// the phase so the line can qualify its own backlog instead of leaving it
@@ -54,6 +58,7 @@ struct SpeedTestPhase: Codable {
         case dials
         case backlogBytes = "backlog_bytes"
         case confirmedRatio = "confirmed_ratio"
+        case confirmedKnown = "confirmed_known"
         case backlogTailBytes = "backlog_tail_bytes"
         case warnings
     }
