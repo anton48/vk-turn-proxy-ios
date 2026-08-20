@@ -222,7 +222,6 @@ final class SpeedTestRunner: ObservableObject {
         pathTrace = SpeedTestPathTrace(atStart)
         pathObservations = [SpeedTestPathObservation(at: Date(), path: atStart)]
         lastPathSampleAt = Date()
-        watchThePath()
 
         let cfg: [String: Any] = [
             "server_id": serverID,
@@ -256,6 +255,13 @@ final class SpeedTestRunner: ObservableObject {
             refusal = startError
             return
         }
+        // 🚨 AFTER THE START SUCCEEDED, NEVER BEFORE. Installed at the top of
+        // this function, the subscription outlived every early exit — a refused
+        // start, or a config that would not encode — and kept recording route
+        // changes for a run that does not exist, until the NEXT run replaced it.
+        // ⚖️ The microseconds between the engine starting and this line are
+        // covered by the poll backstop, which stamps at the previous look.
+        watchThePath()
         previousServerID = lastAutomaticServerID
         let config = SpeedTestRunConfig(serverID: serverID, serverLabel: serverLabel,
                                         threads: threads, direction: direction,
@@ -329,11 +335,13 @@ final class SpeedTestRunner: ObservableObject {
             // measurement at BOTH ends: a route change before the window opened,
             // or after it closed while the engine was still unwinding, would
             // otherwise condemn a result that is complete and correct.
-            // ⚖️ For a both-direction run the interval spans from the first
-            // window's open to the last one's close, so a change in the gap
-            // between the phases still counts — the two phases would then have
-            // been measured on different routes, and one label cannot describe
-            // both.
+            // ⚖️ Each phase's OWN window is scored and the phases must then
+            // agree. The union of the two was wrong: it also covered the pause
+            // between them, where nothing is measured, so a DIRECT round trip
+            // beginning and ending inside that pause flagged a run whose
+            // numbers were untouched. A change that PERSISTS across the pause
+            // still shows up — the phases disagree, and one label cannot
+            // describe two routes.
             pathTrace = SpeedTestPathTrace.overMeasurement(decoded, observations: pathObservations,
                                                           fallback: pathTrace)
             if let run = startedRun {
@@ -390,8 +398,15 @@ extension SpeedTestRunner {
         Publishers.CombineLatest(tunnel.$status, tunnel.$directMode)
             .map { SpeedTestPath.current(connected: $0 == .connected, directMode: $1) }
             .removeDuplicates()
+            // 🚨 STAMPED HERE, UPSTREAM OF THE HOP. `receive(on:)` schedules the
+            // sink for a later turn of the main run loop, so a `Date()` taken
+            // inside it carries however long that turn was away — under load,
+            // exactly when a route flips, that is the delay being measured
+            // rather than the event. This map runs synchronously on whatever
+            // thread published the change.
+            .map { SpeedTestPathObservation(at: Date(), path: $0) }
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] path in self?.notePath(path, at: Date()) }
+            .sink { [weak self] o in self?.notePath(o.path, at: o.at) }
             .store(in: &pathWatch)
     }
 

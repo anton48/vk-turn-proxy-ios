@@ -1839,6 +1839,42 @@ do {
           + "late hides one")
     check(runner.contains("stopWatchingThePath()") && runner.contains("pathWatch.removeAll()"),
           "the subscription is released when the run ends")
+
+    // 🚨 THE STAMP MUST BE TAKEN UPSTREAM OF THE SCHEDULER HOP. `receive(on:)`
+    // defers the sink to a later turn of the run loop, so a Date() inside it
+    // measures how busy the main queue was — worst exactly when a route flips.
+    if let stamp = runner.range(of: "SpeedTestPathObservation(at: Date(), path: $0)"),
+       let hop = runner.range(of: ".receive(on: DispatchQueue.main)") {
+        check(stamp.lowerBound < hop.lowerBound,
+              "🚨 the observation is stamped BEFORE receive(on:) — stamped after, the timestamp "
+              + "carries the scheduler's delay instead of the event's instant")
+    } else {
+        check(false, "the stamping map or the hop is gone — this scan no longer tests anything")
+    }
+
+    // 🚨 AND THE WATCHER MAY NOT OUTLIVE A START THAT NEVER HAPPENED.
+    //
+    // Stated as "it does not appear BEFORE the engine is asked", which is the
+    // invariant itself — an earlier version compared the index of a two-line
+    // anchor, and moving the call simply made that anchor vanish, so the
+    // sabotage reddened the "I cannot find it" branch instead of the claim.
+    if let start = runner.range(of: "func start(serverID"),
+       let engineCall = runner.range(of: "wgSpeedtestStart(cstr)") {
+        let beforeTheEngineIsAsked = runner[start.lowerBound..<engineCall.lowerBound]
+        check(!beforeTheEngineIsAsked.contains("watchThePath()"),
+              "🚨 the route subscription is installed BEFORE the engine has been asked to start — "
+              + "every early exit then leaves a watcher recording for a run that does not exist")
+    } else {
+        check(false, "start() or the engine call could not be found — the scan is inert")
+    }
+
+    // 🚨 THIS ONE IS DELIBERATELY ABOUT THE PROSE, because the prose is the
+    // artefact: a comment describing the model that was replaced is what the
+    // next reader will believe.
+    let runnerWithComments = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+    check(!runnerWithComments.contains("the interval spans from the first"),
+          "🚨 no comment still describes the single-interval model — each phase's own window is "
+          + "scored now, and a stale comment outlives the code it explains")
     check(runner.contains("SpeedTestPathTrace.overMeasurement("),
           "🚨 and the runner NARROWS the trace on the terminal poll — the rule is worth nothing "
           + "if the result still carries the run-wide one")
