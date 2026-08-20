@@ -603,6 +603,228 @@ do {
           "🚨 but an unconfirmed OFF REBUILDS the tunnel — the only repair that cannot itself be unconfirmed")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 25. THE RESULT IS RENDERED FROM THE RUN, NOT FROM THE SCREEN'S CONTROLS.
+//
+//     The knobs are @AppStorage bindings that keep living after Run is pressed,
+//     so a finished result rendered from them changes when the user touches a
+//     picker. Concretely: a download-only run grew an "Upload 0.0 Mbit/s" row on
+//     a tap that measured nothing.
+//
+//     SABOTAGES RUN, each reddening exactly one check:
+//       a. render `if direction != "upload"` in SpeedTestResultView instead of
+//          `run.ranDownload`;
+//       b. delete `startedRun` from the runner — the view then has nothing to
+//          render from and falls back to the bindings.
+do {
+    let result = source("VKTurnProxy/VKTurnProxy/SpeedTestResultView.swift")
+    let runner = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+    let view = source("VKTurnProxy/VKTurnProxy/SpeedTestView.swift")
+
+    check(runner.contains("private(set) var startedRun: SpeedTestRunConfig?"),
+          "🚨 the runner records the config the run STARTED with")
+    check(result.contains("run.ranDownload") && result.contains("run.ranUpload"),
+          "🚨 the result picks its rows from the RUN, not from the live Direction binding")
+    check(!result.contains("@AppStorage"),
+          "🚨 the result view owns no live bindings at all")
+    check(view.contains("SpeedTestResultView(run:"),
+          "and the screen passes the recorded run into it")
+
+    // The parameters are history once a run starts.
+    let cfg = SpeedTestRunConfig(serverID: "1", serverLabel: "x", threads: 8,
+                                 direction: "download", durationSec: 15)
+    check(cfg.ranDownload && !cfg.ranUpload,
+          "a download-only run reports one direction, whatever the picker says later")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 26. THE PATH LABEL DESCRIBES THE WHOLE RUN, NOT ITS FIRST INSTANT.
+//
+//     DIRECT is a LIVE route switch (~420 ms) and the runner deliberately
+//     outlives the screen, so a run can span two paths. Reading the path once at
+//     start records something that may simply not be true of the bytes measured
+//     — and the old code did exactly that under a comment arguing for it.
+//
+//     SABOTAGES RUN:
+//       a. `isAttributable` returning `true` unconditionally — the "changed"
+//          check goes red, the single-path one stays green;
+//       b. `record` appending unconditionally — a stable run reports a change.
+do {
+    check(SpeedTestPath.current(connected: false, directMode: false) == .vpnOff,
+          "no tunnel ⇒ VPN off")
+    check(SpeedTestPath.current(connected: true, directMode: false) == .throughVPN,
+          "connected, not DIRECT ⇒ through the tunnel")
+    check(SpeedTestPath.current(connected: true, directMode: true) == .directMode,
+          "🚨 DIRECT is labelled, never refused — measuring without the tunnel is the arm users want")
+
+    var stable = SpeedTestPathTrace(.throughVPN)
+    stable.record(.throughVPN)
+    stable.record(.throughVPN)
+    check(stable.isAttributable && stable.label == SpeedTestPath.throughVPN.rawValue,
+          "a run that stayed put is attributable and says so plainly")
+
+    var moved = SpeedTestPathTrace(.throughVPN)
+    moved.record(.directMode)
+    check(!moved.isAttributable,
+          "🚨 a run whose route changed is NOT attributable to either path")
+    check(moved.label.contains("CHANGED"),
+          "🚨 and the result says so instead of picking one of them")
+
+    var andBack = SpeedTestPathTrace(.throughVPN)
+    andBack.record(.directMode)
+    andBack.record(.throughVPN)
+    check(andBack.seen.count == 3,
+          "returning to the first path is two changes, not zero — the run still spanned both")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 27. THE SERVER LIST IS DESCRIBED BY THE PATH IT WAS FETCHED ON.
+//
+//     Ookla builds the list from the apparent IP, so it is "near your exit" with
+//     the tunnel up and "near you" with it down. The header used to be computed
+//     from the LIVE tunnel state while the rows were whatever had been fetched
+//     earlier — so after a switch it confidently described a neighbourhood the
+//     rows did not come from. A header that lies is worse than none.
+//
+//     SABOTAGES RUN:
+//       a. `header(now:)` ignoring `fetchedOn` and branching on `now` — the
+//          stale-header check reddens, the fresh one stays green;
+//       b. `staleNotice` returning nil always.
+do {
+    let picker = source("VKTurnProxy/VKTurnProxy/SpeedTestServerPicker.swift")
+    let list = SpeedTestServerList(servers: [], fetchedOn: .throughVPN)
+
+    check(list.header(now: .throughVPN) == "Servers near your EXIT",
+          "a fresh list names the exit's neighbourhood")
+    check(list.header(now: .vpnOff).contains("before the route changed"),
+          "a stale list says so")
+    // 🚨 THE DISCRIMINATING CASE, and the reason this check exists at all: the
+    // rows were fetched through the tunnel, we are now looking at them with the
+    // tunnel off, and the header must still describe THE ROWS — near the EXIT —
+    // not where the device is now. An earlier version of this section only
+    // asserted the "before the route changed" suffix, which comes from isStale;
+    // it stayed GREEN when header() was rewired to branch on `now`.
+    check(list.header(now: .vpnOff).contains("near your EXIT"),
+          "🚨 a stale header describes the ROWS' neighbourhood, not the current one")
+    check(SpeedTestServerList(servers: [], fetchedOn: .vpnOff)
+            .header(now: .throughVPN).contains("near you")
+          && !SpeedTestServerList(servers: [], fetchedOn: .vpnOff)
+            .header(now: .throughVPN).contains("EXIT"),
+          "🚨 and the same the other way round — a list fetched off-VPN never claims the exit")
+    check(list.staleNotice(now: .vpnOff) != nil && list.staleNotice(now: .throughVPN) == nil,
+          "the notice appears only when the rows and the route disagree")
+    check(list.staleNotice(now: .vpnOff)?.contains("pinned server is unaffected") == true,
+          "🚨 and it does NOT clear the pin — pinning one id across tunnel states is the " +
+          "only thing that makes a VPN-on/off pair comparable")
+    check(picker.contains("runner.serverList?.header(now: livePath)"),
+          "🚨 the picker asks the LIST for its header instead of computing one from the live state")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. 🚨 THE Go↔Swift WIRE CONTRACT, WHICH FAILS ASYMMETRICALLY.
+//
+//     A field Go sends and Swift ignores is silent and harmless. A non-Optional
+//     Swift CodingKey for a field Go does NOT send is FATAL: the synthesized
+//     decoder throws, and the screen sits at "running" for ever.
+//
+//     So this checks BOTH directions over the Go source of truth.
+//
+//     SABOTAGES RUN:
+//       a. remove `window_sec` from the Swift CodingKeys — "decoded by Swift"
+//          reddens;
+//       b. add a bogus `case ghost = "ghost"` key — "sent by Go" reddens.
+do {
+    let goSrc = source("pkg/speedtest/speedtest.go")
+    let swiftSrc = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+
+    // Every `json:"name"` tag inside one Go struct. Plain scanning, no regex
+    // literals: a `"` cannot appear inside one.
+    func goTags(after marker: String) -> Set<String> {
+        guard let start = goSrc.range(of: marker) else {
+            check(false, "🚨 anchor \(marker) missing from the Go source — every check below would be vacuous")
+            return []
+        }
+        var body = String(goSrc[start.upperBound...])
+        if let close = body.range(of: "\n}\n") { body = String(body[..<close.lowerBound]) }
+        var out = Set<String>()
+        for piece in body.components(separatedBy: "json:\"").dropFirst() {
+            let tag = piece.prefix { $0 != "\"" && $0 != "," }
+            if !tag.isEmpty { out.insert(String(tag)) }
+        }
+        return out
+    }
+
+    let phaseTags = goTags(after: "type Phase struct")
+    let progressTags = goTags(after: "type Progress struct")
+    check(phaseTags.count > 8 && progressTags.count > 8,
+          "the Go structs were parsed (\(phaseTags.count) phase, \(progressTags.count) progress fields)")
+
+    // Every wire name Swift will accept: the renamed `case x = "y"` form plus the
+    // bare `case a, b, c` form, where the property name IS the wire name.
+    var swiftKeys = Set<String>()
+    for line in swiftSrc.components(separatedBy: "\n") {
+        let t = line.trimmingCharacters(in: CharacterSet.whitespaces)
+        guard t.hasPrefix("case ") else { continue }
+        let rest = String(t.dropFirst(5))
+        if let eq = rest.range(of: "= \"") {
+            let name = rest[eq.upperBound...].prefix { $0 != "\"" }
+            swiftKeys.insert(String(name))
+        } else {
+            for name in rest.components(separatedBy: ",") {
+                let n = name.trimmingCharacters(in: CharacterSet.whitespaces)
+                if !n.isEmpty && !n.contains(" ") { swiftKeys.insert(n) }
+            }
+        }
+    }
+    check(swiftKeys.count > 15, "the Swift CodingKeys were parsed (\(swiftKeys.count) keys)")
+
+    // Every field Go sends must be decoded — otherwise it silently never reaches
+    // the screen, which is how warmup_sec was shipped and then dropped.
+    let goAll = phaseTags.union(progressTags)
+    let undecoded = goAll.subtracting(swiftKeys)
+    check(undecoded.isEmpty,
+          "🚨 every field Go sends is decoded by Swift (missing: \(undecoded.sorted()))")
+
+    // And nothing Swift insists on may be absent from Go.
+    let unknown = swiftKeys.subtracting(goAll)
+    check(unknown.isEmpty,
+          "🚨 Swift decodes nothing Go does not send — a key Go dropped throws and freezes the screen (extra: \(unknown.sorted()))")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 29. THE SPEED TEST'S KEYS ARE NOT OBSERVED BY THE NAVIGATION HOST.
+//
+//     An unused @AppStorage is still SUBSCRIBED, so declaring one of these in
+//     ContentView — which hosts the NavigationView — makes any write tear down
+//     whatever is pushed. That is the build-177/issue-65 pop trap.
+do {
+    let content = source("VKTurnProxy/VKTurnProxy/ContentView.swift")
+    check(!content.contains("speedTest"),
+          "🚨 no speedTest @AppStorage key is declared in the NavigationView host")
+    check(content.contains("SpeedTestView(tunnel: tunnel)"),
+          "and the screen is reached from MainNavigationLinks, which does not observe the tunnel")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 30. A POLL THAT CANNOT BE READ MUST SAY SO, NOT FREEZE.
+//
+//     The decode used to be `try?` with a bare `return`: a wire mismatch left the
+//     screen on its last value, the 2 Hz timer never invalidated and the Run
+//     button never came back. Killing the app was the only way out.
+do {
+    let runner = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+    check(!runner.contains("try? JSONDecoder().decode(SpeedTestProgress.self"),
+          "🚨 the progress decode is not silently discarded")
+    check(runner.contains("stopPolling()"),
+          "and there is one place that stops the timer")
+    let poll = runner.range(of: "private func poll()")
+    let body = poll.map { String(runner[$0.lowerBound...].prefix(1400)) } ?? ""
+    check(body.contains("catch"),
+          "🚨 a decode failure is caught")
+    check(body.contains("built from different versions"),
+          "🚨 and reported as what it is — the app and the engine disagreeing about the wire")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

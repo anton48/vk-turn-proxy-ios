@@ -30,7 +30,15 @@ struct SpeedTestView: View {
             serverSection
             testSection
             runSection
-            if runner.progress.state != "idle" { resultSection }
+            if let run = runner.startedRun, runner.progress.state != "idle" {
+                Section {
+                    SpeedTestResultView(run: run,
+                                        progress: runner.progress,
+                                        path: runner.pathTrace)
+                } header: {
+                    Text("Result")
+                }
+            }
         }
         .navigationTitle("Speed test")
         .navigationBarTitleDisplayMode(.inline)
@@ -83,9 +91,27 @@ struct SpeedTestView: View {
         } header: {
             Text("Test")
         } footer: {
-            Text("Duration is a ceiling: the engine stops early once the rate steadies, "
-                 + "so the result reports how long each direction really ran. "
-                 + "Keep the app open — the test stops if you leave it.")
+            // 🚨 BOTH HALVES OF THIS USED TO BE FALSE.
+            //   - "the engine stops early" is not true in Research mode, whose
+            //     toggle is eleven lines above: two adjacent controls contradicting
+            //     each other on screen. The sentence is now conditional.
+            //   - "the test stops if you leave it" was implemented NOWHERE. iOS
+            //     suspends the process; the phase's timer then fires on resume,
+            //     the duration spans the suspended interval, and the result is a
+            //     collapsed rate explained by a warning about the estimator —
+            //     precisely the "true statement offered as the wrong reason" this
+            //     screen's own warnings are split to avoid. Say what actually
+            //     happens instead of promising a stop nothing performs.
+            Text(research
+                 ? "Research mode holds the full duration: a warm-up is discarded and the "
+                   + "rest is measured as a fixed window, so runs at different thread counts "
+                   + "can be compared. Keep the app open and on this screen — iOS suspends "
+                   + "the app in the background, which corrupts the timing rather than "
+                   + "stopping the run."
+                 : "Duration is a ceiling: the engine stops early once the rate steadies, so "
+                   + "the result reports how long each direction really ran. Keep the app open "
+                   + "and on this screen — iOS suspends the app in the background, which "
+                   + "corrupts the timing rather than stopping the run.")
         }
     }
 
@@ -102,6 +128,14 @@ struct SpeedTestView: View {
                     Button("Stop") { runner.cancel() }
                         .foregroundColor(.red)
                 }
+                // Surfaced WHILE running, not only afterwards: if the route
+                // moves now, the user can stop and re-run instead of finding out
+                // at the end that the number belongs to neither path.
+                if !runner.pathTrace.isAttributable {
+                    Label(runner.pathTrace.label, systemImage: "arrow.triangle.branch")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
             } else {
                 if let refusal = runner.refusal {
                     Label(refusal, systemImage: "exclamationmark.triangle")
@@ -109,9 +143,9 @@ struct SpeedTestView: View {
                         .foregroundColor(.orange)
                 }
                 Button {
-                    runner.start(serverID: serverID, threads: threads,
-                                 direction: direction, durationSec: durationSec,
-                                 research: research)
+                    runner.start(serverID: serverID, serverLabel: serverLabel,
+                                 threads: threads, direction: direction,
+                                 durationSec: durationSec, research: research)
                 } label: {
                     Text("Run").frame(maxWidth: .infinity)
                 }
@@ -119,78 +153,4 @@ struct SpeedTestView: View {
         }
     }
 
-    // MARK: Result
-
-    @ViewBuilder
-    private var resultSection: some View {
-        let p = runner.progress
-        Section {
-            if p.state == "error" {
-                Label(p.error ?? "unknown error", systemImage: "exclamationmark.triangle")
-                    .foregroundColor(.red)
-            } else {
-                if direction != "upload" { phaseRow("Download", p.download) }
-                if direction != "download" { phaseRow("Upload", p.upload) }
-                metadata(p)
-            }
-        } header: {
-            Text("Result")
-        }
-    }
-
-    @ViewBuilder
-    private func phaseRow(_ title: String, _ phase: SpeedTestPhase) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(title).font(.headline)
-                Spacer()
-                Text(String(format: "%.1f Mbit/s", phase.rawMbps))
-                    .font(.headline.monospacedDigit())
-            }
-            // Both figures, always. They answer different questions and it is
-            // normal for them to disagree: the engine's own number is weighted
-            // to the last seconds of the run, the raw one is the average.
-            Text(String(format: "engine %.1f · raw %.1f · %.1fs of %ds",
-                        phase.libraryMbps, phase.rawMbps, phase.actualSec, p_requested))
-                .font(.caption.monospacedDigit())
-                .foregroundColor(.secondary)
-            if phase.confirmedRatio > 0 && phase.confirmedRatio < 0.999 {
-                Text(String(format: "confirmed %.1f%%", phase.confirmedRatio * 100))
-                    .font(.caption.monospacedDigit())
-                    .foregroundColor(.secondary)
-            }
-            ForEach(phase.warnings ?? [], id: \.self) { w in
-                Label(w, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundColor(.orange)
-            }
-        }
-        .padding(.vertical, 2)
-    }
-
-    private var p_requested: Int { runner.progress.requestedSec }
-
-    @ViewBuilder
-    private func metadata(_ p: SpeedTestProgress) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            // 🚨 Mandatory, not decoration: this is the "label it, do not refuse
-            // it" decision made visible. Without it a DIRECT-mode run reads as
-            // VPN speed.
-            Text(runner.path.rawValue).font(.caption.bold())
-            if !p.serverDesc.isEmpty {
-                Text("\(p.serverDesc) · id \(p.serverID)").font(.caption)
-            }
-            if p.pingMs > 0 {
-                Text(String(format: "ping %.0f ms · threads %d · %@",
-                            p.pingMs, p.threads, p.estimator)).font(.caption)
-            }
-            if !p.ooklaSeesIP.isEmpty {
-                // Named for whose view it is: measured 2026-08-20 to differ from
-                // this device's actual address by a whole address.
-                Text("seen by Ookla as \(p.ooklaSeesIP) (\(p.ooklaSeesISP))").font(.caption)
-            }
-            Text(p.engine).font(.caption)
-        }
-        .foregroundColor(.secondary)
-    }
 }

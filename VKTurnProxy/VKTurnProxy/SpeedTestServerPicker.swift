@@ -18,10 +18,18 @@ struct SpeedTestServerPicker: View {
 
     @State private var query = ""
 
+    /// The route RIGHT NOW — used only to ask the list whether it is stale, never
+    /// to describe the rows.
+    private var livePath: SpeedTestPath {
+        .current(connected: tunnel.status == .connected, directMode: tunnel.directMode)
+    }
+
+    /// 🚨 Asked of the LIST, which knows what it was fetched under. This used to
+    /// be computed from the live tunnel state while the rows below were whatever
+    /// had been fetched earlier, so after a VPN → DIRECT switch the header
+    /// described a neighbourhood the rows did not come from.
     private var neighbourhood: String {
-        tunnel.status == .connected && !tunnel.directMode
-            ? "Servers near your EXIT"
-            : "Servers near you"
+        runner.serverList?.header(now: livePath) ?? "Servers"
     }
 
     private var filtered: [SpeedTestServer] {
@@ -59,6 +67,15 @@ struct SpeedTestServerPicker: View {
                         .foregroundColor(.orange)
                     Button("Try again") { runner.loadServers() }
                 } else {
+                    if let notice = runner.serverList?.staleNotice(now: livePath) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label(notice, systemImage: "arrow.triangle.branch")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                            Button("Reload for this route") { runner.loadServers() }
+                                .font(.caption)
+                        }
+                    }
                     ForEach(filtered) { server in
                         Button {
                             serverID = server.id
