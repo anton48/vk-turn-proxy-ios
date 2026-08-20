@@ -93,10 +93,15 @@ struct SpeedTestResultView: View {
         let pct = String(format: "confirmed %.1f%%", p.confirmedRatio * 100)
         guard p.backlogBytes > 0 else { return pct }
         let mb = String(format: "%.1f MB", Double(p.backlogBytes) / 1e6)
+        // 🚨 "OUTSTANDING", NEVER "CANCELLED" OR "NEVER CONFIRMED". The counter
+        // is read at the cutoff, so what is true of these bytes is that they
+        // had not been confirmed YET — some of them are confirmed during the
+        // cleanup that follows, and the wording must not claim their final
+        // fate, which this side never observes.
         if p.backlogTailBytes > 0 && p.backlogBytes <= p.backlogTailBytes {
-            return pct + " — \(mb) was still in flight when the phase ended (normal)"
+            return pct + " — \(mb) still in flight when the window closed (expected)"
         }
-        return pct + " — \(mb) pushed and never confirmed"
+        return pct + " — \(mb) outstanding at the cutoff, more than the workers can hold"
     }
 
     /// 🚨 NOTHING IS SUBTRACTED HERE. The warm-up and the window arrive already

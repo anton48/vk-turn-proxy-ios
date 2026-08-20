@@ -1616,7 +1616,7 @@ do {
     check(upLine.contains("confirmed=93.9%"),
           "an UPLOAD still reports the ratio — it is a fact, and 0% against a large backlog is "
           + "what identified the 307 endpoint")
-    check(upLine.contains("tail of 32 cancelled uploads"),
+    check(upLine.contains("held in flight by 32 workers at the cutoff"),
           "🚨 and the backlog QUALIFIES ITSELF: 29.5MB is under the 32.0MB ceiling of one "
           + "in-flight chunk per worker, so it is a normal end of phase, not refusal")
 
@@ -1630,7 +1630,7 @@ do {
                                                             durationSec: 30),
                                          progress: { var p = SpeedTestProgress(); p.upload = broken; return p }(),
                                          path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
-    check(!brokenLine.contains("tail of"),
+    check(!brokenLine.contains("held in flight by"),
           "🚨 a backlog the tail CANNOT explain is not qualified away — 45.8MB against 8 workers "
           + "is the Frankfurt 307 shape, and that is the case the field was added for")
 
@@ -1680,9 +1680,12 @@ do {
           "🚨 and the SCREEN names it too — a 35s arm that reads as 30s is how two different "
           + "experiments get compared as one")
 
-    check(view.contains("backlogTailBytes") && view.contains("still in flight when the phase ended"),
-          "🚨 and it EXPLAINS a shortfall the cancellation tail accounts for, instead of showing a "
+    check(view.contains("backlogTailBytes") && view.contains("still in flight when the window closed"),
+          "🚨 and it EXPLAINS a shortfall the in-flight chunks account for, instead of showing a "
           + "bare 93.9% whose reason lives only in a log and a memory file")
+    check(!view.contains("never confirmed") && !view.contains("cancelled"),
+          "🚨 and it does NOT claim those bytes were cancelled or never confirmed — the counter "
+          + "is read at the CUTOFF, so their final fate is something this side never observes")
 }
 
 print("")

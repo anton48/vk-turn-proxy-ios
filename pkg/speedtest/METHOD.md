@@ -153,3 +153,36 @@ long the engine takes to stop.
 arm's window is whatever its workers allowed; after it, the window is the one
 that was asked for. ⚠️ The 60-allocation T16 and T32 means from
 `20.08/speedtest0` are indicative for that reason, not final.
+
+## Method 8 — the window's boundary stops racing the engine, and the last field changes scope
+
+**Method 7's window could silently not happen.** The wrapper's close sample and
+the engine's own stop were armed for the SAME instant — `SetCaptureTime` was
+`warm-up + requested`, and the close timer fired at the same moment — so which
+one ran first was the scheduler's business. Worse, the timer was armed *after*
+the warm-up sample returned, so it inherited that timer's scheduling delay and
+was biased to lose. A lost sample fell back to the phase's own end: the
+pre-Method-7 variable window, wearing a fixed window's label, in silence.
+
+⇒ the engine is now given `warm-up + requested + 2s`, so the window closes while
+it is still pushing; both boundaries are absolute, anchored on the phase start;
+and a window that was asked for and NOT closed says so in a warning instead of
+falling back quietly.
+
+**And `consistent` / `implied_sec` were still the phase's.** Every other
+qualifying figure had moved to the window — raw, window bytes, backlog, confirmed
+— while the consistency check compared the engine's rate against the whole
+phase's bytes over the whole phase's duration, cleanup included. A reader doing
+the arithmetic the line invites uses the window figures printed on it, so a
+CORRECT research line could fail its own check. Both are computed from the window
+now. *(Same defect as the phase-scoped confirmed ratio in Method 6, one field
+along; the third time this scope has had to be chased.)*
+
+**Wording, because the sampling point moved.** At the cutoff the outstanding
+bytes are exactly that — outstanding. Some are confirmed during the cleanup that
+follows, so nothing may call them *cancelled*, *refused* or *never confirmed*;
+the log, the screen and the warning all say *held in flight at the cutoff* /
+*had been confirmed when the window closed*.
+
+⇒ **Do not compare a research figure from Method 7 with one from Method 8**: a
+Method 7 run cannot be known to have enforced its window.

@@ -145,7 +145,7 @@ enum SpeedTestLog {
             // this clause the figure grows with the thread count and reads as
             // the server refusing more and more.
             if p.backlogTailBytes > 0 && p.backlogBytes <= p.backlogTailBytes {
-                s += String(format: "(≤%.1fMB tail of %d cancelled uploads)",
+                s += String(format: "(≤%.1fMB held in flight by %d workers at the cutoff)",
                             Double(p.backlogTailBytes) / 1e6, threads)
             }
         }

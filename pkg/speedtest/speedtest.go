@@ -77,7 +77,7 @@ const forkRevision = 5
 // under which a figure is published. Not for wording, UI or tests.
 // TestEngineVersionNamesEveryMethodRevision fails if this and METHOD.md
 // disagree.
-const methodRevision = 7
+const methodRevision = 8
 
 // EngineVersion is reported beside every result so a number can be traced to the
 // code that produced it. The upstream version is READ FROM THE LIBRARY rather
@@ -223,10 +223,14 @@ type Phase struct {
 	CleanupSec float64 `json:"cleanup_sec"`
 
 	// BacklogTailBytes is how much of the backlog a NORMAL end of phase
-	// explains: every worker has one chunk in flight when the phase stops, and
-	// those bytes are pushed and never confirmed through no fault of the
-	// server. Printed beside the backlog so the number qualifies itself
-	// instead of reading as refusal — see confirmRatio.
+	// explains: every worker has one chunk in flight when the window closes.
+	//
+	// 🚨 THOSE BYTES ARE OUTSTANDING, NOT REFUSED AND NOT LOST. Since the
+	// counter is now read AT THE CUTOFF rather than after the engine unwinds,
+	// some of them are confirmed during the cleanup that follows — so nothing
+	// here may call them cancelled or never-confirmed. What is true of them is
+	// only that they had not been confirmed YET. Printed beside the backlog so
+	// the number qualifies itself instead of reading as refusal.
 	BacklogTailBytes int64 `json:"backlog_tail_bytes"`
 
 	// Warnings is what the UI shows instead of a bare number when the figure
@@ -506,6 +510,10 @@ func describe(list stgo.Servers) []ServerInfo {
 // runPlan is everything the engine is configured with, decided in ONE place.
 //
 // It exists because the three settings are entangled: research mode needs the
+// closeGuard keeps the wrapper's window-close sample strictly BEFORE the
+// engine's own stop, so the two are not racing for the same instant.
+const closeGuard = 2 * time.Second
+
 // capture time EXTENDED to cover a warm-up it then discards, AND early stop
 // turned off, or the "fixed window" it promises is neither fixed nor a window.
 // Deciding them at three call sites is how the previous version ended up
@@ -571,7 +579,18 @@ func plan(cfg Config) (runPlan, error) {
 
 	if cfg.Research {
 		p.warmup = researchWarmup
-		p.capture = p.requested + p.warmup
+		// 🚨 THE ENGINE IS GIVEN A LATER DEADLINE THAN THE WINDOW, DELIBERATELY.
+		// Both used to expire at the same instant — the engine's
+		// time.AfterFunc(captureTime) and the wrapper's window-close sample —
+		// so which one ran first was the scheduler's business, and losing the
+		// race meant the sample was never taken and the window silently
+		// reverted to the variable one this whole mechanism exists to replace.
+		// A lost sample that falls back QUIETLY is the worst of the three
+		// possible outcomes.
+		// ⚖️ The guard costs the engine a little extra pushing AFTER the window
+		// has closed; those bytes are outside the measurement and the time is
+		// reported as cleanup.
+		p.capture = p.requested + p.warmup + closeGuard
 		p.earlyStop = false
 		p.mode = fmt.Sprintf("research · %.0fs warm-up discarded · fixed %.0fs window",
 			p.warmup.Seconds(), p.requested.Seconds())
@@ -774,7 +793,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		// counted into this phase's connection figures.
 		meas.conns.reset()
 		start := time.Now()
-		ws, cs, err := runPhase(ctx, pl.warmup, pl.closeWindow(), spec.sample, spec.run)
+		ws, cs, err := runPhase(ctx, start, pl.warmup, pl.closeWindow(), spec.sample, spec.run)
 		end := time.Now()
 		used, dials := meas.conns.stats()
 		endBytes, endBacklog := spec.sample()
@@ -900,17 +919,23 @@ type warmSample struct {
 // depends on its arms being the same length. `window > 0` asks for that second
 // boundary; a phase that ends before it (early stop, a cancel) leaves the
 // sample not-ok and the caller falls back to the end of the phase.
-func runPhase(ctx context.Context, warmup, window time.Duration, sample func() (bytes, backlog int64), run func(context.Context) error) (warm, closed warmSample, err error) {
+func runPhase(ctx context.Context, start time.Time, warmup, window time.Duration, sample func() (bytes, backlog int64), run func(context.Context) error) (warm, closed warmSample, err error) {
 	if warmup <= 0 {
 		return warmSample{}, warmSample{}, phaseErr(ctx, run(ctx))
 	}
+	// 🚨 BOTH BOUNDARIES ARE ABSOLUTE, ANCHORED ON THE PHASE'S START. Arming the
+	// close timer for `window` AFTER the warm-up sample returns adds the warm-up
+	// timer's own scheduling delay to it, which is exactly the wrong direction:
+	// it pushes the close later, toward the engine's stop.
+	warmAt := start.Add(warmup)
+	closeAt := start.Add(warmup + window)
 	type pair struct{ warm, closed warmSample }
 	ch := make(chan pair, 1)
 	done := make(chan struct{})
 	go func() {
 		var p pair
 		p.warm.warmup = warmup
-		warmTimer := time.NewTimer(warmup)
+		warmTimer := time.NewTimer(time.Until(warmAt))
 		defer warmTimer.Stop()
 		select {
 		case <-warmTimer.C:
@@ -924,7 +949,10 @@ func runPhase(ctx context.Context, warmup, window time.Duration, sample func() (
 			return
 		}
 		if window > 0 {
-			closeTimer := time.NewTimer(window)
+			// Records what was ASKED for, so a sample that never happened can
+			// be told from one that was never wanted — the caller warns on it.
+			p.closed.warmup = window
+			closeTimer := time.NewTimer(time.Until(closeAt))
 			defer closeTimer.Stop()
 			select {
 			case <-closeTimer.C:
@@ -967,6 +995,7 @@ func applyWindow(p Phase, s, closed warmSample, start, end time.Time, endBytes, 
 		p.WindowSec = p.ActualSec
 		p.WindowBytes = p.Bytes
 		p.BacklogBytes = endBacklog
+		p = consistency(p, p.Bytes, p.ActualSec)
 		if s.warmup > 0 {
 			p.Warnings = append(p.Warnings, fmt.Sprintf(
 				"the phase ended before the %.0fs warm-up did, so no measurement window opened — "+
@@ -988,9 +1017,26 @@ func applyWindow(p Phase, s, closed warmSample, start, end time.Time, endBytes, 
 	if closed.ok {
 		windowEnd, windowBytes, windowBacklog = closed.at, closed.bytes, closed.backlog
 		p.CleanupSec = end.Sub(closed.at).Seconds()
+	} else if closed.warmup > 0 {
+		// 🚨 ASKED FOR AND NOT TAKEN. Falling back to the phase's own end is
+		// the OLD behaviour — a variable window wearing a fixed window's label
+		// — and it is the one outcome that must never be silent, because every
+		// figure on the line stays plausible while the experiment changes
+		// underneath it.
+		p.Warnings = append(p.Warnings, fmt.Sprintf(
+			"the %.0fs window could not be closed on time, so this figure covers the phase to "+
+				"its end instead — not comparable with a run whose window held",
+			closed.warmup.Seconds()))
 	}
 	p.WindowSec = windowEnd.Sub(s.at).Seconds()
 	p.WindowBytes = windowBytes - s.bytes
+	// 🚨 THE CONSISTENCY CHECK MOVES WITH EVERYTHING ELSE. It was computed in
+	// measure() from the WHOLE phase against the whole phase's duration, so
+	// after the window was split out it was the last field still speaking in a
+	// different scope — the same defect §333 fixed for confirmed/backlog, one
+	// field along. A reader doing the arithmetic the line invites uses the
+	// window figures printed on it, so the check has to use them too.
+	p = consistency(p, p.WindowBytes, p.WindowSec)
 	// 🚨 THE BACKLOG IS SCOPED TO THE WINDOW TOO, and that is not pedantry: the
 	// confirmation ratio exists to qualify the RATE, and the rate covers the
 	// window. A phase-scoped ratio qualifies a number that appears nowhere —
@@ -1064,9 +1110,9 @@ func confirmRatio(p Phase, upload bool, threads int) Phase {
 	unexplained := p.BacklogBytes - p.BacklogTailBytes
 	if p.ConfirmedKnown && p.ConfirmedRatio < 0.95 && unexplained > 0 {
 		p.Warnings = append(p.Warnings, fmt.Sprintf(
-			"only %.0f%% of uploaded bytes were confirmed by the server — %.1f MB more backlog "+
-				"than %d cancelled chunks can explain", p.ConfirmedRatio*100,
-			float64(unexplained)/1e6, threads))
+			"only %.0f%% of the uploaded bytes had been confirmed when the window closed — "+
+				"%.1f MB more outstanding than %d in-flight chunks explain",
+			p.ConfirmedRatio*100, float64(unexplained)/1e6, threads))
 	}
 	return p
 }
@@ -1122,38 +1168,51 @@ func measure(libBytesPerSec float64, bytes int64, start, end time.Time, isUpload
 		sec = 0.001
 	}
 	lib := libBytesPerSec * 8 / 1e6
-	implied := 0.0
-	if lib > 0 {
-		implied = float64(bytes) * 8 / 1e6 / lib
-	}
-	// A phase that moved nothing is NOT "consistent" — there is simply nothing to
-	// compare, and letting the flag stand green on an empty run is how a broken
-	// endpoint would slip past a caller that checks the flag and not the bytes.
-	consistent := bytes > 0 && lib > 0
-	if consistent && implied > 0 && sec > 0 {
-		r := implied / sec
-		consistent = r > 0.75 && r < 1.25
-	}
 	p := Phase{
 		LibraryMbps: lib,
 		Bytes:       bytes,
 		ActualSec:   sec,
-		ImpliedSec:  implied,
-		Consistent:  consistent,
 	}
-	// The backlog and the confirmation ratio belong to applyWindow, which knows
-	// the window: see confirmRatio.
+	// ImpliedSec and Consistent are NOT set here: they belong to the window,
+	// and only applyWindow knows it. Computing them from the whole phase left
+	// the one qualifying field on the line still speaking in the phase's scope
+	// after everything else had moved to the window's.
+	// The backlog and the confirmation ratio belong to applyWindow too: see
+	// confirmRatio.
 	if isUpload && bytes == 0 {
 		p.Warnings = append(p.Warnings, "the server confirmed NOTHING — the endpoint may be redirecting or rejecting uploads")
 	}
-	// Two different failures, two different sentences. An empty phase is already
-	// explained by the warning above; adding "the estimator is weighted to the
-	// last seconds" there would offer a true statement about the engine as if it
-	// were the reason nothing moved.
-	if !consistent && bytes > 0 {
+	return p
+}
+
+// consistency compares the engine's own rate against the bytes and the seconds
+// the line PRINTS, and is the only writer of ImpliedSec and Consistent.
+//
+// 🚨 IT TAKES THE WINDOW, NOT THE PHASE. The check exists so a reader can do the
+// arithmetic the line invites — and every other figure beside it is the
+// window's, so measuring against the phase (warm-up and the engine's unwinding
+// included) made a CORRECT line fail its own check, and an inconsistent one pass.
+// Same defect as the phase-scoped confirmed ratio, one field along.
+func consistency(p Phase, bytes int64, sec float64) Phase {
+	if p.LibraryMbps > 0 {
+		p.ImpliedSec = float64(bytes) * 8 / 1e6 / p.LibraryMbps
+	}
+	// A window that moved nothing is NOT "consistent" — there is nothing to
+	// compare, and a flag standing green on an empty run is how a broken
+	// endpoint slips past a caller that checks the flag and not the bytes.
+	p.Consistent = bytes > 0 && p.LibraryMbps > 0
+	if p.Consistent && p.ImpliedSec > 0 && sec > 0 {
+		r := p.ImpliedSec / sec
+		p.Consistent = r > 0.75 && r < 1.25
+	}
+	// Two different failures, two different sentences. An empty window is
+	// already explained by the "confirmed NOTHING" warning; adding "the
+	// estimator is weighted to the last seconds" there would offer a true
+	// statement about the engine as if it were the reason nothing moved.
+	if !p.Consistent && bytes > 0 {
 		p.Warnings = append(p.Warnings, fmt.Sprintf(
-			"the reported rate implies %.1fs of data but the phase ran %.1fs — the engine's estimator is weighted to the last seconds, so treat the raw figure as the average",
-			implied, sec))
+			"the reported rate implies %.1fs of data but the measured window was %.1fs — the engine's estimator is weighted to the last seconds, so treat the raw figure as the average",
+			p.ImpliedSec, sec))
 	}
 	return p
 }

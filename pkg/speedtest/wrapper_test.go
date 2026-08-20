@@ -105,9 +105,17 @@ func TestPlanRefusesConfigsTheCSurfaceCouldDeliver(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if p.capture != 20*time.Second {
-			t.Errorf("capture %v, want 20s (15s window + 5s warm-up) — a warm-up discarded "+
-				"without extending the capture shortens the window it was meant to protect", p.capture)
+		// 🚨 THE ENGINE MUST OUTLIVE THE WINDOW, not merely cover it. Equal
+		// deadlines put the wrapper's window-close sample and the engine's own
+		// stop in a race, and losing it reverts to the variable window in
+		// silence — so the assertion is the INEQUALITY, with the literal beside
+		// it to catch an accidental change of the guard.
+		if p.capture <= p.warmup+p.requested {
+			t.Errorf("capture %v does not outlive the %v window plus its %v warm-up — the "+
+				"close sample and the engine's stop would race", p.capture, p.requested, p.warmup)
+		}
+		if p.capture != 15*time.Second+5*time.Second+closeGuard {
+			t.Errorf("capture %v, want 15s window + 5s warm-up + %v guard", p.capture, closeGuard)
 		}
 		if p.earlyStop {
 			t.Error("early stop still on: the fixed window is neither fixed nor a window")
@@ -165,7 +173,7 @@ func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
 
 	const warm = 30 * time.Millisecond
 	for i := 0; i < 200; i++ {
-		s, _, err := runPhase(context.Background(), warm, 0,
+		s, _, err := runPhase(context.Background(), time.Now(), warm, 0,
 			func() (int64, int64) { return counter.Load(), 0 },
 			// Ends AT the boundary: the goroutine is racing us to send.
 			func(context.Context) error { time.Sleep(warm); return nil })
@@ -185,7 +193,7 @@ func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
 
 // A phase shorter than its own warm-up must not produce a rate.
 func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
-	s, _, err := runPhase(context.Background(), 500*time.Millisecond, 0,
+	s, _, err := runPhase(context.Background(), time.Now(), 500*time.Millisecond, 0,
 		func() (int64, int64) { return 0, 0 },
 		func(context.Context) error { time.Sleep(20 * time.Millisecond); return nil })
 	if err != nil {
@@ -522,8 +530,8 @@ func TestCancellationTailIsNotReportedAsRefusal(t *testing.T) {
 			"without it", p.BacklogTailBytes, 32*uploadChunkBytes)
 	}
 	for _, w := range p.Warnings {
-		if strings.Contains(w, "confirmed by the server") {
-			t.Errorf("warned about the cancellation tail: %q\n"+
+		if strings.Contains(w, "more outstanding than") {
+			t.Errorf("warned about the in-flight chunks: %q\n"+
 				"backlog %.1f MB against a %.1f MB ceiling of in-flight chunks",
 				w, 29.5, float64(32*uploadChunkBytes)/1e6)
 		}
@@ -554,9 +562,9 @@ func TestABrokenEndpointStillWarns(t *testing.T) {
 	}
 	found := false
 	for _, w := range p.Warnings {
-		if strings.Contains(w, "confirmed by the server") {
+		if strings.Contains(w, "more outstanding than") {
 			found = true
-			if !strings.Contains(w, "more backlog") {
+			if !strings.Contains(w, "in-flight chunks explain") {
 				t.Errorf("the warning does not say how much is UNEXPLAINED: %q", w)
 			}
 		}
@@ -643,7 +651,7 @@ func TestRunPhaseSamplesAtTheWindowBoundary(t *testing.T) {
 	defer close(stop)
 
 	sample := func() (int64, int64) { return atomic.LoadInt64(&counter), 0 }
-	warm, closed, err := runPhase(context.Background(), 50*time.Millisecond, 100*time.Millisecond,
+	warm, closed, err := runPhase(context.Background(), time.Now(), 50*time.Millisecond, 100*time.Millisecond,
 		sample,
 		func(context.Context) error {
 			// The engine returns LATE — this is the unwinding the fix exists for.
@@ -699,8 +707,81 @@ func TestOnlyResearchModeEnforcesAWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(src), "runPhase(ctx, pl.warmup, pl.closeWindow()") {
+	if !strings.Contains(string(src), "runPhase(ctx, start, pl.warmup, pl.closeWindow()") {
 		t.Error("runPhase is not called with pl.closeWindow() — the plan can enforce whatever " +
 			"it likes if the phase loop does not pass it")
+	}
+}
+
+// 🚨 A WINDOW THAT WAS ASKED FOR AND NOT CLOSED MUST SAY SO. Falling back to the
+// phase's own end is the pre-Method-7 behaviour — a variable window wearing a
+// fixed window's label — and silence there leaves every figure on the line
+// plausible while the experiment changes underneath it.
+func TestALostCloseSampleIsAnnounced(t *testing.T) {
+	start := time.Now()
+	warmAt := start.Add(5 * time.Second)
+	end := start.Add(38 * time.Second)
+
+	p := applyWindow(measure(1e6, 1000e6, start, end, true),
+		warmSample{warmup: 5 * time.Second, bytes: 100e6, at: warmAt, ok: true},
+		warmSample{warmup: 30 * time.Second}, // asked for, never taken
+		start, end, 1000e6, 9e6, true, 8)
+
+	found := false
+	for _, w := range p.Warnings {
+		if strings.Contains(w, "could not be closed on time") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no warning: the window was requested and lost, and the figure quietly "+
+			"covers %.1fs instead of 30s. Warnings: %q", p.WindowSec, p.Warnings)
+	}
+
+	// A window that was never REQUESTED must stay quiet — standard mode is not
+	// a failure, and a warning there would train the reader to ignore it.
+	q := applyWindow(measure(1e6, 400e6, start, end, false),
+		warmSample{}, warmSample{}, start, end, 400e6, 0, false, 8)
+	for _, w := range q.Warnings {
+		if strings.Contains(w, "could not be closed") {
+			t.Errorf("standard mode warns about a window it never asked for: %q", w)
+		}
+	}
+}
+
+// 🚨 CONSISTENT/IMPLIED ARE THE WINDOW'S, like every other qualifying figure on
+// the line. Measured against the phase, a CORRECT research line fails its own
+// arithmetic: the reader checks window-bytes ÷ window-seconds, and the flag was
+// checking phase-bytes ÷ phase-seconds.
+func TestConsistencyIsScopedToTheWindow(t *testing.T) {
+	start := time.Now()
+	warmAt := start.Add(5 * time.Second)
+	closeAt := start.Add(35 * time.Second)
+	end := start.Add(40 * time.Second) // 5s of unwinding after the window
+
+	// The engine reports 160 Mbit/s; the window moved 600 MB in 30s = 160
+	// Mbit/s, so the WINDOW is consistent. The phase moved 1000 MB in 40s =
+	// 200 Mbit/s, which against a 160 Mbit/s estimate implies 50s of data
+	// against 40s measured — 1.25, outside the band, i.e. the phase-scoped
+	// check would call this line inconsistent.
+	p := measure(20e6, 1000e6, start, end, true) // 20 MB/s = 160 Mbit/s
+	p = applyWindow(p,
+		warmSample{warmup: 5 * time.Second, bytes: 100e6, at: warmAt, ok: true},
+		warmSample{bytes: 700e6, at: closeAt, ok: true},
+		start, end, 1000e6, 0, true, 8)
+
+	if !p.Consistent {
+		t.Errorf("a line whose own window figures agree (%.0f MB over %.1fs against %.1f Mbit/s) "+
+			"is reported INCONSISTENT — implied %.1fs", float64(p.WindowBytes)/1e6, p.WindowSec,
+			p.LibraryMbps, p.ImpliedSec)
+	}
+	if got := p.ImpliedSec; got < 29.9 || got > 30.1 {
+		t.Errorf("ImpliedSec = %.1f, want ~30 — it must be derived from the WINDOW bytes the "+
+			"line prints, not from the phase total", got)
+	}
+	for _, w := range p.Warnings {
+		if strings.Contains(w, "estimator is weighted") {
+			t.Errorf("a consistent line carries the estimator warning: %q", w)
+		}
 	}
 }
