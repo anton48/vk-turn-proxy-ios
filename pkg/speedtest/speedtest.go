@@ -77,7 +77,7 @@ const forkRevision = 5
 // under which a figure is published. Not for wording, UI or tests.
 // TestEngineVersionNamesEveryMethodRevision fails if this and METHOD.md
 // disagree.
-const methodRevision = 8
+const methodRevision = 9
 
 // EngineVersion is reported beside every result so a number can be traced to the
 // code that produced it. The upstream version is READ FROM THE LIBRARY rather
@@ -208,8 +208,19 @@ type Phase struct {
 	// absent, warned about nowhere, and printed on no line.
 	ConfirmedKnown bool `json:"confirmed_known"`
 
-	// CleanupSec is the time between the window CLOSING and the engine
-	// returning — the tail during which blocked workers unwind.
+	// GuardSec is the DELIBERATE part of the tail: the engine is given a
+	// deadline slightly later than the window so the two are not racing, and it
+	// keeps pushing for that long after the window has closed. Reported because
+	// warm-up + window + guard + cleanup must account for the whole phase, and a
+	// reader who cannot make those add up cannot check anything else either.
+	GuardSec float64 `json:"guard_sec"`
+
+	// CleanupSec is the time between the ENGINE'S OWN DEADLINE and its return —
+	// the tail during which blocked workers unwind.
+	//
+	// 🚨 IT IS NOT THE WHOLE TAIL. It used to be everything after the window
+	// closed, which meant it also contained the guard above: a deliberate
+	// constant reported as if it were the engine taking its time.
 	//
 	// 🚨 IT USED TO BE INSIDE THE WINDOW. The wrapper read its end timestamp
 	// and its byte counter after `run()` returned, so a phase whose workers
@@ -512,7 +523,13 @@ func describe(list stgo.Servers) []ServerInfo {
 // It exists because the three settings are entangled: research mode needs the
 // closeGuard keeps the wrapper's window-close sample strictly BEFORE the
 // engine's own stop, so the two are not racing for the same instant.
-const closeGuard = 2 * time.Second
+// 🚨 500 ms, not the 2 s it started at. The guard only has to cover the skew
+// between two timers armed from the same clock — sub-millisecond in practice —
+// and every millisecond of it is traffic OUTSIDE the measurement: it disturbs
+// the link, it lands in the connection counters unless they are sampled at the
+// window's edge, and it weights the engine's own estimator away from the window.
+// Buy the certainty, do not buy more of it than the race needs.
+const closeGuard = 500 * time.Millisecond
 
 // capture time EXTENDED to cover a warm-up it then discards, AND early stop
 // turned off, or the "fixed window" it promises is neither fixed nor a window.
@@ -654,10 +671,12 @@ func Start(cfg Config) error {
 // written twice.
 type phaseSpec struct {
 	stage string
-	// sample returns the confirmed-byte counter and the outstanding backlog, so
-	// the warm-up boundary can be taken for BOTH and every figure on a result
-	// describes the same window.
-	sample func() (bytes, backlog int64)
+	// sample returns EVERYTHING that describes the run at this instant: the
+	// confirmed-byte counter, the outstanding backlog, the engine's own rate
+	// estimate and the connection counters. One closure, taken at one moment,
+	// because a figure sampled later than the window it is printed beside is
+	// how the line stops being checkable.
+	sample func() warmSample
 	run    func(context.Context) error
 	speed  func() float64
 	upload bool
@@ -756,15 +775,28 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 
 	specs := map[string]phaseSpec{
 		"download": {
-			stage:  "download",
-			sample: func() (int64, int64) { return target.Context.GetTotalDownload(), 0 },
-			run:    target.DownloadTestContext,
-			speed:  func() float64 { return float64(target.DLSpeed) },
+			stage: "download",
+			sample: func() warmSample {
+				used, dials := meas.conns.stats()
+				return warmSample{
+					bytes:     target.Context.GetTotalDownload(),
+					libBps:    float64(target.DLSpeed),
+					connsUsed: used, dials: dials,
+				}
+			},
+			run:   target.DownloadTestContext,
+			speed: func() float64 { return float64(target.DLSpeed) },
 		},
 		"upload": {
 			stage: "upload",
-			sample: func() (int64, int64) {
-				return target.Context.GetTotalUpload(), target.Context.GetUploadBacklog()
+			sample: func() warmSample {
+				used, dials := meas.conns.stats()
+				return warmSample{
+					bytes:     target.Context.GetTotalUpload(),
+					backlog:   target.Context.GetUploadBacklog(),
+					libBps:    float64(target.ULSpeed),
+					connsUsed: used, dials: dials,
+				}
 			},
 			run:    target.UploadTestContext,
 			speed:  func() float64 { return float64(target.ULSpeed) },
@@ -795,8 +827,18 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		start := time.Now()
 		ws, cs, err := runPhase(ctx, start, pl.warmup, pl.closeWindow(), spec.sample, spec.run)
 		end := time.Now()
-		used, dials := meas.conns.stats()
-		endBytes, endBacklog := spec.sample()
+		final := spec.sample()
+
+		// 🚨 THE WINDOW'S FIGURES COME FROM THE WINDOW'S EDGE, INCLUDING THESE
+		// TWO. The close guard makes the engine push for a moment AFTER the
+		// window has closed, so connections first used in that moment — or
+		// during the unwinding — were never part of the measurement, and the
+		// engine's own estimate is weighted to its last seconds, which by then
+		// describe the guard rather than the window.
+		lib, used, dials := final.libBps, final.connsUsed, final.dials
+		if cs.ok {
+			lib, used, dials = cs.libBps, cs.connsUsed, cs.dials
+		}
 
 		// The gate comes AFTER the samples are taken and BEFORE anything is
 		// published: a stopped run is not a result. Without it the engine
@@ -806,8 +848,8 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 
-		phase := measure(spec.speed(), endBytes, start, end, spec.upload)
-		phase = applyWindow(phase, ws, cs, start, end, endBytes, endBacklog, spec.upload, pl.threads)
+		phase := measure(lib, final.bytes, start, end, spec.upload)
+		phase = applyWindow(phase, ws, cs, start, end, final.bytes, final.backlog, spec.upload, pl.threads, closeGuard)
 		// After the gate on purpose: a cancelled phase has peak < threads and
 		// would otherwise emit a spurious "the knob lied" warning on every Stop.
 		phase = applyConnStats(phase, used, dials, pl.threads, warm)
@@ -898,6 +940,17 @@ type warmSample struct {
 	backlog int64         // unconfirmed bytes outstanding at the boundary
 	at      time.Time     // when the boundary was crossed
 	ok      bool          // false: the phase ended before the warm-up did
+
+	// 🚨 EVERYTHING THAT DESCRIBES THE WINDOW IS SAMPLED AT THE WINDOW'S EDGE.
+	// These three used to be read after the phase returned, which was already
+	// wrong by the length of the engine's unwinding and became wronger when the
+	// close guard added deliberate traffic after the window: the engine's own
+	// estimate is weighted to its last seconds, so it partly described the
+	// guard, and the connection counters could include connections that never
+	// carried a byte inside the window at all.
+	libBps    float64 // the engine's own rate estimate, AT the boundary
+	connsUsed int     // distinct connections that carried data by then
+	dials     int
 }
 
 // runPhase executes one direction and, when a warm-up is asked for, samples the
@@ -919,7 +972,7 @@ type warmSample struct {
 // depends on its arms being the same length. `window > 0` asks for that second
 // boundary; a phase that ends before it (early stop, a cancel) leaves the
 // sample not-ok and the caller falls back to the end of the phase.
-func runPhase(ctx context.Context, start time.Time, warmup, window time.Duration, sample func() (bytes, backlog int64), run func(context.Context) error) (warm, closed warmSample, err error) {
+func runPhase(ctx context.Context, start time.Time, warmup, window time.Duration, sample func() warmSample, run func(context.Context) error) (warm, closed warmSample, err error) {
 	if warmup <= 0 {
 		return warmSample{}, warmSample{}, phaseErr(ctx, run(ctx))
 	}
@@ -939,8 +992,9 @@ func runPhase(ctx context.Context, start time.Time, warmup, window time.Duration
 		defer warmTimer.Stop()
 		select {
 		case <-warmTimer.C:
-			p.warm.bytes, p.warm.backlog = sample()
-			p.warm.at, p.warm.ok = time.Now(), true
+			s := sample()
+			s.warmup, s.at, s.ok = warmup, time.Now(), true
+			p.warm = s
 		case <-done:
 			ch <- p // exactly one send, on every path
 			return
@@ -956,8 +1010,9 @@ func runPhase(ctx context.Context, start time.Time, warmup, window time.Duration
 			defer closeTimer.Stop()
 			select {
 			case <-closeTimer.C:
-				p.closed.bytes, p.closed.backlog = sample()
-				p.closed.at, p.closed.ok = time.Now(), true
+				s := sample()
+				s.warmup, s.at, s.ok = window, time.Now(), true
+				p.closed = s
 			case <-done:
 			case <-ctx.Done():
 			}
@@ -990,7 +1045,7 @@ func phaseErr(ctx context.Context, err error) error {
 // wrapper timestamps as ActualSec — so WarmupSec + WindowSec == ActualSec
 // exactly, and the UI can print all three without deriving any of them a second
 // time.
-func applyWindow(p Phase, s, closed warmSample, start, end time.Time, endBytes, endBacklog int64, upload bool, threads int) Phase {
+func applyWindow(p Phase, s, closed warmSample, start, end time.Time, endBytes, endBacklog int64, upload bool, threads int, guard time.Duration) Phase {
 	if !s.ok {
 		p.WindowSec = p.ActualSec
 		p.WindowBytes = p.Bytes
@@ -1016,7 +1071,16 @@ func applyWindow(p Phase, s, closed warmSample, start, end time.Time, endBytes, 
 	windowEnd, windowBytes, windowBacklog := end, endBytes, endBacklog
 	if closed.ok {
 		windowEnd, windowBytes, windowBacklog = closed.at, closed.bytes, closed.backlog
-		p.CleanupSec = end.Sub(closed.at).Seconds()
+		// The tail splits in two: the guard we asked for, and whatever the
+		// engine took beyond its own deadline. Reporting them as one number
+		// made a deliberate 2 s constant look like the engine being slow.
+		tail := end.Sub(closed.at)
+		g := guard
+		if g > tail {
+			g = tail // the engine returned before its own deadline
+		}
+		p.GuardSec = g.Seconds()
+		p.CleanupSec = (tail - g).Seconds()
 	} else if closed.warmup > 0 {
 		// 🚨 ASKED FOR AND NOT TAKEN. Falling back to the phase's own end is
 		// the OLD behaviour — a variable window wearing a fixed window's label

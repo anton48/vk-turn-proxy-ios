@@ -1662,13 +1662,17 @@ do {
     // returned and the engine returns only after its blocked workers unwind.
     var slow = SpeedTestPhase()
     slow.rawMbps = 93.8; slow.actualSec = 40; slow.windowSec = 30; slow.warmupSec = 5
-    slow.cleanupSec = 5; slow.bytes = 400_000_000; slow.windowBytes = 351_000_000
+    slow.cleanupSec = 5; slow.guardSec = 0.5
+    slow.bytes = 400_000_000; slow.windowBytes = 351_000_000
     slow.connsUsed = 16; slow.dials = 15
     let slowLine = SpeedTestLog.result(SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
                                                           threads: 16, direction: "upload",
                                                           durationSec: 30),
                                         progress: { var p = SpeedTestProgress(); p.upload = slow; return p }(),
                                         path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
+    check(slowLine.contains("guard=0.5s"),
+          "🚨 the guard is printed separately — it is time WE asked the engine to keep pushing "
+          + "after the window, and folded into cleanup it reads as the engine being slow")
     check(slowLine.contains("window=30.0s") && slowLine.contains("cleanup=5.0s"),
           "🚨 the log separates the WINDOW from the tail spent stopping — folded together they "
           + "made a fixed-window experiment produce arms of 30.0s and 35.0s")

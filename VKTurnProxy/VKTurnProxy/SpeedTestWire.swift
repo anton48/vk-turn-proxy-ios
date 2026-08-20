@@ -37,9 +37,14 @@ struct SpeedTestPhase: Codable {
     /// is the Frankfurt-307 answer — so presence cannot be inferred from the
     /// value being non-zero.
     var confirmedKnown: Bool = false
-    /// Time between the window CLOSING and the engine returning — blocked
-    /// workers unwinding. It used to be counted INSIDE the window, which is how
-    /// a "fixed 30s" research arm came back as 35.0s.
+    /// The DELIBERATE part of the tail: the engine is given a deadline slightly
+    /// later than the window so the two do not race, and it keeps pushing for
+    /// that long after the window closed.
+    var guardSec: Double = 0
+    /// Time between the ENGINE'S OWN deadline and its return — blocked workers
+    /// unwinding. It used to be counted inside the window (a "fixed 30s" arm
+    /// came back as 35.0s), and then it briefly contained the guard as well,
+    /// which reported a constant we chose as the engine being slow.
     var cleanupSec: Double = 0
     /// How much of the backlog a NORMAL end of phase explains: one in-flight
     /// chunk per worker, cancelled when the capture time expires. Travels with
@@ -63,6 +68,7 @@ struct SpeedTestPhase: Codable {
         case backlogBytes = "backlog_bytes"
         case confirmedRatio = "confirmed_ratio"
         case confirmedKnown = "confirmed_known"
+        case guardSec = "guard_sec"
         case cleanupSec = "cleanup_sec"
         case backlogTailBytes = "backlog_tail_bytes"
         case warnings

@@ -186,3 +186,36 @@ the log, the screen and the warning all say *held in flight at the cutoff* /
 
 ⇒ **Do not compare a research figure from Method 7 with one from Method 8**: a
 Method 7 run cannot be known to have enforced its window.
+
+## Method 9 — everything that describes the window is sampled at the window's edge
+
+Method 8 bought certainty with a guard: the engine is given a deadline a little
+later than the window, so the close sample cannot lose a race. **That guard is
+traffic outside the measurement, and three figures were still being read after
+it.**
+
+- **The engine's own rate.** `LibraryMbps` is an estimator weighted to its last
+  seconds, and it was read when the phase returned — by then those seconds were
+  the guard and the unwinding, not the window. The consistency check then
+  compared window bytes over window seconds against a rate that partly described
+  something else.
+- **`conns_used` / `dials`.** Read at the end, they could count a connection
+  first used during the guard or while the workers unwound — a connection that
+  never carried a byte inside the measurement window.
+- **The tail itself.** `cleanup_sec` was everything after the window closed, so
+  it contained the guard: a constant we chose, reported as the engine taking its
+  time.
+
+⇒ one closure now samples bytes, backlog, the engine's rate and both connection
+counters **at the same instant**, and the boundary sample is what the result is
+built from. The tail is split into `guard_sec` (asked for) and `cleanup_sec`
+(the unwinding beyond the engine's own deadline), so **warm-up + window + guard +
+cleanup == actual** exactly.
+
+⚙️ And the guard shrank from **2 s to 500 ms**: it only has to cover the skew
+between two timers armed from the same clock, and everything beyond that is
+unmeasured traffic on the link under test.
+
+⇒ **Do not compare a research figure across this line**: before Method 9 the
+`engine` column and the connection counts of a research run include time the
+window deliberately excluded.

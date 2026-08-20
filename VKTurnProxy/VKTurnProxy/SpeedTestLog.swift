@@ -113,6 +113,13 @@ enum SpeedTestLog {
         // the engine's blocked workers were being measured too. A run with a
         // long cleanup is still comparable now — this is the number that says
         // how long it took to stop, and it is the only measurement of that.
+        // 🚨 THE TAIL IS TWO NUMBERS, and both are printed so the line's own
+        // arithmetic closes: warm-up + window + guard + cleanup == actual. The
+        // guard is time we ASKED the engine to keep pushing past the window
+        // (so the close sample cannot lose a race); the cleanup is what it took
+        // beyond its own deadline. Folded together, a constant we chose read as
+        // the engine being slow.
+        if p.guardSec > 0.05 { s += String(format: " guard=%.1fs", p.guardSec) }
         if p.cleanupSec > 0.05 { s += String(format: " cleanup=%.1fs", p.cleanupSec) }
         // 🚨 In research mode `bytes` is the WHOLE phase and the rate covers the
         // window, so a reader checking bytes/window against raw on a CORRECT

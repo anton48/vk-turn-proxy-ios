@@ -174,7 +174,7 @@ func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
 	const warm = 30 * time.Millisecond
 	for i := 0; i < 200; i++ {
 		s, _, err := runPhase(context.Background(), time.Now(), warm, 0,
-			func() (int64, int64) { return counter.Load(), 0 },
+			func() warmSample { return warmSample{bytes: counter.Load()} },
 			// Ends AT the boundary: the goroutine is racing us to send.
 			func(context.Context) error { time.Sleep(warm); return nil })
 		if err != nil {
@@ -194,7 +194,7 @@ func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
 // A phase shorter than its own warm-up must not produce a rate.
 func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
 	s, _, err := runPhase(context.Background(), time.Now(), 500*time.Millisecond, 0,
-		func() (int64, int64) { return 0, 0 },
+		func() warmSample { return warmSample{} },
 		func(context.Context) error { time.Sleep(20 * time.Millisecond); return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +203,7 @@ func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
 		t.Fatal("claims a warm-up boundary that never came")
 	}
 	start := time.Now().Add(-20 * time.Millisecond)
-	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, warmSample{}, start, time.Now(), 1234, 0, false, 8)
+	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, warmSample{}, start, time.Now(), 1234, 0, false, 8, closeGuard)
 	if p.RawMbps != 0 {
 		t.Errorf("stated %v Mbit/s from a 0.02s window", p.RawMbps)
 	}
@@ -220,7 +220,7 @@ func TestWindowSplitSumsToActual(t *testing.T) {
 	end := start.Add(20 * time.Second)
 
 	p := measure(1e6, 40e6, start, end, false)
-	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, warmSample{}, start, end, 40e6, 0, false, 8)
+	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, warmSample{}, start, end, 40e6, 0, false, 8, closeGuard)
 
 	if got := p.WarmupSec + p.WindowSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
 		t.Errorf("warmup %.3f + window %.3f = %.3f, but actual is %.3f",
@@ -323,21 +323,32 @@ func TestEveryPhaseIsPrimedBeforeItCounts(t *testing.T) {
 
 	prime := strings.Index(loop, "meas.prime(ctx,")
 	reset := strings.Index(loop, "meas.conns.reset()")
-	stats := strings.Index(loop, "meas.conns.stats()")
+	// 🚨 The counter is read by the SAMPLE closure now, so that the connection
+	// figures describe the window rather than the phase — the close guard makes
+	// the engine push after the window has closed, and connections first used
+	// there were never part of the measurement. What still has to hold is the
+	// ORDER: prime, then reset, then any read.
+	sampled := strings.Index(loop, "final := spec.sample()")
 
 	if prime < 0 {
 		t.Fatal("🚨 the phase does not prime a connection — an unprimed phase reads N connections " +
 			"whatever the protocol, so the HTTP/2 guard is inert")
 	}
-	if reset < 0 || stats < 0 {
-		t.Fatal("the counter is no longer reset or read inside the phase loop")
+	if reset < 0 || sampled < 0 {
+		t.Fatal("the counter is no longer reset, or the phase no longer takes a final sample")
 	}
 	if prime > reset {
 		t.Error("🚨 priming happens AFTER the counter is reset, so the primed connection is " +
 			"counted as measurement capacity — the figure reads one too high")
 	}
-	if reset > stats {
+	if reset > sampled {
 		t.Error("the counter is read before it is reset")
+	}
+	if !strings.Contains(body, "used, dials = cs.libBps, cs.connsUsed, cs.dials") &&
+		!strings.Contains(body, "lib, used, dials = cs.libBps, cs.connsUsed, cs.dials") {
+		t.Error("🚨 the connection figures do not come from the window's own sample — with the " +
+			"close guard in place, reading them at the end counts connections that never " +
+			"carried a byte inside the measurement window")
 	}
 }
 
@@ -405,7 +416,7 @@ func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
 
 	p := measure(1e6, 40e6, start, end, false)
 	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, warmSample{},
-		start, end, 40e6, 0, false, 8)
+		start, end, 40e6, 0, false, 8, closeGuard)
 
 	if p.WindowBytes != 30e6 {
 		t.Errorf("WindowBytes = %d, want 30000000 (40 MB total minus the 10 MB warm-up)", p.WindowBytes)
@@ -423,7 +434,7 @@ func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
 
 	// Outside research mode the two must agree, or the same check breaks there.
 	q := measure(1e6, 40e6, start, end, false)
-	q = applyWindow(q, warmSample{}, warmSample{}, start, end, 40e6, 0, false, 8)
+	q = applyWindow(q, warmSample{}, warmSample{}, start, end, 40e6, 0, false, 8, closeGuard)
 	if q.WindowBytes != q.Bytes {
 		t.Errorf("outside research mode WindowBytes (%d) must equal Bytes (%d)", q.WindowBytes, q.Bytes)
 	}
@@ -453,7 +464,7 @@ func TestConfirmedRatioIsScopedToTheWindow(t *testing.T) {
 	// ⇒ the window moved 600 MB and accumulated only 5 MB of backlog.
 	p := measure(1e6, 1000e6, start, end, true)
 	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 20e6,
-		at: warmAt, ok: true}, warmSample{}, start, end, 1000e6, 25e6, true, 8)
+		at: warmAt, ok: true}, warmSample{}, start, end, 1000e6, 25e6, true, 8, closeGuard)
 
 	if p.WindowBytes != 600e6 {
 		t.Fatalf("WindowBytes = %d, want 600000000", p.WindowBytes)
@@ -478,7 +489,7 @@ func TestConfirmedRatioIsScopedToTheWindow(t *testing.T) {
 	// backlog: it is a level, and a delta of a level can go either way.
 	q := applyWindow(measure(1e6, 1000e6, start, end, true),
 		warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 40e6, at: warmAt, ok: true}, warmSample{},
-		start, end, 1000e6, 25e6, true, 8)
+		start, end, 1000e6, 25e6, true, 8, closeGuard)
 	if q.BacklogBytes != 0 {
 		t.Errorf("backlog = %d after the server caught up, want 0", q.BacklogBytes)
 	}
@@ -491,7 +502,7 @@ func TestDownloadPublishesNoConfirmationFigure(t *testing.T) {
 	start := time.Now()
 	end := start.Add(15 * time.Second)
 	p := applyWindow(measure(1e6, 400e6, start, end, false), warmSample{}, warmSample{},
-		start, end, 400e6, 0, false, 32)
+		start, end, 400e6, 0, false, 32, closeGuard)
 
 	if p.ConfirmedRatio != 0 {
 		t.Errorf("ConfirmedRatio = %.3f on a DOWNLOAD — the field is upload-only and a "+
@@ -519,7 +530,7 @@ func TestCancellationTailIsNotReportedAsRefusal(t *testing.T) {
 	// a ratio of 93.9%, and every byte of that backlog explained by 32
 	// cancelled chunks.
 	p := applyWindow(measure(1e6, 452.8e6, start, end, true), warmSample{}, warmSample{},
-		start, end, 452.8e6, 29.5e6, true, 32)
+		start, end, 452.8e6, 29.5e6, true, 32, closeGuard)
 
 	if p.ConfirmedRatio > 0.95 {
 		t.Fatalf("precondition failed: ratio %.3f is above the warning threshold, so this "+
@@ -550,7 +561,7 @@ func TestABrokenEndpointStillWarns(t *testing.T) {
 	start := time.Now()
 	end := start.Add(15 * time.Second)
 	p := applyWindow(measure(1e6, 0, start, end, true), warmSample{}, warmSample{},
-		start, end, 0, 45.8e6, true, 8)
+		start, end, 0, 45.8e6, true, 8, closeGuard)
 
 	if p.ConfirmedRatio != 0 {
 		t.Fatalf("precondition failed: ratio %.4f — this fixture must be the EXACT zero, "+
@@ -590,19 +601,27 @@ func TestTheWindowClosesOnTimeAndCleanupIsReportedSeparately(t *testing.T) {
 	p = applyWindow(p,
 		warmSample{warmup: 5 * time.Second, bytes: 100e6, backlog: 2e6, at: warmAt, ok: true},
 		warmSample{bytes: 700e6, backlog: 5e6, at: closeAt, ok: true},
-		start, end, 1000e6, 9e6, true, 8)
+		start, end, 1000e6, 9e6, true, 8, closeGuard)
 
 	if got := p.WindowSec; got < 29.99 || got > 30.01 {
 		t.Errorf("WindowSec = %.2f, want 30.00 — the requested window, not the window plus "+
 			"however long the engine took to stop", got)
 	}
-	if got := p.CleanupSec; got < 2.99 || got > 3.01 {
-		t.Errorf("CleanupSec = %.2f, want 3.00", got)
+	// 🚨 THE TAIL SPLITS IN TWO. The guard is time we ASKED the engine to keep
+	// pushing after the window closed; the cleanup is what it took beyond its
+	// own deadline. Reported as one number, a deliberate constant read as the
+	// engine being slow.
+	if got := p.GuardSec; got < closeGuard.Seconds()-0.01 || got > closeGuard.Seconds()+0.01 {
+		t.Errorf("GuardSec = %.2f, want %.2f", got, closeGuard.Seconds())
 	}
-	if got := p.WarmupSec + p.WindowSec + p.CleanupSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
-		t.Errorf("warmup %.2f + window %.2f + cleanup %.2f = %.2f, but the phase took %.2f — "+
-			"the three parts must still account for the whole", p.WarmupSec, p.WindowSec,
-			p.CleanupSec, got, p.ActualSec)
+	if want := 3.0 - closeGuard.Seconds(); p.CleanupSec < want-0.01 || p.CleanupSec > want+0.01 {
+		t.Errorf("CleanupSec = %.2f, want %.2f — the guard is not the engine taking its time",
+			p.CleanupSec, want)
+	}
+	if got := p.WarmupSec + p.WindowSec + p.GuardSec + p.CleanupSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
+		t.Errorf("warmup %.2f + window %.2f + guard %.2f + cleanup %.2f = %.2f, but the phase "+
+			"took %.2f — the four parts must account for the whole", p.WarmupSec, p.WindowSec,
+			p.GuardSec, p.CleanupSec, got, p.ActualSec)
 	}
 	// 🚨 The BYTES must come from the boundary too. Taking them at the end
 	// counts everything the unwinding workers confirmed, which is exactly the
@@ -622,7 +641,7 @@ func TestStandardModeHasNoCleanupToReport(t *testing.T) {
 	start := time.Now()
 	end := start.Add(20 * time.Second)
 	p := applyWindow(measure(1e6, 400e6, start, end, false), warmSample{}, warmSample{},
-		start, end, 400e6, 0, false, 8)
+		start, end, 400e6, 0, false, 8, closeGuard)
 	if p.CleanupSec != 0 {
 		t.Errorf("CleanupSec = %.2f in standard mode", p.CleanupSec)
 	}
@@ -650,7 +669,7 @@ func TestRunPhaseSamplesAtTheWindowBoundary(t *testing.T) {
 	}()
 	defer close(stop)
 
-	sample := func() (int64, int64) { return atomic.LoadInt64(&counter), 0 }
+	sample := func() warmSample { return warmSample{bytes: atomic.LoadInt64(&counter)} }
 	warm, closed, err := runPhase(context.Background(), time.Now(), 50*time.Millisecond, 100*time.Millisecond,
 		sample,
 		func(context.Context) error {
@@ -725,7 +744,7 @@ func TestALostCloseSampleIsAnnounced(t *testing.T) {
 	p := applyWindow(measure(1e6, 1000e6, start, end, true),
 		warmSample{warmup: 5 * time.Second, bytes: 100e6, at: warmAt, ok: true},
 		warmSample{warmup: 30 * time.Second}, // asked for, never taken
-		start, end, 1000e6, 9e6, true, 8)
+		start, end, 1000e6, 9e6, true, 8, closeGuard)
 
 	found := false
 	for _, w := range p.Warnings {
@@ -741,7 +760,7 @@ func TestALostCloseSampleIsAnnounced(t *testing.T) {
 	// A window that was never REQUESTED must stay quiet — standard mode is not
 	// a failure, and a warning there would train the reader to ignore it.
 	q := applyWindow(measure(1e6, 400e6, start, end, false),
-		warmSample{}, warmSample{}, start, end, 400e6, 0, false, 8)
+		warmSample{}, warmSample{}, start, end, 400e6, 0, false, 8, closeGuard)
 	for _, w := range q.Warnings {
 		if strings.Contains(w, "could not be closed") {
 			t.Errorf("standard mode warns about a window it never asked for: %q", w)
@@ -768,7 +787,7 @@ func TestConsistencyIsScopedToTheWindow(t *testing.T) {
 	p = applyWindow(p,
 		warmSample{warmup: 5 * time.Second, bytes: 100e6, at: warmAt, ok: true},
 		warmSample{bytes: 700e6, at: closeAt, ok: true},
-		start, end, 1000e6, 0, true, 8)
+		start, end, 1000e6, 0, true, 8, closeGuard)
 
 	if !p.Consistent {
 		t.Errorf("a line whose own window figures agree (%.0f MB over %.1fs against %.1f Mbit/s) "+
@@ -783,5 +802,36 @@ func TestConsistencyIsScopedToTheWindow(t *testing.T) {
 		if strings.Contains(w, "estimator is weighted") {
 			t.Errorf("a consistent line carries the estimator warning: %q", w)
 		}
+	}
+}
+
+// 🚨 THE ENGINE'S OWN RATE AND THE CONNECTION COUNTS MUST COME FROM THE WINDOW'S
+// EDGE. The close guard makes the engine push for a moment AFTER the window has
+// closed: its estimator is weighted to its last seconds, so read at the end it
+// partly describes the guard, and a connection first used in the guard — or
+// while the workers unwind — was never part of the measurement at all.
+func TestTheEngineRateAndConnsComeFromTheWindowEdge(t *testing.T) {
+	src, err := os.ReadFile("speedtest.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+
+	if !strings.Contains(body, "lib, used, dials = cs.libBps, cs.connsUsed, cs.dials") {
+		t.Error("the rate and the connection counts are not taken from the close sample")
+	}
+	// And the sample closure must actually collect them, or the fields above are
+	// zero and the fallback silently wins.
+	if !strings.Contains(body, "libBps:    float64(target.ULSpeed)") ||
+		!strings.Contains(body, "connsUsed: used, dials: dials") {
+		t.Error("🚨 the boundary sample does not collect the engine's rate and the connection " +
+			"counters — taking them from cs then yields zeros, and the code falls back to the " +
+			"end-of-phase values without saying so")
+	}
+	// The guard exists to win a race, not to be generous: every millisecond of
+	// it is traffic outside the measurement.
+	if closeGuard > time.Second {
+		t.Errorf("closeGuard is %v — it only has to cover the skew between two timers armed "+
+			"from the same clock, and the rest is unmeasured traffic on the link", closeGuard)
 	}
 }
