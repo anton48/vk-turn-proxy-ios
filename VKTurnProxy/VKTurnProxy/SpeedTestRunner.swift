@@ -212,6 +212,9 @@ final class SpeedTestRunner: ObservableObject {
         guard !q.isEmpty, !search.isSearching else { return }
         searchGeneration += 1
         let generation = searchGeneration
+        // Captured at the START, like the nearby list's: the latencies about to
+        // be measured belong to the route in use right now.
+        let fetchedOn = Self.currentPath()
         // One assignment: from here the screen cannot show results under a
         // query they do not answer.
         search = .searching(query: q)
@@ -242,7 +245,8 @@ final class SpeedTestRunner: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, generation == self.searchGeneration else { return }
                 self.search = err.map { .failed(query: q, message: $0) }
-                    ?? .results(query: q, servers: results)
+                    ?? .results(query: q,
+                                list: SpeedTestServerList(servers: results, fetchedOn: fetchedOn))
             }
         }
     }

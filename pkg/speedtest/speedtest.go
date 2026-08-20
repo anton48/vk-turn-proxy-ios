@@ -39,6 +39,7 @@ package speedtest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -389,8 +390,15 @@ func FindServers(ctx context.Context, query string) ([]ServerInfo, error) {
 		client := newEngine(1, false)
 		defer client.close()
 		server, err := client.FetchServerByIDContext(ctx, query)
-		if err != nil || server == nil {
+		// 🚨 "NOT FOUND" IS A CLAIM, AND ONLY ONE OF THESE PATHS SUPPORTS IT.
+		// Collapsing every failure into it told a user with a perfectly good id
+		// that their server does not exist, on a timeout or a malformed
+		// response — and the obvious reaction is to stop trying that id.
+		switch {
+		case errors.Is(err, stgo.ErrServerNotFound), err == nil && server == nil:
 			return nil, fmt.Errorf("no server with id %s", query)
+		case err != nil:
+			return nil, fmt.Errorf("looking up server %s: %w", query, err)
 		}
 		return describe(stgo.Servers{server}), nil
 	}

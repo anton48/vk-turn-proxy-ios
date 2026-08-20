@@ -90,6 +90,11 @@ struct SpeedTestServerPicker: View {
                         .foregroundColor(.orange)
                     Button("Try again") { runner.loadServers() }
                 } else {
+                    if let latency = runner.serverList?.latencyNotice(now: livePath) {
+                        Label(latency, systemImage: "arrow.triangle.branch")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
                     if let notice = runner.serverList?.staleNotice(now: livePath) {
                         VStack(alignment: .leading, spacing: 6) {
                             Label(notice, systemImage: "arrow.triangle.branch")
@@ -142,12 +147,19 @@ struct SpeedTestServerPicker: View {
                             .foregroundColor(.orange)
                         Button("Search again") { runner.searchServers(query) }
                             .font(.caption)
-                    case let .results(query, servers):
-                        if servers.isEmpty {
+                    case let .results(query, list):
+                        if list.servers.isEmpty {
                             Text("Ookla returned nothing for “\(query)”.")
                                 .font(.caption).foregroundColor(.secondary)
                         }
-                        ForEach(servers) { server in
+                        // The latencies below were measured on the route the
+                        // search ran on. Say so when that is no longer the route.
+                        if let notice = list.latencyNotice(now: livePath) {
+                            Label(notice, systemImage: "arrow.triangle.branch")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        }
+                        ForEach(list.servers) { server in
                             row(server)
                         }
                     }

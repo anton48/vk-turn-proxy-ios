@@ -65,6 +65,22 @@ struct SpeedTestServerList: Equatable {
         return isStale(now: now) ? "\(whose) — fetched before the route changed" : whose
     }
 
+    /// The latencies in this list were MEASURED on `fetchedOn`, and latency is
+    /// the number the picker now leads with and tells people to choose by. Take
+    /// the tunnel down and every one of them describes a path that is no longer
+    /// in use — a server that read 5.6 ms through the VPN may read anything at
+    /// all without it.
+    ///
+    /// 🎯 This applies to a SEARCH exactly as it applies to the nearby list,
+    /// which is why the search reuses this type rather than growing its own
+    /// staleness rule. A second copy of a rule is how the two drift apart.
+    func latencyNotice(now: SpeedTestPath) -> String? {
+        guard isStale(now: now) else { return nil }
+        guard servers.contains(where: { $0.latencyMs > 0 }) else { return nil }
+        return "These latencies were measured while the route was "
+            + "\"\(fetchedOn.rawValue)\". They describe that path, not the one in use now."
+    }
+
     /// 🚫 A stale list does NOT clear the pin. Only the LIST is out of date; the
     /// pinned server is still reachable and still the right one, because pinning
     /// one id across tunnel states is the entire reason a VPN-on/off pair is
@@ -93,7 +109,10 @@ struct SpeedTestServerList: Equatable {
 enum SpeedTestSearchState: Equatable {
     case idle
     case searching(query: String)
-    case results(query: String, servers: [SpeedTestServer])
+    /// Carries a SpeedTestServerList, not a bare array, so the path the
+    /// latencies were measured on travels with them — the same rule, and the
+    /// same code, as the nearby list.
+    case results(query: String, list: SpeedTestServerList)
     case failed(query: String, message: String)
 
     var isSearching: Bool {

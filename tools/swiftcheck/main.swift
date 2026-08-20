@@ -1016,7 +1016,9 @@ do {
     let picker = source("VKTurnProxy/VKTurnProxy/SpeedTestServerPicker.swift")
 
     // A result cannot exist apart from the query it answers.
-    let found = SpeedTestSearchState.results(query: "Funchal", servers: [])
+    let found = SpeedTestSearchState.results(
+        query: "Funchal",
+        list: SpeedTestServerList(servers: [], fetchedOn: .throughVPN))
     check(found.query == "Funchal",
           "🚨 results carry the query they answer — the heading cannot describe another search")
     check(SpeedTestSearchState.searching(query: "Funchal").isSearching,
@@ -1052,6 +1054,55 @@ do {
           "and the search reports its own failure, naming its own query")
     check(picker.contains("runner.searchServers(query)"),
           "🚨 'Search again' retries the SEARCH, not the nearby-list fetch")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 35. A LATENCY BELONGS TO THE PATH IT WAS MEASURED ON.
+//
+//     Latency is now the number the picker leads with and tells people to choose
+//     by — which makes it the number that most needs a path. A search run
+//     through the tunnel kept showing its latencies after a switch to DIRECT,
+//     where they describe a route no longer in use.
+//
+//     🎯 The search reuses SpeedTestServerList rather than growing its own
+//     staleness rule: a second copy of a rule is how two copies drift apart, and
+//     this project has paid for that more than once.
+//
+//     SABOTAGES RUN, each reddening exactly one check:
+//       a. latencyNotice ignoring isStale — the fresh-path check;
+//       b. it returning a notice even with no measured latencies — the
+//          nothing-to-warn-about check;
+//       c. searchServers capturing the path at COMPLETION instead of at start —
+//          not scannable, so it is stated in the comment there and left to
+//          review.
+do {
+    let picker = source("VKTurnProxy/VKTurnProxy/SpeedTestServerPicker.swift")
+    let runner = source("VKTurnProxy/VKTurnProxy/SpeedTestRunner.swift")
+
+    let measured = SpeedTestServer(id: "31551", name: "Funchal", sponsor: "MEO",
+                                   country: "Portugal", host: "h", distanceKm: 1186,
+                                   latencyMs: 5.6)
+    let onVPN = SpeedTestServerList(servers: [measured], fetchedOn: .throughVPN)
+
+    check(onVPN.latencyNotice(now: .throughVPN) == nil,
+          "on the same route the latencies stand and nothing is said")
+    check(onVPN.latencyNotice(now: .directMode) != nil,
+          "🚨 after the route changes the latencies are disclaimed — they describe the old path")
+    check(onVPN.latencyNotice(now: .directMode)?.contains("Through VPN") == true,
+          "and the notice names the route they WERE measured on")
+
+    // Nothing measured, nothing to disclaim.
+    let unmeasured = SpeedTestServer(id: "1", name: "n", sponsor: "s", country: "c",
+                                     host: "h", distanceKm: 10, latencyMs: 0)
+    check(SpeedTestServerList(servers: [unmeasured], fetchedOn: .throughVPN)
+            .latencyNotice(now: .vpnOff) == nil,
+          "a list with no measured latency says nothing about latency")
+
+    check(runner.contains("let fetchedOn = Self.currentPath()"),
+          "🚨 the search records the path at the START — recording it at completion would " +
+          "stamp results with the route the user had already switched to")
+    check(picker.contains("list.latencyNotice(now: livePath)"),
+          "🚨 and the SEARCH results carry the notice too, not only the nearby list")
 }
 
 print("")

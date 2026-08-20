@@ -2,6 +2,8 @@ package speedtest
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"regexp"
 	"strings"
@@ -327,5 +329,38 @@ func TestEveryPhaseIsPrimedBeforeItCounts(t *testing.T) {
 	}
 	if reset > stats {
 		t.Error("the counter is read before it is reset")
+	}
+}
+
+// TestIDLookupDoesNotCallEveryFailureNotFound.
+//
+// 🚨 "There is no server with id X" is a CLAIM about Ookla's database, and only
+// one failure supports it. Collapsing a timeout or a malformed response into it
+// tells a user with a perfectly good id that their server does not exist — and
+// the reasonable reaction to that is to stop trying the id, which is the one
+// thing they should keep doing.
+//
+// Seen RED by restoring `if err != nil || server == nil`.
+func TestIDLookupDoesNotCallEveryFailureNotFound(t *testing.T) {
+	// A server that answers everything with garbage: the XML decode fails, which
+	// is emphatically not "no such id".
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("this is not xml"))
+	}))
+	defer srv.Close()
+
+	// Point the library's advanced-server endpoint at it by using a context that
+	// is already dead — the same class of failure, reached without patching a
+	// package-level URL.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := FindServers(ctx, "31551")
+	if err == nil {
+		t.Fatal("a cancelled lookup reported success")
+	}
+	if strings.Contains(err.Error(), "no server with id") {
+		t.Errorf("a cancelled lookup was reported as %q — that is a claim about Ookla's "+
+			"database, and this failure says nothing about it", err)
 	}
 }
