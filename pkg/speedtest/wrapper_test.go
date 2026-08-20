@@ -1,0 +1,195 @@
+package speedtest
+
+import (
+	"context"
+	"os"
+	"regexp"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// TestEngineVersionNamesEveryForkDivergence closes the traceability loop from
+// this side: FORK.md documents the divergences, and the number reported beside
+// every result must name all of them.
+//
+// The other half lives in the fork: TestForkDivergesFromUpstreamExactlyHere
+// fails on a divergence nobody wrote down. Together, a change to the
+// methodology cannot reach a user's screen under an unchanged label.
+//
+// Seen RED by adding a sixth "## Divergence 6:" section to FORK.md.
+func TestEngineVersionNamesEveryForkDivergence(t *testing.T) {
+	const forkMD = "../../third_party/speedtest-go/FORK.md"
+	b, err := os.ReadFile(forkMD)
+	if err != nil {
+		t.Fatalf("read %s: %v", forkMD, err)
+	}
+	found := regexp.MustCompile(`(?m)^## Divergence (\d+):`).FindAllStringSubmatch(string(b), -1)
+	if len(found) == 0 {
+		t.Fatal("no '## Divergence N:' sections found — the anchor is wrong and the check below " +
+			"would pass on any tree")
+	}
+	if len(found) != forkRevision {
+		t.Errorf("FORK.md documents %d divergences but forkRevision is %d — bump the constant "+
+			"(EngineVersion is what traces a measurement to the methodology that produced it)",
+			len(found), forkRevision)
+	}
+	if want := "+vkturn."; !regexp.MustCompile(regexp.QuoteMeta(want)).MatchString(EngineVersion) {
+		t.Errorf("EngineVersion %q does not name the fork", EngineVersion)
+	}
+}
+
+func TestPlanRefusesConfigsTheCSurfaceCouldDeliver(t *testing.T) {
+	// wgSpeedtestStart unmarshals arbitrary JSON, so these are reachable even
+	// though the Swift screen constrains all three.
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"threads above the cap spawns that many workers", Config{Threads: 10000, DurationSec: 15}},
+		{"an unknown direction measured NOTHING and reported done", Config{Threads: 4, Direction: "sideways", DurationSec: 15}},
+		{"duration far above anything the UI offers", Config{Threads: 4, DurationSec: 100000}},
+		{"duration below the engine's own floor", Config{Threads: 4, DurationSec: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := plan(tc.cfg); err == nil {
+				t.Error("accepted")
+			}
+		})
+	}
+
+	t.Run("research extends the capture and disables early stop", func(t *testing.T) {
+		p, err := plan(Config{Threads: 4, DurationSec: 15, Research: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.capture != 20*time.Second {
+			t.Errorf("capture %v, want 20s (15s window + 5s warm-up) — a warm-up discarded "+
+				"without extending the capture shortens the window it was meant to protect", p.capture)
+		}
+		if p.earlyStop {
+			t.Error("early stop still on: the fixed window is neither fixed nor a window")
+		}
+	})
+
+	t.Run("standard mode keeps early stop", func(t *testing.T) {
+		p, err := plan(Config{Threads: 4, DurationSec: 15})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !p.earlyStop || p.warmup != 0 || p.capture != 15*time.Second {
+			t.Errorf("standard plan is %+v", p)
+		}
+	})
+}
+
+// TestRunPhaseDeliversTheWarmupSample must be run with -race.
+//
+// It covers two distinct defects in the same six lines:
+//
+//   - the sample used to be written into the enclosing function's NAMED RETURN
+//     VALUES by the goroutine and read by the caller with only a closed channel
+//     between them — a signal, not a happens-before edge. `-race` reports it.
+//   - the obvious repair, a non-blocking `select/default` receive, compiles and
+//     looks right and silently LOSES the sample whenever the goroutine has not
+//     sent yet, which reads downstream as a run that had no warm-up.
+//
+// 🚨 THE TIMING IS THE TEST. With a phase much longer than the warm-up the
+// goroutine has long since sent into the buffered channel, so a non-blocking
+// receive finds the value and PASSES — I verified that, and an earlier version
+// of this test was vacuous for exactly that reason. The phase must end AT the
+// boundary, repeatedly, so the goroutine is still in flight when we read.
+//
+// The discriminator is `warmup`: the goroutine stamps it on every path, so a
+// zero there means we read a zero value instead of the goroutine's sample.
+//
+// Seen RED under: the named-return version (DATA RACE), and the select/default
+// receive (sample lost).
+func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
+	var counter atomic.Int64
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				counter.Add(1000)
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	defer close(stop)
+
+	const warm = 30 * time.Millisecond
+	for i := 0; i < 200; i++ {
+		s, err := runPhase(context.Background(), warm,
+			func() int64 { return counter.Load() },
+			// Ends AT the boundary: the goroutine is racing us to send.
+			func(context.Context) error { time.Sleep(warm); return nil })
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if s.warmup != warm {
+			t.Fatalf("iteration %d returned a zero sample (warmup=%v, want %v) — the goroutine's "+
+				"value was dropped, so a research run would report the warm-up as measured data",
+				i, s.warmup, warm)
+		}
+		if s.ok && (s.bytes <= 0 || s.at.IsZero()) {
+			t.Fatalf("iteration %d: sample claims a boundary but is empty: %+v", i, s)
+		}
+	}
+}
+
+// A phase shorter than its own warm-up must not produce a rate.
+func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
+	s, err := runPhase(context.Background(), 500*time.Millisecond,
+		func() int64 { return 0 },
+		func(context.Context) error { time.Sleep(20 * time.Millisecond); return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ok {
+		t.Fatal("claims a warm-up boundary that never came")
+	}
+	start := time.Now().Add(-20 * time.Millisecond)
+	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, start, time.Now(), 1234)
+	if p.RawMbps != 0 {
+		t.Errorf("stated %v Mbit/s from a 0.02s window", p.RawMbps)
+	}
+	if len(p.Warnings) == 0 {
+		t.Error("no warning: a figure covering the warm-up is not the figure research mode promises")
+	}
+}
+
+// The two halves must ADD UP to the whole, because the UI prints all three and
+// must never have to subtract.
+func TestWindowSplitSumsToActual(t *testing.T) {
+	start := time.Now()
+	warmAt := start.Add(5 * time.Second)
+	end := start.Add(20 * time.Second)
+
+	p := measure(1e6, 40e6, start, end, false, 0, 0)
+	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, start, end, 40e6)
+
+	if got := p.WarmupSec + p.WindowSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
+		t.Errorf("warmup %.3f + window %.3f = %.3f, but actual is %.3f",
+			p.WarmupSec, p.WindowSec, got, p.ActualSec)
+	}
+	// 30 MB over the 15 s window, not 40 MB over 20 s.
+	if want := 30e6 * 8 / 15 / 1e6; p.RawMbps < want-0.5 || p.RawMbps > want+0.5 {
+		t.Errorf("raw %.2f Mbit/s, want ~%.2f — the rate must cover the WINDOW, not the phase",
+			p.RawMbps, want)
+	}
+}
+
+func TestApplyConnStatsWarnsWhenThreadsDidNotBecomeConnections(t *testing.T) {
+	p := applyConnStats(Phase{}, 1, 1, 8)
+	if len(p.Warnings) == 0 {
+		t.Error("8 threads on 1 connection passed without a word — that is the HTTP/2 state " +
+			"every thread-count comparison was taken in before 2026-08-20")
+	}
+	if q := applyConnStats(Phase{}, 8, 8, 8); len(q.Warnings) != 0 {
+		t.Errorf("healthy phase warned: %v", q.Warnings)
+	}
+}

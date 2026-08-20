@@ -1,12 +1,16 @@
 // Package speedtest wraps showwin/speedtest-go for the iOS app's in-app speed
-// test. It runs in the APP, never in the network extension: a 32-flow generator
-// next to the extension's ~50 MB jetsam budget is what builds 130-146 were about.
+// test. It runs in the APP, never in the network extension: a many-flow load
+// generator next to the extension's ~50 MB jetsam budget is what builds 130-146
+// were about.
 //
 // Design notes that are not obvious from the code:
 //
 //   - ONE RUN PER PROCESS. The guard lives here, at package scope, not in a view
 //     model: a guard scoped to one object cannot protect a process-wide resource,
 //     which is exactly how build 271 ended up with two concurrent load runs.
+//     🚨 Servers() takes the SAME guard. Fetching the list is not a lookup — the
+//     engine pings every server in it concurrently for up to 4 s — so doing it
+//     during a run is a second generator inside the measurement.
 //
 //   - POLLED, NOT CALLBACK-DRIVEN. Progress crosses into Swift by polling a
 //     snapshot rather than by a cgo callback. The app already polls stats, and it
@@ -14,14 +18,23 @@
 //
 //   - TWO RESULTS, ALWAYS. The library reports a blended estimator
 //     (0.5*EWMA + 0.5*mean of the last 5 s) whose value depends on how long the
-//     phase actually ran; we also compute raw = confirmed bytes / actual elapsed.
-//     Only the raw figure is comparable across different thread counts and
-//     durations, which is the whole point of exposing those knobs.
+//     phase actually ran; we also compute raw = confirmed bytes over the window
+//     they were measured in. Only the raw figure is comparable across runs.
 //
-//   - EARLY STOP CANNOT BE DISABLED. The library ends a phase once the rate is
-//     stable (CV < 3%), and its Welford window is hardcoded at 5 s inside an
-//     `internal/` package. So `Duration` is a CEILING; the ACTUAL per-phase
-//     duration is measured and reported, and the raw metric is computed over it.
+//   - EARLY STOP IS A PER-RUN CHOICE, not a fixed property of the engine.
+//     Upstream ends a phase once the rate is stable (CV < 3%), so Duration is a
+//     CEILING and a requested 15 s lands at ~10 s. Fork divergence 3 added
+//     SetEarlyStop, and research mode turns it off to hold a fixed window; plan()
+//     is the single place that decides. The ACTUAL per-phase duration is measured
+//     and reported either way.
+//
+//   - THREADS MEANS TCP CONNECTIONS, and only because this package forces it.
+//     The engine's own transport sets ForceAttemptHTTP2, and the measured URL is
+//     https after resolveUploadURL follows the endpoint's 307 — so N workers
+//     multiplexed onto ONE connection and every thread-count comparison measured
+//     nothing. This package supplies its own transport with HTTP/2 disabled and
+//     COUNTS the connections, so the claim is checked at run time rather than
+//     assumed. Numbers collected before 2026-08-20 were taken under that defect.
 package speedtest
 
 import (
@@ -37,11 +50,36 @@ import (
 	stgo "github.com/showwin/speedtest-go/speedtest"
 )
 
+// forkRevision is the number of deliberate divergences in
+// third_party/speedtest-go (see its FORK.md). It is part of EngineVersion
+// because those divergences CHANGE THE METHODOLOGY — the thread count means
+// something different, phases end at a different time — so "speedtest-go
+// v1.7.11" alone does not identify what produced a number.
+//
+// 🚨 It cannot drift: TestEngineVersionNamesEveryForkDivergence reads FORK.md,
+// counts its "## Divergence N:" sections and fails if they disagree. Together
+// with the fork's own TestForkDivergesFromUpstreamExactlyHere — which fails on a
+// divergence nobody documented — the loop closes in both directions:
+// undocumented change -> that guard; documented but unnamed here -> this one.
+const forkRevision = 5
+
 // EngineVersion is reported beside every result so a number can be traced to the
-// code that produced it. v1.7.10 counted ATTEMPTED upload bytes (they were added
+// code that produced it. The upstream half is READ FROM THE LIBRARY rather than
+// typed here, so a version bump cannot leave the label behind.
+//
+// On the upstream version itself: v1.7.10 counted ATTEMPTED upload bytes (added
 // as the transport read the request body, before the server confirmed); 1.7.11
 // splits that into a separate read-volume accumulator. Do not go back.
-const EngineVersion = "speedtest-go v1.7.11"
+var EngineVersion = fmt.Sprintf("speedtest-go v%s+vkturn.%d", stgo.Version(), forkRevision)
+
+// Limits on what the C surface will accept. wgSpeedtestStart takes arbitrary
+// JSON, so these are enforced here rather than trusted from the caller: Swift
+// constrains all three today, and "today" is not a guarantee.
+const (
+	maxThreads  = 32
+	minDuration = 5
+	maxDuration = 120
+)
 
 // Config is what the UI collects. JSON tags match the Swift side.
 type Config struct {
@@ -61,7 +99,6 @@ type ServerInfo struct {
 	Country  string  `json:"country"`
 	Host     string  `json:"host"`
 	Distance float64 `json:"distance_km"`
-	LatencyM float64 `json:"latency_ms"`
 }
 
 // Phase carries one direction's outcome. Library and Raw are both kept on
@@ -83,12 +120,28 @@ type Phase struct {
 	// rather than trust or distrust the engine wholesale, every result carries
 	// the check. A number whose own bytes disagree with its own rate must never
 	// be shown as a plain figure.
-	// WarmupSec is non-zero only in research mode: the seconds discarded before
-	// the measurement window opened. RawMbps then covers the window ALONE, which
-	// is what makes two runs at different thread counts comparable.
+	// WarmupSec and WindowSec split ActualSec, and they are MEASURED, not the
+	// values that were requested: WarmupSec is how long the discarded prefix
+	// actually lasted and WindowSec is the window RawMbps covers. Outside
+	// research mode WarmupSec is 0 and WindowSec == ActualSec.
+	//
+	// 🚨 THE UI MUST NOT SUBTRACT. It used to print ActualSec beside a RawMbps
+	// computed over a shorter window, so a research run read "20.0s" next to a
+	// rate measured over 15 — two numbers on one line that could not both be
+	// true. A quantity derived in two places is this project's recurring defect,
+	// so the split is computed once, here, and shipped.
 	WarmupSec  float64 `json:"warmup_sec"`
+	WindowSec  float64 `json:"window_sec"`
 	ImpliedSec float64 `json:"implied_sec"`
 	Consistent bool    `json:"consistent"`
+
+	// PeakConns is the most TCP connections open at once during this phase and
+	// Dials is how many were newly opened. PeakConns is the one that matters:
+	// under HTTP/2 it is 1 no matter how many workers run, which is precisely
+	// the state every thread-count comparison was silently taken in until
+	// 2026-08-20.
+	PeakConns int `json:"peak_conns"`
+	Dials     int `json:"dials"`
 
 	// UPLOAD ONLY. Confirmed bytes are counted after the server's response, so
 	// the two below say whether the bytes we pushed were actually ACCEPTED.
@@ -133,10 +186,24 @@ type Progress struct {
 	PingMs       float64 `json:"ping_ms"`
 	Threads      int     `json:"threads"`
 	Requested    int     `json:"requested_sec"`
-	Down         Phase   `json:"download"`
-	Up           Phase   `json:"upload"`
-	Engine       string  `json:"engine"`
-	Estimator    string  `json:"estimator"`
+
+	// Direction and Mode describe the run that produced this snapshot, so a
+	// result can be rendered without consulting whatever the UI's controls
+	// happen to say NOW. Mode is authored by plan(), the function that actually
+	// calls SetEarlyStop, so the label cannot disagree with the setting.
+	Direction string `json:"direction"`
+	Mode      string `json:"mode"`
+
+	// 🚨 POINTERS, AND OMITTED WHEN THE DIRECTION DID NOT RUN. As values these
+	// were always marshalled, so a download-only run emitted a complete, tidy
+	// upload object of zeros — indistinguishable on the wire from a measured
+	// 0.0 Mbit/s. Any consumer that renders what it is given reproduced the
+	// fabrication; making it absent is the only fix that survives the next
+	// consumer.
+	Down      *Phase `json:"download,omitempty"`
+	Up        *Phase `json:"upload,omitempty"`
+	Engine    string `json:"engine"`
+	Estimator string `json:"estimator"`
 }
 
 var (
@@ -169,12 +236,39 @@ func Cancel() {
 	}
 }
 
+// serverListTimeout bounds the whole list fetch. There was no bound at all: the
+// bridge passed context.Background(), the client has no Timeout and the
+// transport sets no ResponseHeaderTimeout, so a peer that accepted the
+// connection and never answered hung the fetch for the life of the process —
+// while the UI's "loading" latch, which hides its own retry button, never
+// cleared. Killing the app was the only way out.
+const serverListTimeout = 20 * time.Second
+
 // Servers fetches the selectable list. NOTE: the list is built from this
 // device's APPARENT IP, so with the tunnel up it describes servers near the
 // EXIT and with it down servers near the user. The caller must say which,
 // because the same "auto" otherwise measures two different paths silently.
 func Servers(ctx context.Context) ([]ServerInfo, error) {
-	client := stgo.New()
+	// 🚨 THE ONE-RUN GUARD COVERS THIS TOO. Fetching the list is not a lookup:
+	// the engine pings EVERY server in it concurrently, under its own detached
+	// 4 s deadline, before returning. Doing that during a measurement puts a
+	// second load generator inside it — the exact condition this package's
+	// header calls its founding rule, and one the run guard did not cover
+	// because Servers never consulted it. The picker is reachable mid-run, so
+	// this was one tap away.
+	mu.Lock()
+	busy := running
+	mu.Unlock()
+	if busy {
+		return nil, fmt.Errorf(
+			"a speed test is running: the server list pings every server at once, " +
+				"so fetching it now would land inside the measurement")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, serverListTimeout)
+	defer cancel()
+
+	client := newEngine(1, false)
 	if _, err := client.FetchUserInfoContext(ctx); err != nil {
 		return nil, fmt.Errorf("fetch user info: %w", err)
 	}
@@ -196,9 +290,82 @@ func Servers(ctx context.Context) ([]ServerInfo, error) {
 	return out, nil
 }
 
+// runPlan is everything the engine is configured with, decided in ONE place.
+//
+// It exists because the three settings are entangled: research mode needs the
+// capture time EXTENDED to cover a warm-up it then discards, AND early stop
+// turned off, or the "fixed window" it promises is neither fixed nor a window.
+// Deciding them at three call sites is how the previous version ended up
+// discarding a warm-up without extending the capture whenever duration_sec was
+// 0 — unreachable from the UI, reachable through the bridge's JSON.
+type runPlan struct {
+	threads   int
+	direction string
+	requested time.Duration
+	capture   time.Duration
+	warmup    time.Duration
+	earlyStop bool
+
+	// mode is the label shown beside the result. It is authored HERE, by the
+	// function that actually calls SetEarlyStop, so it cannot claim a
+	// methodology the run did not use.
+	mode string
+}
+
+// plan validates the config and derives the engine settings from it.
+func plan(cfg Config) (runPlan, error) {
+	p := runPlan{threads: cfg.Threads, direction: cfg.Direction}
+
+	if p.threads < 1 {
+		p.threads = 1
+	}
+	if p.threads > maxThreads {
+		return runPlan{}, fmt.Errorf("threads %d is above the %d this app will run", cfg.Threads, maxThreads)
+	}
+	switch p.direction {
+	case "":
+		p.direction = "both"
+	case "download", "upload", "both":
+	default:
+		// Silently accepting it made BOTH directions false, so run() returned
+		// success having measured nothing and the snapshot carried two
+		// fabricated zero phases.
+		return runPlan{}, fmt.Errorf("direction %q is not one of download, upload, both", cfg.Direction)
+	}
+
+	sec := cfg.DurationSec
+	if sec == 0 {
+		sec = 15
+	}
+	if sec < minDuration || sec > maxDuration {
+		return runPlan{}, fmt.Errorf("duration %ds is outside %d-%ds", cfg.DurationSec, minDuration, maxDuration)
+	}
+	p.requested = time.Duration(sec) * time.Second
+
+	if cfg.Research {
+		p.warmup = researchWarmup
+		p.capture = p.requested + p.warmup
+		p.earlyStop = false
+		p.mode = fmt.Sprintf("research · %.0fs warm-up discarded · fixed %.0fs window",
+			p.warmup.Seconds(), p.requested.Seconds())
+	} else {
+		p.capture = p.requested
+		p.earlyStop = true
+		p.mode = "standard · early stop on, so the duration is a ceiling"
+	}
+	return p, nil
+}
+
 // Start begins a run. It refuses if one is already in flight — the refusal is
 // the point: two concurrent generators would measure each other.
 func Start(cfg Config) error {
+	// Validate BEFORE taking the guard, so a rejected config does not leave the
+	// package marked busy.
+	pl, err := plan(cfg)
+	if err != nil {
+		return err
+	}
+
 	mu.Lock()
 	if running {
 		mu.Unlock()
@@ -210,8 +377,10 @@ func Start(cfg Config) error {
 	snap = Progress{
 		State:     "running",
 		Stage:     "ping",
-		Threads:   cfg.Threads,
-		Requested: cfg.DurationSec,
+		Threads:   pl.threads,
+		Requested: int(pl.requested.Seconds()),
+		Direction: pl.direction,
+		Mode:      pl.mode,
 		Engine:    EngineVersion,
 		Estimator: "EWMA5",
 		ServerID:  cfg.ServerID,
@@ -225,7 +394,7 @@ func Start(cfg Config) error {
 			cancel = nil
 			mu.Unlock()
 		}()
-		if err := run(ctx, cfg); err != nil {
+		if err := run(ctx, cfg, pl); err != nil {
 			setSnap(func(p *Progress) {
 				p.State = "error"
 				p.Err = err.Error()
@@ -237,12 +406,18 @@ func Start(cfg Config) error {
 	return nil
 }
 
-func run(ctx context.Context, cfg Config) error {
-	threads := cfg.Threads
-	if threads < 1 {
-		threads = 1
-	}
-	client := stgo.New(stgo.WithUserConfig(&stgo.UserConfig{MaxConnections: threads, Debug: cfg.Debug}))
+// phaseSpec is one direction, so the two phases cannot drift apart by being
+// written twice.
+type phaseSpec struct {
+	stage  string
+	total  func() int64
+	run    func(context.Context) error
+	speed  func() float64
+	upload bool
+}
+
+func run(ctx context.Context, cfg Config, pl runPlan) error {
+	client := newEngine(pl.threads, cfg.Debug)
 
 	user, err := client.FetchUserInfoContext(ctx)
 	if err != nil {
@@ -292,21 +467,9 @@ func run(ctx context.Context, cfg Config) error {
 		p.ServerURL = target.URL
 	})
 
-	// Duration is a CEILING: the library ends a phase early once the rate is
-	// stable, and that cannot be switched off from outside the package.
-	if cfg.DurationSec > 0 {
-		d := time.Duration(cfg.DurationSec) * time.Second
-		if cfg.Research {
-			// The window must OPEN after the warm-up, so the capture has to
-			// cover both. And the engine's stability cut-off has to go, or the
-			// phase ends at ~10 s regardless of what was asked for and the
-			// "fixed window" is not fixed.
-			d += researchWarmup
-			client.SetEarlyStop(false)
-		}
-		client.SetCaptureTime(d)
-	}
-	client.SetNThread(threads)
+	client.SetCaptureTime(pl.capture)
+	client.SetEarlyStop(pl.earlyStop)
+	client.SetNThread(pl.threads)
 
 	setSnap(func(p *Progress) { p.Stage = "ping" })
 	if err := target.PingTestContext(ctx, nil); err != nil {
@@ -314,35 +477,62 @@ func run(ctx context.Context, cfg Config) error {
 	}
 	setSnap(func(p *Progress) { p.PingMs = float64(target.Latency.Milliseconds()) })
 
-	wantDown := cfg.Direction == "download" || cfg.Direction == "both" || cfg.Direction == ""
-	wantUp := cfg.Direction == "upload" || cfg.Direction == "both" || cfg.Direction == ""
-
-	if wantDown {
-		setSnap(func(p *Progress) { p.Stage = "download" })
-		start := time.Now()
-		wb, wat, err := runPhase(ctx, cfg.Research,
-			&int64Reader{read: func() int64 { return target.Context.GetTotalDownload() }},
-			target.DownloadTestContext)
-		if err != nil {
-			return fmt.Errorf("download: %w", err)
-		}
-		phase := measure(float64(target.DLSpeed), target.Context.GetTotalDownload(), start, target.TestDuration.Download, 0, 0, false)
-		phase = applyWarmup(phase, wb, wat, target.Context.GetTotalDownload())
-		setSnap(func(p *Progress) { p.Down = phase })
+	specs := map[string]phaseSpec{
+		"download": {
+			stage: "download",
+			total: target.Context.GetTotalDownload,
+			run:   target.DownloadTestContext,
+			speed: func() float64 { return float64(target.DLSpeed) },
+		},
+		"upload": {
+			stage:  "upload",
+			total:  target.Context.GetTotalUpload,
+			run:    target.UploadTestContext,
+			speed:  func() float64 { return float64(target.ULSpeed) },
+			upload: true,
+		},
 	}
-	if wantUp {
-		setSnap(func(p *Progress) { p.Stage = "upload" })
+	order := []string{"download", "upload"}
+	if pl.direction != "both" {
+		order = []string{pl.direction}
+	}
+
+	for _, name := range order {
+		spec := specs[name]
+		setSnap(func(p *Progress) { p.Stage = spec.stage })
+
+		// 🚨 NOTHING MAY DIAL BETWEEN reset() AND stats(): anything that does is
+		// counted into this phase's connection figures.
+		client.conns.reset()
 		start := time.Now()
-		wb, wat, err := runPhase(ctx, cfg.Research,
-			&int64Reader{read: func() int64 { return target.Context.GetTotalUpload() }},
-			target.UploadTestContext)
+		ws, err := runPhase(ctx, pl.warmup, spec.total, spec.run)
+		end := time.Now()
+		peak, dials := client.conns.stats()
+		endBytes := spec.total()
+
+		// The gate comes AFTER the samples are taken and BEFORE anything is
+		// published: a stopped run is not a result. Without it the engine
+		// reports success unconditionally — DownloadTestContext returns nil even
+		// when the phase was cut short — so Stop produced a fabricated "done".
 		if err != nil {
-			return fmt.Errorf("upload: %w", err)
+			return fmt.Errorf("%s: %w", name, err)
 		}
-		phase := measure(float64(target.ULSpeed), target.Context.GetTotalUpload(), start, target.TestDuration.Upload,
-			target.Context.GetUploadBacklog(), target.Context.GetUploadConfirmationRatio(), true)
-		phase = applyWarmup(phase, wb, wat, target.Context.GetTotalUpload())
-		setSnap(func(p *Progress) { p.Up = phase })
+
+		phase := measure(spec.speed(), endBytes, start, end, spec.upload,
+			target.Context.GetUploadBacklog(), target.Context.GetUploadConfirmationRatio())
+		phase = applyWindow(phase, ws, start, end, endBytes)
+		// After the gate on purpose: a cancelled phase has peak < threads and
+		// would otherwise emit a spurious "the knob lied" warning on every Stop.
+		phase = applyConnStats(phase, peak, dials, pl.threads)
+
+		done := phase
+		setSnap(func(p *Progress) {
+			if spec.upload {
+				p.Up = &done
+			} else {
+				p.Down = &done
+			}
+		})
 	}
 	return nil
 }
@@ -361,9 +551,15 @@ func run(ctx context.Context, cfg Config) error {
 // built on truncated, redirected requests. v1.7.11 checks the status and refuses
 // to count them — which is correct, and is why upload reads N/A there until the
 // URL is resolved. Resolving it once makes both versions measure accepted bytes.
+//
+// It uses the same no-HTTP/2 transport as the measurement. This probe reads only
+// the status and Location, so h2 here would harm nothing today — but a probe on
+// a different transport than the thing it configures is a trap waiting for the
+// first person who measures with it.
 func resolveUploadURL(ctx context.Context, raw string) string {
 	client := &http.Client{
-		Timeout: 15 * time.Second,
+		Timeout:   15 * time.Second,
+		Transport: newRoundTripper(nil),
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse // we want to SEE the 307, not chase it
 		},
@@ -395,59 +591,122 @@ func resolveUploadURL(ctx context.Context, raw string) string {
 // engine's own estimator carries a 5 s window.
 const researchWarmup = 5 * time.Second
 
-// runPhase executes one direction and, in research mode, samples the byte
-// counter at the warm-up boundary so the raw figure covers the measurement
-// window alone.
-func runPhase(ctx context.Context, research bool, total *int64Reader, run func(context.Context) error) (warmBytes int64, warmAt time.Time, err error) {
-	if !research {
-		return 0, time.Time{}, run(ctx)
+// minRateWindow is the shortest interval a rate may be computed over. A window
+// of a few milliseconds turns a handful of bytes into millions of Mbit/s, which
+// is not a wrong number so much as a meaningless one presented as a right one.
+const minRateWindow = 1.0
+
+// warmSample is what the warm-up goroutine observed, carried back over a channel
+// rather than through shared variables.
+type warmSample struct {
+	warmup time.Duration // what was REQUESTED, for the message when ok is false
+	bytes  int64         // counter reading at the boundary
+	at     time.Time     // when the boundary was crossed
+	ok     bool          // false: the phase ended before the warm-up did
+}
+
+// runPhase executes one direction and, when a warm-up is asked for, samples the
+// byte counter at the boundary so the raw figure covers the measurement window
+// alone.
+//
+// 🚨 THE CHANNEL IS THE SYNCHRONISATION, AND THE RECEIVE MUST BLOCK. The
+// previous version wrote the sample into the enclosing function's named return
+// values from the goroutine and merely closed a `done` channel — a signal, not a
+// happens-before edge. `go test -race` reported both fields. A non-blocking
+// receive (select with default) is no better in a different way: it compiles,
+// passes, and silently LOSES the sample when the goroutine has not sent yet,
+// which reads as a run with no warm-up.
+func runPhase(ctx context.Context, warmup time.Duration, total func() int64, run func(context.Context) error) (warmSample, error) {
+	if warmup <= 0 {
+		return warmSample{}, phaseErr(ctx, run(ctx))
 	}
+	ch := make(chan warmSample, 1)
 	done := make(chan struct{})
 	go func() {
+		s := warmSample{warmup: warmup}
 		select {
-		case <-time.After(researchWarmup):
-			warmBytes = total.read()
-			warmAt = time.Now()
+		case <-time.After(warmup):
+			s.bytes, s.at, s.ok = total(), time.Now(), true
 		case <-done:
 		case <-ctx.Done():
 		}
+		ch <- s // exactly one send, on every path
 	}()
-	err = run(ctx)
+	err := run(ctx)
 	close(done)
-	return warmBytes, warmAt, err
+	s := <-ch // blocking: this is what orders the goroutine's writes before our reads
+	return s, phaseErr(ctx, err)
 }
 
-// applyWarmup rewrites the raw figure to cover the measurement window only.
-// Called with a zero warmAt outside research mode, where it does nothing.
-func applyWarmup(p Phase, warmBytes int64, warmAt time.Time, endBytes int64) Phase {
-	if warmAt.IsZero() {
-		return p
+// phaseErr turns a cancelled phase into an error.
+//
+// The engine reports success unconditionally — DownloadTestContext and
+// UploadTestContext both `return nil` even when the phase was cut short — so
+// ctx.Err() is the only signal that the numbers about to be measured cover a
+// window the user stopped.
+func phaseErr(ctx context.Context, err error) error {
+	if err == nil {
+		return ctx.Err()
 	}
-	window := time.Since(warmAt).Seconds()
-	if window <= 0 {
-		return p
+	return err
+}
+
+// applyWindow splits the phase into the discarded warm-up and the measured
+// window, and is the ONLY place RawMbps is decided.
+//
+// Both halves are MEASURED, not requested, and both are anchored on the same two
+// wrapper timestamps as ActualSec — so WarmupSec + WindowSec == ActualSec
+// exactly, and the UI can print all three without deriving any of them a second
+// time.
+func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes int64) Phase {
+	if !s.ok {
+		p.WindowSec = p.ActualSec
+		if s.warmup > 0 {
+			p.Warnings = append(p.Warnings, fmt.Sprintf(
+				"the phase ended before the %.0fs warm-up did, so no measurement window opened — "+
+					"this figure covers the whole phase, warm-up included", s.warmup.Seconds()))
+		}
+		return setRaw(p, p.Bytes, p.WindowSec)
 	}
-	p.WarmupSec = researchWarmup.Seconds()
-	p.RawMbps = float64(endBytes-warmBytes) * 8 / window / 1e6
-	if endBytes-warmBytes <= 0 {
-		p.Warnings = append(p.Warnings, "nothing moved after the warm-up — the measurement window is empty")
+	p.WarmupSec = s.at.Sub(start).Seconds()
+	p.WindowSec = end.Sub(s.at).Seconds()
+	return setRaw(p, endBytes-s.bytes, p.WindowSec)
+}
+
+// setRaw is the single writer of RawMbps.
+func setRaw(p Phase, bytes int64, sec float64) Phase {
+	switch {
+	case bytes <= 0:
+		p.RawMbps = 0
+		p.Warnings = append(p.Warnings, "nothing moved in the measurement window")
+	case sec < minRateWindow:
+		p.RawMbps = 0
+		p.Warnings = append(p.Warnings, fmt.Sprintf(
+			"the measurement window was %.2fs — too short to state a rate from", sec))
+	default:
+		p.RawMbps = float64(bytes) * 8 / sec / 1e6
 	}
 	return p
 }
 
-// int64Reader is a tiny indirection so runPhase can sample either direction's
-// counter without knowing which.
-type int64Reader struct{ read func() int64 }
-
-// measure turns one phase into both numbers. The library figure is taken as
-// reported; the raw one is bytes over the ACTUAL elapsed time, which is the only
-// figure comparable across thread counts and durations.
-func measure(libBytesPerSec float64, bytes int64, start time.Time, reported *time.Duration, backlog int64, ratio float64, isUpload bool) Phase {
-	elapsed := time.Since(start)
-	if reported != nil && *reported > 0 {
-		elapsed = *reported
+// applyConnStats records how many TCP connections the phase really used.
+func applyConnStats(p Phase, peak, dials, threads int) Phase {
+	p.PeakConns, p.Dials = peak, dials
+	if threads > 1 && peak > 0 && peak < threads {
+		p.Warnings = append(p.Warnings, fmt.Sprintf(
+			"asked for %d threads but at most %d TCP connections were open at once — "+
+				"this is not a %d-flow measurement", threads, peak, threads))
 	}
-	sec := elapsed.Seconds()
+	return p
+}
+
+// measure turns one phase into its figures, EXCEPT RawMbps — that belongs to
+// applyWindow, which knows the window. The library figure is taken as reported.
+func measure(libBytesPerSec float64, bytes int64, start, end time.Time, isUpload bool, backlog int64, ratio float64) Phase {
+	// ActualSec comes from the wrapper's own clock rather than the engine's
+	// TestDuration so that it shares one clock with the warm-up split. The two
+	// bracket the same call and agree to milliseconds.
+	sec := end.Sub(start).Seconds()
 	if sec <= 0 {
 		sec = 0.001
 	}
@@ -461,12 +720,11 @@ func measure(libBytesPerSec float64, bytes int64, start time.Time, reported *tim
 	// endpoint would slip past a caller that checks the flag and not the bytes.
 	consistent := bytes > 0 && lib > 0
 	if consistent && implied > 0 && sec > 0 {
-		ratio := implied / sec
-		consistent = ratio > 0.75 && ratio < 1.25
+		r := implied / sec
+		consistent = r > 0.75 && r < 1.25
 	}
 	p := Phase{
 		LibraryMbps: lib,
-		RawMbps:     float64(bytes) * 8 / sec / 1e6,
 		Bytes:       bytes,
 		ActualSec:   sec,
 		ImpliedSec:  implied,
@@ -491,8 +749,6 @@ func measure(libBytesPerSec float64, bytes int64, start time.Time, reported *tim
 		p.Warnings = append(p.Warnings, fmt.Sprintf(
 			"the reported rate implies %.1fs of data but the phase ran %.1fs — the engine's estimator is weighted to the last seconds, so treat the raw figure as the average",
 			implied, sec))
-	} else if !consistent && bytes == 0 && lib <= 0 {
-		p.Warnings = append(p.Warnings, "this phase moved no data at all")
 	}
 	return p
 }
