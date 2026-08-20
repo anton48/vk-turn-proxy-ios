@@ -65,7 +65,13 @@ enum SpeedTestLog {
             lines.append(phase("UPLOAD", up, threads: run.threads))
         }
         if let error = progress.error {
-            lines.append("speedtest: ERROR \(error)")
+            // 🚨 THROUGH clean() LIKE EVERYTHING ELSE — and this is the field
+            // most likely to need it. Engine errors WRAP remote text: a server
+            // name, a sponsor, an endpoint's own response. It was the last
+            // interpolation in this file that bypassed the policy, which is
+            // exactly where such a thing survives: on the path nobody exercises
+            // when everything works.
+            lines.append("speedtest: ERROR \(clean(error))")
         }
         guard !lines.isEmpty else { return [] }
 

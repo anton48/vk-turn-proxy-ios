@@ -1342,6 +1342,36 @@ do {
     check(SpeedTestLog.clean(String(repeating: "x", count: 400)).count <= 120,
           "an unbounded remote string cannot flood the line")
 
+    // 🚨 A STRUCTURAL GUARD, NOT A LIST OF FIELDS. Checking the fields I happen
+    // to remember is how the ERROR line kept its raw interpolation through three
+    // reviews of this file: every other one was converted and that one, on the
+    // path nobody exercises when things work, was not. This finds ANY value
+    // interpolated into a log string without going through clean().
+    //
+    // Numeric fields do not appear here at all — they go through
+    // String(format:) — so an interpolation of a stored property is by
+    // construction a string, and a string in this file is remote until proven
+    // otherwise.
+    let logSrc = source("VKTurnProxy/VKTurnProxy/SpeedTestLog.swift")
+    // The exemptions are a "prove it is not remote" list, and each one carries
+    // its reason — so a new interpolation must be CLASSIFIED rather than
+    // silently inherit somebody's memory.
+    let notRemote: Set<String> = [
+        "run.threads", "run.durationSec", "threads",   // Int, from the UI's own pickers
+        "p.connsUsed", "p.dials",                      // Int, counted locally
+        "p.consistent", "research",                    // Bool
+        "path.rawValue", "path.label",                 // our own enum text, never Ookla's
+        "server",                                      // already built from clean() above
+    ]
+    var raw: [String] = []
+    for piece in logSrc.components(separatedBy: "\\(").dropFirst() {
+        let expr = String(piece.prefix(while: { $0 != ")" && $0 != "\n" }))
+        if expr.hasPrefix("clean(") || notRemote.contains(expr) { continue }
+        raw.append(expr)
+    }
+    check(raw.isEmpty,
+          "🚨 every interpolated value in a log line goes through clean() — these do not: \(raw)")
+
     var progress = SpeedTestProgress()
     progress.serverID = "31551"
     progress.serverDesc = "MEO · Funchal"
