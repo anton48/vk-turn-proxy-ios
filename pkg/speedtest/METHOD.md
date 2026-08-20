@@ -121,3 +121,35 @@ so it is part of Method 6 rather than a revision of its own.
 
 ⇒ **Do not compare a `confirmed` figure across this line**: before Method 6 a
 download's is meaningless and an upload's warning is thread-count noise.
+
+## Method 7 — the measurement window closes on its own timer
+
+**Before this, research mode's "fixed window" was not fixed.** The wrapper read
+its end timestamp and its byte counter after the engine's phase function
+returned — and that returns only once every blocked worker has unwound. So the
+unwinding was measured too.
+
+Seen across two palindromes on 2026-08-20 (`20.08/speedtest0`), which are
+designed around their arms being the same length:
+
+```
+30 allocations · T4   window 33.6s and 34.1s   (asked for 30)
+30 allocations · T32  window 31.7s
+60 allocations · T32  window 33.1s and 32.8s
+60 allocations · T16  window 35.0s
+```
+
+The rate stayed arithmetically honest — bytes divided by the window it actually
+used — which is exactly why nothing looked wrong. What was broken is
+comparability: two arms of different lengths are not the same experiment, and a
+palindrome cannot separate drift from treatment when its arms differ by 17%.
+
+The window is now closed by its own timer at `warm-up + requested`, and both the
+byte counter and the timestamp are taken THERE. What happens afterwards is
+reported as **`cleanup_sec`** — which also makes it the first measurement of how
+long the engine takes to stop.
+
+⇒ **Do not compare a research-mode figure across this line.** Before Method 7 an
+arm's window is whatever its workers allowed; after it, the window is the one
+that was asked for. ⚠️ The 60-allocation T16 and T32 means from
+`20.08/speedtest0` are indicative for that reason, not final.

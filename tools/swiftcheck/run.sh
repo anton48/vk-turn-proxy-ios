@@ -44,6 +44,7 @@ SOURCES=(
     "$S/SpeedTestServerList.swift"
     "$S/SpeedTestWire.swift"
     "$S/SpeedTestLog.swift"
+    "$S/SpeedTestResultView.swift"
     "$S/SharedLogger.swift"
     "$S/AppEntitlements.swift"
 )

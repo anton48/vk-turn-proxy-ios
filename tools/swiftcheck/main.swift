@@ -1657,6 +1657,29 @@ do {
     let view = codeWithoutComments("VKTurnProxy/VKTurnProxy/SpeedTestResultView.swift")
     check(view.contains("phase.confirmedKnown"),
           "🚨 the result view tests confirmedKnown, not the value — same reason as the log line")
+    // 🚨 THE CLEANUP IS NAMED, NOT ABSORBED. Research mode promised a fixed 30s
+    // window and delivered 33.6-35.0s, because the window ran until the engine
+    // returned and the engine returns only after its blocked workers unwind.
+    var slow = SpeedTestPhase()
+    slow.rawMbps = 93.8; slow.actualSec = 40; slow.windowSec = 30; slow.warmupSec = 5
+    slow.cleanupSec = 5; slow.bytes = 400_000_000; slow.windowBytes = 351_000_000
+    slow.connsUsed = 16; slow.dials = 15
+    let slowLine = SpeedTestLog.result(SpeedTestRunConfig(serverID: "31551", serverLabel: "MEO · Funchal",
+                                                          threads: 16, direction: "upload",
+                                                          durationSec: 30),
+                                        progress: { var p = SpeedTestProgress(); p.upload = slow; return p }(),
+                                        path: SpeedTestPathTrace(.vpnOff)).joined(separator: "\n")
+    check(slowLine.contains("window=30.0s") && slowLine.contains("cleanup=5.0s"),
+          "🚨 the log separates the WINDOW from the tail spent stopping — folded together they "
+          + "made a fixed-window experiment produce arms of 30.0s and 35.0s")
+    check(slowLine.contains("actual=40.0s"),
+          "and the phase's whole length is still there, so warm-up + window + cleanup can be "
+          + "checked against it")
+
+    check(SpeedTestResultView.timing(slow, requested: 30).contains("to stop"),
+          "🚨 and the SCREEN names it too — a 35s arm that reads as 30s is how two different "
+          + "experiments get compared as one")
+
     check(view.contains("backlogTailBytes") && view.contains("still in flight when the phase ended"),
           "🚨 and it EXPLAINS a shortfall the cancellation tail accounts for, instead of showing a "
           + "bare 93.9% whose reason lives only in a log and a memory file")

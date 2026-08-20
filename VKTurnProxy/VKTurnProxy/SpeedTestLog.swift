@@ -108,6 +108,12 @@ enum SpeedTestLog {
         // which they have.
         s += String(format: " actual=%.1fs window=%.1fs", p.actualSec, p.windowSec)
         if p.warmupSec > 0 { s += String(format: " warmup=%.1fs", p.warmupSec) }
+        // 🚨 The tail AFTER the window closed, printed rather than folded into
+        // it: research promised a fixed window and delivered 33.6-35.0s because
+        // the engine's blocked workers were being measured too. A run with a
+        // long cleanup is still comparable now — this is the number that says
+        // how long it took to stop, and it is the only measurement of that.
+        if p.cleanupSec > 0.05 { s += String(format: " cleanup=%.1fs", p.cleanupSec) }
         // 🚨 In research mode `bytes` is the WHOLE phase and the rate covers the
         // window, so a reader checking bytes/window against raw on a CORRECT
         // line concludes the tool is lying. Log what the rate was computed from,

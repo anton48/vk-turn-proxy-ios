@@ -77,7 +77,7 @@ const forkRevision = 5
 // under which a figure is published. Not for wording, UI or tests.
 // TestEngineVersionNamesEveryMethodRevision fails if this and METHOD.md
 // disagree.
-const methodRevision = 6
+const methodRevision = 7
 
 // EngineVersion is reported beside every result so a number can be traced to the
 // code that produced it. The upstream version is READ FROM THE LIBRARY rather
@@ -207,6 +207,20 @@ type Phase struct {
 	// confirms NOTHING — came out as exactly 0.0 and was therefore rendered as
 	// absent, warned about nowhere, and printed on no line.
 	ConfirmedKnown bool `json:"confirmed_known"`
+
+	// CleanupSec is the time between the window CLOSING and the engine
+	// returning — the tail during which blocked workers unwind.
+	//
+	// 🚨 IT USED TO BE INSIDE THE WINDOW. The wrapper read its end timestamp
+	// and its byte counter after `run()` returned, so a phase whose workers
+	// took another 3-5 s to let go produced a "fixed 30 s window" of 33.6,
+	// 34.1, 35.0 s. The rate stayed arithmetically honest — bytes over the
+	// window it actually used — but the EXPERIMENT was not the one requested,
+	// and research arms of different lengths are not comparable.
+	// ⇒ the window is now closed by its own timer, and this is what happens
+	// after it. Reported rather than hidden, because it is also the only
+	// measurement of how long the engine takes to stop.
+	CleanupSec float64 `json:"cleanup_sec"`
 
 	// BacklogTailBytes is how much of the backlog a NORMAL end of phase
 	// explains: every worker has one chunk in flight when the phase stops, and
@@ -511,6 +525,20 @@ type runPlan struct {
 	mode string
 }
 
+// closeWindow is the window the wrapper ENFORCES, or 0 when none was promised.
+//
+// 🚨 A METHOD, NOT AN INLINE CONDITIONAL AT THE CALL SITE. The first version
+// computed this in the phase loop, and deleting it there left every test green:
+// they drive applyWindow and runPhase directly, so nothing observed that the
+// plan had stopped ASKING for a boundary. Guarding a function and not its call
+// site is a failure this repo has shipped before.
+func (p runPlan) closeWindow() time.Duration {
+	if p.earlyStop {
+		return 0 // the duration is a ceiling; the phase's own end is the answer
+	}
+	return p.requested
+}
+
 // plan validates the config and derives the engine settings from it.
 func plan(cfg Config) (runPlan, error) {
 	p := runPlan{threads: cfg.Threads, direction: cfg.Direction}
@@ -746,7 +774,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		// counted into this phase's connection figures.
 		meas.conns.reset()
 		start := time.Now()
-		ws, err := runPhase(ctx, pl.warmup, spec.sample, spec.run)
+		ws, cs, err := runPhase(ctx, pl.warmup, pl.closeWindow(), spec.sample, spec.run)
 		end := time.Now()
 		used, dials := meas.conns.stats()
 		endBytes, endBacklog := spec.sample()
@@ -760,7 +788,7 @@ func run(ctx context.Context, cfg Config, pl runPlan) error {
 		}
 
 		phase := measure(spec.speed(), endBytes, start, end, spec.upload)
-		phase = applyWindow(phase, ws, start, end, endBytes, endBacklog, spec.upload, pl.threads)
+		phase = applyWindow(phase, ws, cs, start, end, endBytes, endBacklog, spec.upload, pl.threads)
 		// After the gate on purpose: a cancelled phase has peak < threads and
 		// would otherwise emit a spurious "the knob lied" warning on every Stop.
 		phase = applyConnStats(phase, used, dials, pl.threads, warm)
@@ -864,27 +892,54 @@ type warmSample struct {
 // receive (select with default) is no better in a different way: it compiles,
 // passes, and silently LOSES the sample when the goroutine has not sent yet,
 // which reads as a run with no warm-up.
-func runPhase(ctx context.Context, warmup time.Duration, sample func() (bytes, backlog int64), run func(context.Context) error) (warmSample, error) {
+//
+// 🚨 AND IT TAKES A SECOND SAMPLE, AT THE WINDOW'S CLOSE. `run()` returns only
+// once every worker has unwound, so reading the counter after it means the
+// measurement absorbs however long that takes — which is how a "fixed 30 s
+// window" came back as 33.6 / 34.1 / 35.0 s in a palindrome whose whole design
+// depends on its arms being the same length. `window > 0` asks for that second
+// boundary; a phase that ends before it (early stop, a cancel) leaves the
+// sample not-ok and the caller falls back to the end of the phase.
+func runPhase(ctx context.Context, warmup, window time.Duration, sample func() (bytes, backlog int64), run func(context.Context) error) (warm, closed warmSample, err error) {
 	if warmup <= 0 {
-		return warmSample{}, phaseErr(ctx, run(ctx))
+		return warmSample{}, warmSample{}, phaseErr(ctx, run(ctx))
 	}
-	ch := make(chan warmSample, 1)
+	type pair struct{ warm, closed warmSample }
+	ch := make(chan pair, 1)
 	done := make(chan struct{})
 	go func() {
-		s := warmSample{warmup: warmup}
+		var p pair
+		p.warm.warmup = warmup
+		warmTimer := time.NewTimer(warmup)
+		defer warmTimer.Stop()
 		select {
-		case <-time.After(warmup):
-			s.bytes, s.backlog = sample()
-			s.at, s.ok = time.Now(), true
+		case <-warmTimer.C:
+			p.warm.bytes, p.warm.backlog = sample()
+			p.warm.at, p.warm.ok = time.Now(), true
 		case <-done:
+			ch <- p // exactly one send, on every path
+			return
 		case <-ctx.Done():
+			ch <- p
+			return
 		}
-		ch <- s // exactly one send, on every path
+		if window > 0 {
+			closeTimer := time.NewTimer(window)
+			defer closeTimer.Stop()
+			select {
+			case <-closeTimer.C:
+				p.closed.bytes, p.closed.backlog = sample()
+				p.closed.at, p.closed.ok = time.Now(), true
+			case <-done:
+			case <-ctx.Done():
+			}
+		}
+		ch <- p
 	}()
-	err := run(ctx)
+	err = run(ctx)
 	close(done)
-	s := <-ch // blocking: this is what orders the goroutine's writes before our reads
-	return s, phaseErr(ctx, err)
+	p := <-ch // blocking: this is what orders the goroutine's writes before our reads
+	return p.warm, p.closed, phaseErr(ctx, err)
 }
 
 // phaseErr turns a cancelled phase into an error.
@@ -907,7 +962,7 @@ func phaseErr(ctx context.Context, err error) error {
 // wrapper timestamps as ActualSec — so WarmupSec + WindowSec == ActualSec
 // exactly, and the UI can print all three without deriving any of them a second
 // time.
-func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes, endBacklog int64, upload bool, threads int) Phase {
+func applyWindow(p Phase, s, closed warmSample, start, end time.Time, endBytes, endBacklog int64, upload bool, threads int) Phase {
 	if !s.ok {
 		p.WindowSec = p.ActualSec
 		p.WindowBytes = p.Bytes
@@ -920,8 +975,22 @@ func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes, endBackl
 		return confirmRatio(setRaw(p, p.Bytes, p.WindowSec), upload, threads)
 	}
 	p.WarmupSec = s.at.Sub(start).Seconds()
-	p.WindowSec = end.Sub(s.at).Seconds()
-	p.WindowBytes = endBytes - s.bytes
+
+	// 🚨 THE WINDOW CLOSES ON ITS OWN TIMER, NOT WHEN THE ENGINE RETURNS.
+	// `run()` comes back only after every blocked worker has unwound, so
+	// measuring to that moment put the unwinding INSIDE the window: a research
+	// mode promising a fixed 30 s produced 33.6 / 34.1 / 35.0 s arms, and a
+	// palindrome whose design rests on its arms being equal was quietly not
+	// one. The trailing time is now reported as CleanupSec instead of being
+	// absorbed — which also makes it the first measurement of how long the
+	// engine takes to stop.
+	windowEnd, windowBytes, windowBacklog := end, endBytes, endBacklog
+	if closed.ok {
+		windowEnd, windowBytes, windowBacklog = closed.at, closed.bytes, closed.backlog
+		p.CleanupSec = end.Sub(closed.at).Seconds()
+	}
+	p.WindowSec = windowEnd.Sub(s.at).Seconds()
+	p.WindowBytes = windowBytes - s.bytes
 	// 🚨 THE BACKLOG IS SCOPED TO THE WINDOW TOO, and that is not pedantry: the
 	// confirmation ratio exists to qualify the RATE, and the rate covers the
 	// window. A phase-scoped ratio qualifies a number that appears nowhere —
@@ -932,7 +1001,7 @@ func applyWindow(p Phase, s warmSample, start, end time.Time, endBytes, endBackl
 	// It is a DELTA of an outstanding level, so it can be negative when the
 	// server caught up during the window; clamped, because a negative backlog is
 	// not a thing to report.
-	p.BacklogBytes = endBacklog - s.backlog
+	p.BacklogBytes = windowBacklog - s.backlog
 	if p.BacklogBytes < 0 {
 		p.BacklogBytes = 0
 	}

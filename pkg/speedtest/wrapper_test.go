@@ -165,7 +165,7 @@ func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
 
 	const warm = 30 * time.Millisecond
 	for i := 0; i < 200; i++ {
-		s, err := runPhase(context.Background(), warm,
+		s, _, err := runPhase(context.Background(), warm, 0,
 			func() (int64, int64) { return counter.Load(), 0 },
 			// Ends AT the boundary: the goroutine is racing us to send.
 			func(context.Context) error { time.Sleep(warm); return nil })
@@ -185,7 +185,7 @@ func TestRunPhaseDeliversTheWarmupSample(t *testing.T) {
 
 // A phase shorter than its own warm-up must not produce a rate.
 func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
-	s, err := runPhase(context.Background(), 500*time.Millisecond,
+	s, _, err := runPhase(context.Background(), 500*time.Millisecond, 0,
 		func() (int64, int64) { return 0, 0 },
 		func(context.Context) error { time.Sleep(20 * time.Millisecond); return nil })
 	if err != nil {
@@ -195,7 +195,7 @@ func TestRunPhaseShorterThanItsWarmup(t *testing.T) {
 		t.Fatal("claims a warm-up boundary that never came")
 	}
 	start := time.Now().Add(-20 * time.Millisecond)
-	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, start, time.Now(), 1234, 0, false, 8)
+	p := applyWindow(Phase{Bytes: 1234, ActualSec: 0.02}, s, warmSample{}, start, time.Now(), 1234, 0, false, 8)
 	if p.RawMbps != 0 {
 		t.Errorf("stated %v Mbit/s from a 0.02s window", p.RawMbps)
 	}
@@ -212,7 +212,7 @@ func TestWindowSplitSumsToActual(t *testing.T) {
 	end := start.Add(20 * time.Second)
 
 	p := measure(1e6, 40e6, start, end, false)
-	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, start, end, 40e6, 0, false, 8)
+	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, warmSample{}, start, end, 40e6, 0, false, 8)
 
 	if got := p.WarmupSec + p.WindowSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
 		t.Errorf("warmup %.3f + window %.3f = %.3f, but actual is %.3f",
@@ -396,7 +396,7 @@ func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
 	end := start.Add(20 * time.Second)
 
 	p := measure(1e6, 40e6, start, end, false)
-	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true},
+	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 10e6, at: warmAt, ok: true}, warmSample{},
 		start, end, 40e6, 0, false, 8)
 
 	if p.WindowBytes != 30e6 {
@@ -415,7 +415,7 @@ func TestWindowBytesMatchesTheRateItProduced(t *testing.T) {
 
 	// Outside research mode the two must agree, or the same check breaks there.
 	q := measure(1e6, 40e6, start, end, false)
-	q = applyWindow(q, warmSample{}, start, end, 40e6, 0, false, 8)
+	q = applyWindow(q, warmSample{}, warmSample{}, start, end, 40e6, 0, false, 8)
 	if q.WindowBytes != q.Bytes {
 		t.Errorf("outside research mode WindowBytes (%d) must equal Bytes (%d)", q.WindowBytes, q.Bytes)
 	}
@@ -445,7 +445,7 @@ func TestConfirmedRatioIsScopedToTheWindow(t *testing.T) {
 	// ⇒ the window moved 600 MB and accumulated only 5 MB of backlog.
 	p := measure(1e6, 1000e6, start, end, true)
 	p = applyWindow(p, warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 20e6,
-		at: warmAt, ok: true}, start, end, 1000e6, 25e6, true, 8)
+		at: warmAt, ok: true}, warmSample{}, start, end, 1000e6, 25e6, true, 8)
 
 	if p.WindowBytes != 600e6 {
 		t.Fatalf("WindowBytes = %d, want 600000000", p.WindowBytes)
@@ -469,7 +469,7 @@ func TestConfirmedRatioIsScopedToTheWindow(t *testing.T) {
 	// A server that caught up during the window must not produce a negative
 	// backlog: it is a level, and a delta of a level can go either way.
 	q := applyWindow(measure(1e6, 1000e6, start, end, true),
-		warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 40e6, at: warmAt, ok: true},
+		warmSample{warmup: 5 * time.Second, bytes: 400e6, backlog: 40e6, at: warmAt, ok: true}, warmSample{},
 		start, end, 1000e6, 25e6, true, 8)
 	if q.BacklogBytes != 0 {
 		t.Errorf("backlog = %d after the server caught up, want 0", q.BacklogBytes)
@@ -482,7 +482,7 @@ func TestConfirmedRatioIsScopedToTheWindow(t *testing.T) {
 func TestDownloadPublishesNoConfirmationFigure(t *testing.T) {
 	start := time.Now()
 	end := start.Add(15 * time.Second)
-	p := applyWindow(measure(1e6, 400e6, start, end, false), warmSample{},
+	p := applyWindow(measure(1e6, 400e6, start, end, false), warmSample{}, warmSample{},
 		start, end, 400e6, 0, false, 32)
 
 	if p.ConfirmedRatio != 0 {
@@ -510,7 +510,7 @@ func TestCancellationTailIsNotReportedAsRefusal(t *testing.T) {
 	// The measured 32-thread shape: 452.8 MB in the window, 29.5 MB backlog —
 	// a ratio of 93.9%, and every byte of that backlog explained by 32
 	// cancelled chunks.
-	p := applyWindow(measure(1e6, 452.8e6, start, end, true), warmSample{},
+	p := applyWindow(measure(1e6, 452.8e6, start, end, true), warmSample{}, warmSample{},
 		start, end, 452.8e6, 29.5e6, true, 32)
 
 	if p.ConfirmedRatio > 0.95 {
@@ -541,7 +541,7 @@ func TestCancellationTailIsNotReportedAsRefusal(t *testing.T) {
 func TestABrokenEndpointStillWarns(t *testing.T) {
 	start := time.Now()
 	end := start.Add(15 * time.Second)
-	p := applyWindow(measure(1e6, 0, start, end, true), warmSample{},
+	p := applyWindow(measure(1e6, 0, start, end, true), warmSample{}, warmSample{},
 		start, end, 0, 45.8e6, true, 8)
 
 	if p.ConfirmedRatio != 0 {
@@ -564,5 +564,143 @@ func TestABrokenEndpointStillWarns(t *testing.T) {
 	if !found {
 		t.Error("45.8 MB of backlog against 8 workers is 5.7x what cancellation can explain, " +
 			"and nothing warned — this is the case the field was added for")
+	}
+}
+
+// 🚨 THE WINDOW MUST CLOSE ON ITS OWN TIMER. `run()` returns only once every
+// blocked worker has unwound, so measuring to that moment puts the unwinding
+// inside the window: research mode promised a fixed 30 s and produced arms of
+// 33.6, 34.1 and 35.0 s in a palindrome whose whole design is that its arms are
+// the same length (20.08/speedtest0).
+func TestTheWindowClosesOnTimeAndCleanupIsReportedSeparately(t *testing.T) {
+	start := time.Now()
+	warmAt := start.Add(5 * time.Second)
+	closeAt := start.Add(35 * time.Second) // warm-up + the requested 30s
+	end := start.Add(38 * time.Second)     // workers took 3s more to let go
+
+	p := measure(1e6, 1000e6, start, end, true)
+	p = applyWindow(p,
+		warmSample{warmup: 5 * time.Second, bytes: 100e6, backlog: 2e6, at: warmAt, ok: true},
+		warmSample{bytes: 700e6, backlog: 5e6, at: closeAt, ok: true},
+		start, end, 1000e6, 9e6, true, 8)
+
+	if got := p.WindowSec; got < 29.99 || got > 30.01 {
+		t.Errorf("WindowSec = %.2f, want 30.00 — the requested window, not the window plus "+
+			"however long the engine took to stop", got)
+	}
+	if got := p.CleanupSec; got < 2.99 || got > 3.01 {
+		t.Errorf("CleanupSec = %.2f, want 3.00", got)
+	}
+	if got := p.WarmupSec + p.WindowSec + p.CleanupSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
+		t.Errorf("warmup %.2f + window %.2f + cleanup %.2f = %.2f, but the phase took %.2f — "+
+			"the three parts must still account for the whole", p.WarmupSec, p.WindowSec,
+			p.CleanupSec, got, p.ActualSec)
+	}
+	// 🚨 The BYTES must come from the boundary too. Taking them at the end
+	// counts everything the unwinding workers confirmed, which is exactly the
+	// arithmetic that kept `raw` self-consistent while the experiment drifted.
+	if p.WindowBytes != 600e6 {
+		t.Errorf("WindowBytes = %d, want 600000000 (700 MB at the close minus the 100 MB "+
+			"warm-up) — %d means the cleanup's bytes were counted", p.WindowBytes, p.WindowBytes)
+	}
+	if p.BacklogBytes != 3e6 {
+		t.Errorf("BacklogBytes = %d, want 3000000 — the backlog is the window's too", p.BacklogBytes)
+	}
+}
+
+// Standard mode promises no window — the duration is explicitly a ceiling — so
+// there is nothing to enforce and nothing to report as cleanup.
+func TestStandardModeHasNoCleanupToReport(t *testing.T) {
+	start := time.Now()
+	end := start.Add(20 * time.Second)
+	p := applyWindow(measure(1e6, 400e6, start, end, false), warmSample{}, warmSample{},
+		start, end, 400e6, 0, false, 8)
+	if p.CleanupSec != 0 {
+		t.Errorf("CleanupSec = %.2f in standard mode", p.CleanupSec)
+	}
+	if got := p.WindowSec; got < p.ActualSec-0.01 || got > p.ActualSec+0.01 {
+		t.Errorf("WindowSec %.2f != ActualSec %.2f — with no promised window the phase's own "+
+			"length is the honest answer", got, p.ActualSec)
+	}
+}
+
+// And the boundary must actually FIRE while the phase is still running: the
+// sample is taken by a timer inside runPhase, not by the caller afterwards.
+func TestRunPhaseSamplesAtTheWindowBoundary(t *testing.T) {
+	var counter int64
+	stop := make(chan struct{})
+	go func() { // a worker that keeps confirming bytes the whole time
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				atomic.AddInt64(&counter, 1_000_000)
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+	defer close(stop)
+
+	sample := func() (int64, int64) { return atomic.LoadInt64(&counter), 0 }
+	warm, closed, err := runPhase(context.Background(), 50*time.Millisecond, 100*time.Millisecond,
+		sample,
+		func(context.Context) error {
+			// The engine returns LATE — this is the unwinding the fix exists for.
+			time.Sleep(400 * time.Millisecond)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !warm.ok || !closed.ok {
+		t.Fatalf("warm.ok=%v closed.ok=%v — both boundaries must fire while the phase runs",
+			warm.ok, closed.ok)
+	}
+	// The window is 100ms; the phase runs 400ms. The defect measures the phase
+	// (~350ms from the warm-up boundary), so the bound has to exclude that and
+	// admit ordinary scheduling jitter — not merely be "small", which is how the
+	// first version of this check managed to demand < 60ms of a 100ms window.
+	if d := closed.at.Sub(warm.at); d < 90*time.Millisecond || d > 200*time.Millisecond {
+		t.Errorf("the window measured %v, want ~100ms — anything near 350ms means the close "+
+			"sample was taken when the phase ENDED, not when the window closed", d)
+	}
+	if closed.bytes >= atomic.LoadInt64(&counter) {
+		t.Error("the close sample carries the FINAL counter, so it was read after the phase " +
+			"finished rather than at the boundary")
+	}
+}
+
+// 🚨 THE PLAN MUST ASK FOR THE BOUNDARY, and that is a separate claim from the
+// boundary working. Deleting the request left every other test in this file
+// green, because they drive applyWindow and runPhase directly — the same shape
+// as a guard that checks only the write half of a two-part hookup.
+func TestOnlyResearchModeEnforcesAWindow(t *testing.T) {
+	research, err := plan(Config{Threads: 8, Direction: "upload", DurationSec: 30, Research: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if research.closeWindow() != 30*time.Second {
+		t.Errorf("research mode enforces %v, want 30s — a fixed window that is not enforced is "+
+			"just a longer ceiling", research.closeWindow())
+	}
+	standard, err := plan(Config{Threads: 8, Direction: "upload", DurationSec: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if standard.closeWindow() != 0 {
+		t.Errorf("standard mode enforces %v — early stop means the duration is a CEILING and "+
+			"the phase's own end is the honest answer", standard.closeWindow())
+	}
+
+	// And the value has to REACH runPhase: computed-and-not-passed is how the
+	// first version of this fix stayed green under its own sabotage.
+	src, err := os.ReadFile("speedtest.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "runPhase(ctx, pl.warmup, pl.closeWindow()") {
+		t.Error("runPhase is not called with pl.closeWindow() — the plan can enforce whatever " +
+			"it likes if the phase loop does not pass it")
 	}
 }

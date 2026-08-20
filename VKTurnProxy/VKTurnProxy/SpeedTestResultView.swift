@@ -105,11 +105,18 @@ struct SpeedTestResultView: View {
     /// window, so a research run read "20.0s" next to a figure covering 15 —
     /// two numbers on one line that could not both be true.
     static func timing(_ phase: SpeedTestPhase, requested: Int) -> String {
+        // 🚨 The cleanup is NAMED, not absorbed. The window used to run until
+        // the engine returned, so blocked workers stretched a promised 30s to
+        // 35s and two research arms of different lengths were compared as if
+        // they were the same experiment.
+        let tail = phase.cleanupSec > 0.05
+            ? String(format: " + %.1fs to stop", phase.cleanupSec)
+            : ""
         if phase.warmupSec > 0 {
             return String(format: "%.1fs warm-up discarded + %.1fs measured (asked for %ds)",
-                          phase.warmupSec, phase.windowSec, requested)
+                          phase.warmupSec, phase.windowSec, requested) + tail
         }
-        return String(format: "%.1fs measured of %ds asked", phase.windowSec, requested)
+        return String(format: "%.1fs measured of %ds asked", phase.windowSec, requested) + tail
     }
 
     /// The figure that says whether "Threads" meant anything.
