@@ -148,6 +148,17 @@ final class SpeedTestRunner: ObservableObject {
     var isRunning: Bool { progress.state == "running" }
     var servers: [SpeedTestServer] { serverList?.servers ?? [] }
 
+    /// 🚨 ONE GUARD FOR BOTH, because Go has one. The nearby fetch and the
+    /// remote search were guarded by SEPARATE flags, so this side happily
+    /// started both at once — and Go, which allows one activity at a time,
+    /// refused the second with a `busy:` error that then replaced a perfectly
+    /// good nearby list. Nothing was corrupted; the screen simply reported a
+    /// collision this side had created and could have avoided.
+    ///
+    /// The two are asked from different places (the picker's list, the picker's
+    /// search button), so nothing but a shared predicate keeps them apart.
+    var isFetchingServers: Bool { serversLoading || search.isSearching }
+
     private var poller: Timer?
 
     private init() {}
@@ -159,7 +170,7 @@ final class SpeedTestRunner: ObservableObject {
     /// side must not paper over that refusal: it is the difference between a
     /// slow measurement and a wrong one.
     func loadServers() {
-        guard !serversLoading else { return }
+        guard !isFetchingServers else { return }
         serversLoading = true
         serversError = nil
         let fetchedOn = Self.currentPath()
@@ -209,7 +220,7 @@ final class SpeedTestRunner: ObservableObject {
     /// it. Digits are looked up by id.
     func searchServers(_ query: String) {
         let q = query.trimmingCharacters(in: CharacterSet.whitespaces)
-        guard !q.isEmpty, !search.isSearching else { return }
+        guard !q.isEmpty, !isFetchingServers else { return }
         searchGeneration += 1
         let generation = searchGeneration
         // Captured at the START, like the nearby list's: the latencies about to

@@ -2,13 +2,14 @@ package speedtest
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
+	"errors"
 	"os"
 	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	stgo "github.com/showwin/speedtest-go/speedtest"
 	"time"
 )
 
@@ -332,35 +333,50 @@ func TestEveryPhaseIsPrimedBeforeItCounts(t *testing.T) {
 	}
 }
 
-// TestIDLookupDoesNotCallEveryFailureNotFound.
+// TestIDLookupDoesNotCallEveryFailureNotFound exercises the RULE, not the
+// network.
 //
-// 🚨 "There is no server with id X" is a CLAIM about Ookla's database, and only
-// one failure supports it. Collapsing a timeout or a malformed response into it
-// tells a user with a perfectly good id that their server does not exist — and
-// the reasonable reaction to that is to stop trying the id, which is the one
-// thing they should keep doing.
+// 🚨 An earlier version of this test stood up an httptest.Server serving
+// malformed XML, said in its comment that it tested a malformed response — and
+// never used the server. What it actually exercised was a cancelled context.
+// Dead scaffolding makes a test look more thorough than it is, and the comment
+// made a claim the code did not support.
 //
-// Seen RED by restoring `if err != nil || server == nil`.
+// The classification is a pure function now, so every outcome is reachable
+// without a socket: only ErrServerNotFound may be reported as "no server with
+// id", because only it says anything about whether the server exists.
+//
+// Seen RED by collapsing the switch back to `if err != nil || server == nil`.
 func TestIDLookupDoesNotCallEveryFailureNotFound(t *testing.T) {
-	// A server that answers everything with garbage: the XML decode fails, which
-	// is emphatically not "no such id".
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("this is not xml"))
-	}))
-	defer srv.Close()
+	notFound := "no server with id"
 
-	// Point the library's advanced-server endpoint at it by using a context that
-	// is already dead — the same class of failure, reached without patching a
-	// package-level URL.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err := FindServers(ctx, "31551")
-	if err == nil {
-		t.Fatal("a cancelled lookup reported success")
+	for _, tc := range []struct {
+		name       string
+		err        error
+		claimsGone bool
+	}{
+		{"the library says it is not there", stgo.ErrServerNotFound, true},
+		{"a cancelled lookup", context.Canceled, false},
+		{"a deadline", context.DeadlineExceeded, false},
+		{"a malformed response", errors.New("XML syntax error on line 1"), false},
+		{"a refused connection", errors.New("dial tcp: connection refused"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := idLookupError("31551", nil, tc.err)
+			if err == nil {
+				t.Fatal("reported success")
+			}
+			claims := strings.Contains(err.Error(), notFound)
+			if claims != tc.claimsGone {
+				t.Errorf("reported %q — claims the server does not exist: %v, want %v. "+
+					"Only Ookla saying so supports that claim; anything else leaves the user "+
+					"abandoning an id that is fine.", err, claims, tc.claimsGone)
+			}
+		})
 	}
-	if strings.Contains(err.Error(), "no server with id") {
-		t.Errorf("a cancelled lookup was reported as %q — that is a claim about Ookla's "+
-			"database, and this failure says nothing about it", err)
+
+	// A successful lookup is not an error at all.
+	if err := idLookupError("31551", &stgo.Server{ID: "31551"}, nil); err != nil {
+		t.Errorf("a successful lookup was reported as %v", err)
 	}
 }

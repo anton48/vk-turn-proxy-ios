@@ -1098,6 +1098,25 @@ do {
             .latencyNotice(now: .vpnOff) == nil,
           "a list with no measured latency says nothing about latency")
 
+    // 🚨 ONE GUARD FOR BOTH FETCHES. Go allows one activity at a time; this side
+    // used two separate flags and could start both, whereupon Go's `busy:`
+    // refusal replaced a perfectly good nearby list with an error this side had
+    // caused. The two are triggered from different places, so only a shared
+    // predicate keeps them apart.
+    //
+    // Sabotage run: restore `guard !serversLoading` in loadServers — the first
+    // check reddens, the second stays green.
+    check(runner.contains("var isFetchingServers: Bool { serversLoading || search.isSearching }"),
+          "🚨 one predicate covers the nearby fetch AND the search")
+    let loadFn = runner.range(of: "func loadServers()")
+    let loadBody = loadFn.map { String(runner[$0.lowerBound...].prefix(400)) } ?? ""
+    check(loadBody.contains("guard !isFetchingServers"),
+          "🚨 and the nearby fetch takes it — otherwise it starts on top of a running search")
+    let searchFn = runner.range(of: "func searchServers(")
+    let searchGuard = searchFn.map { String(runner[$0.lowerBound...].prefix(300)) } ?? ""
+    check(searchGuard.contains("!isFetchingServers"),
+          "as does the search")
+
     check(runner.contains("let fetchedOn = Self.currentPath()"),
           "🚨 the search records the path at the START — recording it at completion would " +
           "stamp results with the route the user had already switched to")

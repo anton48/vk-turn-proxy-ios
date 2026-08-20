@@ -390,15 +390,8 @@ func FindServers(ctx context.Context, query string) ([]ServerInfo, error) {
 		client := newEngine(1, false)
 		defer client.close()
 		server, err := client.FetchServerByIDContext(ctx, query)
-		// 🚨 "NOT FOUND" IS A CLAIM, AND ONLY ONE OF THESE PATHS SUPPORTS IT.
-		// Collapsing every failure into it told a user with a perfectly good id
-		// that their server does not exist, on a timeout or a malformed
-		// response — and the obvious reaction is to stop trying that id.
-		switch {
-		case errors.Is(err, stgo.ErrServerNotFound), err == nil && server == nil:
-			return nil, fmt.Errorf("no server with id %s", query)
-		case err != nil:
-			return nil, fmt.Errorf("looking up server %s: %w", query, err)
+		if problem := idLookupError(query, server, err); problem != nil {
+			return nil, problem
 		}
 		return describe(stgo.Servers{server}), nil
 	}
@@ -413,6 +406,29 @@ func FindServers(ctx context.Context, query string) ([]ServerInfo, error) {
 		return nil, fmt.Errorf("search %q: %w", query, err)
 	}
 	return describe(list), nil
+}
+
+// idLookupError decides what a lookup's outcome MEANS, and it is a separate
+// function so the rule can be tested without a network.
+//
+// 🚨 "THERE IS NO SERVER WITH ID X" IS A CLAIM ABOUT OOKLA'S DATABASE, and only
+// one outcome supports it. Collapsing every failure into it told a user with a
+// perfectly good id that their server does not exist — and the reasonable
+// reaction to that is to stop trying the id, which is the one thing they should
+// keep doing. A timeout, a decode failure and a cancelled context say nothing
+// about whether the server exists.
+func idLookupError(query string, server *stgo.Server, err error) error {
+	switch {
+	case errors.Is(err, stgo.ErrServerNotFound):
+		return fmt.Errorf("no server with id %s", query)
+	case err != nil:
+		return fmt.Errorf("looking up server %s: %w", query, err)
+	case server == nil:
+		// No error and no server: the library should not do this, but reporting
+		// success with a nil server would crash describe().
+		return fmt.Errorf("no server with id %s", query)
+	}
+	return nil
 }
 
 func isServerID(q string) bool {
