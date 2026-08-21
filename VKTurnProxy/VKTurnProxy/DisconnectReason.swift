@@ -74,12 +74,23 @@ struct DisconnectReasonGate {
 
     /// Whether an answer fetched under `fetchedUnder` may still be shown.
     ///
-    /// `messageAtFetch` / `messageNow` are the error message as it stood when the
-    /// fetch was issued and as it stands now: if anything else has published in
-    /// between it is both newer and more specific, and this must not clobber it.
-    /// That is defect (1) above, and no ordering of the CALL can fix it — only
-    /// comparing the slot can.
-    func mayPublish(fetchedUnder: Int, messageAtFetch: String?, messageNow: String?) -> Bool {
-        fetchedUnder == generation && messageAtFetch == messageNow
+    /// 🚨 THE SLOT MUST BE EMPTY, not merely unchanged. The first version compared
+    /// the message as it stood when the fetch was ISSUED against the message now —
+    /// which is only a defence if the more specific writer publishes DURING the
+    /// fetch. In production it publishes BEFORE: the VKAuth branch runs
+    /// synchronously in the same status handler, so the snapshot captured VKAuth's
+    /// own message as the baseline, the two compared equal, and the guard cheerfully
+    /// permitted the overwrite it existed to prevent. Moving the call after that
+    /// branch did not help — it is what made the snapshot pick the message up.
+    ///
+    /// 🎯 The disconnect reason is a FALLBACK, so the honest test is "is anything
+    /// else already saying something about this cycle?", and that is a test on the
+    /// slot NOW. `messageAtFetch` was a test of my belief about the ordering rather
+    /// than of the ordering, and it is gone.
+    ///
+    /// ⚖️ `.connected` clears the slot, and so does `connect()`, so a cycle that
+    /// reaches the tunnel starts empty and a genuine death does get reported.
+    func mayPublish(fetchedUnder: Int, messageNow: String?) -> Bool {
+        fetchedUnder == generation && messageNow == nil
     }
 }

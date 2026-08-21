@@ -2108,9 +2108,19 @@ do {
     check(tm.contains("let deathGeneration = self.disconnectGate.observe(newStatus)"),
           "🚨 the gate sees EVERY status, not only terminal ones — it cannot know something died "
           + "unless it first saw a session become live")
-    check(tm.contains("messageNow: self.errorMessage"),
-          "🚨 the late answer yields to whatever published while it was in flight — with an async "
-          + "fetch, ordering the CALL cannot give precedence, only comparing the slot can")
+    check(tm.contains("messageNow: self.errorMessage") && !tm.contains("messageAtFetch:"),
+          "🚨 the late answer yields to whatever is IN the slot on arrival — not to a snapshot "
+          + "taken when the fetch was issued, which in production had already picked up the very "
+          + "message it was supposed to defer to")
+    check(tm.contains("let generation = disconnectGate.generation"),
+          "🚨 the cold-attach fetch carries a generation too — a full connect/disconnect cycle can "
+          + "finish while it is in flight, and the status is `.disconnected` at both ends of that")
+    // 🚨 …and CONSULTS it. Added because a sabotage that deleted the attach
+    // guard reddened nothing: capturing a generation nobody checks is exactly
+    // the shape of a rule that is present and switched off.
+    check(tm.components(separatedBy: "disconnectGate.mayPublish(").count - 1 == 2,
+          "🚨 BOTH fetch paths — the observer's and the cold attach — ask mayPublish before "
+          + "publishing; a captured generation that nothing consults is a rule switched off")
 
     // 🚨 THE GATE ITSELF, by fixture — the three defects here are all about
     // ORDERING, which no scan over TunnelManager can check.
@@ -2130,23 +2140,44 @@ do {
 
         // The staleness test a status check cannot do: cycle N's answer must not
         // be published into cycle N+1, and both cycles see `.disconnected`.
-        check(g.mayPublish(fetchedUnder: died!, messageAtFetch: nil, messageNow: nil),
-              "an answer for the current cycle is publishable")
+        check(g.mayPublish(fetchedUnder: died!, messageNow: nil),
+              "an answer for the current cycle, with nothing else claiming the slot, is publishable")
         _ = g.observe(.connecting)
-        check(!g.mayPublish(fetchedUnder: died!, messageAtFetch: nil, messageNow: nil),
+        check(!g.mayPublish(fetchedUnder: died!, messageNow: nil),
               "🚨 …and the SAME answer is dropped once a new session has begun — a status check "
               + "cannot see this, because both down-cycles look identical")
 
-        // Defect (1): the VKAuth message publishes synchronously while the fetch
-        // is in flight, so the slot has changed by the time the answer lands.
+        // 🚨 THE PRODUCTION SEQUENCE, which the previous fixture did NOT test.
+        // The VKAuth branch publishes SYNCHRONOUSLY in the same status handler,
+        // i.e. BEFORE the fetch is even issued — so a guard comparing the slot
+        // against a snapshot taken at issue time captured VKAuth's own message as
+        // its baseline, compared equal, and allowed the overwrite. The honest
+        // question is only ever "is the slot empty NOW".
         var h = DisconnectReasonGate()
         _ = h.observe(.connecting)
         let gen = h.observe(.invalid)!
-        check(!h.mayPublish(fetchedUnder: gen, messageAtFetch: nil, messageNow: "VK session rejected"),
-              "🚨 a late answer never clobbers a message published while it was in flight — being "
-              + "FIRST in source order means arriving LAST in time")
-        check(h.mayPublish(fetchedUnder: gen, messageAtFetch: "old", messageNow: "old"),
-              "…while an unchanged slot is still fair game")
+        check(!h.mayPublish(fetchedUnder: gen, messageNow: "Сессия VK отклонена или истекла."),
+              "🚨 a message ALREADY in the slot when the answer lands wins — this is the real "
+              + "ordering: VKAuth publishes synchronously before the fetch is issued, not during it")
+        check(!h.mayPublish(fetchedUnder: gen, messageNow: "anything at all"),
+              "🚨 …and it wins whatever it says: the stop reason is a FALLBACK, so it fills an "
+              + "empty slot and never competes for a full one")
+        check(h.mayPublish(fetchedUnder: gen, messageNow: nil),
+              "…while an empty slot is what it exists to fill")
+
+        // P2: the cold-attach fetch carries a generation for the same reason the
+        // observer path does — a full connect/disconnect cycle can complete while
+        // the attach answer is still in flight.
+        var a = DisconnectReasonGate()
+        let atAttach = a.generation
+        check(a.mayPublish(fetchedUnder: atAttach, messageNow: nil),
+              "an attach-time answer publishes while nothing has happened since")
+        _ = a.observe(.connecting)
+        _ = a.observe(.connected)
+        _ = a.observe(.disconnected)
+        check(!a.mayPublish(fetchedUnder: atAttach, messageNow: nil),
+              "🚨 …and is DROPPED once a whole session has come and gone — otherwise a reason from "
+              + "before the app launched is published against a death that just happened")
 
         // A death is asked about once, not on every subsequent observation.
         var k = DisconnectReasonGate()

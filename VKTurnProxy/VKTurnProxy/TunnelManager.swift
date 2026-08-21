@@ -2013,26 +2013,26 @@ class TunnelManager: ObservableObject {
                         self.errorMessage = "Сессия VK отклонена или истекла. Войдите заново в Настройках."
                         shared.removeObject(forKey: "vkauth_error")
                     }
-                    // 🚨 Issued AFTER the VKAuth branch above, not before it.
-                    // The first version was placed first "so the more specific
-                    // message wins" — but with an async fetch, first in source
-                    // order means LAST in time, so it overwrote exactly the
-                    // message it was meant to defer to. Ordering the call cannot
-                    // fix that; only comparing the slot on arrival can, which is
-                    // what mayPublish does.
+                    // 🚨 Position in this handler is NOT what gives the VKAuth
+                    // branch above precedence — an async answer always lands
+                    // after everything synchronous here, wherever the call sits.
+                    // What defers to it is `mayPublish` requiring the message
+                    // slot to be EMPTY on arrival. An earlier version compared
+                    // the slot against a snapshot taken when the fetch was
+                    // issued; placed after VKAuth, that snapshot captured
+                    // VKAuth's own message, the two compared equal, and the
+                    // guard permitted the very overwrite it existed to prevent.
                     //
                     // ⚖️ nil on a user-initiated Disconnect, so an ordinary stop
                     // reports nothing. Per Apple's note the error is OURS when
                     // the extension cancelled the tunnel itself, so the
                     // provider's own reason surfaces here too.
                     if #available(iOS 16.0, *), let generation = deathGeneration {
-                        let atFetch = self.errorMessage
                         manager.connection.fetchLastDisconnectError { stop in
                             guard let stop else { return }
                             Task { @MainActor in
                                 guard self.disconnectGate.mayPublish(
                                         fetchedUnder: generation,
-                                        messageAtFetch: atFetch,
                                         messageNow: self.errorMessage) else { return }
                                 self.errorMessage = Self.failureText("The tunnel stopped", stop)
                             }
@@ -2062,14 +2062,22 @@ class TunnelManager: ObservableObject {
     /// through it routinely.
     /// ⚠️ And it fills an EMPTY slot only: this reason may be hours old, so it
     /// must never displace something about the session the user is looking at.
+    /// 🚨 It captures a GENERATION like the observer path does. Without one, a
+    /// fetch issued at attach could still be in flight while the user connects
+    /// and the tunnel then dies — and its answer, describing a death from before
+    /// the app launched, would publish against the new one. Checking the status
+    /// cannot see that: both moments are `.disconnected`.
     private func fetchStopReasonAtAttach(_ manager: NETunnelProviderManager) {
         guard #available(iOS 16.0, *), manager.connection.status == .disconnected,
               errorMessage == nil else { return }
+        let generation = disconnectGate.generation
         manager.connection.fetchLastDisconnectError { stop in
             guard let stop else { return }
             Task { @MainActor in
-                guard self.errorMessage == nil,
-                      self.status == .disconnected else { return }
+                guard self.status == .disconnected,
+                      self.disconnectGate.mayPublish(fetchedUnder: generation,
+                                                     messageNow: self.errorMessage)
+                else { return }
                 self.errorMessage = Self.failureText("The tunnel had stopped", stop)
             }
         }
