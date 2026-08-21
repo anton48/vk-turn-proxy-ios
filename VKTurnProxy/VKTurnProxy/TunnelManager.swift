@@ -1853,9 +1853,16 @@ class TunnelManager: ObservableObject {
         return manager
     }
 
+    /// Decides when a stop reason is worth asking for, and whether a late answer
+    /// still belongs to the cycle on screen. → DisconnectReason.swift for the
+    /// three ordering defects it exists to prevent.
+    private var disconnectGate = DisconnectReasonGate()
+
     private func observeStatus(_ manager: NETunnelProviderManager) {
         statusObserver.map { NotificationCenter.default.removeObserver($0) }
         status = manager.connection.status
+        _ = disconnectGate.observe(status)
+        fetchStopReasonAtAttach(manager)
         // App-relaunch case: the tunnel may already be running in
         // .connected when we attach. NEVPNStatusDidChange only fires on
         // future transitions, so the switch below would never run for
@@ -1932,6 +1939,10 @@ class TunnelManager: ObservableObject {
                 let newStatus = manager.connection.status
                 self.debugLog("NEVPNStatus changed: \(newStatus.rawValue) captchaPending=\(self.captchaPending)")
                 self.status = newStatus
+                // Fed for EVERY status, not only terminal ones: the gate needs
+                // to see a session become live in order to know, later, that
+                // something actually died.
+                let deathGeneration = self.disconnectGate.observe(newStatus)
                 switch newStatus {
                 case .connected:
                     // Stamp the moment we first reach .connected so StatsView
@@ -1994,32 +2005,6 @@ class TunnelManager: ObservableObject {
                     self.stopStatsPolling()
                     self.resetCaptchaState()
                     self.live.connectedAt = nil
-                    // 🚨 A tunnel that dies AFTER starting reports through
-                    // `lastDisconnectError` and never through a thrown error, so
-                    // until now it was invisible: the status flipped to
-                    // disconnected and the user was told nothing at all. Read
-                    // BEFORE the VKAuth branch below so that more specific
-                    // message still wins when both are present.
-                    //
-                    // ⚖️ nil on a user-initiated Disconnect, which is why this
-                    // does not need to distinguish one — there is simply nothing
-                    // to report. And per Apple's own note the error is OURS when
-                    // the extension cancelled the tunnel itself, so the
-                    // provider's reason surfaces here too.
-                    // ⚙️ It is an async FETCH, not a property — the reason lives
-                    // in the configuration daemon, not in our copy of the
-                    // connection. So this lands a turn later, which is also why
-                    // it must not clobber a message set in the meantime.
-                    if #available(iOS 16.0, *) {
-                        manager.connection.fetchLastDisconnectError { stop in
-                            guard let stop else { return }
-                            Task { @MainActor in
-                                guard self.status == .disconnected || self.status == .invalid
-                                else { return }
-                                self.errorMessage = Self.failureText("The tunnel stopped", stop)
-                            }
-                        }
-                    }
                     // If the extension self-stopped due to a rejected VKAuth
                     // cookie, it wrote the reason to the App Group before
                     // cancelling — surface it (and clear it so it shows once).
@@ -2027,6 +2012,31 @@ class TunnelManager: ObservableObject {
                        let ae = shared.string(forKey: "vkauth_error"), !ae.isEmpty {
                         self.errorMessage = "Сессия VK отклонена или истекла. Войдите заново в Настройках."
                         shared.removeObject(forKey: "vkauth_error")
+                    }
+                    // 🚨 Issued AFTER the VKAuth branch above, not before it.
+                    // The first version was placed first "so the more specific
+                    // message wins" — but with an async fetch, first in source
+                    // order means LAST in time, so it overwrote exactly the
+                    // message it was meant to defer to. Ordering the call cannot
+                    // fix that; only comparing the slot on arrival can, which is
+                    // what mayPublish does.
+                    //
+                    // ⚖️ nil on a user-initiated Disconnect, so an ordinary stop
+                    // reports nothing. Per Apple's note the error is OURS when
+                    // the extension cancelled the tunnel itself, so the
+                    // provider's own reason surfaces here too.
+                    if #available(iOS 16.0, *), let generation = deathGeneration {
+                        let atFetch = self.errorMessage
+                        manager.connection.fetchLastDisconnectError { stop in
+                            guard let stop else { return }
+                            Task { @MainActor in
+                                guard self.disconnectGate.mayPublish(
+                                        fetchedUnder: generation,
+                                        messageAtFetch: atFetch,
+                                        messageNow: self.errorMessage) else { return }
+                                self.errorMessage = Self.failureText("The tunnel stopped", stop)
+                            }
+                        }
                     }
                 default:
                     // .disconnecting only — keep polling/state, the tunnel
@@ -2036,6 +2046,31 @@ class TunnelManager: ObservableObject {
                 // Mirror the new state onto the Live Activity. After the switch
                 // so it sees the connectedAt this transition just set/cleared.
                 self.syncLiveActivity()
+            }
+        }
+    }
+
+    /// P2: the tunnel may ALREADY be dead when the app launches.
+    ///
+    /// `NEVPNStatusDidChange` only ever delivers FUTURE transitions, so the
+    /// switch in `observeStatus` cannot see a death that happened while the app
+    /// was not running — which is precisely the case a user opens the app to
+    /// have explained.
+    ///
+    /// ⚠️ `.disconnected` only. `.invalid` at attach means there is no usable
+    /// configuration, not that a tunnel died, and `saveToPreferences()` passes
+    /// through it routinely.
+    /// ⚠️ And it fills an EMPTY slot only: this reason may be hours old, so it
+    /// must never displace something about the session the user is looking at.
+    private func fetchStopReasonAtAttach(_ manager: NETunnelProviderManager) {
+        guard #available(iOS 16.0, *), manager.connection.status == .disconnected,
+              errorMessage == nil else { return }
+        manager.connection.fetchLastDisconnectError { stop in
+            guard let stop else { return }
+            Task { @MainActor in
+                guard self.errorMessage == nil,
+                      self.status == .disconnected else { return }
+                self.errorMessage = Self.failureText("The tunnel had stopped", stop)
             }
         }
     }

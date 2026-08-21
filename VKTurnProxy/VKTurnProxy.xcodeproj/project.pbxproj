@@ -30,6 +30,7 @@
 		548E254EF4C178FACD9DCAF6 /* VKAuthWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15C079F499D57B27E1635DE /* VKAuthWebView.swift */; };
 		54BDFA3B7322033AA76D1C66 /* UplinkPaceSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2842251868A37320A5C238F2 /* UplinkPaceSync.swift */; };
 		55808C77B750142FE667ECDE /* VPNConfigFailure.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54B78245B4410AB09F5B6E47 /* VPNConfigFailure.swift */; };
+		5A51F39BC5B490E741582E37 /* DisconnectReason.swift in Sources */ = {isa = PBXBuildFile; fileRef = 146B18C17C1A93DCF5F73315 /* DisconnectReason.swift */; };
 		5BFFE56605C7A3D0A4672924 /* VKTurnProxyApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE10D4B4A2BE32E0DD5E3D4 /* VKTurnProxyApp.swift */; };
 		6481DAB30DAF3572C55089E0 /* TunnelMTU.swift in Sources */ = {isa = PBXBuildFile; fileRef = C80CE8603F45C625FABAC090 /* TunnelMTU.swift */; };
 		652C39DB65907355CDF83B99 /* UplinkPace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 422D7F513A45A12E8A142AA1 /* UplinkPace.swift */; };
@@ -107,6 +108,7 @@
 		0ACB6146869BD6DC55039EC2 /* ConfigValidation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigValidation.swift; sourceTree = "<group>"; };
 		1282B32632D21838CCD72924 /* DirectRouteSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DirectRouteSync.swift; sourceTree = "<group>"; };
 		12A7A42ADDB7D021CA9C8352 /* VKTurnProxy.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = VKTurnProxy.entitlements; sourceTree = "<group>"; };
+		146B18C17C1A93DCF5F73315 /* DisconnectReason.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisconnectReason.swift; sourceTree = "<group>"; };
 		16894D17BB018EECDC8F01FF /* ServerEditView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerEditView.swift; sourceTree = "<group>"; };
 		17FC00C95995BA91DADA2EB3 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		196C853F06BE5F3D3202EA2D /* VKTurnProxyWidget.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = VKTurnProxyWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -239,6 +241,7 @@
 				A3F6AB47B5515172AD460053 /* ContentView.swift */,
 				B72BF34DDA41B9171843CDA5 /* CredCache.swift */,
 				1282B32632D21838CCD72924 /* DirectRouteSync.swift */,
+				146B18C17C1A93DCF5F73315 /* DisconnectReason.swift */,
 				3979E0E80EBC90588B51D4A5 /* Info.plist */,
 				6D9ADA67065E63261009BBE2 /* KeyboardDismisser.swift */,
 				8B1A512B35CE1D505CB1A3CD /* LiveActivityController.swift */,
@@ -451,6 +454,7 @@
 				96F82C428BBBE30E65182344 /* ContentView.swift in Sources */,
 				2263C90DC75E56A0D637B2B4 /* CredCache.swift in Sources */,
 				50AF389CBE3BAA5A56C452A6 /* DirectRouteSync.swift in Sources */,
+				5A51F39BC5B490E741582E37 /* DisconnectReason.swift in Sources */,
 				E0F6CA7385F3718A0A9CD3FC /* KeyboardDismisser.swift in Sources */,
 				C272EDFB69425D4F95736DE9 /* LiveActivityController.swift in Sources */,
 				3A638CAC10B3F4B84965F83F /* LiveActivityIntents.swift in Sources */,

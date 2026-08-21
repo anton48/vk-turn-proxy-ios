@@ -2101,12 +2101,60 @@ do {
     check(tm.contains("manager.connection.fetchLastDisconnectError { stop in"),
           "🚨 a tunnel that dies AFTER starting is reported — the reason arrives only through "
           + "fetchLastDisconnectError, never as a thrown error, so it used to be invisible")
-    // 🚨 It is an async FETCH, so its answer lands a turn later than the status
-    // change that asked for it. Publishing unconditionally would let a stale
-    // reason overwrite the message of a reconnect that has already begun.
-    check(tm.contains("guard self.status == .disconnected || self.status == .invalid"),
-          "🚨 …and the late answer is dropped if the tunnel is no longer down — an async fetch "
-          + "resolves after the state that asked for it may have moved on")
+    check(tm.contains("fetchStopReasonAtAttach(manager)"),
+          "🚨 …and the ALREADY-dead case is read at attach: NEVPNStatusDidChange delivers only "
+          + "FUTURE transitions, so a death while the app was not running is invisible to the "
+          + "observer — which is exactly the death a user opens the app to have explained")
+    check(tm.contains("let deathGeneration = self.disconnectGate.observe(newStatus)"),
+          "🚨 the gate sees EVERY status, not only terminal ones — it cannot know something died "
+          + "unless it first saw a session become live")
+    check(tm.contains("messageNow: self.errorMessage"),
+          "🚨 the late answer yields to whatever published while it was in flight — with an async "
+          + "fetch, ordering the CALL cannot give precedence, only comparing the slot can")
+
+    // 🚨 THE GATE ITSELF, by fixture — the three defects here are all about
+    // ORDERING, which no scan over TunnelManager can check.
+    do {
+        var g = DisconnectReasonGate()
+        // 🚨 `.invalid` is a saveToPreferences() waypoint, not a death. Observed
+        // with no live session behind it, it must ask nothing.
+        check(g.observe(.invalid) == nil && g.observe(.disconnected) == nil,
+              "🚨 a terminal state with no live session behind it asks NOTHING — "
+              + "saveToPreferences() passes through .invalid on every ordinary reconnect")
+
+        _ = g.observe(.connecting)
+        _ = g.observe(.connected)
+        let died = g.observe(.disconnected)
+        check(died != nil,
+              "🚨 …but a session that WAS live going terminal does ask for a reason")
+
+        // The staleness test a status check cannot do: cycle N's answer must not
+        // be published into cycle N+1, and both cycles see `.disconnected`.
+        check(g.mayPublish(fetchedUnder: died!, messageAtFetch: nil, messageNow: nil),
+              "an answer for the current cycle is publishable")
+        _ = g.observe(.connecting)
+        check(!g.mayPublish(fetchedUnder: died!, messageAtFetch: nil, messageNow: nil),
+              "🚨 …and the SAME answer is dropped once a new session has begun — a status check "
+              + "cannot see this, because both down-cycles look identical")
+
+        // Defect (1): the VKAuth message publishes synchronously while the fetch
+        // is in flight, so the slot has changed by the time the answer lands.
+        var h = DisconnectReasonGate()
+        _ = h.observe(.connecting)
+        let gen = h.observe(.invalid)!
+        check(!h.mayPublish(fetchedUnder: gen, messageAtFetch: nil, messageNow: "VK session rejected"),
+              "🚨 a late answer never clobbers a message published while it was in flight — being "
+              + "FIRST in source order means arriving LAST in time")
+        check(h.mayPublish(fetchedUnder: gen, messageAtFetch: "old", messageNow: "old"),
+              "…while an unchanged slot is still fair game")
+
+        // A death is asked about once, not on every subsequent observation.
+        var k = DisconnectReasonGate()
+        _ = k.observe(.connecting)
+        check(k.observe(.disconnected) != nil && k.observe(.disconnected) == nil,
+              "🚨 the reason is asked for ONCE per death — iOS re-notifies terminal states, and "
+              + "a second fetch would race the first")
+    }
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT
     // no-op — and that is the SAME population that hits the missing VPN
