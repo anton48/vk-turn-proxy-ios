@@ -1750,26 +1750,41 @@ class TunnelManager: ObservableObject {
     /// "Don't Allow" produces, and until now both were interpolated through
     /// `localizedDescription` and thrown away, so no report could tell them
     /// apart.
+    /// 🚨 BOTH channels, and neither is redundant. `SharedLogger.shared.log` is
+    /// `guard let url = fileURL else { return }` — a SILENT no-op when the App
+    /// Group container is unavailable, which is the state of every re-signed
+    /// build. That is the same population that hits the missing VPN entitlement,
+    /// since both are consequences of re-signing: the one user who most needs
+    /// this text would have been sent to a Logs screen that never received it.
+    /// `logDiagnostic` reaches os_log, which the Logs screen falls back to
+    /// reading — but only as a FALLBACK, so on a healthy build (an entitled one
+    /// refused for some other reason) the file is still where the user looks.
     private static func vpnConfigFailure(_ prefix: String, _ error: Error) -> String {
         let ns = error as NSError
-        SharedLogger.shared.log(
-            "[AppDebug] \(prefix): \(error.localizedDescription) "
-            + "[\(ns.domain) \(ns.code)]\n" + AppEntitlements.vpnPermissionDiagnosis())
+        let full = "\(prefix): \(error.localizedDescription) [\(ns.domain) \(ns.code)]\n"
+                 + AppEntitlements.vpnPermissionDiagnosis()
+        SharedLogger.logDiagnostic(full, category: "VPNConfig")
+        SharedLogger.shared.log("[AppDebug] " + full)
         return "\(prefix): \(error.localizedDescription)\n"
              + AppEntitlements.vpnPermissionHeadline()
     }
 
     /// A connect fails for many reasons that have nothing to do with signing —
-    /// captcha, creds, network, a dead call link. So the signature diagnosis is
-    /// appended ONLY when the failure came from NetworkExtension AND this binary
-    /// genuinely cannot run a tunnel. Without both tests an unrelated failure
-    /// would be blamed on the signature, sending a user to re-sign a build that
-    /// is already correct — the same false accusation `vpnPermissionDiagnosis`
-    /// refuses to make in its entitled branch.
+    /// captcha, creds, network, a dead call link. So the diagnosis is appended
+    /// only when the failure came from NetworkExtension itself; that test, and
+    /// only that test, is what stops an unrelated failure being blamed on the
+    /// signature.
+    ///
+    /// 🚨 It deliberately does NOT also require the build to be unentitled.
+    /// The first version did, and that silently deleted the entitled branch from
+    /// this path: on a correctly signed build — the "Don't Allow", leftover
+    /// profile and MDM cases, which is every refusal that is NOT about signing —
+    /// the guard fell through and published the framework's bare "permission
+    /// denied" again. `vpnPermissionDiagnosis()` already decides what to say for
+    /// an entitled build; re-deciding it here could only disagree with it, and
+    /// it did.
     private static func connectFailure(_ error: Error) -> String {
-        let ns = error as NSError
-        guard ns.domain.hasPrefix("NE"),
-              !AppEntitlements.current.hasPacketTunnelProvider else {
+        guard (error as NSError).domain.hasPrefix("NE") else {
             return error.localizedDescription
         }
         return vpnConfigFailure("VPN configuration refused", error)

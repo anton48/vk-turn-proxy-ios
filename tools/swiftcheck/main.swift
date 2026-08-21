@@ -1975,11 +1975,35 @@ do {
     check(!tm.contains("errorMessage = error.localizedDescription\n"),
           "🚨 no catch still publishes a BARE localizedDescription — that is the state where "
           + "the whole message was the framework's \"permission denied\"")
-    // The gate is the point: an unrelated connect failure must not be blamed on signing.
-    check(tm.contains("ns.domain.hasPrefix(\"NE\")")
-          && tm.contains("!AppEntitlements.current.hasPacketTunnelProvider"),
-          "🚨 the connect path appends the signing diagnosis only for a NetworkExtension "
-          + "failure on a build that genuinely cannot run a tunnel")
+    // The gate is the point: an unrelated connect failure must not be blamed on
+    // signing. But it must gate on ONE thing only.
+    check(tm.contains("(error as NSError).domain.hasPrefix(\"NE\")"),
+          "🚨 the connect path appends the diagnosis only for a NetworkExtension failure — "
+          + "captcha, creds and network errors are not blamed on the signature")
+    // 🚨 P2, caught in review: the first version ALSO required the build to be
+    // unentitled, which deleted the entitled branch from this path entirely. On a
+    // correctly signed build — "Don't Allow", a leftover profile, MDM, i.e. every
+    // refusal that is NOT about signing — it fell through to the bare framework
+    // string, so the branch written to handle exactly those cases was unreachable.
+    check(!tm.contains("!AppEntitlements.current.hasPacketTunnelProvider"),
+          "🚨 …and it does NOT also gate on the entitlement: vpnPermissionDiagnosis() already "
+          + "decides what an ENTITLED build is told, and a caller re-deciding it can only "
+          + "disagree — which is how the entitled branch became unreachable")
+    check(tm.contains("return vpnConfigFailure(\"VPN configuration refused\", error)"),
+          "…and the positive half: an NE failure DOES reach the diagnosis (a bare absence "
+          + "check passes just as happily when the whole function is gone)")
+    // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
+    // else { return }`, so on a build with no App Group container it is a SILENT
+    // no-op — and that is the SAME population that hits the missing VPN
+    // entitlement, both being consequences of re-signing. The headline says "see
+    // Logs"; without the os_log channel the Logs screen would have nothing.
+    check(tm.contains("SharedLogger.logDiagnostic(full, category: \"VPNConfig\")"),
+          "🚨 the full diagnosis goes to os_log, which survives a missing App Group — the "
+          + "file-backed logger is a silent no-op there, and that is exactly the build that "
+          + "needs this text")
+    check(tm.contains("SharedLogger.shared.log(\"[AppDebug] \" + full)"),
+          "🚨 …and to the shared file too, because the Logs screen only FALLS BACK to os_log: "
+          + "on a healthy build the file is where the user actually looks")
     check(tm.contains("[\\(ns.domain) \\(ns.code)]"),
           "🚨 the NSError domain and code reach the log — the STRING does not discriminate, "
           + "since a prompt answered \"Don't Allow\" also reads \"permission denied\"")
