@@ -649,7 +649,7 @@ class TunnelManager: ObservableObject {
                                                  vkHostIPs: vkHostIPs,
                                                  seededTURN: seeded)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = Self.connectFailure(error)
         }
     }
 
@@ -825,7 +825,11 @@ class TunnelManager: ObservableObject {
             // Stay alive long enough to SEE it come up, so the card can be told.
             await awaitConnected()
         } catch {
-            errorMessage = error.localizedDescription
+            // Reaches saveToPreferences() through applyConfigurationAndStart just
+            // as connect() does, so on an unentitled build it produced the same
+            // bare "permission denied". Found by the harness check that the
+            // diagnosis has no un-wired call site left.
+            errorMessage = Self.connectFailure(error)
             SharedLogger.shared.log("[AppDebug] live-activity: switch failed — \(error.localizedDescription)")
         }
     }
@@ -1729,8 +1733,46 @@ class TunnelManager: ObservableObject {
                 observeStatus(existing)
             }
         } catch {
-            errorMessage = "Failed to load VPN config: \(error.localizedDescription)"
+            errorMessage = Self.vpnConfigFailure("Failed to load VPN config", error)
         }
+    }
+
+    /// Compose the message for a refused VPN-configuration call, and log the
+    /// full explanation.
+    ///
+    /// NetworkExtension answers an unentitled build with its own
+    /// `configurationPermissionDenied`, whose localized description is the bare
+    /// words "permission denied" — naming neither a cause nor anything the user
+    /// can do, while the cause is readable from our own code signature.
+    ///
+    /// The NSError domain and code are carried deliberately: the STRING does not
+    /// discriminate. "permission denied" is also what a prompt answered with
+    /// "Don't Allow" produces, and until now both were interpolated through
+    /// `localizedDescription` and thrown away, so no report could tell them
+    /// apart.
+    private static func vpnConfigFailure(_ prefix: String, _ error: Error) -> String {
+        let ns = error as NSError
+        SharedLogger.shared.log(
+            "[AppDebug] \(prefix): \(error.localizedDescription) "
+            + "[\(ns.domain) \(ns.code)]\n" + AppEntitlements.vpnPermissionDiagnosis())
+        return "\(prefix): \(error.localizedDescription)\n"
+             + AppEntitlements.vpnPermissionHeadline()
+    }
+
+    /// A connect fails for many reasons that have nothing to do with signing —
+    /// captcha, creds, network, a dead call link. So the signature diagnosis is
+    /// appended ONLY when the failure came from NetworkExtension AND this binary
+    /// genuinely cannot run a tunnel. Without both tests an unrelated failure
+    /// would be blamed on the signature, sending a user to re-sign a build that
+    /// is already correct — the same false accusation `vpnPermissionDiagnosis`
+    /// refuses to make in its entitled branch.
+    private static func connectFailure(_ error: Error) -> String {
+        let ns = error as NSError
+        guard ns.domain.hasPrefix("NE"),
+              !AppEntitlements.current.hasPacketTunnelProvider else {
+            return error.localizedDescription
+        }
+        return vpnConfigFailure("VPN configuration refused", error)
     }
 
     private func getOrCreateManager() async throws -> NETunnelProviderManager {

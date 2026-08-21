@@ -1893,6 +1893,98 @@ do {
           + "comparison possible at all")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 41. 🚨 "permission denied" NAMES NOTHING. It is NetworkExtension's own
+//     `configurationPermissionDenied` text, and it is the entire message a user
+//     got when the IPA was signed without the packet-tunnel entitlement — while
+//     the cause sits in a code signature we already parse (issue #75).
+//
+//     🚨 The other half is the FALSE ACCUSATION: an entitled build that is
+//     refused for some other reason (a leftover VPN profile from a different
+//     signing identity, MDM/supervision, a prompt answered "Don't Allow") must
+//     NOT be told to re-sign. So the entitled branch is checked as strictly as
+//     the unentitled one.
+do {
+    let unentitled = AppEntitlements(dict: [
+        "application-identifier": "4FN8R4RQZT.app.rainbow5144.lychee3940",
+    ])
+    let entitled = AppEntitlements(dict: [
+        "application-identifier": "CDMQ33VFQC.com.vkturnproxy.app",
+        "com.apple.developer.networking.networkextension": ["packet-tunnel-provider"],
+    ])
+    // A build holding a DIFFERENT NE mode is as unable to start a packet tunnel
+    // as one holding none — "the array is non-empty" would be the wrong test.
+    let otherMode = AppEntitlements(dict: [
+        "com.apple.developer.networking.networkextension": ["app-proxy-provider"],
+    ])
+
+    check(!unentitled.hasPacketTunnelProvider && entitled.hasPacketTunnelProvider,
+          "🚨 the packet-tunnel entitlement is read off the signature")
+    check(!otherMode.hasPacketTunnelProvider,
+          "🚨 a DIFFERENT NetworkExtension mode does not count as a packet tunnel — the mode "
+          + "string is matched exactly, not merely present")
+
+    let bad = unentitled.vpnPermissionDiagnosis()
+    check(bad.contains("packet-tunnel-provider") && bad.contains("CANNOT create a VPN configuration"),
+          "🚨 the unentitled diagnosis names the missing entitlement, not just the symptom")
+    check(bad.contains("TestFlight") && bad.contains("DELETE THIS APP FIRST"),
+          "🚨 …and it says what to DO, including the install trap that would otherwise read as "
+          + "\"An error occurred while installing\"")
+    check(bad.contains("4FN8R4RQZT"),
+          "🚨 …and it names the signer, so the report identifies the build without a Mac")
+
+    let good = entitled.vpnPermissionDiagnosis()
+    check(good.contains("did NOT come from how the IPA was signed"),
+          "🚨 an ENTITLED build is not accused of a signing problem — the refusal came from "
+          + "elsewhere and re-signing would not help")
+    check(good.contains("VPN & Device Management") && good.contains("supervised"),
+          "🚨 …and it names the causes that DO produce this on an entitled build")
+    // 🚨 Written after my own first draft lowercased the whole signer line. A
+    // team identifier is case-significant and is what a reader compares against
+    // a provisioning profile, so "cdmq33vfqc" names nothing.
+    check(good.contains("CDMQ33VFQC"),
+          "🚨 the team identifier keeps its case — it is compared against a provisioning "
+          + "profile, and a lowercased team id matches nothing")
+    check(!good.contains("TestFlight"),
+          "🚨 …and it does NOT send an entitled user to reinstall — that is the false "
+          + "accusation this branch exists to prevent")
+
+    let unreadable = AppEntitlements(error: "no XML entitlements blob in code signature")
+    let unknown = unreadable.vpnPermissionDiagnosis()
+    check(unknown.contains("cannot say whether"),
+          "🚨 an unreadable signature says it CANNOT TELL — it must claim neither presence nor "
+          + "absence, which is the shape build 338 had to fix on `confirmed`")
+    check(!unknown.contains("CANNOT create a VPN configuration"),
+          "🚨 …and specifically does not report the unentitled verdict")
+
+    // The headline is what the SCREEN shows; the diagnosis is what the LOG gets.
+    check(unentitled.vpnPermissionHeadline().contains("without the VPN entitlement"),
+          "the one-line headline carries the cause")
+    check(unentitled.vpnPermissionHeadline().count < 130,
+          "🚨 …and stays one line — the status area is a centered caption, and a wall of red "
+          + "there is what a user crops out of the screenshot they attach")
+
+    // 🚨 And the WIRING: a diagnosis nothing calls is worth nothing. Build 339's
+    // sabotage passed every test in its file because only the CALL SITE was gone.
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(tm.contains("Self.vpnConfigFailure(\"Failed to load VPN config\""),
+          "🚨 the LOAD failure — the launch-time message a user screenshots — carries the "
+          + "diagnosis")
+    check(tm.contains("errorMessage = Self.connectFailure(error)"),
+          "🚨 and so does the connect failure, which is what the user sees after tapping Connect")
+    check(!tm.contains("errorMessage = error.localizedDescription\n"),
+          "🚨 no catch still publishes a BARE localizedDescription — that is the state where "
+          + "the whole message was the framework's \"permission denied\"")
+    // The gate is the point: an unrelated connect failure must not be blamed on signing.
+    check(tm.contains("ns.domain.hasPrefix(\"NE\")")
+          && tm.contains("!AppEntitlements.current.hasPacketTunnelProvider"),
+          "🚨 the connect path appends the signing diagnosis only for a NetworkExtension "
+          + "failure on a build that genuinely cannot run a tunnel")
+    check(tm.contains("[\\(ns.domain) \\(ns.code)]"),
+          "🚨 the NSError domain and code reach the log — the STRING does not discriminate, "
+          + "since a prompt answered \"Don't Allow\" also reads \"permission denied\"")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

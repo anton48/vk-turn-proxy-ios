@@ -52,6 +52,13 @@ struct AppEntitlements: Sendable {
     let teamIdentifier: String?
     let applicationGroups: [String]
     let keychainAccessGroups: [String]
+    /// The modes granted by `com.apple.developer.networking.networkextension`,
+    /// e.g. ["packet-tunnel-provider"]. EMPTY on a build whose signature does
+    /// not carry the entitlement at all — which is the state this file exists
+    /// to name, because iOS then refuses every NEVPNManager /
+    /// NETunnelProviderManager operation and the user only sees the framework's
+    /// own "permission denied".
+    let networkExtensionModes: [String]
     /// nil when parsing succeeded; otherwise why it didn't.
     let error: String?
 
@@ -60,6 +67,17 @@ struct AppEntitlements: Sendable {
 
     func hasAppGroup(_ identifier: String) -> Bool {
         applicationGroups.contains(identifier)
+    }
+
+    /// Whether this binary may run a packet tunnel at all.
+    ///
+    /// The mode string is matched EXACTLY. `com.apple.developer.networking.networkextension`
+    /// also grants unrelated modes (app-proxy-provider, content-filter-provider,
+    /// dns-proxy-provider …), and a build holding one of those but not ours is
+    /// as unable to start the tunnel as one holding none — so "the array is
+    /// non-empty" would be the wrong test.
+    var hasPacketTunnelProvider: Bool {
+        networkExtensionModes.contains("packet-tunnel-provider")
     }
 
     /// Team the binary is signed by, preferring the explicit entitlement and
@@ -104,21 +122,115 @@ struct AppEntitlements: Sendable {
         """
     }
 
+    /// Why a VPN-configuration call was refused — read off THIS binary's own
+    /// signature rather than guessed from the error.
+    ///
+    /// NetworkExtension answers every preferences operation on an unentitled
+    /// build with its own `configurationPermissionDenied`, whose localized
+    /// description is the bare words "permission denied". That string is the
+    /// whole message a user gets today, and it names neither the cause nor
+    /// anything they can act on — while the cause is sitting in the code
+    /// signature we can already read.
+    ///
+    /// 🚨 The entitled branch must NOT accuse the signature. If the entitlement
+    /// IS present the refusal came from somewhere else entirely (a leftover VPN
+    /// profile owned by a different signing identity, a supervised/MDM device,
+    /// or a prompt the user answered with "Don't Allow"), and telling that user
+    /// to re-sign would send them to rebuild a thing that is already correct.
+    func vpnPermissionDiagnosis() -> String {
+        if let err = error {
+            return "Could not read this build's entitlements (\(err)), so this "
+                 + "cannot say whether the VPN entitlement is present. "
+                 + "Please report the model and iOS version."
+        }
+        let team = effectiveTeam ?? "unknown team"
+        let signer = "Signed by team \(team)"
+                   + (applicationIdentifier.map { " (app id \($0))" } ?? "") + "."
+        guard hasPacketTunnelProvider else {
+            let modes = networkExtensionModes.isEmpty
+                ? "none" : networkExtensionModes.joined(separator: ", ")
+            return """
+            This build CANNOT create a VPN configuration: its signature does not \
+            carry com.apple.developer.networking.networkextension = \
+            packet-tunnel-provider. Network Extension modes it does have: \(modes).
+            \(signer)
+            iOS refuses every VPN-configuration call on such a build, which is why \
+            no "would like to add VPN configurations" prompt ever appears and every \
+            attempt ends in "permission denied". Nothing in the app can work around \
+            this — the entitlement is granted by the provisioning profile the IPA \
+            was signed with, and only a paid Apple Developer account can enable \
+            Network Extensions on an App ID. A free Apple ID signature (Personal \
+            Team — what 3uTools, AltStore and Sideloadly produce by default) cannot.
+            Install via TestFlight, or re-sign with a paid developer account.
+            DELETE THIS APP FIRST: iOS refuses to install a differently-signed \
+            build over this one and only reports "An error occurred while \
+            installing". Export a Full Backup from Settings beforehand.
+            """
+        }
+        // 🚨 NOT lowercased. A team identifier is case-significant and is exactly
+        // what a reader compares against a provisioning profile — "cdmq33vfqc"
+        // matches nothing and reads as a different team.
+        return """
+        This build IS entitled to run a packet tunnel. \(signer)
+        So the refusal did NOT come from how the IPA was signed, and re-signing \
+        it will not help.
+        Worth checking instead: a leftover "VK Turn Proxy" entry under Settings › \
+        General › VPN & Device Management left by an earlier, differently-signed \
+        install (delete it, then reinstall); whether the device is supervised or \
+        managed by an MDM profile that forbids creating VPN configurations; and \
+        whether a previous "would like to add VPN configurations" prompt was \
+        answered with "Don't Allow".
+        """
+    }
+
+    /// One line for the main screen; the full text above goes to the log.
+    ///
+    /// The status area is a centered `.caption` under the connection circle —
+    /// eight lines of red there is what a user crops OUT of the screenshot they
+    /// attach to an issue. So the screen states the cause and points at the
+    /// Logs screen, which is copyable and is where the pasteable version lives.
+    func vpnPermissionHeadline() -> String {
+        if error != nil {
+            return "VPN config refused; this build's entitlements are unreadable — see Logs."
+        }
+        return hasPacketTunnelProvider
+            ? "VPN config refused, though this build IS entitled to a tunnel — see Logs."
+            : "This build was signed without the VPN entitlement, so it cannot create a VPN configuration — see Logs."
+    }
+
+    /// Convenience over the running process. The rules themselves live on the
+    /// value above so they can be tested without a real signature.
+    static func vpnPermissionDiagnosis() -> String {
+        current.vpnPermissionDiagnosis()
+    }
+
+    static func vpnPermissionHeadline() -> String {
+        current.vpnPermissionHeadline()
+    }
+
     // MARK: - Parsing
 
-    private init(dict: [String: Any]) {
+    // Both initialisers are internal, not private, so the swiftcheck harness can
+    // drive `vpnPermissionDiagnosis()` with fixtures. The diagnosis is the part
+    // that must be right — it is what a user pastes into an issue — and a rule
+    // reachable only through the live process signature could not be exercised
+    // at all. Same reasoning as SpeedTestPathTrace: put the rule on the TYPE.
+    init(dict: [String: Any]) {
         applicationIdentifier = dict["application-identifier"] as? String
         teamIdentifier = dict["com.apple.developer.team-identifier"] as? String
         applicationGroups = (dict["com.apple.security.application-groups"] as? [String]) ?? []
         keychainAccessGroups = (dict["keychain-access-groups"] as? [String]) ?? []
+        networkExtensionModes =
+            (dict["com.apple.developer.networking.networkextension"] as? [String]) ?? []
         error = nil
     }
 
-    private init(error: String) {
+    init(error: String) {
         applicationIdentifier = nil
         teamIdentifier = nil
         applicationGroups = []
         keychainAccessGroups = []
+        networkExtensionModes = []
         self.error = error
     }
 
