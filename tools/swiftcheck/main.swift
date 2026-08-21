@@ -2051,6 +2051,36 @@ do {
           "🚨 an unreadable signature does not force the diagnosis onto a self-explanatory code — "
           + "unreadable is not the same as unentitled")
 
+    // 🚨 A CONNECTION death is not a CONFIGURATION refusal. This domain was
+    // INERT until the status observer began reading lastDisconnectError; the
+    // moment it did, the fail-open default would have started attaching the
+    // signing leads to every ordinary tunnel drop — no network, overslept,
+    // server not responding.
+    if #available(iOS 16.0, *) {
+        for code in [NEVPNConnectionError.noNetworkAvailable.rawValue,
+                     NEVPNConnectionError.unrecoverableNetworkChange.rawValue,
+                     NEVPNConnectionError.serverNotResponding.rawValue] {
+            check(verdict(ne(NEVPNConnectionErrorDomain, code), entitled) == .plain,
+                  "🚨 a tunnel DEATH (NEVPNConnectionError \(code)) is not a configuration "
+                  + "refusal — it must not be answered with entitlements and MDM")
+        }
+        check(verdict(ne(NEVPNConnectionErrorDomain,
+                         NEVPNConnectionError.noNetworkAvailable.rawValue), unentitled) == .diagnose,
+              "…but on a build that cannot run a tunnel at all, even a connection error is worth "
+              + "explaining — the signature layer is above this suppressor")
+    }
+
+    // 🚨 The retry predicate: exactly the pair a reload can fix, and nothing else.
+    check(VPNConfigFailure.isStaleConfiguration(ne(NEVPNErrorDomain, NEVPNError.configurationStale.rawValue))
+          && VPNConfigFailure.isStaleConfiguration(ne(NEVPNErrorDomain, NEVPNError.configurationInvalid.rawValue)),
+          "🚨 stale(4) and invalid(1) are retried through a reload — the pair WireGuard-apple "
+          + "guards on, and the only failures whose cause is the generation we wrote against")
+    check(!VPNConfigFailure.isStaleConfiguration(ne(NEVPNErrorDomain, NEVPNError.configurationReadWriteFailed.rawValue)),
+          "🚨 …and a PERMISSION refusal is NOT retried — a second identical write cannot help, "
+          + "and retrying it would bury issue #75 behind a doubled delay")
+    check(!VPNConfigFailure.isStaleConfiguration(ne("VKTurnProxyError", 4)),
+          "…nor is a foreign error that merely happens to carry code 4")
+
     // The wiring still has to exist — a verdict nothing consults is worth nothing.
     check(tm.contains("VPNConfigFailure.classify(ns, entitlements: ent)"),
           "🚨 TunnelManager asks the classifier rather than re-deciding — three of these bugs "
@@ -2061,6 +2091,22 @@ do {
           "🚨 all FOUR NE call sites route through it — load, connect, the Live Activity switch, "
           + "and setDirectMode, which the previous check could not see because it was scoped to "
           + "`errorMessage =`")
+    check(tm.contains("try await Self.saveReloadingIfStale(manager, reapply: apply)"),
+          "🚨 the connect path SAVES THROUGH THE RETRY rather than calling saveToPreferences "
+          + "directly — the machinery is worth nothing if the call site bypasses it")
+    check(tm.contains("reapply(manager)") && tm.contains("try await manager.loadFromPreferences()"),
+          "🚨 …and the retry RE-APPLIES after reloading: loadFromPreferences overwrites the "
+          + "in-memory config from disk, so a retry without it would silently save back what iOS "
+          + "just handed us and discard the configuration this connect is for")
+    check(tm.contains("manager.connection.fetchLastDisconnectError { stop in"),
+          "🚨 a tunnel that dies AFTER starting is reported — the reason arrives only through "
+          + "fetchLastDisconnectError, never as a thrown error, so it used to be invisible")
+    // 🚨 It is an async FETCH, so its answer lands a turn later than the status
+    // change that asked for it. Publishing unconditionally would let a stale
+    // reason overwrite the message of a reconnect that has already begun.
+    check(tm.contains("guard self.status == .disconnected || self.status == .invalid"),
+          "🚨 …and the late answer is dropped if the tunnel is no longer down — an async fetch "
+          + "resolves after the state that asked for it may have moved on")
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT
     // no-op — and that is the SAME population that hits the missing VPN

@@ -82,7 +82,18 @@ enum VPNConfigFailure {
             return .diagnose
         }
 
-        // 3. The only suppressors, and only for PUBLIC codes that provably cannot
+        // 3. A CONNECTION death is not a CONFIGURATION refusal. `lastDisconnectError`
+        //    carries NEVPNConnectionErrorDomain — overslept, no network,
+        //    unrecoverable network change, server not responding — none of which
+        //    has anything to do with entitlements, MDM or leftover profiles. This
+        //    domain was inert until the status observer started reading it; the
+        //    moment it did, the fail-open default would have started attaching the
+        //    signing leads to every ordinary tunnel drop.
+        if #available(iOS 16.0, *), error.domain == NEVPNConnectionErrorDomain {
+            return .plain
+        }
+
+        // 4. The only suppressors, and only for PUBLIC codes that provably cannot
         //    be a masked permission denial:
         //      · disabled(2) and connectionFailed(3) are never produced by
         //        mapError: at all — they cannot carry a config-layer refusal;
@@ -103,9 +114,28 @@ enum VPNConfigFailure {
             }
         }
 
-        // 4. Everything else — readWriteFailed(5), which is where "permission
+        // 5. Everything else — readWriteFailed(5), which is where "permission
         //    denied" lands, configurationUnknown(6), a code this build has never
         //    heard of, or another NE-family domain. Loud by default.
         return .diagnose
+    }
+
+    /// Whether a failed save means "the configuration you are holding is out of
+    /// date" — the one failure a retry can actually fix.
+    ///
+    /// `configurationStale` says it outright: something else changed the profile
+    /// since we loaded it, so the object we are writing is a dead generation.
+    /// `configurationInvalid` reaches us from five internal codes and one of them
+    /// is the same situation (a profile owned by another install), so it is worth
+    /// one reload as well — this is also the pair WireGuard-apple guards on in
+    /// `startActivation`.
+    ///
+    /// 🚨 Retrying the SAME write cannot fix either: what must change is the
+    /// generation we are writing against, which is why the caller reloads before
+    /// trying again.
+    static func isStaleConfiguration(_ error: NSError) -> Bool {
+        guard error.domain == NEVPNErrorDomain,
+              let code = NEVPNError.Code(rawValue: error.code) else { return false }
+        return code == .configurationStale || code == .configurationInvalid
     }
 }

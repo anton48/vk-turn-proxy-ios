@@ -971,12 +971,14 @@ class TunnelManager: ObservableObject {
                 proto.excludeCellularServices = false
             }
 
-            manager.protocolConfiguration = proto
-            manager.localizedDescription = "VK TURN Proxy"
-            manager.isEnabled = true
+            let apply = { (m: NETunnelProviderManager) in
+                m.protocolConfiguration = proto
+                m.localizedDescription = "VK TURN Proxy"
+                m.isEnabled = true
+            }
+            apply(manager)
 
-            try await manager.saveToPreferences()
-            try await manager.loadFromPreferences()
+            try await Self.saveReloadingIfStale(manager, reapply: apply)
 
             // NECP settle delay before startVPNTunnel.
             //
@@ -1807,6 +1809,40 @@ class TunnelManager: ObservableObject {
         failureText(nil, error)
     }
 
+    /// `saveToPreferences()` + `loadFromPreferences()`, retried ONCE through a
+    /// reload when iOS says the configuration we are holding is out of date.
+    ///
+    /// This is the pair WireGuard-apple guards on in `startActivation`, and we
+    /// had no retry on either: a stale generation — another process, or our own
+    /// extension, having touched the profile since we loaded it — surfaced as a
+    /// dead-end message the user could only answer by trying again by hand.
+    ///
+    /// 🚨 `reapply` is not optional. `loadFromPreferences()` overwrites the
+    /// manager's in-memory properties from what is on disk, so a retry that
+    /// skipped it would save back whatever iOS just handed us — silently
+    /// discarding the configuration this connect exists to apply, and doing it on
+    /// the success path where nothing would ever report it.
+    ///
+    /// ⚖️ Exactly one retry, deliberately. A loop here is a reconnect loop
+    /// against a condition this side cannot fix; if the second write fails the
+    /// error propagates and is classified like any other.
+    private static func saveReloadingIfStale(
+        _ manager: NETunnelProviderManager,
+        reapply: (NETunnelProviderManager) -> Void
+    ) async throws {
+        do {
+            try await manager.saveToPreferences()
+        } catch let error as NSError where VPNConfigFailure.isStaleConfiguration(error) {
+            SharedLogger.shared.log(
+                "[AppDebug] saveToPreferences: \(error.localizedDescription) "
+                + "[\(error.domain) \(error.code)] — reloading and retrying once")
+            try await manager.loadFromPreferences()
+            reapply(manager)
+            try await manager.saveToPreferences()
+        }
+        try await manager.loadFromPreferences()
+    }
+
     private func getOrCreateManager() async throws -> NETunnelProviderManager {
         if let manager = self.manager {
             return manager
@@ -1958,6 +1994,32 @@ class TunnelManager: ObservableObject {
                     self.stopStatsPolling()
                     self.resetCaptchaState()
                     self.live.connectedAt = nil
+                    // 🚨 A tunnel that dies AFTER starting reports through
+                    // `lastDisconnectError` and never through a thrown error, so
+                    // until now it was invisible: the status flipped to
+                    // disconnected and the user was told nothing at all. Read
+                    // BEFORE the VKAuth branch below so that more specific
+                    // message still wins when both are present.
+                    //
+                    // ⚖️ nil on a user-initiated Disconnect, which is why this
+                    // does not need to distinguish one — there is simply nothing
+                    // to report. And per Apple's own note the error is OURS when
+                    // the extension cancelled the tunnel itself, so the
+                    // provider's reason surfaces here too.
+                    // ⚙️ It is an async FETCH, not a property — the reason lives
+                    // in the configuration daemon, not in our copy of the
+                    // connection. So this lands a turn later, which is also why
+                    // it must not clobber a message set in the meantime.
+                    if #available(iOS 16.0, *) {
+                        manager.connection.fetchLastDisconnectError { stop in
+                            guard let stop else { return }
+                            Task { @MainActor in
+                                guard self.status == .disconnected || self.status == .invalid
+                                else { return }
+                                self.errorMessage = Self.failureText("The tunnel stopped", stop)
+                            }
+                        }
+                    }
                     // If the extension self-stopped due to a rejected VKAuth
                     // cookie, it wrote the reason to the App Group before
                     // cancelling — surface it (and clear it so it shows once).
