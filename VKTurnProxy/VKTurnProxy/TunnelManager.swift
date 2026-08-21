@@ -364,6 +364,11 @@ class TunnelManager: ObservableObject {
             return
         }
         errorMessage = nil
+        // 🚨 The attempt starts HERE, not when iOS first reports `.connecting`.
+        // Pre-bootstrap runs for seconds before that, and clearing the slot on
+        // the line above is precisely what would let a fetch from the previous
+        // death slip through its guard during the wait.
+        disconnectGate.attemptBegan()
         preBootstrapInProgress = true
         defer { preBootstrapInProgress = false }
 
@@ -794,6 +799,9 @@ class TunnelManager: ObservableObject {
 
     func switchAndReconnect(to serverId: UUID, because reason: ReconnectReason) async {
         guard let server = ServerStore.shared.servers.first(where: { $0.id == serverId }) else { return }
+        // Same reason as connect(): this is where the attempt begins, and it runs
+        // for a while before any status transition.
+        disconnectGate.attemptBegan()
         SharedLogger.shared.log("[AppDebug] reconnect → \"\(server.serverName)\" "
             + "[\(server.modeLabel)] — \(reason.rawValue)")
         // 🚨 HOLD THE CARD FIRST. This passes through `.disconnected`, on which

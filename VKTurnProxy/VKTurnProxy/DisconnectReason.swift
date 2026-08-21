@@ -47,6 +47,24 @@ struct DisconnectReasonGate {
 
     init() {}
 
+    /// Call when a new attempt BEGINS — the user's intent, not the system's status.
+    ///
+    /// 🚨 `observe` can only advance the generation when iOS reports
+    /// `.connecting`, and that is far too late. Pre-bootstrap — captcha, creds,
+    /// the VK API — runs for seconds or minutes inside `connect()` before
+    /// `startVPNTunnel()` moves the status at all. Throughout that window a fetch
+    /// left over from the PREVIOUS death still matched the generation and still
+    /// found the message slot empty, because `connect()` had just cleared it —
+    /// so it published a stale death reason on top of a connect in progress.
+    ///
+    /// ⚖️ It deliberately does not touch `sawLiveSession`: an attempt that dies
+    /// in pre-bootstrap never produces a status transition at all, and marking a
+    /// session live here would make the next `.invalid` from an ordinary
+    /// `saveToPreferences()` look like a death.
+    mutating func attemptBegan() {
+        generation += 1
+    }
+
     /// Feed every status observation. Returns the generation to fetch the stop
     /// reason under, or nil when this transition is not a session death.
     mutating func observe(_ status: NEVPNStatus) -> Int? {

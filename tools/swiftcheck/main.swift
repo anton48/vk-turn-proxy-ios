@@ -1236,8 +1236,16 @@ do {
     // caller must remember is one the next caller forgets.
     check(controller.contains("func holdThroughReconnect()"),
           "the card can be held across a deliberate reconnect")
+    // 🚨 The body is taken up to the NEXT method, not as a fixed prefix. It used
+    // to be `.prefix(900)`, and adding three lines near the top pushed the anchor
+    // out of the window — a guard that goes red because something ELSE was
+    // inserted is one people learn to silence.
     let switchFn = tunnel.range(of: "func switchAndReconnect(")
-    let switchBody = switchFn.map { String(tunnel[$0.lowerBound...].prefix(900)) } ?? ""
+    let switchBody: String = switchFn.map { r in
+        let rest = String(tunnel[r.upperBound...])
+        if let end = rest.range(of: "\n    func ") { return String(rest[..<end.lowerBound]) }
+        return rest
+    } ?? ""
     check(switchBody.contains("holdThroughReconnect()"),
           "🚨 and switchAndReconnect holds it ITSELF, so every caller is covered — including " +
           "the DIRECT repair, which was not")
@@ -2118,6 +2126,10 @@ do {
     // 🚨 …and CONSULTS it. Added because a sabotage that deleted the attach
     // guard reddened nothing: capturing a generation nobody checks is exactly
     // the shape of a rule that is present and switched off.
+    check(tm.contains("disconnectGate.attemptBegan()")
+          && tm.components(separatedBy: "disconnectGate.attemptBegan()").count - 1 == 2,
+          "🚨 BOTH attempt entry points — connect() and switchAndReconnect() — advance the "
+          + "generation, because each runs for a long time before iOS reports any status change")
     check(tm.components(separatedBy: "disconnectGate.mayPublish(").count - 1 == 2,
           "🚨 BOTH fetch paths — the observer's and the cold attach — ask mayPublish before "
           + "publishing; a captured generation that nothing consults is a rule switched off")
@@ -2178,6 +2190,40 @@ do {
         check(!a.mayPublish(fetchedUnder: atAttach, messageNow: nil),
               "🚨 …and is DROPPED once a whole session has come and gone — otherwise a reason from "
               + "before the app launched is published against a death that just happened")
+
+        // 🚨 THE WINDOW A STATUS-DRIVEN GENERATION CANNOT SEE. connect() runs
+        // pre-bootstrap — captcha, creds, the VK API — for seconds or minutes
+        // before startVPNTunnel() moves the status, and it clears the message
+        // slot on entry. A fetch from the previous death therefore matched the
+        // generation AND found an empty slot for that whole window.
+        var b = DisconnectReasonGate()
+        _ = b.observe(.connecting)
+        let prevDeath = b.observe(.disconnected)!
+        check(b.mayPublish(fetchedUnder: prevDeath, messageNow: nil),
+              "before a new attempt, the previous death's answer is still its own")
+        b.attemptBegan()   // connect() entered; NO status transition yet
+        check(!b.mayPublish(fetchedUnder: prevDeath, messageNow: nil),
+              "🚨 …and once an ATTEMPT has begun it is dropped, even though iOS has not reported "
+              + "`.connecting` yet — the generation must track INTENT, not the system's status")
+
+        // 🚨 Added because a sabotage that made attemptBegan() ALSO mark the
+        // session live reddened nothing. It must not: an attempt that dies in
+        // pre-bootstrap never produces a status transition, so the flag would
+        // still be set when some later `saveToPreferences()` emits `.invalid` —
+        // and P3 would be back, asking why a tunnel that never started stopped.
+        var d = DisconnectReasonGate()
+        d.attemptBegan()
+        check(d.observe(.invalid) == nil && d.observe(.disconnected) == nil,
+              "🚨 announcing an ATTEMPT does not make a session live — a connect that dies in "
+              + "pre-bootstrap must not turn the next saveToPreferences() `.invalid` into a death")
+
+        // …and the same for the cold-attach answer.
+        var c = DisconnectReasonGate()
+        let coldGen = c.generation
+        c.attemptBegan()
+        check(!c.mayPublish(fetchedUnder: coldGen, messageNow: nil),
+              "🚨 …which covers the attach answer too: a connect begun during pre-bootstrap must "
+              + "not be captioned with why the tunnel died before the app launched")
 
         // A death is asked about once, not on every subsequent observation.
         var k = DisconnectReasonGate()
