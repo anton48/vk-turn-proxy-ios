@@ -29,6 +29,7 @@
 		5474956678AC676C6E7AE2E6 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 50685ED014984982ABF8CF0C /* Assets.xcassets */; };
 		548E254EF4C178FACD9DCAF6 /* VKAuthWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B15C079F499D57B27E1635DE /* VKAuthWebView.swift */; };
 		54BDFA3B7322033AA76D1C66 /* UplinkPaceSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2842251868A37320A5C238F2 /* UplinkPaceSync.swift */; };
+		55808C77B750142FE667ECDE /* VPNConfigFailure.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54B78245B4410AB09F5B6E47 /* VPNConfigFailure.swift */; };
 		5BFFE56605C7A3D0A4672924 /* VKTurnProxyApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE10D4B4A2BE32E0DD5E3D4 /* VKTurnProxyApp.swift */; };
 		6481DAB30DAF3572C55089E0 /* TunnelMTU.swift in Sources */ = {isa = PBXBuildFile; fileRef = C80CE8603F45C625FABAC090 /* TunnelMTU.swift */; };
 		652C39DB65907355CDF83B99 /* UplinkPace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 422D7F513A45A12E8A142AA1 /* UplinkPace.swift */; };
@@ -122,6 +123,7 @@
 		4D06132B25271A4E9DA8F0C6 /* PacketTunnelProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PacketTunnelProvider.swift; sourceTree = "<group>"; };
 		4D13B015BF30B930DDDB8BBF /* BackupManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupManager.swift; sourceTree = "<group>"; };
 		50685ED014984982ABF8CF0C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		54B78245B4410AB09F5B6E47 /* VPNConfigFailure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPNConfigFailure.swift; sourceTree = "<group>"; };
 		58612E89BCBF7234C05D3831 /* VPNLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPNLiveActivity.swift; sourceTree = "<group>"; };
 		605ED1D89D0F1886A8414767 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		642EE859E329B8CA42D7FEB6 /* SpeedTestPath.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeedTestPath.swift; sourceTree = "<group>"; };
@@ -268,6 +270,7 @@
 				12A7A42ADDB7D021CA9C8352 /* VKTurnProxy.entitlements */,
 				FDE10D4B4A2BE32E0DD5E3D4 /* VKTurnProxyApp.swift */,
 				284043E2EA6CAC284FF241D3 /* VPNActivityAttributes.swift */,
+				54B78245B4410AB09F5B6E47 /* VPNConfigFailure.swift */,
 			);
 			path = VKTurnProxy;
 			sourceTree = "<group>";
@@ -477,6 +480,7 @@
 				E1250E1BF6D8FBFBCCFB25BF /* VKProfileCache.swift in Sources */,
 				5BFFE56605C7A3D0A4672924 /* VKTurnProxyApp.swift in Sources */,
 				AACB3A08FC4C5ACF9B5D9FE0 /* VPNActivityAttributes.swift in Sources */,
+				55808C77B750142FE667ECDE /* VPNConfigFailure.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

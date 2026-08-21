@@ -1249,7 +1249,11 @@ class TunnelManager: ObservableObject {
                 + "\(Int(Date().timeIntervalSince(t0) * 1000)) ms")
         } catch {
             note("🚨 could not save the profile: \(error.localizedDescription)")
-            directModeError = "Could not switch routing: \(error.localizedDescription)"
+            // Fourth NE call site, and the one the harness could not see: its
+            // check was scoped to `errorMessage =`, so a bare framework string
+            // published as `directModeError` slipped past. saveToPreferences()
+            // here refuses for exactly the same reasons it refuses on connect.
+            directModeError = Self.failureText("Could not switch routing", error)
             // The in-memory restore above fixes the object we hold; re-reading
             // fixes anything else that moved. Only then may the switch refresh.
             try? await manager.loadFromPreferences()
@@ -1733,7 +1737,7 @@ class TunnelManager: ObservableObject {
                 observeStatus(existing)
             }
         } catch {
-            errorMessage = Self.vpnConfigFailure("Failed to load VPN config", error)
+            errorMessage = Self.failureText("Failed to load VPN config", error)
         }
     }
 
@@ -1750,44 +1754,57 @@ class TunnelManager: ObservableObject {
     /// "Don't Allow" produces, and until now both were interpolated through
     /// `localizedDescription` and thrown away, so no report could tell them
     /// apart.
-    /// 🚨 BOTH channels, and neither is redundant. `SharedLogger.shared.log` is
-    /// `guard let url = fileURL else { return }` — a SILENT no-op when the App
-    /// Group container is unavailable, which is the state of every re-signed
-    /// build. That is the same population that hits the missing VPN entitlement,
-    /// since both are consequences of re-signing: the one user who most needs
-    /// this text would have been sent to a Logs screen that never received it.
-    /// `logDiagnostic` reaches os_log, which the Logs screen falls back to
-    /// reading — but only as a FALLBACK, so on a healthy build (an entitled one
-    /// refused for some other reason) the file is still where the user looks.
-    private static func vpnConfigFailure(_ prefix: String, _ error: Error) -> String {
+    /// Compose the user-facing text for a failed call, and log what happened.
+    ///
+    /// The classification is `VPNConfigFailure.classify` — a pure function in its
+    /// own file precisely so the harness can fail a WRONG VERDICT rather than
+    /// only a missing line. Three narrowings of this rule have shipped defects
+    /// that a source scan could not see.
+    ///
+    /// 🚨 Logging is UNCONDITIONAL. The domain and code are the data this
+    /// diagnosis exists to collect, and a gate that declines to explain an error
+    /// must still record it — otherwise the one case nobody has captured (a
+    /// prompt answered "Don't Allow") stays uncaptured forever.
+    ///
+    /// 🚨 The os_log channel is not redundant with the file one.
+    /// `SharedLogger.shared.log` is `guard let url = fileURL else { return }` — a
+    /// silent no-op when the App Group container is unavailable, which is the
+    /// state of every re-signed build, i.e. the same population that hits the
+    /// missing entitlement. `logDiagnostic` reaches os_log, which the Logs screen
+    /// falls back to reading — but only as a FALLBACK, so on a healthy build the
+    /// file is still where the user looks.
+    private static func failureText(_ prefix: String?, _ error: Error) -> String {
         let ns = error as NSError
-        let full = "\(prefix): \(error.localizedDescription) [\(ns.domain) \(ns.code)]\n"
-                 + AppEntitlements.vpnPermissionDiagnosis()
-        SharedLogger.logDiagnostic(full, category: "VPNConfig")
-        SharedLogger.shared.log("[AppDebug] " + full)
-        return "\(prefix): \(error.localizedDescription)\n"
-             + AppEntitlements.vpnPermissionHeadline()
+        let ent = AppEntitlements.current
+        let onScreen = prefix.map { "\($0): \(error.localizedDescription)" }
+                    ?? error.localizedDescription
+
+        let headline: String?
+        let detail: String?
+        switch VPNConfigFailure.classify(ns, entitlements: ent) {
+        case .plain:
+            headline = nil; detail = nil
+        case .diagnose:
+            headline = ent.vpnPermissionHeadline(); detail = ent.vpnPermissionDiagnosis()
+        case .savedConfigurationSuspect:
+            headline = ent.savedConfigurationHeadline(); detail = ent.savedConfigurationDiagnosis()
+        }
+
+        let record = "\(prefix ?? "VPN call failed"): \(error.localizedDescription) "
+                   + "[\(ns.domain) \(ns.code)]"
+                   + (detail.map { "\n" + $0 } ?? "")
+        SharedLogger.shared.log("[AppDebug] " + record)
+        if detail != nil {
+            SharedLogger.logDiagnostic(record, category: "VPNConfig")
+        }
+        return headline.map { onScreen + "\n" + $0 } ?? onScreen
     }
 
-    /// A connect fails for many reasons that have nothing to do with signing —
-    /// captcha, creds, network, a dead call link. So the diagnosis is appended
-    /// only when the failure came from NetworkExtension itself; that test, and
-    /// only that test, is what stops an unrelated failure being blamed on the
-    /// signature.
-    ///
-    /// 🚨 It deliberately does NOT also require the build to be unentitled.
-    /// The first version did, and that silently deleted the entitled branch from
-    /// this path: on a correctly signed build — the "Don't Allow", leftover
-    /// profile and MDM cases, which is every refusal that is NOT about signing —
-    /// the guard fell through and published the framework's bare "permission
-    /// denied" again. `vpnPermissionDiagnosis()` already decides what to say for
-    /// an entitled build; re-deciding it here could only disagree with it, and
-    /// it did.
+    /// A connect fails for many reasons that have nothing to do with the VPN
+    /// configuration — captcha, creds, network, a dead call link — so its text is
+    /// left exactly as the thrower wrote it unless the classifier says otherwise.
     private static func connectFailure(_ error: Error) -> String {
-        guard (error as NSError).domain.hasPrefix("NE") else {
-            return error.localizedDescription
-        }
-        return vpnConfigFailure("VPN configuration refused", error)
+        failureText(nil, error)
     }
 
     private func getOrCreateManager() async throws -> NETunnelProviderManager {

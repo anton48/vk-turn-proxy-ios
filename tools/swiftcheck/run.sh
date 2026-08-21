@@ -47,6 +47,7 @@ SOURCES=(
     "$S/SpeedTestResultView.swift"
     "$S/SharedLogger.swift"
     "$S/AppEntitlements.swift"
+    "$S/VPNConfigFailure.swift"
 )
 
 require_tracked "$0" "${SOURCES[@]}"

@@ -183,6 +183,30 @@ struct AppEntitlements: Sendable {
         """
     }
 
+    /// The narrower lead for `NEVPNError.configurationInvalid`.
+    ///
+    /// That code is the image of five internal ones, among them "configuration
+    /// owner application is wrong" — a VPN profile left behind by a
+    /// differently-signed install, which is the first lead the entitled branch
+    /// gives. So it must not be suppressed. But the other four internal sources
+    /// are ordinary corruption, so it must not talk about entitlements, MDM or
+    /// re-signing either: the system rejected a SAVED configuration, and that is
+    /// all this can honestly say.
+    func savedConfigurationDiagnosis() -> String {
+        """
+        iOS rejected the saved VPN configuration itself, not this app's right to \
+        create one.
+        The usual cause is a "VK Turn Proxy" entry under Settings › General › \
+        VPN & Device Management left behind by an earlier install signed with a \
+        different certificate — iOS will not let this build touch it. Delete that \
+        entry and connect again.
+        """
+    }
+
+    func savedConfigurationHeadline() -> String {
+        "iOS rejected the saved VPN configuration — see Logs."
+    }
+
     /// One line for the main screen; the full text above goes to the log.
     ///
     /// The status area is a centered `.caption` under the connection circle —

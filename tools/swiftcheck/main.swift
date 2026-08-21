@@ -41,6 +41,7 @@
 //     without one was moved into a value type that can be.
 
 import Foundation
+import NetworkExtension
 
 var failures = 0
 
@@ -1967,41 +1968,109 @@ do {
     // 🚨 And the WIRING: a diagnosis nothing calls is worth nothing. Build 339's
     // sabotage passed every test in its file because only the CALL SITE was gone.
     let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
-    check(tm.contains("Self.vpnConfigFailure(\"Failed to load VPN config\""),
-          "🚨 the LOAD failure — the launch-time message a user screenshots — carries the "
-          + "diagnosis")
+    check(tm.contains("errorMessage = Self.failureText(\"Failed to load VPN config\", error)"),
+          "🚨 the LOAD failure — the launch-time message a user screenshots — is classified "
+          + "rather than published bare")
     check(tm.contains("errorMessage = Self.connectFailure(error)"),
           "🚨 and so does the connect failure, which is what the user sees after tapping Connect")
     check(!tm.contains("errorMessage = error.localizedDescription\n"),
           "🚨 no catch still publishes a BARE localizedDescription — that is the state where "
           + "the whole message was the framework's \"permission denied\"")
-    // The gate is the point: an unrelated connect failure must not be blamed on
-    // signing. But it must gate on ONE thing only.
-    check(tm.contains("(error as NSError).domain.hasPrefix(\"NE\")"),
-          "🚨 the connect path appends the diagnosis only for a NetworkExtension failure — "
-          + "captcha, creds and network errors are not blamed on the signature")
-    // 🚨 P2, caught in review: the first version ALSO required the build to be
-    // unentitled, which deleted the entitled branch from this path entirely. On a
-    // correctly signed build — "Don't Allow", a leftover profile, MDM, i.e. every
-    // refusal that is NOT about signing — it fell through to the bare framework
-    // string, so the branch written to handle exactly those cases was unreachable.
-    check(!tm.contains("!AppEntitlements.current.hasPacketTunnelProvider"),
-          "🚨 …and it does NOT also gate on the entitlement: vpnPermissionDiagnosis() already "
-          + "decides what an ENTITLED build is told, and a caller re-deciding it can only "
-          + "disagree — which is how the entitled branch became unreachable")
-    check(tm.contains("return vpnConfigFailure(\"VPN configuration refused\", error)"),
-          "…and the positive half: an NE failure DOES reach the diagnosis (a bare absence "
-          + "check passes just as happily when the whole function is gone)")
+    // 🚨 THE VERDICTS THEMSELVES, driven by fixtures. Three narrowings of this
+    // rule have shipped defects, and every one of them passed a source grep:
+    // a `contains` check sees a missing line and never a wrong answer.
+    func ne(_ domain: String, _ code: Int) -> NSError {
+        NSError(domain: domain, code: code, userInfo: [NSLocalizedDescriptionKey: "permission denied"])
+    }
+    func verdict(_ e: NSError, _ ent: AppEntitlements) -> VPNFailureAdvice {
+        VPNConfigFailure.classify(e, entitlements: ent)
+    }
+
+    check(verdict(ne("VKTurnProxyError", 42), entitled) == .plain,
+          "🚨 a NON-NetworkExtension failure is never touched — captcha, creds and network "
+          + "errors must not be blamed on how the app was signed")
+
+    // The issue-75 build: the signature decides, and it decides for EVERY code,
+    // so the diagnosis cannot stop matching when Apple renumbers something.
+    for code in 1...6 {
+        check(verdict(ne(NEVPNErrorDomain, code), unentitled) == .diagnose,
+              "🚨 an unentitled build is diagnosed whatever the code carries (NEVPNError \(code)) "
+              + "— that verdict comes from OUR signature, never from the error")
+    }
+
+    // The reviewer's objection: ordinary NE errors must NOT get the entitlement text.
+    check(verdict(ne(NEVPNErrorDomain, NEVPNError.configurationDisabled.rawValue), entitled) == .plain,
+          "🚨 ConfigurationDisabled on an entitled build says only what it is")
+    check(verdict(ne(NEVPNErrorDomain, NEVPNError.connectionFailed.rawValue), entitled) == .plain,
+          "🚨 ConnectionFailed likewise — it is not a configuration refusal at all")
+    check(verdict(ne(NEVPNErrorDomain, NEVPNError.configurationStale.rawValue), entitled) == .plain,
+          "🚨 ConfigurationStale likewise — its one internal source is a stale config, a reload")
+
+    // …but invalid(1) is the image of five internal codes, one of them
+    // "configuration owner application is wrong" — the leftover-profile case.
+    // Suppressing it outright would delete the lead the entitled branch exists
+    // to give, so it gets a NARROWER message instead of none.
+    check(verdict(ne(NEVPNErrorDomain, NEVPNError.configurationInvalid.rawValue), entitled)
+          == .savedConfigurationSuspect,
+          "🚨 ConfigurationInvalid is neither suppressed nor given the entitlement text — it is "
+          + "the image of \"configuration owner application is wrong\", i.e. a leftover profile")
+
+    // Where "permission denied" actually lands: mapError: sends internal code 10
+    // to NEVPNError 5. This is the entitled half of issue 75.
+    check(verdict(ne(NEVPNErrorDomain, NEVPNError.configurationReadWriteFailed.rawValue), entitled)
+          == .diagnose,
+          "🚨 ConfigurationReadWriteFailed IS diagnosed — internal code 10, \"permission denied\", "
+          + "is mapped onto exactly this public code")
+    check(verdict(ne(NEVPNErrorDomain, NEVPNError.configurationUnknown.rawValue), entitled) == .diagnose,
+          "ConfigurationUnknown is diagnosed rather than passed through bare")
+
+    // 🚨 FAIL OPEN. The check that would have caught both earlier narrowings: an
+    // NE-family error this build has never heard of must be the LOUD path. A
+    // false positive costs three dead-end leads in a branch that never accuses
+    // the signature; a false negative is silent, and lands on the users whose
+    // App Group is dead and who therefore have no log to send.
+    check(verdict(ne("NESomethingNewErrorDomain", 999), entitled) == .diagnose,
+          "🚨 an UNRECOGNISED NE domain and code still gets the leads — when the classifier "
+          + "cannot decide it must say more, never less")
+    check(verdict(ne(NEVPNErrorDomain, 99), entitled) == .diagnose,
+          "🚨 …and so does an unrecognised code in a known NE domain")
+
+    // An unreadable signature must not be read as "unentitled".
+    check(verdict(ne(NEVPNErrorDomain, NEVPNError.configurationReadWriteFailed.rawValue), unreadable)
+          == .diagnose
+          && unreadable.vpnPermissionDiagnosis().contains("cannot say whether"),
+          "🚨 an unreadable signature is diagnosed but claims nothing — hasPacketTunnelProvider "
+          + "is false there without that meaning the entitlement is absent")
+
+    // 🚨 Added because a sabotage that DROPPED the `error == nil` test reddened
+    // nothing: every fixture I had written happened to expect .diagnose, so the
+    // two behaviours were indistinguishable. This is the fixture that separates
+    // them — an unreadable signature must not be read as "unentitled", so a
+    // self-explanatory code still passes through plain.
+    check(verdict(ne(NEVPNErrorDomain, NEVPNError.configurationDisabled.rawValue), unreadable) == .plain,
+          "🚨 an unreadable signature does not force the diagnosis onto a self-explanatory code — "
+          + "unreadable is not the same as unentitled")
+
+    // The wiring still has to exist — a verdict nothing consults is worth nothing.
+    check(tm.contains("VPNConfigFailure.classify(ns, entitlements: ent)"),
+          "🚨 TunnelManager asks the classifier rather than re-deciding — three of these bugs "
+          + "were a caller disagreeing with the rule it had already been given")
+    check(tm.contains("errorMessage = Self.failureText(\"Failed to load VPN config\", error)")
+          && tm.contains("failureText(nil, error)")
+          && tm.contains("directModeError = Self.failureText(\"Could not switch routing\", error)"),
+          "🚨 all FOUR NE call sites route through it — load, connect, the Live Activity switch, "
+          + "and setDirectMode, which the previous check could not see because it was scoped to "
+          + "`errorMessage =`")
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT
     // no-op — and that is the SAME population that hits the missing VPN
     // entitlement, both being consequences of re-signing. The headline says "see
     // Logs"; without the os_log channel the Logs screen would have nothing.
-    check(tm.contains("SharedLogger.logDiagnostic(full, category: \"VPNConfig\")"),
+    check(tm.contains("SharedLogger.logDiagnostic(record, category: \"VPNConfig\")"),
           "🚨 the full diagnosis goes to os_log, which survives a missing App Group — the "
           + "file-backed logger is a silent no-op there, and that is exactly the build that "
           + "needs this text")
-    check(tm.contains("SharedLogger.shared.log(\"[AppDebug] \" + full)"),
+    check(tm.contains("SharedLogger.shared.log(\"[AppDebug] \" + record)"),
           "🚨 …and to the shared file too, because the Logs screen only FALLS BACK to os_log: "
           + "on a healthy build the file is where the user actually looks")
     check(tm.contains("[\\(ns.domain) \\(ns.code)]"),
