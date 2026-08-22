@@ -30,58 +30,21 @@ extension View {
 struct ContentView: View {
     @StateObject private var tunnel = TunnelManager.shared
 
-    // Name of the ACTIVE server, shown under the status text. Deliberately a
-    // @State snapshot refreshed in .onAppear (which fires when Settings is
-    // popped) rather than an @ObservedObject on ServerStore: observing the store
-    // would re-render this root view on every edit keystroke, which is exactly
-    // what popped the pushed editor before (see MainNavigationLinks below).
-    @State private var activeServerName = ServerStore.shared.activeServer.serverName
 
-    // vkLink is the one GLOBAL setting this screen reads (it is not per-server).
-    // The 20 per-server keys that used to be mirrored here are gone: every
-    // per-server value is read straight from ServerStore.activeServer below.
-    // Keeping them as @AppStorage was not merely redundant — an unused
-    // @AppStorage still subscribes, so ANY write to those keys (a backup
-    // import, a link import, the old projection) re-rendered this view, which
-    // hosts the NavigationView and therefore tears down whatever is pushed.
-    // That is the build-177 pop trap, left armed. See MainNavigationLinks and
-    // TunnelLiveStats for the same lesson learned the hard way in build 195.
-    @AppStorage("vkLink") private var vkLink = ""
-
-    /// First BLOCKING (.error) validation issue for the ACTIVE server mode, or
-    /// nil if the config is good enough to attempt a connection. Gates the
-    /// Connect button — a malformed required field would otherwise just fail
-    /// the handshake silently. Mode-aware: WRAP-A validates the password (WG
-    /// keys are server-provisioned via GETCONF); the other modes validate the
-    /// WG keys instead. Format / optional-field issues are surfaced as
-    /// non-blocking hints in Settings, not here. Mirrors serverModeBinding's
-    /// precedence (useWrapA > useSrtp > useWrap).
-    private var configValidationError: String? {
-        // Per-server fields come from the ACTIVE server (read directly from the
-        // store, NOT from the flat @AppStorage keys — those are no longer
-        // projected during Settings, which is what caused the NavigationView pop
-        // on iOS 26). vkLink is global.
-        let s = ServerStore.shared.activeServer
-        var issues: [ConfigValidation.Issue?] = [
-            ConfigValidation.vkLink(vkLink),
-            ConfigValidation.peerAddress(s.peerAddress),
-            ConfigValidation.turnOverride(s.turnServerOverride),
-        ]
-        if s.useWrapA {
-            issues.append(ConfigValidation.wrapAPassword(s.wrapAPassword))
-        } else {
-            issues.append(ConfigValidation.wgKey(s.privateKey, label: "Private key", required: true))
-            issues.append(ConfigValidation.wgKey(s.peerPublicKey, label: "Peer public key", required: true))
-            issues.append(ConfigValidation.wgKey(s.presharedKey, label: "Preshared key", required: false))
-            issues.append(ConfigValidation.tunnelAddress(s.tunnelAddress))
-            // SRTP+WRAP / SRTP-WRAP-S also need the hex key.
-            if (!s.useSrtp && s.useWrap) || s.useWrapS {
-                issues.append(ConfigValidation.wrapKeyHex(s.wrapKeyHex))
-            }
-        }
-        return issues.compactMap { $0 }.first { $0.severity == .error }?.message
-    }
-
+    // 🚨 THIS VIEW HOSTS THE `NavigationView`, SO IT SUBSCRIBES TO NOTHING BUT
+    // THE TUNNEL. Re-rendering this body tears down whatever is pushed (build
+    // 177, GitHub #65), so everything that follows the ACTIVE SERVER lives in
+    // `ActiveServerControls` below, which owns its own observation. An
+    // `@AppStorage` here would be the same trap — it subscribes even unread.
+    //
+    // Until build 350 the server name was a `@State` snapshot refreshed in
+    // `.onAppear` (plus a `willEnterForeground` hook for the Live Activity's
+    // picker). That is sound only while the active server can change nowhere
+    // but on a screen you have to come BACK from — and a tapped connection
+    // link applies while THIS screen is on top, so the snapshot went stale:
+    // the subtitle named the old server while Connect, which reads the store
+    // live, used the new one. Reading the store at render time in a child
+    // removes the class, not the case.
     var body: some View {
         NavigationView {
             // ScrollView is the safety net for very small screens
@@ -102,82 +65,12 @@ struct ContentView: View {
                     Text(statusText)
                         .font(.headline)
 
-                    // Which named server this status refers to.
-                    Text(tunnel.status == .connected
-                         ? "Connected to \(activeServerName)"
-                         : "Server: \(activeServerName)")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-
-                    if let error = tunnel.errorMessage {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundColor(.red)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal)
-                    }
-
-                    // Blocking config-validation error for the active server
-                    // mode — shown only while disconnected (it gates the
-                    // Connect button below). Required-field errors only;
-                    // non-blocking format hints live inline in Settings.
-                    if tunnel.status != .connected, tunnel.status != .connecting,
-                       let v = configValidationError {
-                        Text(v)
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal)
-                    }
-
-                    // Stats (shown when connected)
-                    if tunnel.status == .connected {
-                        StatsView(live: tunnel.live)
-                            .padding(.horizontal)
-                    }
-
-                    // Connect / Disconnect button
-                    Button(action: {
-                        if tunnel.status == .connected || tunnel.status == .connecting {
-                            // Log user-initiated stop so we can later distinguish
-                            // "user pressed Disconnect" from iOS-side stops with
-                            // the same reason=1 (.userInitiated) NEProviderStopReason.
-                            // iOS occasionally fires stopTunnel(reason=1) for non-
-                            // user-initiated reasons (network change with
-                            // includeAllNetworks=true being the suspected case);
-                            // having this log line lets us differentiate at triage
-                            // time rather than guessing.
-                            NSLog("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
-                            SharedLogger.shared.log("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
-                            tunnel.disconnect()
-                        } else {
-                            // Per-server fields come from the ACTIVE server (read
-                            // directly from the store); vkLink / VKAuth /
-                            // forceLegacyCaptcha are global.
-                            let active = ServerStore.shared.activeServer
-                            NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue), server=\"\(active.serverName)\" [\(active.modeLabel)])")
-                            SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue), server=\"\(active.serverName)\" [\(active.modeLabel)])")
-                            let config = TunnelConfig.make(for: active)
-                            Task {
-                                await tunnel.connect(config: config)
-                            }
-                        }
-                    }) {
-                        Text(buttonText)
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(buttonColor)
-                            .cornerRadius(12)
-                    }
-                    .padding(.horizontal)
-                    .padding(.top, 8)
-                    // Block Connect when a required field for the active mode
-                    // is empty/invalid (e.g. WRAP-A without a password → Go
-                    // disables WRAP-A → broken direct fallback; or a malformed
-                    // peerAddress / WG key). Never disables the Disconnect action.
-                    .disabled(connectBlocked)
+                    // Everything that depends on the ACTIVE SERVER — its name,
+                    // the blocking-validation caption, the stats and the Connect
+                    // button — is one child that observes `ServerStore`, so a
+                    // link import or a Live Activity switch re-renders THAT and
+                    // not the NavigationView host.
+                    ActiveServerControls(tunnel: tunnel)
 
                     // Logs & Settings links
                     MainNavigationLinks(tunnel: tunnel)
@@ -188,21 +81,6 @@ struct ContentView: View {
             }
             .navigationTitle("VK Turn Proxy")
             .navigationBarTitleDisplayMode(.inline)
-            // Fires on first show AND when Settings is popped, so the displayed
-            // server name follows a rename / active-server switch.
-            .onAppear { activeServerName = ServerStore.shared.activeServer.serverName }
-            // ...but NOT on a return from background, which is how the Live
-            // Activity's server picker changes it (issue #64 stage 2): the view
-            // never disappeared, so onAppear never fires and the header kept
-            // naming the server from launch while Settings showed the real one
-            // (device log 29.07). Guarded on a real change — an unconditional
-            // @State write here would re-render the view that hosts the
-            // NavigationView on every foregrounding.
-            .onReceive(NotificationCenter.default.publisher(
-                for: UIApplication.willEnterForegroundNotification)) { _ in
-                let name = ServerStore.shared.activeServer.serverName
-                if name != activeServerName { activeServerName = name }
-            }
             .sheet(isPresented: $tunnel.captchaPending) {
                 if let urlStr = tunnel.captchaImageURL, let url = URL(string: urlStr) {
                     CaptchaWebView(
@@ -234,10 +112,8 @@ struct ContentView: View {
                     tunnel.onVKLoginResult(result)
                 }
             }
-            // 🚨 The root consumer for tapped vkturnproxy:// links, and it is a
-            // SEPARATE VIEW on purpose: it owns the inbox observation, so an
-            // arriving link re-renders only it and NOT this body — which hosts
-            // the NavigationView and would tear down whatever is pushed.
+            // The root consumer for tapped vkturnproxy:// links. A separate
+            // view so that its inbox observation cannot re-render this body.
             // → ConnectionLinkImport.swift.
             .background(ConnectionLinkImporter())
         }
@@ -270,32 +146,6 @@ struct ContentView: View {
         @unknown default: return "Unknown"
         }
     }
-
-    private var buttonText: String {
-        if tunnel.preBootstrapInProgress { return "Disconnect" }
-        switch tunnel.status {
-        case .connected, .connecting: return "Disconnect"
-        default: return "Connect"
-        }
-    }
-
-    /// True when Connect is blocked by a required field being empty/invalid.
-    /// Named once and used by BOTH `.disabled` and the button colour: while
-    /// they disagreed the button stayed a confident blue that swallowed taps
-    /// with no explanation, which reads as a broken app rather than as
-    /// "something above is missing".
-    private var connectBlocked: Bool {
-        tunnel.status != .connected && tunnel.status != .connecting && configValidationError != nil
-    }
-
-    private var buttonColor: Color {
-        if connectBlocked { return .gray }
-        if tunnel.preBootstrapInProgress { return .red }
-        switch tunnel.status {
-        case .connected, .connecting: return .red
-        default: return .blue
-        }
-    }
 }
 
 /// The two links out of the main screen, deliberately in a view of their own.
@@ -323,6 +173,186 @@ private struct MainNavigationLinks: View {
                 Label("Settings", systemImage: "gear")
             }
         }
+    }
+}
+
+/// The part of the main screen that depends on the ACTIVE SERVER: its name, the
+/// blocking-validation caption, the stats grid and the Connect button.
+///
+/// 🚨 IT IS A SEPARATE VIEW SO THAT IT CAN OBSERVE `ServerStore`. `ContentView`
+/// hosts the `NavigationView` and must not: observing the store there re-renders
+/// the host on every edit keystroke and tears down whatever is pushed (build
+/// 177, GitHub #65). Same isolation as `MainNavigationLinks` and
+/// `TunnelLiveStats`, and the same reason `ConnectionLinkImporter` exists.
+///
+/// 🎯 WHY IT IS READ AT RENDER TIME AND NOT SNAPSHOT. `ContentView` used to keep
+/// the name in `@State`, refreshed in `.onAppear` — which fires when Settings is
+/// popped, and that covered every way the active server could change, because
+/// changing it required going to Settings and coming back. A tapped connection
+/// link applies while the main screen is on top and nothing pops, so the
+/// snapshot survived the change: the subtitle kept naming the previous server
+/// while the Connect action, which reads `ServerStore.shared.activeServer` live,
+/// used the new one. The validation gate had the same split — it reads the store
+/// live but was only recomputed when something ELSE re-rendered the host, so a
+/// link that writes no `vkLink` (freeturn://, or an unchanged call link) left
+/// Connect greyed out on a config that had just become valid.
+private struct ActiveServerControls: View {
+    @ObservedObject private var store = ServerStore.shared
+
+    /// Observed rather than passed-and-read: this body branches on
+    /// `tunnel.status`, and SwiftUI may skip re-evaluating a child whose stored
+    /// properties are unchanged — which a class reference is, by definition.
+    /// `MainNavigationLinks` can take a plain `let` because it only forwards it.
+    @ObservedObject var tunnel: TunnelManager
+
+    /// vkLink is the one GLOBAL setting this screen validates (it is not
+    /// per-server). It lives here rather than on the host for the reason above:
+    /// an `@AppStorage` subscribes whether or not the value is read, so on the
+    /// host it re-renders the NavigationView on every write.
+    @AppStorage("vkLink") private var vkLink = ""
+
+    /// First BLOCKING (.error) validation issue for the ACTIVE server mode, or
+    /// nil if the config is good enough to attempt a connection. Gates the
+    /// Connect button — a malformed required field would otherwise just fail
+    /// the handshake silently. Mode-aware: WRAP-A validates the password (WG
+    /// keys are server-provisioned via GETCONF); the other modes validate the
+    /// WG keys instead. Format / optional-field issues are surfaced as
+    /// non-blocking hints in Settings, not here. Mirrors serverModeBinding's
+    /// precedence (useWrapA > useSrtp > useWrap).
+    private var configValidationError: String? {
+        // Per-server fields come from the ACTIVE server (read from the store,
+        // NOT from the flat @AppStorage keys — those are no longer projected
+        // during Settings, which is what caused the NavigationView pop on iOS
+        // 26). vkLink is global.
+        let s = store.activeServer
+        var issues: [ConfigValidation.Issue?] = [
+            ConfigValidation.vkLink(vkLink),
+            ConfigValidation.peerAddress(s.peerAddress),
+            ConfigValidation.turnOverride(s.turnServerOverride),
+        ]
+        if s.useWrapA {
+            issues.append(ConfigValidation.wrapAPassword(s.wrapAPassword))
+        } else {
+            issues.append(ConfigValidation.wgKey(s.privateKey, label: "Private key", required: true))
+            issues.append(ConfigValidation.wgKey(s.peerPublicKey, label: "Peer public key", required: true))
+            issues.append(ConfigValidation.wgKey(s.presharedKey, label: "Preshared key", required: false))
+            issues.append(ConfigValidation.tunnelAddress(s.tunnelAddress))
+            // SRTP+WRAP / SRTP-WRAP-S also need the hex key.
+            if (!s.useSrtp && s.useWrap) || s.useWrapS {
+                issues.append(ConfigValidation.wrapKeyHex(s.wrapKeyHex))
+            }
+        }
+        return issues.compactMap { $0 }.first { $0.severity == .error }?.message
+    }
+
+    /// True when Connect is blocked by a required field being empty/invalid.
+    /// Named once and used by BOTH `.disabled` and the button colour: while
+    /// they disagreed the button stayed a confident blue that swallowed taps
+    /// with no explanation, which reads as a broken app rather than as
+    /// "something above is missing".
+    private var connectBlocked: Bool {
+        tunnel.status != .connected && tunnel.status != .connecting && configValidationError != nil
+    }
+
+    private var buttonText: String {
+        if tunnel.preBootstrapInProgress { return "Disconnect" }
+        switch tunnel.status {
+        case .connected, .connecting: return "Disconnect"
+        default: return "Connect"
+        }
+    }
+
+    private var buttonColor: Color {
+        if connectBlocked { return .gray }
+        if tunnel.preBootstrapInProgress { return .red }
+        switch tunnel.status {
+        case .connected, .connecting: return .red
+        default: return .blue
+        }
+    }
+
+    var body: some View {
+        let server = store.activeServer
+        return VStack(spacing: 16) {
+            // Which named server this status refers to.
+            Text(tunnel.status == .connected
+                 ? "Connected to \(server.serverName)"
+                 : "Server: \(server.serverName)")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+            if let error = tunnel.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+
+            // Blocking config-validation error for the active server mode —
+            // shown only while disconnected (it gates the Connect button
+            // below). Required-field errors only; non-blocking format hints
+            // live inline in Settings.
+            if tunnel.status != .connected, tunnel.status != .connecting,
+               let v = configValidationError {
+                Text(v)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+
+            // Stats (shown when connected)
+            if tunnel.status == .connected {
+                StatsView(live: tunnel.live)
+                    .padding(.horizontal)
+            }
+
+            // Connect / Disconnect button
+            Button(action: {
+                if tunnel.status == .connected || tunnel.status == .connecting {
+                    // Log user-initiated stop so we can later distinguish
+                    // "user pressed Disconnect" from iOS-side stops with
+                    // the same reason=1 (.userInitiated) NEProviderStopReason.
+                    // iOS occasionally fires stopTunnel(reason=1) for non-
+                    // user-initiated reasons (network change with
+                    // includeAllNetworks=true being the suspected case);
+                    // having this log line lets us differentiate at triage
+                    // time rather than guessing.
+                    NSLog("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
+                    SharedLogger.shared.log("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
+                    tunnel.disconnect()
+                } else {
+                    // Per-server fields come from the ACTIVE server (read from
+                    // the same store this view renders, so the button and the
+                    // name above can never disagree); vkLink / VKAuth /
+                    // forceLegacyCaptcha are global.
+                    let active = store.activeServer
+                    NSLog("[UI] user pressed Connect button (status=\(tunnel.status.rawValue), server=\"\(active.serverName)\" [\(active.modeLabel)])")
+                    SharedLogger.shared.log("[UI] user pressed Connect button (status=\(tunnel.status.rawValue), server=\"\(active.serverName)\" [\(active.modeLabel)])")
+                    let config = TunnelConfig.make(for: active)
+                    Task {
+                        await tunnel.connect(config: config)
+                    }
+                }
+            }) {
+                Text(buttonText)
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(buttonColor)
+                    .cornerRadius(12)
+            }
+            .padding(.horizontal)
+            .padding(.top, 8)
+            // Block Connect when a required field for the active mode is
+            // empty/invalid (e.g. WRAP-A without a password → Go disables
+            // WRAP-A → broken direct fallback; or a malformed peerAddress /
+            // WG key). Never disables the Disconnect action.
+            .disabled(connectBlocked)
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -418,11 +448,13 @@ struct SettingsView: View {
     @State private var alertMessage: String? = nil
     @State private var alertTitle: String = ""
 
-    // 1-Click Connection Link import. Same flow as Full Backup but with
-    // a separate state pair so a user juggling both never gets confusing
-    // alert collisions. The inbox observes vkturnproxy:// URL deliveries
-    // from App.onOpenURL — see VKTurnProxyApp.swift for the producer side
-    // and the .onAppear/.onChange handlers further down for the consumer.
+    // 1-Click Connection Link import, PASTE PATH ONLY. Same flow as Full
+    // Backup but with a separate state pair so a user juggling both never gets
+    // confusing alert collisions. 🚫 This screen is NOT a consumer of
+    // `ConnectionLinkInbox` — a tapped vkturnproxy:// / wdtt:// / freeturn://
+    // URL is handled by `ConnectionLinkImporter` at the root, and re-attaching
+    // the inbox here would give the app two consumers (double prompt, or one
+    // swallowing the other's URL). → ConnectionLinkImport.swift.
     @State private var pendingConnectionLink: ConnectionLink? = nil
     @State private var showConnectionLinkConfirm = false
 
@@ -695,7 +727,13 @@ struct SettingsView: View {
         // cache or captured browser profile.
         .alert("Import Connection Link?", isPresented: $showConnectionLinkConfirm, presenting: pendingConnectionLink) { link in
             Button("Import", role: .destructive) {
-                applyPendingConnectionLink(link)
+                // ONE apply path, shared with the tapped-link importer. This was
+                // a private copy that duplicated the call, the title AND the
+                // body — exactly the drift the extraction exists to prevent.
+                let msg = ConnectionLinkPrompt.apply(link)
+                pendingConnectionLink = nil
+                alertTitle = ConnectionLinkPrompt.importedTitle
+                alertMessage = msg
             }
             Button("Cancel", role: .cancel) {
                 pendingConnectionLink = nil
@@ -784,12 +822,8 @@ struct SettingsView: View {
                 Text(msg)
             }
         }
-        // 🚫 The inbox is NOT consumed here any more. It used to be, and this
-        // screen was the ONLY consumer — so a link tapped while the app sat on
-        // the main screen did nothing until the user happened to open Settings.
-        // ConnectionLinkImporter, mounted at the root, handles tapped links now;
-        // this screen keeps the alert above solely for the PASTE button.
-        // → ConnectionLinkImport.swift for why it is a separate view.
+        // 🚫 The inbox is not consumed here — the alert above is the PASTE
+        // path only. → ConnectionLinkImport.swift.
     }
 
     // MARK: - Backup actions
@@ -847,33 +881,9 @@ struct SettingsView: View {
             pendingConnectionLink = link
             showConnectionLinkConfirm = true
         } catch {
-            alertTitle = "Connection Link Invalid"
+            alertTitle = ConnectionLinkPrompt.invalidTitle
             alertMessage = error.localizedDescription
         }
-    }
-
-    /// Counterpart of handleConnectionLinkPaste for the inbox / URL-open
-    /// path. Same parse → confirm logic; takes a URL the system
-    /// delivered instead of a clipboard string.
-    private func handleConnectionLinkURL(_ url: URL) {
-        do {
-            let link = try BackupManager.parseConnectionLink(from: url)
-            pendingConnectionLink = link
-            showConnectionLinkConfirm = true
-        } catch {
-            alertTitle = "Connection Link Invalid"
-            alertMessage = error.localizedDescription
-        }
-    }
-
-    /// Apply the parsed link to UserDefaults. Doesn't touch creds-pool
-    /// or vk_profile (those are device-specific state); the user's
-    /// existing TURN cache and browser profile, if any, stay in place.
-    private func applyPendingConnectionLink(_ link: ConnectionLink) {
-        BackupManager.applyConnectionLink(link)
-        pendingConnectionLink = nil
-        alertTitle = "Connection Link Imported"
-        alertMessage = "Settings applied. Reconnect to use them."
     }
 
     // MARK: - Reset actions

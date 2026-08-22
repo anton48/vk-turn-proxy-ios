@@ -1,38 +1,20 @@
 import SwiftUI
 
 /// The root-level consumer for `vkturnproxy://` / `wdtt://` / `freeturn://`
-/// links, and the one place the confirmation text is built.
+/// links, and the one place the confirmation wording and the apply step live.
 ///
-/// WHY THIS EXISTS
-/// ---------------
-/// `.onOpenURL` at the `WindowGroup` fires reliably and parks the URL in
-/// `ConnectionLinkInbox`. Until build 350 the ONLY consumer was `SettingsView`,
-/// through its `.onAppear` / `.onChange` — so a link tapped while the app was on
-/// the main screen sat in the inbox and **nothing happened until the user
-/// navigated to Settings**, at which point the prompt finally appeared. That was
-/// the reported behaviour, and the code described it as intended: *"acted on
-/// whether SettingsView was already mounted … or only mounted later when the
-/// user navigates to it"*. Reproduced in the simulator before this was written.
-///
-/// 🚨 WHY IT IS A SEPARATE VIEW AND NOT AN OBSERVER ON `ContentView`
-/// The obvious fix — let `ContentView` watch the inbox — re-arms the trap this
-/// project has been bitten by twice (build 177, GitHub #65): `ContentView` hosts
-/// the `NavigationView`, so anything that re-renders its body tears down
-/// whatever is pushed. A link arriving while the user was inside Settings or
-/// ServerEditView would have thrown them out of it. That is also why
-/// `ContentView` keeps the active server name as a `@State` snapshot rather than
-/// observing `ServerStore`.
-///
-/// Owning the `@StateObject` HERE means the inbox's publish re-renders only this
-/// view. `ContentView`'s body does not read the inbox and therefore does not
-/// re-run — the push survives. Same move as `MainNavigationLinks`, which was
-/// lifted out of the churning root for the same reason.
+/// 🚨 IT IS A SEPARATE VIEW, NOT AN OBSERVER ON `ContentView`. `ContentView`
+/// hosts the `NavigationView`, so anything that re-renders its body tears down
+/// whatever is pushed (build 177, GitHub #65) — a link arriving while the user
+/// was inside Settings or ServerEditView would have thrown them out of it.
+/// Owning the `@StateObject` here means the inbox's publish re-renders only this
+/// view. Same move as `MainNavigationLinks` and `ActiveServerControls`.
 /// → reference_swiftui_pop_navigationview_host_rerender
 ///
-/// ⚖️ `SettingsView` keeps its own copy of the confirm alert, because it also
+/// ⚖️ `SettingsView` keeps its own copy of the confirm alert because it also
 /// serves the PASTE path ("Import from Connection Link…"), which never touches
-/// the inbox. Both call `ConnectionLinkPrompt` so the wording and the apply step
-/// exist once — two copies of a rule is how two copies drift apart.
+/// the inbox. Both go through `ConnectionLinkPrompt`, so the wording, the titles
+/// and the apply step exist once — two copies of a rule is how two copies drift.
 struct ConnectionLinkImporter: View {
     @StateObject private var inbox = ConnectionLinkInbox.shared
 
@@ -51,7 +33,7 @@ struct ConnectionLinkImporter: View {
                 Button("Import", role: .destructive) {
                     let msg = ConnectionLinkPrompt.apply(link)
                     pending = nil
-                    resultTitle = "Connection Link Imported"
+                    resultTitle = ConnectionLinkPrompt.importedTitle
                     resultMessage = msg
                     showResult = true
                 }
@@ -66,6 +48,10 @@ struct ConnectionLinkImporter: View {
             }
             .onAppear { consume() }
             .onChange(of: inbox.pendingURL) { _ in consume() }
+            // A URL that arrives while an alert is up stays PARKED; these two
+            // fire when that alert goes away and pick it up then.
+            .onChange(of: showConfirm) { _ in consume() }
+            .onChange(of: showResult) { _ in consume() }
     }
 
     /// Take the URL out of the inbox and act on it.
@@ -73,6 +59,19 @@ struct ConnectionLinkImporter: View {
     /// Consuming (setting `pendingURL = nil`) is what stops the link being
     /// replayed the next time this view appears.
     private func consume() {
+        // 🚨 ONE ALERT AT A TIME. This used to take the URL unconditionally and
+        // overwrite `pending` UNDERNEATH a live confirmation, so a second link
+        // arriving while the user read the first was the one Import applied —
+        // a different configuration from the one on screen, silently. And
+        // raising `showConfirm` while `showResult` is still true puts two
+        // alerts on one view, which SwiftUI resolves by dropping one.
+        //
+        // Leaving it parked costs nothing: `pendingURL` is published and the
+        // dismissal hooks above re-enter here, with `.onAppear` as the backstop
+        // if a present is swallowed for arriving mid-dismissal. The importer is
+        // always mounted now, so this is far easier to reach than when Settings
+        // was the only consumer. *(Review-caught, 3d7b9953.)*
+        guard !showConfirm, !showResult else { return }
         guard let url = inbox.pendingURL else { return }
         inbox.pendingURL = nil
         do {
@@ -80,17 +79,20 @@ struct ConnectionLinkImporter: View {
             showConfirm = true
         } catch {
             pending = nil
-            resultTitle = "Connection Link Invalid"
+            resultTitle = ConnectionLinkPrompt.invalidTitle
             resultMessage = error.localizedDescription
             showResult = true
         }
     }
 }
 
-/// The confirmation wording and the apply step, in one place so the two
-/// presenters — this importer (tapped links) and SettingsView (pasted links) —
-/// cannot drift apart.
+/// The confirmation wording, the alert titles and the apply step, in one place
+/// so the two presenters — this importer (tapped links) and SettingsView (pasted
+/// links) — cannot drift apart.
 enum ConnectionLinkPrompt {
+    static let importedTitle = "Connection Link Imported"
+    static let invalidTitle = "Connection Link Invalid"
+
     /// What the user is about to get. Names what will be CREATED rather than
     /// what gets overwritten: since build 179 a link ADDS a named server and
     /// makes it active instead of replacing the current configuration.

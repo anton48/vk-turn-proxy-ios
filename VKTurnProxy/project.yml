@@ -62,8 +62,9 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         # 1-Click Connection Link import. Tapping a
         # vkturnproxy://import?data=<base64> URL anywhere on iOS
-        # launches us and delivers the URL via .onOpenURL in
-        # SettingsView. The base64 payload is a JSON ConnectionLink
+        # launches us and delivers the URL via .onOpenURL at the
+        # WindowGroup; ConnectionLinkImporter is what acts on it (see
+        # ConnectionLinkImport.swift). The base64 payload is a JSON ConnectionLink
         # (see AppConfig.swift + BackupManager.parseConnectionLink).
         # Generator script: quick_link.py at repo root.
         CFBundleURLTypes:

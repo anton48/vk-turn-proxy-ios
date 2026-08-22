@@ -1,13 +1,14 @@
 import SwiftUI
 
-/// Tiny inbox that forwards an incoming `vkturnproxy://import?data=…`
-/// URL from the App's `.onOpenURL` (which fires reliably on cold and
-/// warm launches at the WindowGroup level) into SettingsView, where
-/// the parse + confirm + apply flow lives. SettingsView observes
-/// `pendingURL` via @StateObject and consumes it on .onAppear AND
-/// .onChange, so the URL is acted on whether SettingsView was already
-/// mounted at the moment of delivery or only mounted later when the
-/// user navigates to it.
+/// Tiny inbox that parks an incoming `vkturnproxy://import?data=…` URL from the
+/// App's `.onOpenURL` (which fires reliably on cold and warm launches at the
+/// WindowGroup level) until a view consumes it.
+///
+/// 🚨 THE SOLE CONSUMER IS `ConnectionLinkImporter`, mounted at the root — see
+/// ConnectionLinkImport.swift. It used to be SettingsView, which meant a link
+/// tapped while the app sat on the main screen did NOTHING until the user
+/// happened to open Settings. Do not add a second consumer: two of them race
+/// for one `pendingURL`, so one prompt is swallowed or shown twice.
 @MainActor
 final class ConnectionLinkInbox: ObservableObject {
     static let shared = ConnectionLinkInbox()

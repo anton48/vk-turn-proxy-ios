@@ -2249,6 +2249,105 @@ do {
           + "since a prompt answered \"Don't Allow\" also reads \"permission denied\"")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+print("The main screen's active-server controls, and the link importer")
+
+// 32. 🚨 THE ACTIVE SERVER IS READ AT RENDER TIME BY A VIEW THAT OBSERVES THE
+//     STORE, AND THE NAVIGATION HOST SUBSCRIBES TO NEITHER.
+//
+//     Two failure directions, and BOTH have happened here:
+//       • observe the store on `ContentView` → every edit keystroke re-renders
+//         the NavigationView host and pops the pushed editor (build 177, #65);
+//       • snapshot it into `@State` on `ContentView` → nothing refreshes the
+//         snapshot when the active server changes while the main screen is on
+//         top, which is what a tapped connection link does. The subtitle named
+//         the previous server while Connect, reading the store live, used the
+//         new one. *(Review-caught, 3d7b9953.)*
+//     Only a child view satisfies both, which is why this asserts WHERE the
+//     reads live rather than that any single line is present.
+//
+//     ⚠️ Comments are stripped: this scan matches names the surrounding prose is
+//     full of, and a scan reddening on its own documentation has happened four
+//     times in this project.
+do {
+    let content = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+
+    // SettingsView lives in this file too and legitimately declares
+    // @AppStorage("vkLink"), so the host must be isolated before scanning.
+    guard let start = content.range(of: "struct ContentView: View {"),
+          let hostEnd = content.range(of: "\nprivate struct MainNavigationLinks",
+                                      range: start.upperBound..<content.endIndex) else {
+        check(false, "could not isolate ContentView — every check below would pass vacuously")
+        exit(1)
+    }
+    let host = String(content[start.upperBound..<hostEnd.lowerBound])
+
+    check(!host.contains("@AppStorage"),
+          "🚨 the NavigationView host declares no @AppStorage — an unused one still SUBSCRIBES")
+    check(!host.contains("ServerStore"),
+          "🚨 …and does not read ServerStore either, in any form")
+    check(!content.contains("activeServerName"),
+          "🚨 no @State snapshot of the active server name survives — a snapshot is stale from "
+          + "the moment a link changes the active server without a screen being popped")
+    check(host.contains("ActiveServerControls(tunnel: tunnel)"),
+          "the server-dependent controls are reached as a child view")
+
+    guard let cs = content.range(of: "private struct ActiveServerControls: View {"),
+          // NOT the "// MARK: - Server Mode" line that follows it: comments are
+          // stripped above, so a comment anchor is not there to be found — and
+          // the guard below then reports "inert" instead of the invariant.
+          let ce = content.range(of: "\nenum ServerMode",
+                                 range: cs.upperBound..<content.endIndex) else {
+        check(false, "could not isolate ActiveServerControls — the checks below would pass vacuously")
+        exit(1)
+    }
+    let child = String(content[cs.upperBound..<ce.lowerBound])
+
+    check(child.contains("@ObservedObject private var store = ServerStore.shared"),
+          "the child OBSERVES the store, so an import or a Live Activity switch re-renders it")
+    check(child.contains("store.activeServer"),
+          "…and reads the active server from it at render time")
+    check(child.contains("@ObservedObject var tunnel: TunnelManager"),
+          "🚨 the tunnel is OBSERVED here, not passed-and-read: SwiftUI may skip re-evaluating a "
+          + "child whose stored properties are unchanged, and a class reference never changes")
+    check(child.contains("private var connectBlocked: Bool") && child.contains(".disabled(connectBlocked)"),
+          "the Connect gate is computed and applied in the same view that renders the name — "
+          + "while they lived apart, one could follow the new server and the other the old")
+}
+
+// 33. ONE ALERT AT A TIME, ONE CONSUMER, ONE APPLY PATH.
+//
+//     `consume()` used to take the URL unconditionally, so a second link
+//     arriving while the confirm alert was up replaced `pending` underneath it
+//     and Import applied a configuration the user had not read. The importer is
+//     mounted always now, so that is far easier to reach than when Settings was
+//     the only consumer. *(Review-caught, 3d7b9953.)*
+//
+//     ⚖️ Scan-only: ConnectionLinkPrompt pulls in BackupManager and ServerStore,
+//     so it cannot be compiled standalone the way the value types above are.
+do {
+    let imp = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConnectionLinkImport.swift")
+    let content = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+
+    check(imp.contains("guard !showConfirm, !showResult else { return }"),
+          "🚨 a URL arriving while an alert is up stays PARKED instead of replacing the link "
+          + "the user is currently reading")
+    check(imp.contains(".onChange(of: showConfirm)") && imp.contains(".onChange(of: showResult)"),
+          "…and each alert's dismissal re-enters consume(), or the parked URL would wait for "
+          + "the next .onAppear")
+    check(!content.contains("ConnectionLinkInbox"),
+          "🚨 ContentView is not a second consumer of the inbox — two consumers race for one "
+          + "pendingURL, so a prompt is swallowed or shown twice")
+    check(!content.contains("handleConnectionLinkURL"),
+          "and the dead URL handler is gone rather than left as an invitation to re-attach it")
+    check(!content.contains("BackupManager.applyConnectionLink"),
+          "🚨 ContentView does not apply a link itself")
+    check(content.contains("ConnectionLinkPrompt.apply(link)")
+          && content.contains("ConnectionLinkPrompt.importedTitle"),
+          "…the paste path goes through the shared apply AND the shared title — sharing only "
+          + "the wording is what let the apply step drift")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")
