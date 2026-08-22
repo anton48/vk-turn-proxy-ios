@@ -2381,9 +2381,54 @@ do {
           && imp.contains(".onChange(of: showResult) { _ in settle() }"),
           "…and each alert's dismissal re-enters the take path, or the parked URL would wait for "
           + "an .onAppear that may never come")
-    check(imp.contains("inbox.finish()") && imp.contains("guard !showConfirm, !showResult else { return }\n        inbox.finish()"),
-          "🚨 …and it releases the link that was on screen ONLY once both alerts are closed — a "
-          + "link released a step early drops out of the dedupe window while still being shown")
+    // 🚨 AND THE HANDLER'S BODY, IN ORDER — not just its first two lines.
+    //
+    // Pinning the `.onChange` line and then `guard … / inbox.finish()` still let
+    // `settle()` lose its `consume()` call with the WHOLE SUITE GREEN, which is
+    // the reviewer's original objection surviving one level in: a URL parked
+    // under an alert then waits for an `.onAppear` this importer may never get.
+    // The check followed the rename and stopped one line short of the behaviour.
+    // *(Re-raised by the user against the fixed code, and confirmed by
+    // sabotage before this was written.)*
+    //
+    // ⚖️ Asserted as an ORDER over the body rather than as a verbatim block: a
+    // comment inserted mid-body would break a multi-line match on correct code,
+    // and this project has reddened on its own prose four times already.
+    func inOrder(_ body: String, _ steps: [String]) -> Bool {
+        var from = body.startIndex
+        for step in steps {
+            guard let r = body.range(of: step, range: from..<body.endIndex) else { return false }
+            from = r.upperBound
+        }
+        return true
+    }
+    func bodyOf(_ decl: String) -> String? {
+        guard let d = imp.range(of: decl),
+              let e = imp.range(of: "\n    }", range: d.upperBound..<imp.endIndex) else { return nil }
+        return String(imp[d.upperBound..<e.lowerBound])
+    }
+    if let settle = bodyOf("private func settle() {") {
+        check(inOrder(settle, ["guard !showConfirm, !showResult else { return }",
+                               "inbox.finish()",
+                               "consume()"]),
+              "🚨 the dismissal path GUARDS, then releases, then TAKES THE NEXT ONE — releasing "
+              + "early drops the link out of the dedupe window while it is still on screen, and "
+              + "not consuming leaves a parked URL waiting for an .onAppear that may never come")
+    } else {
+        check(false, "could not find settle() — the order check would be vacuous")
+    }
+    if let consume = bodyOf("private func consume() {") {
+        check(inOrder(consume, ["guard !showConfirm, !showResult else { return }",
+                                "inbox.recoverIfAbandoned()",
+                                "guard let url = inbox.take() else { return }"]),
+              "🚨 …and the take path reconciles an abandoned transaction BEFORE taking, which is "
+              + "only safe because the guard above says this consumer has no alert of its own")
+        check(consume.contains("showConfirm = true") && consume.contains("showResult = true"),
+              "🚨 …and it RAISES something either way — a take that neither prompts nor reports "
+              + "swallows the link, and the queue would look correct while nothing appeared")
+    } else {
+        check(false, "could not find consume() — the checks above would be vacuous")
+    }
     // 🚨 THE TWO HALVES OF SURVIVING A TORN-DOWN IMPORTER, and both are call
     // sites the harness cannot reach: an irreversible step must be ANNOUNCED, and
     // a fresh consumer must RECONCILE. Missing the first re-imports a deployment;
@@ -2404,11 +2449,6 @@ do {
     } else {
         check(false, "could not locate the invalid-link branch — the check above would be vacuous")
     }
-    check(imp.contains("guard !showConfirm, !showResult else { return }")
-          && imp.range(of: "inbox.recoverIfAbandoned()")
-                .map({ r in imp.range(of: "guard let url = inbox.take()").map { $0.lowerBound > r.lowerBound } ?? false }) == true,
-          "🚨 …and a consumer with no alert of its own reconciles an abandoned transaction BEFORE "
-          + "taking the next link")
     check(!content.contains("ConnectionLinkInbox"),
           "🚨 ContentView is not a second consumer of the inbox — two consumers race for one "
           + "pendingURL, so a prompt is swallowed or shown twice")
