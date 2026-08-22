@@ -61,9 +61,6 @@ struct VPNActivityAttributes: ActivityAttributes {
         /// has attached to a tunnel whose profile carries no identity, and
         /// falling back to the selection there is precisely the false claim this
         /// contract exists to prevent. → SessionServer.swift.
-        /// *(This line used to name `ServerStore.activeServer.serverName`, and
-        /// a widget contract is the one place a later change would "correct" the
-        /// publisher back to the store. Review-caught, 7ed59d5d.)*
         var serverName: String
         /// When the tunnel reached .connected, or nil when it isn't up. The
         /// view renders a live timer from this, so the clock keeps running even

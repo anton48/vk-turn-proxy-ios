@@ -2155,15 +2155,11 @@ class TunnelManager: ObservableObject {
     /// No-op below iOS 16.1 and whenever no activity is warranted; see
     /// LiveActivityController for the lifecycle.
     ///
-    /// 🚨 THE CARD NAMES THE RUNNING SESSION, NOT THE SELECTION — so a change of
-    /// active server that has NOT reconnected must not reach it. This doc used
-    /// to say the opposite ("the server name is read fresh each time, so
-    /// switching the active server shows up on the next status transition"),
-    /// which was true while a switch could only happen through a reconnect and
-    /// became an argument FOR the defect the moment a tapped link could change
-    /// the selection under a live tunnel. *(Review-caught, 7ed59d5d — the same
-    /// species as the `873a927` comment that documented the opposite of what
-    /// its code did.)*
+    /// 🚨 THE CARD NAMES THE RUNNING SESSION, NOT THE SELECTION — a change of
+    /// active server that has not reconnected must not reach it. The tempting
+    /// shortcut is `ServerStore.activeServer`, and it is right only while a
+    /// switch REQUIRES a reconnect; a tapped connection link changes the
+    /// selection with no reconnect at all. → SessionServer.swift.
     private func syncLiveActivity() {
         // The one shared rule; an empty name means NAME NOTHING, never the
         // selection. → SessionServer.swift.
