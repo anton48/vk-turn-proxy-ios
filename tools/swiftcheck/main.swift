@@ -2287,8 +2287,15 @@ do {
     check(!host.contains("ServerStore"),
           "🚨 …and does not read ServerStore either, in any form")
     check(!content.contains("activeServerName"),
-          "🚨 no @State snapshot of the active server name survives — a snapshot is stale from "
-          + "the moment a link changes the active server without a screen being popped")
+          "🚨 the historical snapshot identifier is gone — a snapshot is stale from the moment a "
+          + "link changes the active server without a screen being popped")
+    // 🚨 …AND THE IDENTIFIER IS NOT THE INVARIANT. Forbidding one name forbids one
+    // name: the same defect under any other spelling passes. `@State ` (with the
+    // space) does not match `@StateObject`, so the host keeps its tunnel and may
+    // hold no per-render copy of anything at all. *(Review-caught, 63f25071.)*
+    check(!host.contains("@State "),
+          "🚨 …and the host holds NO @State whatsoever, so the snapshot cannot come back under a "
+          + "different name")
     check(host.contains("ActiveServerControls(tunnel: tunnel)"),
           "the server-dependent controls are reached as a child view")
 
@@ -2307,6 +2314,32 @@ do {
           "the child OBSERVES the store, so an import or a Live Activity switch re-renders it")
     check(child.contains("store.activeServer"),
           "…and reads the active server from it at render time")
+    // 🚨 THE CHECK ABOVE IS SATISFIED BY THE CONNECT ACTION ALONE. That is exactly
+    // the shape of the original defect — Connect read the store live while the
+    // subtitle came from a stored copy — so "the child mentions store.activeServer
+    // somewhere" cannot be the whole claim. Two statements close it: the child
+    // holds no @State at all, and the SUBTITLE itself interpolates a live read.
+    // *(Review-caught, 63f25071.)*
+    check(!child.contains("@State "),
+          "🚨 the child holds NO @State either — a copy of anything the store owns is the "
+          + "subtitle-vs-Connect split back, whatever it is called")
+    guard let bodyR = child.range(of: "var body: some View {") else {
+        check(false, "could not find ActiveServerControls.body — the subtitle check would pass vacuously")
+        exit(1)
+    }
+    let childBody = String(child[bodyR.upperBound...])
+    // ⚖️ Both arms of the ternary, and either spelling of a live read: pinning one
+    // arm leaves the other free to drift, while demanding one spelling would
+    // redden on a correct inlining. The defect this excludes is a read of
+    // something OTHER than the active server, which no spelling makes correct.
+    func readsActiveServer(_ prefix: String) -> Bool {
+        childBody.contains("\(prefix)\\(server.serverName)")
+            || childBody.contains("\(prefix)\\(store.activeServer.serverName)")
+    }
+    check(readsActiveServer("Connected to ") && readsActiveServer("Server: "),
+          "🚨 …and the SUBTITLE interpolates that live read — the screen naming one server while "
+          + "Connect uses another is the whole defect, and it is invisible to a check that only "
+          + "asks whether the store is mentioned")
     check(child.contains("@ObservedObject var tunnel: TunnelManager"),
           "🚨 the tunnel is OBSERVED here, not passed-and-read: SwiftUI may skip re-evaluating a "
           + "child whose stored properties are unchanged, and a class reference never changes")
@@ -2332,9 +2365,15 @@ do {
     check(imp.contains("guard !showConfirm, !showResult else { return }"),
           "🚨 a URL arriving while an alert is up stays PARKED instead of replacing the link "
           + "the user is currently reading")
-    check(imp.contains(".onChange(of: showConfirm)") && imp.contains(".onChange(of: showResult)"),
-          "…and each alert's dismissal re-enters consume(), or the parked URL would wait for "
-          + "the next .onAppear")
+    // 🚨 THE FULL LINE, NOT THE MODIFIER. Asserting `.onChange(of: showConfirm)`
+    // appears is green on an EMPTY handler — and then a URL parked under an alert
+    // waits for an .onAppear this view may never get again. My sabotage deleted
+    // the whole line, which is a stronger edit than the invariant: it proved that
+    // SOME breakage is caught, not this one. *(Review-caught, 63f25071.)*
+    check(imp.contains(".onChange(of: showConfirm) { _ in consume() }")
+          && imp.contains(".onChange(of: showResult) { _ in consume() }"),
+          "…and each alert's dismissal CALLS consume(), or the parked URL would wait for an "
+          + ".onAppear that may never come")
     check(!content.contains("ConnectionLinkInbox"),
           "🚨 ContentView is not a second consumer of the inbox — two consumers race for one "
           + "pendingURL, so a prompt is swallowed or shown twice")

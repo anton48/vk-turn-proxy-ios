@@ -25,10 +25,25 @@ struct ConnectionLinkImporter: View {
     @State private var showResult = false
 
     var body: some View {
-        // An empty, zero-footprint view: it exists to host the alerts and to be
-        // the thing that re-renders when a URL arrives.
+        // An invisible, inert layer: it exists to host the alerts and to be the
+        // thing that re-renders when a URL arrives.
+        //
+        // ⚖️ SIZED AND HIT-TEST-DISABLED, not 0×0. A `.background` takes its
+        // parent's size and does not affect its layout, so this is invisible
+        // either way — but a zero-bounds host is a documented way to lose an
+        // alert presentation or an `.onAppear`, and there is no reason to stand
+        // on that. `allowsHitTesting(false)` is what keeps a full-size clear
+        // layer from swallowing taps on the scroll view's empty space.
+        // *(Review-raised twice: 3d7b9953, 63f25071.)*
+        //
+        // 🚫 NOT moved to the `WindowGroup` beside `KeyboardDismisser`, which was
+        // the other half of that suggestion: presenting over a PUSHED screen,
+        // over a cold launch, and chained confirm → result are all measured
+        // working from here (simulator, 2026-08-22), and moving verified
+        // structure on a theory buys nothing. ⚠️ The residual is simulator vs
+        // DEVICE, which neither placement addresses.
         Color.clear
-            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
             .alert("Import Connection Link?", isPresented: $showConfirm, presenting: pending) { link in
                 Button("Import", role: .destructive) {
                     let msg = ConnectionLinkPrompt.apply(link)
