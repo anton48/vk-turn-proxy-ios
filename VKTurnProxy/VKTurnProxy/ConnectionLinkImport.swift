@@ -47,21 +47,37 @@ struct ConnectionLinkImporter: View {
             .alert("Import Connection Link?", isPresented: $showConfirm, presenting: pending) { link in
                 Button("Import", role: .destructive) {
                     let msg = ConnectionLinkPrompt.apply(link)
-                    // 🚨 The device has changed. If this view is torn down before
-                    // the result alert is dismissed, the inbox must NOT offer the
-                    // link again — that would import the same deployment twice.
-                    inbox.markActed()
+                    // 🚨 The device has changed AND the user has seen it happen.
+                    // Terminal here, in the button's own handler: if this view is
+                    // torn down before the receipt is dismissed, the inbox must
+                    // not offer the link again — that imports it twice.
+                    inbox.markTerminal(.applied)
                     pending = nil
                     resultTitle = ConnectionLinkPrompt.importedTitle
                     resultMessage = msg
                     showResult = true
                 }
-                Button("Cancel", role: .cancel) { pending = nil }
+                Button("Cancel", role: .cancel) {
+                    // 🚨 HERE, not in the dismissal hook. The hook runs on a view
+                    // that survives to see `showConfirm` flip; a view destroyed
+                    // in the same update never runs it, and the link would come
+                    // back as a fresh prompt for something just declined.
+                    // *(User-caught.)*
+                    inbox.markTerminal(.declined)
+                    pending = nil
+                }
             } message: { link in
                 Text(ConnectionLinkPrompt.message(for: link))
             }
             .alert(resultTitle, isPresented: $showResult) {
-                Button("OK", role: .cancel) {}
+                Button("OK", role: .cancel) {
+                    // What makes an INVALID link terminal: until the complaint is
+                    // read, a torn-down view must show it again. ⚖️ After an
+                    // import this is a no-op — `markTerminal` keeps the first
+                    // reason, so the phase stays `applied` rather than being
+                    // relabelled by the button that closed the receipt.
+                    inbox.markTerminal(.reported)
+                }
             } message: {
                 if let m = resultMessage { Text(m) }
             }
@@ -123,10 +139,10 @@ struct ConnectionLinkImporter: View {
             pending = try BackupManager.parseConnectionLink(from: url)
             showConfirm = true
         } catch {
-            // Also irreversible, in the sense that matters here: the user has
-            // been told this link is bad, and re-asking them about it is not a
-            // service. → ConnectionLinkInbox.Phase.
-            inbox.markActed()
+            // 🚫 DELIBERATELY NOT TERMINAL HERE. Composing the complaint is not
+            // the user reading it: a view torn down between the two would drop
+            // the link having told them nothing at all. It becomes terminal on
+            // the OK button above. *(User-caught.)*
             pending = nil
             resultTitle = ConnectionLinkPrompt.invalidTitle
             resultMessage = error.localizedDescription

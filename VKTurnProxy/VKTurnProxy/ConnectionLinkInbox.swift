@@ -35,30 +35,36 @@ final class ConnectionLinkInbox: ObservableObject {
     /// that hosts the `NavigationView` tears its subtree down, which is the
     /// build-177 / #65 trap the importer itself was split out to survive.
     ///
-    /// With a bare `inFlight` flag the two survivors disagreed and both answers
-    /// were wrong:
-    ///   • the flag was cleared ONLY from `.onChange(of:)` on the alert flags,
-    ///     and a freshly built view produces no such transition — so the URL
-    ///     stayed in flight for ever and that link became UN-IMPORTABLE for the
-    ///     rest of the session;
-    ///   • and "just hand it out again on the next `take()`" is UNSAFE, because
-    ///     the flag cannot say whether the user had already tapped Import. If
-    ///     the view vanished while the RESULT alert was up, the link is already
-    ///     applied, and re-offering it imports the same deployment twice.
-    /// *(User-caught, and the previous round's comment claiming this was
-    /// "guarded" was wrong: nothing called `finish()` on that path.)*
-    ///
-    /// So the phase records whether anything has HAPPENED to the device yet,
-    /// which is the only thing that decides how an abandoned transaction ends.
+    /// 🎯 AND THE LINE IS *HAS THE USER SEEN THE OUTCOME*, NOT *IS IT
+    /// IRREVERSIBLE*. The first cut of this phase used the second question and
+    /// got two cases wrong in opposite directions: an UNREADABLE link was
+    /// marked done the moment the error was composed, so a view torn down
+    /// before the alert was read dropped it and the user was never told; and
+    /// CANCEL was left recoverable until a dismissal hook that a dying view
+    /// never runs, so a link the user had just declined came back as a fresh
+    /// prompt. *(Both user-caught.)*
     enum Phase: Equatable {
         case idle
-        /// Handed to a view and being confirmed. Nothing has been applied, so if
-        /// that view goes away this URL may safely be offered again.
-        case offering(URL)
-        /// Acted on — applied, or rejected as unreadable. Offering it again
-        /// would import the same deployment twice, or re-ask about a link the
-        /// user has already been told is invalid.
-        case acted(URL)
+        /// The user has not been given the outcome yet — an unanswered prompt,
+        /// or an error they have not acknowledged. If the view goes away,
+        /// showing this again is the CORRECT repair.
+        case recoverable(URL)
+        /// Over: applied, declined, or the complaint was read. Showing it again
+        /// would import twice, re-ask something already answered, or repeat a
+        /// complaint the user has already dismissed.
+        case terminal(URL, EndReason)
+    }
+
+    /// Why a transaction ended. It exists for the LOG and it is REQUIRED, so a
+    /// new ending cannot inherit somebody else's reason — the same shape as
+    /// `TunnelManager.ReconnectReason`, which is there because a log naming the
+    /// wrong cause sends the next reader to the wrong feature. The first cut
+    /// logged *"was already applied"* for a link that had merely been found
+    /// unreadable. *(User-caught.)*
+    enum EndReason: String, Equatable {
+        case applied = "applied"
+        case declined = "declined by the user"
+        case reported = "reported as unreadable"
     }
 
     private(set) var phase: Phase = .idle
@@ -69,7 +75,8 @@ final class ConnectionLinkInbox: ObservableObject {
     var openURL: URL? {
         switch phase {
         case .idle: return nil
-        case .offering(let u), .acted(let u): return u
+        case .recoverable(let u): return u
+        case .terminal(let u, _): return u
         }
     }
 
@@ -96,29 +103,36 @@ final class ConnectionLinkInbox: ObservableObject {
     /// Removes and returns the oldest queued URL and OPENS a transaction on it.
     ///
     /// ⚖️ Refuses while one is already open, so a second caller cannot overwrite
-    /// a transaction it knows nothing about — the other way this used to lose a
-    /// link. Reconciling an abandoned one is `recoverIfAbandoned()`'s job, and
-    /// it is deliberately a separate decision.
+    /// a transaction it knows nothing about — one of the two ways this used to
+    /// lose a link. Reconciling an abandoned one is `recoverIfAbandoned()`'s
+    /// job, and it is deliberately a separate decision.
     func take() -> URL? {
         guard case .idle = phase, !queued.isEmpty else { return nil }
         let url = queued.removeFirst()
-        phase = .offering(url)
+        phase = .recoverable(url)
         return url
     }
 
-    /// Something irreversible has happened to this link: it was applied, or it
-    /// was rejected as unreadable and the user told so. From here it must never
-    /// be offered again.
-    func markActed() {
-        if case .offering(let u) = phase { phase = .acted(u) }
+    /// The user has now been given the outcome: they imported it, they declined
+    /// it, or they dismissed the complaint about it.
+    ///
+    /// 🚨 CALL THIS FROM THE BUTTON'S OWN HANDLER, never from a dismissal hook.
+    /// A hook runs on a view that survives to see the flag change, and the whole
+    /// point here is the view that does not.
+    ///
+    /// ⚖️ The FIRST reason wins: after an import the result alert's OK is a
+    /// no-op, so the phase keeps `applied` rather than being relabelled by the
+    /// button that merely closed the receipt.
+    func markTerminal(_ reason: EndReason) {
+        if case .recoverable(let u) = phase { phase = .terminal(u, reason) }
     }
 
-    /// The transaction is over — the last alert about it has been dismissed.
+    /// The transaction is over AND its last alert is gone — release the dedupe
+    /// window so the same link may be tapped afresh later.
     ///
     /// ⚖️ It must be called, and it must NOT be skipped as "tidier": leaving a
     /// transaction open for ever would make that exact link un-importable for
     /// the rest of the session, which is the same defect pointing the other way.
-    /// Re-tapping the same link later is a legitimate new intent.
     func finish() {
         phase = .idle
     }
@@ -130,24 +144,26 @@ final class ConnectionLinkInbox: ObservableObject {
     /// it would produce a second prompt for what is already up.
     ///
     /// The two phases end differently, and that difference is the whole point:
-    ///   • `.offering` — nothing was applied, so the link goes back to the FRONT
-    ///     of the queue and is offered again, keeping its place ahead of
-    ///     anything that arrived behind it;
-    ///   • `.acted` — the device already changed, so it is DROPPED. What is lost
-    ///     is the confirmation alert, which is cosmetic; the new server is in
-    ///     Settings and the main screen already names it.
+    ///   • `recoverable` — the user never saw the outcome, so the link goes back
+    ///     to the FRONT of the queue, keeping its place ahead of anything that
+    ///     arrived behind it;
+    ///   • `terminal` — they did, so it is DROPPED. After an import what is lost
+    ///     is the receipt alone; the new server is in Settings and the main
+    ///     screen already names it.
     func recoverIfAbandoned() {
         switch phase {
         case .idle:
             return
-        case .offering(let u):
+        case .recoverable(let u):
             phase = .idle
             queued.insert(u, at: 0)
-            SharedLogger.shared.log("[AppDebug] connection link was left unconfirmed — offering it again")
-        case .acted(let u):
+            SharedLogger.shared.log("[AppDebug] a connection link's prompt went away unanswered — offering it again")
+        case .terminal(_, let reason):
             phase = .idle
-            SharedLogger.shared.log("[AppDebug] connection link \(u.scheme ?? "?") was already applied before the "
-                + "prompt went away — not offering it again")
+            // ⚖️ The URL itself is NOT logged: a connection link's payload
+            // carries WireGuard keys, and vpn.log is the file users send us.
+            SharedLogger.shared.log("[AppDebug] a connection link was already \(reason.rawValue) "
+                + "before its prompt went away — not offering it again")
         }
     }
 }

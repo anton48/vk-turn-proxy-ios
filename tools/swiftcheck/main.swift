@@ -2388,9 +2388,22 @@ do {
     // sites the harness cannot reach: an irreversible step must be ANNOUNCED, and
     // a fresh consumer must RECONCILE. Missing the first re-imports a deployment;
     // missing the second strands the link for the session.
-    check(imp.components(separatedBy: "inbox.markActed()").count - 1 == 2,
-          "🚨 BOTH irreversible branches announce themselves — the apply AND the invalid-link "
-          + "report, or an abandoned transaction is replayed as if nothing had happened")
+    for (call, what) in [("inbox.markTerminal(.applied)", "the import"),
+                         ("inbox.markTerminal(.declined)", "Cancel"),
+                         ("inbox.markTerminal(.reported)", "the OK that closes a complaint")] {
+        check(imp.components(separatedBy: call).count - 1 == 1,
+              "🚨 \(what) ends the transaction in its OWN handler — a dismissal hook runs on a "
+              + "view that survives, and the case that matters is the one that does not")
+    }
+    // 🚨 AND THE CATCH BRANCH MUST NOT. Composing the complaint is not the user
+    // reading it; ending there drops the link having told them nothing.
+    if let c = imp.range(of: "} catch {"), let e = imp.range(of: "showResult = true", range: c.upperBound..<imp.endIndex) {
+        check(!imp[c.upperBound..<e.lowerBound].contains("markTerminal"),
+              "🚨 …and building the invalid-link message does NOT end it — that happens when the "
+              + "user dismisses the message, not when it is composed")
+    } else {
+        check(false, "could not locate the invalid-link branch — the check above would be vacuous")
+    }
     check(imp.contains("guard !showConfirm, !showResult else { return }")
           && imp.range(of: "inbox.recoverIfAbandoned()")
                 .map({ r in imp.range(of: "guard let url = inbox.take()").map { $0.lowerBound > r.lowerBound } ?? false }) == true,
@@ -2502,12 +2515,12 @@ MainActor.assumeIsolated {
           "a double-tap on ONE link is one intent while it WAITS")
     // 🚨 …AND WHILE IT IS OPEN, which is where the window used to end.
     _ = inbox.take()
-    check(inbox.phase == .offering(first), "taking a link OPENS a transaction on it")
+    check(inbox.phase == .recoverable(first), "taking a link OPENS a transaction on it")
     inbox.deliver(first)
     check(inbox.queued.isEmpty,
           "🚨 a repeat of the link CURRENTLY BEING PROMPTED is refused — the dedupe window is "
           + "*queued or open*, not *queued*")
-    inbox.markActed()
+    inbox.markTerminal(.applied)
     inbox.deliver(first)
     check(inbox.queued.isEmpty,
           "…and still refused while the RESULT alert reports on it")
@@ -2529,8 +2542,8 @@ MainActor.assumeIsolated {
     _ = inbox.take()
     inbox.recoverIfAbandoned()          // the view vanished while CONFIRMING
     check(inbox.phase == .idle && inbox.queued == [first],
-          "🚨 an unconfirmed link goes BACK to the queue — nothing was applied, so the user must "
-          + "still get to answer it")
+          "🚨 an unanswered prompt goes BACK to the queue — the user never saw an outcome, so "
+          + "they must still get to answer it")
     check(inbox.take() == first, "…and the next importer is handed the same link")
     reset()
 
@@ -2544,12 +2557,53 @@ MainActor.assumeIsolated {
 
     inbox.deliver(first)
     _ = inbox.take()
-    inbox.markActed()                   // the user tapped Import
+    inbox.markTerminal(.applied)        // the user tapped Import
     inbox.recoverIfAbandoned()          // …and THEN the view vanished
     check(inbox.phase == .idle && inbox.queued.isEmpty,
           "🚨🚨 a link that was already APPLIED is DROPPED, not re-offered — re-offering it "
           + "imports the same deployment a second time, and a flag that only says *in flight* "
           + "cannot tell the two apart")
+    reset()
+
+    // 🚨 THE TWO CASES THE PHASE WAS REFRAMED FOR. Neither is about
+    // irreversibility — both are about whether the user has SEEN the outcome,
+    // and the first cut got them wrong in opposite directions. *(User-caught.)*
+    // ⚖️ WORDED FOR WHAT THIS ACTUALLY DRIVES. The inbox cannot tell an unreadable
+    // link from an unanswered one — both are simply `recoverable` — so the claim
+    // here is the inbox-level one, and what makes an unread COMPLAINT recoverable
+    // is the importer not ending the transaction when it composes the message.
+    // That is the scan above, not this fixture. *(Caught while writing it: the
+    // first wording said "an UNREADABLE link", which is more than it covers —
+    // the same trap as the three collected in feedback_tests_must_be_seen_to_fail.)*
+    inbox.deliver(first)
+    _ = inbox.take()
+    inbox.recoverIfAbandoned()
+    check(inbox.queued == [first],
+          "a transaction still `recoverable` when its view died is offered again, whatever put "
+          + "it in that phase")
+    _ = inbox.take()
+    inbox.markTerminal(.reported)       // now they have read it
+    inbox.recoverIfAbandoned()
+    check(inbox.queued.isEmpty,
+          "…and once the complaint HAS been read it is dropped, not repeated")
+    reset()
+
+    inbox.deliver(first)
+    _ = inbox.take()
+    inbox.markTerminal(.declined)       // Cancel, in the button's own handler
+    inbox.recoverIfAbandoned()
+    check(inbox.queued.isEmpty,
+          "🚨 a DECLINED link does not come back as a fresh prompt — Cancel ends it where it is "
+          + "pressed, not in a dismissal hook the dying view never runs")
+    reset()
+
+    inbox.deliver(first)
+    _ = inbox.take()
+    inbox.markTerminal(.applied)
+    inbox.markTerminal(.reported)       // the OK that closes the receipt
+    check(inbox.phase == .terminal(first, .applied),
+          "🚨 the FIRST reason wins — otherwise the button that merely closes a receipt would "
+          + "relabel an import as a complaint, and the log would name the wrong cause")
     reset()
 
     // ⚖️ This one has NO sabotage of its own, and that is worth saying rather
