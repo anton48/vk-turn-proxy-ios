@@ -234,6 +234,12 @@ struct ContentView: View {
                     tunnel.onVKLoginResult(result)
                 }
             }
+            // 🚨 The root consumer for tapped vkturnproxy:// links, and it is a
+            // SEPARATE VIEW on purpose: it owns the inbox observation, so an
+            // arriving link re-renders only it and NOT this body — which hosts
+            // the NavigationView and would tear down whatever is pushed.
+            // → ConnectionLinkImport.swift.
+            .background(ConnectionLinkImporter())
         }
     }
 
@@ -419,7 +425,6 @@ struct SettingsView: View {
     // and the .onAppear/.onChange handlers further down for the consumer.
     @State private var pendingConnectionLink: ConnectionLink? = nil
     @State private var showConnectionLinkConfirm = false
-    @StateObject private var connectionLinkInbox = ConnectionLinkInbox.shared
 
     // serverModeBinding lived here until the server-mode Picker moved into
     // ServerEditView, which has its own draft-backed equivalent. It survived as
@@ -696,26 +701,8 @@ struct SettingsView: View {
                 pendingConnectionLink = nil
             }
         } message: { link in
-            let s = link.settings
-            // Build 179+: the link ADDS a named server (and makes it active)
-            // instead of overwriting the current configuration, so the message
-            // names what will be created rather than what gets overwritten.
-            let created = ServerProfile(link: s)
-            let name = created.serverName.isEmpty ? "a new server" : "\"\(created.serverName)\""
-            let extras = [
-                s.numConnections.map { "\($0) conns" },
-                s.dnsServers.map { "DNS \($0)" }
-            ].compactMap { $0 }.joined(separator: ", ")
-            let extrasText = extras.isEmpty ? "" : " (\(extras))"
-            // A freeturn:// link (SRTP-WRAP-S) carries neither WG keys nor a VK
-            // call link, so the new server starts without them — say so, or the
-            // user will expect the import to have filled them in. A quick_link.py
-            // WRAP-S link DOES include WG keys (privateKey non-nil).
-            if s.useWrapS == true, s.privateKey == nil {
-                let prof = s.obfProfile ?? "rtpopus"
-                return Text("Add \(name) as SRTP-WRAP-S for \(s.peerAddress)\(extrasText)? Sets the server, WRAP key, obf profile (\(prof)) and Client-ID, and makes it active. WireGuard keys and the VK call link are NOT included — enter them manually.")
-            }
-            return Text("Add \(name) [\(created.modeLabel)] for \(s.peerAddress)\(extrasText) and make it active? Your existing servers are kept; the VK call link is global and will be updated.")
+            // Shared with the tapped-link path so the two cannot drift apart.
+            Text(ConnectionLinkPrompt.message(for: link))
         }
         // Reset confirm — destructive button on the alert removes the
         // creds-pool.json. UserDefaults are untouched.
@@ -797,25 +784,12 @@ struct SettingsView: View {
                 Text(msg)
             }
         }
-        // Pull a pending vkturnproxy:// URL out of the inbox. Two paths:
-        //   • Cold launch via URL-tap — App.onOpenURL stored the URL
-        //     before SettingsView mounted; this onAppear catches it.
-        //   • Warm app already on SettingsView — onChange fires when
-        //     the inbox publishes a new URL.
-        // Both paths consume (set pendingURL = nil) so re-entering
-        // SettingsView doesn't replay an already-handled URL.
-        .onAppear {
-            if let url = connectionLinkInbox.pendingURL {
-                handleConnectionLinkURL(url)
-                connectionLinkInbox.pendingURL = nil
-            }
-        }
-        .onChange(of: connectionLinkInbox.pendingURL) { newURL in
-            if let url = newURL {
-                handleConnectionLinkURL(url)
-                connectionLinkInbox.pendingURL = nil
-            }
-        }
+        // 🚫 The inbox is NOT consumed here any more. It used to be, and this
+        // screen was the ONLY consumer — so a link tapped while the app sat on
+        // the main screen did nothing until the user happened to open Settings.
+        // ConnectionLinkImporter, mounted at the root, handles tapped links now;
+        // this screen keeps the alert above solely for the PASTE button.
+        // → ConnectionLinkImport.swift for why it is a separate view.
     }
 
     // MARK: - Backup actions
