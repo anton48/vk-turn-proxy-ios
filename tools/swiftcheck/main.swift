@@ -2384,6 +2384,18 @@ do {
     check(imp.contains("inbox.finish()") && imp.contains("guard !showConfirm, !showResult else { return }\n        inbox.finish()"),
           "🚨 …and it releases the link that was on screen ONLY once both alerts are closed — a "
           + "link released a step early drops out of the dedupe window while still being shown")
+    // 🚨 THE TWO HALVES OF SURVIVING A TORN-DOWN IMPORTER, and both are call
+    // sites the harness cannot reach: an irreversible step must be ANNOUNCED, and
+    // a fresh consumer must RECONCILE. Missing the first re-imports a deployment;
+    // missing the second strands the link for the session.
+    check(imp.components(separatedBy: "inbox.markActed()").count - 1 == 2,
+          "🚨 BOTH irreversible branches announce themselves — the apply AND the invalid-link "
+          + "report, or an abandoned transaction is replayed as if nothing had happened")
+    check(imp.contains("guard !showConfirm, !showResult else { return }")
+          && imp.range(of: "inbox.recoverIfAbandoned()")
+                .map({ r in imp.range(of: "guard let url = inbox.take()").map { $0.lowerBound > r.lowerBound } ?? false }) == true,
+          "🚨 …and a consumer with no alert of its own reconciles an abandoned transaction BEFORE "
+          + "taking the next link")
     check(!content.contains("ConnectionLinkInbox"),
           "🚨 ContentView is not a second consumer of the inbox — two consumers race for one "
           + "pendingURL, so a prompt is swallowed or shown twice")
@@ -2464,7 +2476,12 @@ do {
 // is honest rather than a workaround: this harness IS the main thread.
 MainActor.assumeIsolated {
     let inbox = ConnectionLinkInbox.shared
-    while inbox.take() != nil {}   // a singleton: start from a known state
+    // @MainActor because a nested func does not inherit the closure's isolation.
+    @MainActor func reset() {
+        inbox.finish()
+        while inbox.take() != nil { inbox.finish() }
+    }
+    reset()   // a singleton: start from a known state
 
     let first = URL(string: "vkturnproxy://import?data=one")!
     let second = URL(string: "vkturnproxy://import?data=two")!
@@ -2472,33 +2489,77 @@ MainActor.assumeIsolated {
     inbox.deliver(second)
     check(inbox.queued.count == 2,
           "🚨 a second URL arriving under a live alert does not replace the first")
-    check(inbox.take() == first && inbox.take() == second && inbox.take() == nil,
-          "…and they come back OLDEST first, in the order the user tapped them")
+    check(inbox.take() == first, "…and they come back OLDEST first, in the order the user tapped them")
+    check(inbox.take() == nil,
+          "🚨 …one at a time: a second take cannot overwrite a transaction it knows nothing about")
+    inbox.finish()
+    check(inbox.take() == second, "…and the next one follows once the first is finished")
+    reset()
 
     inbox.deliver(first)
     inbox.deliver(first)
     check(inbox.queued.count == 1,
           "a double-tap on ONE link is one intent while it WAITS")
-    // 🚨 …AND WHILE IT IS ON SCREEN, which is where the window used to end. The
-    // check above passed on code where `take()` dropped the URL out of the
-    // dedupe set, so the link being confirmed could be re-enqueued by a second
-    // tap and prompted again the moment the user answered — importing the same
-    // deployment twice. The fixture claimed "not two prompts" and only covered
-    // the queued half. *(User-caught.)*
-    let shown = inbox.take()
-    check(shown == first && inbox.inFlight == first,
-          "taking a link marks it in flight")
+    // 🚨 …AND WHILE IT IS OPEN, which is where the window used to end.
+    _ = inbox.take()
+    check(inbox.phase == .offering(first), "taking a link OPENS a transaction on it")
     inbox.deliver(first)
     check(inbox.queued.isEmpty,
           "🚨 a repeat of the link CURRENTLY BEING PROMPTED is refused — the dedupe window is "
-          + "*queued or on screen*, not *queued*")
+          + "*queued or open*, not *queued*")
+    inbox.markActed()
+    inbox.deliver(first)
+    check(inbox.queued.isEmpty,
+          "…and still refused while the RESULT alert reports on it")
     inbox.finish()
     inbox.deliver(first)
     check(inbox.queued == [first],
-          "🚨 …and the window CLOSES when the prompt is answered: re-tapping the same link later "
+          "🚨 …and the window CLOSES when the transaction ends: re-tapping the same link later "
           + "is a new intent, or that link would be un-importable for the rest of the session")
-    while inbox.take() != nil {}
-    inbox.finish()
+    reset()
+
+    // 36. 🚨 THE IMPORTER'S @State DOES NOT OUTLIVE ITS IDENTITY AND THE INBOX
+    //     DOES, so a transaction can be ABANDONED mid-flight — in this app by the
+    //     very thing the importer was split out to survive, the NavigationView
+    //     host re-rendering. The two phases must end DIFFERENTLY, and a flag
+    //     cannot tell them apart: that is why this is a phase.
+    //     *(User-caught; the previous round's comment called this "guarded" and
+    //     nothing on that path called finish().)*
+    inbox.deliver(first)
+    _ = inbox.take()
+    inbox.recoverIfAbandoned()          // the view vanished while CONFIRMING
+    check(inbox.phase == .idle && inbox.queued == [first],
+          "🚨 an unconfirmed link goes BACK to the queue — nothing was applied, so the user must "
+          + "still get to answer it")
+    check(inbox.take() == first, "…and the next importer is handed the same link")
+    reset()
+
+    inbox.deliver(second)
+    inbox.deliver(first)
+    _ = inbox.take()                    // opens on `second`
+    inbox.recoverIfAbandoned()
+    check(inbox.queued == [second, first],
+          "…and it goes back at the FRONT, keeping its place ahead of what arrived behind it")
+    reset()
+
+    inbox.deliver(first)
+    _ = inbox.take()
+    inbox.markActed()                   // the user tapped Import
+    inbox.recoverIfAbandoned()          // …and THEN the view vanished
+    check(inbox.phase == .idle && inbox.queued.isEmpty,
+          "🚨🚨 a link that was already APPLIED is DROPPED, not re-offered — re-offering it "
+          + "imports the same deployment a second time, and a flag that only says *in flight* "
+          + "cannot tell the two apart")
+    reset()
+
+    // ⚖️ This one has NO sabotage of its own, and that is worth saying rather
+    // than leaving to be assumed: every plausible way to break recovery (a
+    // `default:` that re-queues `openURL` unconditionally, for instance) leaves
+    // the idle case a no-op anyway, so it reddens under P5's sabotage or not at
+    // all. It stays as a boundary assertion, not as a validated guard.
+    inbox.recoverIfAbandoned()
+    check(inbox.phase == .idle && inbox.queued.isEmpty,
+          "recovering when nothing was abandoned does nothing (boundary; no sabotage of its own)")
 
     for i in 0..<(ConnectionLinkInbox.capacity + 4) {
         inbox.deliver(URL(string: "vkturnproxy://import?data=\(i)")!)
@@ -2508,7 +2569,7 @@ MainActor.assumeIsolated {
           + "nobody bounded")
     check(inbox.queued.first == URL(string: "vkturnproxy://import?data=0")!,
           "…and it is the NEWEST that is refused: what is already queued was asked for first")
-    while inbox.take() != nil {}
+    reset()
 }
 
 print("")

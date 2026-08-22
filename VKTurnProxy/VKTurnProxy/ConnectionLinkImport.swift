@@ -47,6 +47,10 @@ struct ConnectionLinkImporter: View {
             .alert("Import Connection Link?", isPresented: $showConfirm, presenting: pending) { link in
                 Button("Import", role: .destructive) {
                     let msg = ConnectionLinkPrompt.apply(link)
+                    // 🚨 The device has changed. If this view is torn down before
+                    // the result alert is dismissed, the inbox must NOT offer the
+                    // link again — that would import the same deployment twice.
+                    inbox.markActed()
                     pending = nil
                     resultTitle = ConnectionLinkPrompt.importedTitle
                     resultMessage = msg
@@ -105,11 +109,24 @@ struct ConnectionLinkImporter: View {
         // tapped in a row are all acted on in order instead of all but the last
         // being overwritten in silence. *(User-caught, 63f25071 follow-up.)*
         guard !showConfirm, !showResult else { return }
+        // 🚨 THIS VIEW'S @State DOES NOT OUTLIVE ITS IDENTITY, AND THE INBOX
+        // DOES. If a previous importer was torn down mid-transaction — the
+        // NavigationView host re-rendering does exactly that — the inbox is
+        // still holding it, and only the inbox knows whether the link had
+        // already been applied. Reconciling it is safe HERE and nowhere else:
+        // the guard above is what says this consumer has no alert of its own.
+        // *(User-caught: the previous version could neither recover nor safely
+        // re-offer, so the link was stuck for the session.)*
+        inbox.recoverIfAbandoned()
         guard let url = inbox.take() else { return }
         do {
             pending = try BackupManager.parseConnectionLink(from: url)
             showConfirm = true
         } catch {
+            // Also irreversible, in the sense that matters here: the user has
+            // been told this link is bad, and re-asking them about it is not a
+            // service. → ConnectionLinkInbox.Phase.
+            inbox.markActed()
             pending = nil
             resultTitle = ConnectionLinkPrompt.invalidTitle
             resultMessage = error.localizedDescription
