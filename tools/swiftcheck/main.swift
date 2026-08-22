@@ -2394,6 +2394,14 @@ do {
     // ⚖️ Asserted as an ORDER over the body rather than as a verbatim block: a
     // comment inserted mid-body would break a multi-line match on correct code,
     // and this project has reddened on its own prose four times already.
+    //
+    // 🚨 AND ORDER NEEDS BOTH HALVES: a forward scan proves the steps CAN be read
+    // in sequence and says nothing about a copy sitting ABOVE the marker. Moving
+    // the two raises above `take()` — or leaving a duplicate there — is a green
+    // suite on code where every consume() sets both flags with nothing taken,
+    // which locks the guard at the top of both functions at `true` FOR EVER and
+    // kills the import path outright. *(User-caught, third time on this one
+    // function: presence, then order, now order-in-both-directions.)*
     func inOrder(_ body: String, _ steps: [String]) -> Bool {
         var from = body.startIndex
         for step in steps {
@@ -2402,15 +2410,21 @@ do {
         }
         return true
     }
+    func noneBefore(_ body: String, _ marker: String, _ needles: [String]) -> Bool {
+        guard let m = body.range(of: marker) else { return false }
+        return needles.allSatisfy { body.range(of: $0, range: body.startIndex..<m.lowerBound) == nil }
+    }
     func bodyOf(_ decl: String) -> String? {
         guard let d = imp.range(of: decl),
               let e = imp.range(of: "\n    }", range: d.upperBound..<imp.endIndex) else { return nil }
         return String(imp[d.upperBound..<e.lowerBound])
     }
+    let theGuard = "guard !showConfirm, !showResult else { return }"
+    let theTake = "guard let url = inbox.take() else { return }"
+
     if let settle = bodyOf("private func settle() {") {
-        check(inOrder(settle, ["guard !showConfirm, !showResult else { return }",
-                               "inbox.finish()",
-                               "consume()"]),
+        check(inOrder(settle, [theGuard, "inbox.finish()", "consume()"])
+              && noneBefore(settle, theGuard, ["inbox.finish()", "consume()"]),
               "🚨 the dismissal path GUARDS, then releases, then TAKES THE NEXT ONE — releasing "
               + "early drops the link out of the dedupe window while it is still on screen, and "
               + "not consuming leaves a parked URL waiting for an .onAppear that may never come")
@@ -2418,14 +2432,17 @@ do {
         check(false, "could not find settle() — the order check would be vacuous")
     }
     if let consume = bodyOf("private func consume() {") {
-        check(inOrder(consume, ["guard !showConfirm, !showResult else { return }",
-                                "inbox.recoverIfAbandoned()",
-                                "guard let url = inbox.take() else { return }"]),
+        check(inOrder(consume, [theGuard, "inbox.recoverIfAbandoned()", theTake])
+              && noneBefore(consume, theGuard, ["inbox.recoverIfAbandoned()", "inbox.take()"]),
               "🚨 …and the take path reconciles an abandoned transaction BEFORE taking, which is "
               + "only safe because the guard above says this consumer has no alert of its own")
-        check(consume.contains("showConfirm = true") && consume.contains("showResult = true"),
-              "🚨 …and it RAISES something either way — a take that neither prompts nor reports "
-              + "swallows the link, and the queue would look correct while nothing appeared")
+        let raises = ["showConfirm = true", "showResult = true"]
+        check(raises.allSatisfy { consume.range(of: $0, range: (consume.range(of: theTake)?.upperBound ?? consume.startIndex)..<consume.endIndex) != nil }
+              && noneBefore(consume, theTake, raises),
+              "🚨 …and it raises the prompt or the report ONLY AFTER a link has been taken. "
+              + "Raising before the take leaves every consume() setting both flags with nothing "
+              + "to show, which locks the guard at the top at `true` for ever and the import "
+              + "path never runs again — and a check for mere PRESENCE is green on it")
     } else {
         check(false, "could not find consume() — the checks above would be vacuous")
     }
