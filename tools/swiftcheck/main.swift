@@ -2452,6 +2452,49 @@ do {
               + "has been taken. Raising before the take leaves every consume() setting both "
               + "flags with nothing to show, which locks the guard at the top at `true` for ever "
               + "and the import path never runs again")
+
+        // 🚨 AND EACH RAISE BELONGS TO ITS OWN BRANCH, WITH ITS PAYLOAD ALREADY
+        // SET. Counting them and placing them after the take says nothing about
+        // WHICH branch each sits in: swapping the two passes every check above
+        // and inverts the feature — a valid link raises the RESULT alert over an
+        // empty title and message and is never imported, while an invalid one
+        // raises the CONFIRM alert whose `presenting: pending` is nil, so it
+        // shows nothing at all. *(User-caught.)*
+        //
+        // ⚖️ The claim is READINESS BEFORE PRESENTATION, which also covers a
+        // raise placed above its own payload inside the right branch — and it
+        // deliberately does NOT pin `resultTitle` against `resultMessage`, since
+        // their mutual order is free.
+        if let d = consume.range(of: "do {"),
+           let c = consume.range(of: "} catch {", range: d.upperBound..<consume.endIndex) {
+            let success = String(consume[d.upperBound..<c.lowerBound])
+            let failure = String(consume[c.upperBound..<consume.endIndex])
+            check(inOrder(success, ["pending = try", "showConfirm = true"])
+                  && !success.contains("showResult = true"),
+                  "🚨 the SUCCESS branch parses into `pending` and only then raises the CONFIRM "
+                  + "alert — which renders `presenting: pending`, so raising it first presents "
+                  + "nothing, and raising the RESULT alert here inverts the feature")
+            check(inOrder(failure, ["resultTitle =", "showResult = true"])
+                  && inOrder(failure, ["resultMessage =", "showResult = true"])
+                  && !failure.contains("showConfirm = true"),
+                  "🚨 …and the FAILURE branch fills the title AND the message before raising the "
+                  + "REPORT — a receipt raised over an empty message is a blank alert, and the "
+                  + "confirm alert here would ask the user to import a link that did not parse")
+            // 🚨 AND IT MUST NOT END THE TRANSACTION. Composing the complaint is
+            // not the user reading it; ending here drops the link having told
+            // them nothing at all.
+            //
+            // ⚖️ Folded into this branch split rather than kept as its own scan:
+            // that one anchored the end of the region on `showResult = true`, so
+            // a sabotage that moved THAT line made it report *"could not locate
+            // the invalid-link branch"* — red for the wrong reason, which is the
+            // failure mode this file has a section about. One region, one anchor.
+            check(!failure.contains("markTerminal"),
+                  "🚨 …and building the invalid-link message does NOT end the transaction — that "
+                  + "happens when the user dismisses the message, not when it is composed")
+        } else {
+            check(false, "could not split consume() into its branches — the checks above would be vacuous")
+        }
     } else {
         check(false, "could not find consume() — the checks above would be vacuous")
     }
@@ -2465,15 +2508,6 @@ do {
         check(imp.components(separatedBy: call).count - 1 == 1,
               "🚨 \(what) ends the transaction in its OWN handler — a dismissal hook runs on a "
               + "view that survives, and the case that matters is the one that does not")
-    }
-    // 🚨 AND THE CATCH BRANCH MUST NOT. Composing the complaint is not the user
-    // reading it; ending there drops the link having told them nothing.
-    if let c = imp.range(of: "} catch {"), let e = imp.range(of: "showResult = true", range: c.upperBound..<imp.endIndex) {
-        check(!imp[c.upperBound..<e.lowerBound].contains("markTerminal"),
-              "🚨 …and building the invalid-link message does NOT end it — that happens when the "
-              + "user dismisses the message, not when it is composed")
-    } else {
-        check(false, "could not locate the invalid-link branch — the check above would be vacuous")
     }
     check(!content.contains("ConnectionLinkInbox"),
           "🚨 ContentView is not a second consumer of the inbox — two consumers race for one "
