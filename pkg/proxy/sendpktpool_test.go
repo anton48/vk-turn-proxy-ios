@@ -4,137 +4,163 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
-// same reports whether two slices share a backing array. Comparing *byte is
-// ordinary Go — no unsafe needed — and it is the only way to observe that a
-// buffer came BACK from the pool rather than being freshly made.
-func same(a, b []byte) bool {
-	return len(a) > 0 && len(b) > 0 && &a[0] == &b[0]
+// 🚨 WHY THESE TESTS MEASURE BYTES AND NOT ADDRESSES.
+//
+// The first version asserted that a buffer came back from the pool by comparing
+// backing-array addresses, behind a precondition that Put-then-Get returns the
+// same slice. `sync.Pool` promises neither LIFO nor identity: it is cleared on
+// every GC and an object may be taken by any P. Under `-race -count=20` all
+// three tests — and the precondition itself — failed on CORRECT production code.
+//
+// 🎯 The precondition existed to prevent a VACUOUS PASS, and it did exactly
+// that. The mistake was depending on the property at all: trading a test that
+// can pass wrongly for one that can FAIL wrongly is not an improvement, because
+// a suite that reddens on correct code is one people learn to re-run until it
+// goes green. *(User-caught 2026-08-21, by running `-race -count=20` — which I
+// never did.)*
+//
+// What matters is not identity but REUSE, and reuse is visible in allocated
+// bytes. The comparison is against a control measured in the SAME process: the
+// race detector inflates the pooled path (~25 B/op becomes ~540) while leaving
+// a plain allocation at 1408, so a fixed threshold would be build-mode
+// dependent and a ratio to a live control is not.
+
+// allocSink keeps the control allocation from being optimised away.
+var allocSink []byte
+
+// bytesPerOp is the steady-state allocation of f, in bytes per call. f runs once
+// before the window so a cold pool's New() is not charged to steady state, and
+// ReadMemStats stops the world, so TotalAlloc is exact.
+func bytesPerOp(n int, f func()) uint64 {
+	f()
+	runtime.GC()
+	var m1, m2 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+	for i := 0; i < n; i++ {
+		f()
+	}
+	runtime.ReadMemStats(&m2)
+	return (m2.TotalAlloc - m1.TotalAlloc) / uint64(n)
 }
 
-// requirePoolRoundTrip fails if a Put immediately followed by a Get on this
-// goroutine does not return the same buffer.
-//
-// 🚨 Without it every identity assertion below would pass VACUOUSLY the moment
-// sync.Pool stopped round-tripping — a fresh buffer and a returned one are
-// indistinguishable except by address. The property holds because Put fills the
-// current P's private slot and Get checks it first; a GC between the two would
-// break it, which is why this is checked rather than assumed.
-func requirePoolRoundTrip(t *testing.T) {
+// onePacketAlloc is the control: what ONE packet-sized allocation costs in this
+// process, in this build mode. A path that recycles must come in under it; a
+// path that has stopped recycling cannot, because every Get then falls through
+// to New(make([]byte, 2048)).
+func onePacketAlloc(t *testing.T) uint64 {
 	t.Helper()
-	a := sendPktPoolGet(2048)
-	sendPktPoolPut(a)
-	b := sendPktPoolGet(2048)
-	if !same(a, b) {
-		t.Fatalf("sync.Pool did not round-trip on this runtime — the identity " +
-			"assertions in this file cannot discriminate and would pass vacuously")
+	c := bytesPerOp(2000, func() { allocSink = make([]byte, 1312) })
+	if c == 0 {
+		t.Fatal("control measured 0 bytes/op — the allocation was optimised away, " +
+			"and every comparison against it would pass vacuously")
 	}
-	sendPktPoolPut(b)
+	return c
 }
 
-// TestWritePacketReturnsTheBufferOnSuccess is the steady-state half of the
-// ownership contract: dequeuing transfers ownership to writePacket, which hands
-// the buffer back.
-func TestWritePacketReturnsTheBufferOnSuccess(t *testing.T) {
-	requirePoolRoundTrip(t)
-	p := newWriterProxy(8, 1)
-
-	if err := p.SendPacket(make([]byte, 1312)); err != nil {
-		t.Fatalf("SendPacket: %v", err)
+func assertRecycled(t *testing.T, what string, f func()) {
+	t.Helper()
+	control := onePacketAlloc(t)
+	got := bytesPerOp(2000, f)
+	if got >= control {
+		t.Errorf("%s: %d bytes/op against a control of %d — the buffer is NOT returning "+
+			"to the pool, so every Get falls through to New(make([]byte, 2048)) and this "+
+			"path now allocates MORE than it did before pooling", what, got, control)
 	}
-	item := <-p.sendCh
+	t.Logf("%s: %d bytes/op (one-packet control: %d)", what, got, control)
+}
 
-	if err := p.writePacket(item, 0, func(pkt []byte, _ time.Time) error {
-		if len(pkt) != 1312 {
-			t.Errorf("writer saw %d bytes, want 1312", len(pkt))
+// TestTheBufferIsRecycledOnSuccess is the steady-state half of the ownership
+// contract: dequeuing transfers ownership to writePacket, which hands it back.
+func TestTheBufferIsRecycledOnSuccess(t *testing.T) {
+	p := newWriterProxy(1024, 1)
+	data := make([]byte, 1312)
+	noop := func([]byte, time.Time) error { return nil }
+
+	assertRecycled(t, "success path", func() {
+		if err := p.SendPacket(data); err != nil {
+			t.Fatalf("SendPacket: %v", err)
 		}
-		return nil
-	}); err != nil {
-		t.Fatalf("writePacket: %v", err)
-	}
-
-	if got := sendPktPoolGet(1312); !same(got, item.buf) {
-		t.Fatal("writePacket did not return the buffer to the pool on success")
-	}
+		if err := p.writePacket(<-p.sendCh, 0, noop); err != nil {
+			t.Fatalf("writePacket: %v", err)
+		}
+	})
 }
 
-// TestWritePacketReturnsTheBufferOnWriteError is the half the original patch's
-// "Put after the socket write" would have missed.
+// TestTheBufferIsRecycledOnWriteError is the half the original patch's "Put
+// after the socket write" would have leaked: the writer that owned the buffer
+// is about to exit, and nothing else can return it.
 //
-// SABOTAGE SEEN TO FAIL: move the `defer sendPktPoolPut(item.buf)` below the
-// `if err != nil { return err }` in writepacket.go. Compiles, the success test
-// above still passes, and this one goes red.
-func TestWritePacketReturnsTheBufferOnWriteError(t *testing.T) {
-	requirePoolRoundTrip(t)
-	p := newWriterProxy(8, 1)
-
-	if err := p.SendPacket(make([]byte, 1312)); err != nil {
-		t.Fatalf("SendPacket: %v", err)
-	}
-	item := <-p.sendCh
-
+// SABOTAGE SEEN TO FAIL: move the `defer sendPktPoolPut(item.buf)` in
+// writepacket.go below the `if err != nil { return err }`. Compiles, the
+// success test above still passes, and this one goes red.
+func TestTheBufferIsRecycledOnWriteError(t *testing.T) {
+	p := newWriterProxy(1024, 1)
+	data := make([]byte, 1312)
 	boom := errors.New("boom")
-	if err := p.writePacket(item, 0, func([]byte, time.Time) error { return boom }); !errors.Is(err, boom) {
-		t.Fatalf("writePacket err = %v, want boom", err)
-	}
+	fail := func([]byte, time.Time) error { return boom }
 
-	if got := sendPktPoolGet(1312); !same(got, item.buf) {
-		t.Fatal("a failed write must still return the buffer — the writer that " +
-			"owned it is about to exit and nothing else can")
-	}
+	assertRecycled(t, "write-error path", func() {
+		if err := p.SendPacket(data); err != nil {
+			t.Fatalf("SendPacket: %v", err)
+		}
+		if err := p.writePacket(<-p.sendCh, 0, fail); !errors.Is(err, boom) {
+			t.Fatalf("writePacket err = %v, want boom", err)
+		}
+	})
 }
 
-// TestSendPacketReturnsTheBufferWhenItNeverEnqueues covers the one exit where
-// SendPacket still owns the buffer: the send lost the race with ctx.Done, so it
-// never reached the channel and no writePacket will ever see it.
-func TestSendPacketReturnsTheBufferWhenItNeverEnqueues(t *testing.T) {
-	requirePoolRoundTrip(t)
+// TestTheBufferIsRecycledWhenItNeverEnqueues covers the one exit where
+// SendPacket still owns the buffer: the send lost to ctx.Done, so it never
+// reached the channel and no writePacket will ever see it.
+//
+// SABOTAGE SEEN TO FAIL: delete the sendPktPoolPut on that branch in
+// SendPacket. Nothing else can free it, so every iteration allocates anew.
+func TestTheBufferIsRecycledWhenItNeverEnqueues(t *testing.T) {
 	p := newWriterProxy(1, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	p.ctx = ctx
-
-	// Fill the channel so the fast path cannot take it, then cancel so the slow
-	// path selects ctx.Done.
-	p.sendCh <- sendItem{buf: []byte{0}, at: time.Now().UnixNano()}
 	cancel()
+	// Fill the channel so the non-blocking fast path cannot take the item and
+	// the slow select is forced onto ctx.Done every time.
+	p.sendCh <- sendItem{buf: []byte{0}, at: time.Now().UnixNano()}
+	data := make([]byte, 1312)
 
-	marker := sendPktPoolGet(1312)
-	sendPktPoolPut(marker)
-
-	if err := p.SendPacket(make([]byte, 1312)); !errors.Is(err, context.Canceled) {
-		t.Fatalf("SendPacket err = %v, want context.Canceled", err)
-	}
-	if got := sendPktPoolGet(1312); !same(got, marker) {
-		t.Fatal("SendPacket kept the buffer on the exit where it never enqueued")
-	}
+	assertRecycled(t, "never-enqueued path", func() {
+		if err := p.SendPacket(data); !errors.Is(err, context.Canceled) {
+			t.Fatalf("SendPacket err = %v, want context.Canceled", err)
+		}
+	})
 }
 
-// TestExactlyTwoPutSitesExist is the guard the ownership contract needs.
+// TestExactlyTwoPutSitesExist is the guard the ownership contract needs, and it
+// is static because the failure it prevents cannot be reached from a test.
 //
-// 🚨 The failure it exists to prevent is not a leak. A third Put — the obvious
-// "fix the leak" edit in a writer loop's error branch, or a Put inside a write
-// closure — hands ONE backing array to two of ~30 writer goroutines, which then
-// copy different WireGuard records into it concurrently. On the wire that is
-// corrupt uplink dropped by server1 as an auth failure, indistinguishable from
-// the per-allocation loss already under investigation. `-race` does not see it,
+// 🚨 A third Put is not a leak — it is a DOUBLE FREE of a live buffer. The
+// tempting edit is "the write-error branch leaks, add a Put there": it does not
+// leak (the defer covers it), and adding one hands ONE backing array to two of
+// ~30 writer goroutines, which then copy different WireGuard records into it
+// concurrently. On the wire that is corrupt uplink dropped by server1 as an
+// auth failure — indistinguishable from the per-allocation loss already under
+// investigation, and it would be blamed on the relay. `-race` cannot see it,
 // because no test drives two writers over a real pool.
 //
-// SABOTAGE SEEN TO FAIL: delete the defer in writepacket.go (the writepacket
-// check goes red); add `sendPktPoolPut(item.buf)` to any writer loop in
-// proxy.go (the count goes red).
+// SABOTAGE SEEN TO FAIL: add `sendPktPoolPut(item.buf)` to any writer loop in
+// proxy.go, or delete the defer in writepacket.go.
 func TestExactlyTwoPutSitesExist(t *testing.T) {
+	// Strip `//` comments: this scan matches names that the ownership prose is
+	// full of, and a source scan reddening on its own documentation has already
+	// happened four times in this project.
 	countIn := func(path, needle string) int {
 		src, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("reading %s — a scan over a missing file passes vacuously: %v", path, err)
 		}
-		// Strip the file's own prose: these names appear all over the ownership
-		// comments, and this project has had scans redden on their own
-		// documentation three times.
 		var code strings.Builder
 		for _, line := range strings.Split(string(src), "\n") {
 			if i := strings.Index(line, "//"); i >= 0 {
@@ -146,38 +172,27 @@ func TestExactlyTwoPutSitesExist(t *testing.T) {
 		return strings.Count(code.String(), needle)
 	}
 
-	proxyPuts := countIn("proxy.go", "sendPktPoolPut(")
-	writePuts := countIn("writepacket.go", "sendPktPoolPut(")
-
-	// proxy.go holds the pool helper's own definition plus SendPacket's
-	// never-enqueued exit; writepacket.go holds the one that matters.
-	if proxyPuts != 2 {
-		t.Errorf("proxy.go has %d sendPktPoolPut( occurrences, want 2 "+
-			"(the func declaration and SendPacket's ctx.Done exit) — a Put in a "+
-			"writer loop is a DOUBLE free of a live buffer, not a leak fix", proxyPuts)
+	if n := countIn("proxy.go", "sendPktPoolPut("); n != 2 {
+		t.Errorf("proxy.go has %d sendPktPoolPut( occurrences, want 2 (the helper's own "+
+			"declaration and SendPacket's never-enqueued exit) — a Put in a writer loop "+
+			"is a double free of a LIVE buffer, not a leak fix", n)
 	}
-	if writePuts != 1 {
+	if n := countIn("writepacket.go", "sendPktPoolPut("); n != 1 {
 		t.Errorf("writepacket.go has %d sendPktPoolPut( occurrences, want exactly 1 "+
-			"(the defer that gives writePacket ownership)", writePuts)
+			"(the defer that gives writePacket ownership)", n)
 	}
-	if gets := countIn("proxy.go", "sendPktPoolGet("); gets != 2 {
-		t.Errorf("proxy.go has %d sendPktPoolGet( occurrences, want 2 (the func "+
-			"declaration and SendPacket) — every Get needs an owner that Puts", gets)
+	if n := countIn("proxy.go", "sendPktPoolGet("); n != 2 {
+		t.Errorf("proxy.go has %d sendPktPoolGet( occurrences, want 2 (the helper and "+
+			"SendPacket) — every Get needs exactly one owner that Puts", n)
 	}
-	// And the ownership must sit in writePacket rather than at a call site: the
-	// four writer loops must not mention the pool at all.
 	if countIn("writepacket.go", "sendPktPoolGet(") != 0 {
-		t.Error("writepacket.go takes from the pool — it only ever RETURNS")
+		t.Error("writepacket.go takes from the pool — it must only ever RETURN")
 	}
 }
 
-// BenchmarkSendPacketThroughWritePacket prices the whole hand-off the pool
-// exists for: SendPacket → sendCh → writePacket, with the buffer coming back.
-//
-// Run with -benchmem. Against `make([]byte, len(data))` this should fall from
-// one full-size allocation per packet to the pool's fixed overhead; if it does
-// not, the pool is not round-tripping and the change is not worth its
-// invariant.
+// BenchmarkSendPacketThroughWritePacket prices the hand-off the pool exists for:
+// SendPacket → sendCh → writePacket, with the buffer coming back. Run with
+// -benchmem; against `make([]byte, len(data))` this is 1408 B/op → 24 B/op.
 func BenchmarkSendPacketThroughWritePacket(b *testing.B) {
 	p := newWriterProxy(1024, 1)
 	data := make([]byte, 1312)
