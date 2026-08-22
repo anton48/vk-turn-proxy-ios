@@ -272,14 +272,25 @@ private struct ActiveServerControls: View {
     }
 
     var body: some View {
-        let server = store.activeServer
+        // 🚨 WHICH server this line may name is NOT the selected one while a
+        // tunnel is up: the session runs what it was STARTED with, and a tapped
+        // connection link changes the selection with no reconnect anywhere. One
+        // shared rule, driven by fixtures. → SessionServer.swift.
+        let caption = tunnel.serverCaption
         return VStack(spacing: 16) {
-            // Which named server this status refers to.
-            Text(tunnel.status == .connected
-                 ? "Connected to \(server.serverName)"
-                 : "Server: \(server.serverName)")
+            Text(caption.subtitle)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
+
+            // The selection differs from what is running — say so, or the screen
+            // reads as if the import had not worked.
+            if let pending = caption.pendingSelection {
+                Text(pending)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
 
             if let error = tunnel.errorMessage {
                 Text(error)

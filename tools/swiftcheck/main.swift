@@ -2328,18 +2328,21 @@ do {
         exit(1)
     }
     let childBody = String(child[bodyR.upperBound...])
-    // ⚖️ Both arms of the ternary, and either spelling of a live read: pinning one
-    // arm leaves the other free to drift, while demanding one spelling would
-    // redden on a correct inlining. The defect this excludes is a read of
-    // something OTHER than the active server, which no spelling makes correct.
-    func readsActiveServer(_ prefix: String) -> Bool {
-        childBody.contains("\(prefix)\\(server.serverName)")
-            || childBody.contains("\(prefix)\\(store.activeServer.serverName)")
-    }
-    check(readsActiveServer("Connected to ") && readsActiveServer("Server: "),
-          "🚨 …and the SUBTITLE interpolates that live read — the screen naming one server while "
-          + "Connect uses another is the whole defect, and it is invisible to a check that only "
-          + "asks whether the store is mentioned")
+    // ⚖️ THIS CHECK MOVED RATHER THAN LOOSENED. It used to require the subtitle to
+    // interpolate `store.activeServer.serverName`, and that became WRONG code the
+    // moment the selected server stopped being the right answer for a live tunnel
+    // (§34). The scan now pins only WHERE the text comes from; WHAT it says is
+    // covered by fixtures, which is strictly stronger than any scan.
+    check(childBody.contains("Text(caption.subtitle)"),
+          "🚨 the subtitle is the shared caption, not a string this view builds — three surfaces "
+          + "answering the same question separately is how two of them kept naming the selected "
+          + "server while a different one was running")
+    check(childBody.contains("caption.pendingSelection"),
+          "…and the view renders the pending-selection note, or a selection that will not take "
+          + "effect until the next connect is invisible")
+    check(!childBody.contains("Connected to \\("),
+          "🚨 …and it does NOT build that sentence itself — a second copy of the rule is how the "
+          + "card and the screen drifted apart in the first place")
     check(child.contains("@ObservedObject var tunnel: TunnelManager"),
           "🚨 the tunnel is OBSERVED here, not passed-and-read: SwiftUI may skip re-evaluating a "
           + "child whose stored properties are unchanged, and a class reference never changes")
@@ -2385,6 +2388,101 @@ do {
           && content.contains("ConnectionLinkPrompt.importedTitle"),
           "…the paste path goes through the shared apply AND the shared title — sharing only "
           + "the wording is what let the apply step drift")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+print("What the app may CLAIM about the server, and the link queue")
+
+// 34. 🚨 THE SELECTED SERVER IS NOT THE RUNNING ONE, AND THREE SURFACES USED TO
+//     ANSWER THAT QUESTION SEPARATELY.
+//
+//     `ServerStore.activeServer` is what the NEXT connect will use. A tapped
+//     connection link changes it with no reconnect anywhere, so while a tunnel
+//     is up "Connected to <active server>" is a claim about a session that is
+//     running something else. The card is the worse surface of the two: it
+//     outlives the app, so the false sentence can sit on the Lock Screen.
+//
+//     ⚠️ NO RUN CAN COVER THIS. There is no VPN in the simulator, so `.connected`
+//     is unreachable there, and on a device every case costs a reconnect cycle.
+//     That is exactly why the rule is a value type driven by fixtures.
+do {
+    let alpha = NamedServer(id: UUID(), name: "Alpha")
+    let beta = NamedServer(id: UUID(), name: "Beta")
+
+    let idle = SessionServerLabel.caption(status: .disconnected, session: nil, selected: beta)
+    check(idle.subtitle == "Server: Beta" && idle.cardName == "Beta" && idle.pendingSelection == nil,
+          "with nothing running, the screen names the SELECTED server and says nothing else")
+
+    let agreeing = SessionServerLabel.caption(status: .connected, session: alpha, selected: alpha)
+    check(agreeing.subtitle == "Connected to Alpha" && agreeing.pendingSelection == nil,
+          "a session whose server is still the selected one reads exactly as before")
+
+    // 🚨 THE CASE THE TYPE EXISTS FOR.
+    let diverged = SessionServerLabel.caption(status: .connected, session: alpha, selected: beta)
+    check(diverged.subtitle == "Connected to Alpha",
+          "🚨 an import that switches the selection under a LIVE tunnel does not rename what is "
+          + "connected — the session runs what it was started with")
+    check(diverged.cardName == "Alpha",
+          "🚨 …and the Live Activity names the same server, not the selection")
+    check(diverged.pendingSelection?.contains("Beta") == true,
+          "…while the new selection IS surfaced, or the import reads as having done nothing")
+
+    let unknown = SessionServerLabel.caption(status: .connected, session: nil, selected: beta)
+    check(!unknown.subtitle.contains("Beta") && unknown.cardName.isEmpty,
+          "🚨 attached to a tunnel of unknown provenance, it names NOTHING — falling back to the "
+          + "selection here is the very claim being prevented")
+
+    check(SessionServerLabel.caption(status: .connecting, session: beta, selected: beta).subtitle
+            == "Connecting to Beta",
+          "a starting session names the server it is starting")
+    check(SessionServerLabel.caption(status: .disconnecting, session: alpha, selected: beta).subtitle
+            == "Server: Beta",
+          "…and a session on its way out stops claiming to be connected")
+
+    // 🚨 SAME NAME, DIFFERENT PROFILE. `ServerStore.update` does not uniquify, so
+    // a rename can produce two profiles called the same thing; comparing names
+    // would call them equal and swallow the note.
+    let twin = NamedServer(id: UUID(), name: "Alpha")
+    check(SessionServerLabel.caption(status: .connected, session: alpha, selected: twin)
+            .pendingSelection != nil,
+          "🚨 the two are compared by ID — two profiles can carry one name after a rename")
+}
+
+// 35. 🚨 A QUEUE, NOT A SLOT. Only one link can be confirmed at a time, so a URL
+//     arriving while an alert is up must wait — and with a single slot each new
+//     arrival overwrote the waiting one, so of several links tapped in a row
+//     only the last was ever acted on, silently. *(User-caught.)*
+// ⚙️ The inbox is @MainActor (its only writers are `.onOpenURL` and a View), and
+// top-level code here is not, so the fixtures run inside `assumeIsolated` — which
+// is honest rather than a workaround: this harness IS the main thread.
+MainActor.assumeIsolated {
+    let inbox = ConnectionLinkInbox.shared
+    while inbox.take() != nil {}   // a singleton: start from a known state
+
+    let first = URL(string: "vkturnproxy://import?data=one")!
+    let second = URL(string: "vkturnproxy://import?data=two")!
+    inbox.deliver(first)
+    inbox.deliver(second)
+    check(inbox.queued.count == 2,
+          "🚨 a second URL arriving under a live alert does not replace the first")
+    check(inbox.take() == first && inbox.take() == second && inbox.take() == nil,
+          "…and they come back OLDEST first, in the order the user tapped them")
+
+    inbox.deliver(first)
+    inbox.deliver(first)
+    check(inbox.queued.count == 1,
+          "a double-tap on ONE link is one intent, not two prompts")
+    while inbox.take() != nil {}
+
+    for i in 0..<(ConnectionLinkInbox.capacity + 4) {
+        inbox.deliver(URL(string: "vkturnproxy://import?data=\(i)")!)
+    }
+    check(inbox.queued.count == ConnectionLinkInbox.capacity,
+          "the queue is BOUNDED — a published property that can grow without limit is a queue "
+          + "nobody bounded")
+    check(inbox.queued.first == URL(string: "vkturnproxy://import?data=0")!,
+          "…and it is the NEWEST that is refused: what is already queued was asked for first")
+    while inbox.take() != nil {}
 }
 
 print("")

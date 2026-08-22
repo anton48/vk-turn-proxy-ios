@@ -232,9 +232,11 @@ final class LiveActivityController {
 
     private func pushNow() {
         let tunnel = TunnelManager.shared
+        // The SESSION's server, through the one shared rule — not the selected
+        // profile, which is a different question. → SessionServer.swift.
         sync(status: tunnel.status,
              connectedAt: tunnel.live.connectedAt,
-             serverName: ServerStore.shared.activeServer.serverName,
+             serverName: tunnel.serverCaption.cardName,
              force: true)
     }
 

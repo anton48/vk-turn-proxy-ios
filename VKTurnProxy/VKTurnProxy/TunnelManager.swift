@@ -160,7 +160,9 @@ extension TunnelConfig {
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
             turnServerOverride: turnOv?.host,
-            turnPortOverride: turnOv?.port
+            turnPortOverride: turnOv?.port,
+            serverID: s.id,
+            serverName: s.serverName
         )
     }
 
@@ -200,6 +202,12 @@ class TunnelManager: ObservableObject {
 
     @Published var status: NEVPNStatus = .disconnected
     @Published var errorMessage: String?
+
+    /// The server the RUNNING session was started with — NOT the selected one.
+    /// nil when nothing is running, and also when this app attached to a tunnel
+    /// whose profile carries no identity (started by a build before this one).
+    /// → SessionServer.swift for why the two must not be the same value.
+    @Published private(set) var sessionServer: NamedServer?
 
     /// DIRECT mode (issue #72): traffic goes around the tunnel while the VK
     /// connections stay up.
@@ -927,6 +935,12 @@ class TunnelManager: ObservableObject {
             proto.serverAddress = serverAddress
             proto.providerConfiguration = [
                 "wg_config": wgConfig,
+                // WHICH profile this session is running. The extension ignores
+                // both keys; they exist so that an app relaunched over a live
+                // tunnel can say what it is connected TO instead of naming
+                // whatever happens to be selected. → SessionServer.swift.
+                "server_id": config.serverID?.uuidString ?? "",
+                "server_name": config.serverName,
                 "proxy_config": proxyConfig,
                 "tunnel_address": config.tunnelAddress,
                 "dns_servers": config.dnsServers,
@@ -1009,6 +1023,16 @@ class TunnelManager: ObservableObject {
             // a handful of connect/disconnect cycles.
             try await Task.sleep(nanoseconds: 700_000_000)
 
+            // 🚨 RECORDED HERE, in the one place that starts a tunnel, and not
+            // at the two call sites: `connect()` and `switchAndReconnect()` both
+            // arrive here, and a guard each caller must remember is one the next
+            // caller forgets (build 328's lesson, in the same file).
+            // ⚖️ If the start below throws, this is left set — harmless, because
+            // every reader gates it on a LIVE status, which a failed start never
+            // reaches.
+            if let id = config.serverID {
+                sessionServer = NamedServer(id: id, name: config.serverName)
+            }
             try manager.connection.startVPNTunnel()
     }
 
@@ -1886,6 +1910,21 @@ class TunnelManager: ObservableObject {
         if status == .connected && live.connectedAt == nil {
             live.connectedAt = Date()
         }
+        // 🚨 AND THE SESSION'S SERVER IS RECOVERED HERE, for the same reason as
+        // the two blocks below: this is the only place an already-running tunnel
+        // is seen. Without it, an app relaunched over a live tunnel has no idea
+        // what that tunnel is running and would fall back to the selected
+        // profile — the exact false claim SessionServer.swift exists to prevent.
+        if status == .connected || status == .connecting || status == .reasserting {
+            let cfg = (manager.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+            if let idString = cfg?["server_id"] as? String, let id = UUID(uuidString: idString) {
+                let name = (cfg?["server_name"] as? String) ?? ""
+                sessionServer = NamedServer(id: id, name: name)
+            }
+            // ⚖️ Deliberately no `else`: a profile written by an older build
+            // carries neither key, and leaving `sessionServer` nil is what makes
+            // the caption say "server unknown" rather than guess.
+        }
         // The DIRECT switch reads its state out of the profile, and this is the
         // only place an already-running tunnel is seen. Without it the switch
         // would show "off" after an app relaunch while the tunnel is routing
@@ -2013,6 +2052,8 @@ class TunnelManager: ObservableObject {
                     self.stopStatsPolling()
                     self.resetCaptchaState()
                     self.live.connectedAt = nil
+                    // The session is over, so nothing is running any server.
+                    self.sessionServer = nil
                     // If the extension self-stopped due to a rejected VKAuth
                     // cookie, it wrote the reason to the App Group before
                     // cancelling — surface it (and clear it so it shows once).
@@ -2104,10 +2145,26 @@ class TunnelManager: ObservableObject {
         syncLiveActivity()
     }
 
+    /// What may be CLAIMED about the server right now — ONE copy, so the main
+    /// screen, the Live Activity card and the mid-switch push cannot disagree.
+    /// Three surfaces answering the same question separately is how two of them
+    /// went on naming the selected server. → SessionServer.swift.
+    var serverCaption: ServerCaption {
+        let active = ServerStore.shared.activeServer
+        return SessionServerLabel.caption(
+            status: status,
+            session: sessionServer,
+            selected: NamedServer(id: active.id, name: active.serverName))
+    }
+
     private func syncLiveActivity() {
+        // 🚨 The SESSION's server, not the selected one. The card is the surface
+        // where the false claim is worst: it survives the app being closed, so
+        // "Connected to <a server that is not running>" can sit on the Lock
+        // Screen for hours. → SessionServer.swift.
         LiveActivityBridge.sync(status: status,
                                 connectedAt: live.connectedAt,
-                                serverName: ServerStore.shared.activeServer.serverName)
+                                serverName: serverCaption.cardName)
     }
 
     private func startStatsPolling(reset: Bool = true) {
@@ -3115,6 +3172,13 @@ struct TunnelConfig {
     var credPoolCooldownSeconds: Int = 150
     var turnServerOverride: String?
     var turnPortOverride: String?
+    /// WHICH profile this config was built from. Carried so the one place that
+    /// starts a tunnel can record what the session is running (SessionServer.swift).
+    /// A caller cannot forget to pass it, which is the point: the previous
+    /// arrangement had every SURFACE ask the store instead, and the store
+    /// answers a different question.
+    var serverID: UUID?
+    var serverName: String = ""
 }
 
 extension TunnelConfig {

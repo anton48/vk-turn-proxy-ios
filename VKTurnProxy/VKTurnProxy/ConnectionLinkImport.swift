@@ -62,17 +62,18 @@ struct ConnectionLinkImporter: View {
                 if let m = resultMessage { Text(m) }
             }
             .onAppear { consume() }
-            .onChange(of: inbox.pendingURL) { _ in consume() }
+            .onChange(of: inbox.queued) { _ in consume() }
             // A URL that arrives while an alert is up stays PARKED; these two
             // fire when that alert goes away and pick it up then.
             .onChange(of: showConfirm) { _ in consume() }
             .onChange(of: showResult) { _ in consume() }
     }
 
-    /// Take the URL out of the inbox and act on it.
+    /// Take the oldest URL out of the inbox and act on it.
     ///
-    /// Consuming (setting `pendingURL = nil`) is what stops the link being
-    /// replayed the next time this view appears.
+    /// Taking it is what stops the link being replayed the next time this view
+    /// appears; anything still queued behind it is picked up when this alert is
+    /// dismissed.
     private func consume() {
         // 🚨 ONE ALERT AT A TIME. This used to take the URL unconditionally and
         // overwrite `pending` UNDERNEATH a live confirmation, so a second link
@@ -81,14 +82,17 @@ struct ConnectionLinkImporter: View {
         // raising `showConfirm` while `showResult` is still true puts two
         // alerts on one view, which SwiftUI resolves by dropping one.
         //
-        // Leaving it parked costs nothing: `pendingURL` is published and the
+        // Leaving it queued costs nothing: the queue is published and the
         // dismissal hooks above re-enter here, with `.onAppear` as the backstop
         // if a present is swallowed for arriving mid-dismissal. The importer is
         // always mounted now, so this is far easier to reach than when Settings
         // was the only consumer. *(Review-caught, 3d7b9953.)*
+        //
+        // ⚖️ And the inbox is a QUEUE rather than one slot, so several links
+        // tapped in a row are all acted on in order instead of all but the last
+        // being overwritten in silence. *(User-caught, 63f25071 follow-up.)*
         guard !showConfirm, !showResult else { return }
-        guard let url = inbox.pendingURL else { return }
-        inbox.pendingURL = nil
+        guard let url = inbox.take() else { return }
         do {
             pending = try BackupManager.parseConnectionLink(from: url)
             showConfirm = true

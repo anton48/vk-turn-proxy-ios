@@ -49,6 +49,8 @@ SOURCES=(
     "$S/AppEntitlements.swift"
     "$S/VPNConfigFailure.swift"
     "$S/DisconnectReason.swift"
+    "$S/SessionServer.swift"
+    "$S/ConnectionLinkInbox.swift"
 )
 
 require_tracked "$0" "${SOURCES[@]}"
