@@ -2391,17 +2391,23 @@ do {
     // *(Re-raised by the user against the fixed code, and confirmed by
     // sabotage before this was written.)*
     //
-    // ⚖️ Asserted as an ORDER over the body rather than as a verbatim block: a
+    // ⚖️ Asserted over the body as COUNT PLUS ORDER, not as a verbatim block: a
     // comment inserted mid-body would break a multi-line match on correct code,
     // and this project has reddened on its own prose four times already.
     //
-    // 🚨 AND ORDER NEEDS BOTH HALVES: a forward scan proves the steps CAN be read
-    // in sequence and says nothing about a copy sitting ABOVE the marker. Moving
-    // the two raises above `take()` — or leaving a duplicate there — is a green
-    // suite on code where every consume() sets both flags with nothing taken,
-    // which locks the guard at the top of both functions at `true` FOR EVER and
-    // kills the import path outright. *(User-caught, third time on this one
-    // function: presence, then order, now order-in-both-directions.)*
+    // 🚨 AND THE COUNT IS WHAT MAKES THE ORDER MEAN ANYTHING. A forward scan
+    // proves the steps CAN be read in sequence, so it is satisfied by a
+    // DUPLICATE between two markers: `guard → consume → finish → consume`
+    // passes it, and passes a "nothing before the guard" check too. That code
+    // is broken in production — the premature `consume()` opens the NEXT
+    // transaction and raises its prompt, and the `finish()` behind it then wipes
+    // that transaction's phase, so the link on screen has no dedupe window and a
+    // later take can overwrite it. With each step pinned at EXACTLY ONE
+    // occurrence, order is a statement about where that occurrence is, and a
+    // separate "not before" check is not needed at all.
+    // *(User-caught, fourth round on this one function: presence → order →
+    // order in both directions → count. Each round a level finer, and the shape
+    // of the previous fix is what admitted the next defect.)*
     func inOrder(_ body: String, _ steps: [String]) -> Bool {
         var from = body.startIndex
         for step in steps {
@@ -2410,9 +2416,8 @@ do {
         }
         return true
     }
-    func noneBefore(_ body: String, _ marker: String, _ needles: [String]) -> Bool {
-        guard let m = body.range(of: marker) else { return false }
-        return needles.allSatisfy { body.range(of: $0, range: body.startIndex..<m.lowerBound) == nil }
+    func countIn(_ body: String, _ needle: String) -> Int {
+        body.components(separatedBy: needle).count - 1
     }
     func bodyOf(_ decl: String) -> String? {
         guard let d = imp.range(of: decl),
@@ -2423,26 +2428,30 @@ do {
     let theTake = "guard let url = inbox.take() else { return }"
 
     if let settle = bodyOf("private func settle() {") {
-        check(inOrder(settle, [theGuard, "inbox.finish()", "consume()"])
-              && noneBefore(settle, theGuard, ["inbox.finish()", "consume()"]),
-              "🚨 the dismissal path GUARDS, then releases, then TAKES THE NEXT ONE — releasing "
-              + "early drops the link out of the dedupe window while it is still on screen, and "
-              + "not consuming leaves a parked URL waiting for an .onAppear that may never come")
+        check(countIn(settle, "inbox.finish()") == 1 && countIn(settle, "consume()") == 1
+              && inOrder(settle, [theGuard, "inbox.finish()", "consume()"]),
+              "🚨 the dismissal path GUARDS, then releases ONCE, then takes the next one ONCE — "
+              + "releasing early drops the link out of the dedupe window while it is still on "
+              + "screen, consuming early opens the next transaction and lets the release behind "
+              + "it wipe that one's phase, and not consuming leaves a parked URL waiting for an "
+              + ".onAppear that may never come")
     } else {
         check(false, "could not find settle() — the order check would be vacuous")
     }
     if let consume = bodyOf("private func consume() {") {
-        check(inOrder(consume, [theGuard, "inbox.recoverIfAbandoned()", theTake])
-              && noneBefore(consume, theGuard, ["inbox.recoverIfAbandoned()", "inbox.take()"]),
-              "🚨 …and the take path reconciles an abandoned transaction BEFORE taking, which is "
-              + "only safe because the guard above says this consumer has no alert of its own")
-        let raises = ["showConfirm = true", "showResult = true"]
-        check(raises.allSatisfy { consume.range(of: $0, range: (consume.range(of: theTake)?.upperBound ?? consume.startIndex)..<consume.endIndex) != nil }
-              && noneBefore(consume, theTake, raises),
-              "🚨 …and it raises the prompt or the report ONLY AFTER a link has been taken. "
-              + "Raising before the take leaves every consume() setting both flags with nothing "
-              + "to show, which locks the guard at the top at `true` for ever and the import "
-              + "path never runs again — and a check for mere PRESENCE is green on it")
+        check(countIn(consume, "inbox.recoverIfAbandoned()") == 1 && countIn(consume, "inbox.take()") == 1
+              && inOrder(consume, [theGuard, "inbox.recoverIfAbandoned()", theTake]),
+              "🚨 …and the take path reconciles an abandoned transaction ONCE, BEFORE taking ONCE "
+              + "— which is only safe because the guard above says this consumer has no alert of "
+              + "its own")
+        let afterTake = (consume.range(of: theTake)?.upperBound) ?? consume.endIndex
+        check(["showConfirm = true", "showResult = true"].allSatisfy {
+                  countIn(consume, $0) == 1 && consume.range(of: $0, range: afterTake..<consume.endIndex) != nil
+              },
+              "🚨 …and it raises the prompt or the report EXACTLY ONCE EACH and ONLY AFTER a link "
+              + "has been taken. Raising before the take leaves every consume() setting both "
+              + "flags with nothing to show, which locks the guard at the top at `true` for ever "
+              + "and the import path never runs again")
     } else {
         check(false, "could not find consume() — the checks above would be vacuous")
     }
