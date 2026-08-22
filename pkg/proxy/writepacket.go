@@ -33,6 +33,21 @@ import "time"
 // −1 there keeps those sites byte-for-byte what they were: this helper must not
 // quietly add accounting a call site did not have.
 func (p *Proxy) writePacket(item sendItem, txConnIdx int, write func(pkt []byte, now time.Time) error) error {
+	// 🚨 THE POOL HAND-BACK, and its position is the contract. Dequeuing is what
+	// transfers ownership, so this function returns the buffer EXACTLY ONCE on
+	// every outcome — success, write error, and any exit added later. A `defer`
+	// is what makes "every outcome" true without a reader having to check; see
+	// the ownership note on sendPktPool for why a third Put site anywhere else
+	// would be a double free of a live buffer rather than a leak.
+	defer sendPktPoolPut(item.buf)
+
+	// Read the length BEFORE the write, not after. The deferred Put above runs
+	// after the body, so reading len(item.buf) below would in fact still be
+	// safe today — but only by that reasoning, and the next edit that moves a
+	// read of the CONTENTS down here would be a use-after-Put that nothing
+	// catches. Taking it now removes the question.
+	n := len(item.buf)
+
 	// One clock read serves both the residence stamp and the write deadline.
 	now := time.Now()
 	p.sendWait.observe(item.at, now.UnixNano())
@@ -45,7 +60,7 @@ func (p *Proxy) writePacket(item sendItem, txConnIdx int, write func(pkt []byte,
 	}
 
 	if txConnIdx >= 0 && txConnIdx < len(p.connTxBytes) {
-		p.connTxBytes[txConnIdx].Add(int64(len(item.buf)))
+		p.connTxBytes[txConnIdx].Add(int64(n))
 		p.lastTxAt[txConnIdx].Store(time.Now().UnixNano())
 	}
 	return nil

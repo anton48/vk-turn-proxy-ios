@@ -1674,7 +1674,13 @@ func notePeak(mark *atomic.Int64, depth int) {
 
 // SendPacket sends a WireGuard packet through the tunnel.
 func (p *Proxy) SendPacket(data []byte) error {
-	buf := make([]byte, len(data))
+	// 🚨 THE COPY STAYS, and pooling is exactly why it must. Both producers
+	// REUSE their argument: synth.go re-sends one mutated buffer per burst and
+	// turnbind/bind.go passes wireguard-go's staged buffers, reclaimed the
+	// moment Send returns. Aliasing `data` would put one backing array behind
+	// many queued items and many writers — the only way to get real corruption
+	// out of this design.
+	buf := sendPktPoolGet(len(data))
 	copy(buf, data)
 	// The enqueue instant rides with the packet so a writer can price the wait
 	// it actually served — sendwait.go. One clock read per packet, ~25 ns
@@ -1711,6 +1717,11 @@ func (p *Proxy) SendPacket(data []byte) error {
 		p.txPackets.Add(1)
 		return nil
 	case <-p.ctx.Done():
+		// Ownership: until the send succeeds the buffer is still ours, and this
+		// is the ONLY exit that never reaches the channel. Every other exit is
+		// a successful enqueue, after which sendCh owns it and writePacket
+		// returns it — see the ownership note on sendPktPool.
+		sendPktPoolPut(buf)
 		return p.ctx.Err()
 	}
 }
@@ -4769,6 +4780,64 @@ var recvPktPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, 2048)
 	},
+}
+
+// sendPktPool is the TX twin of recvPktPool, for the WireGuard records
+// SendPacket hands to the writer goroutines through sendCh.
+//
+// 🚨 OWNERSHIP, and it is the whole correctness argument:
+//
+//	before the enqueue  — SendPacket owns the buffer, and Puts it on the one
+//	                      exit that never reaches the channel (ctx.Done)
+//	after the enqueue   — sendCh owns it; nobody may touch it
+//	after the dequeue   — writePacket owns it, and returns it EXACTLY ONCE on
+//	                      every outcome, via a defer at the top of the function
+//
+// ⇒ there are exactly TWO Put sites in the tree and there must never be a
+// third. In particular: NOT in the four writer loops (proxy.go, the
+// `case item := <-p.sendCh` bodies) and NOT inside a `write` closure. Either
+// would be a DOUBLE Put — two of ~30 writer goroutines handed the same backing
+// array, concurrently copying different WireGuard records into it. On the wire
+// that is corrupt uplink which server1 drops as auth failures, i.e. it would
+// read as the per-allocation loss this project is already chasing and be
+// blamed on the relay. `-race` does not catch it. `sendpktpool_test.go` counts
+// the sites for exactly this reason.
+//
+// ⚖️ Two BOUNDED leaks are accepted rather than fixed, and they are written
+// down so nobody "fixes" them into the double above: a writer that dies on a
+// write error loses at most the one packet it held (writePacket's defer covers
+// it, so in fact this leaks nothing), and teardown GCs up to the 256 items
+// still sitting in sendCh, which is created once and never drained. Both
+// self-heal through New().
+//
+// 🚨 AND IT MAKES A DEPENDENCY LOAD-BEARING that was previously irrelevant:
+// every transport must COPY the payload before its Write returns. Verified for
+// the pinned versions — pion/dtls v3.0.10 (`ApplicationData.Marshal` does
+// `append([]byte{}, a.Data...)`, both the DTLS and WRAP-A paths), pion/rtp
+// v1.10.1 (`MarshalTo` → `copy(buf[offset:], payload)`, the SRTP path) and
+// cbeuw/connutil v1.0.1 (`bytes.Buffer.Write`, the direct path). A bump that
+// introduced zero-copy of the application payload would break this silently.
+var sendPktPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 2048)
+	},
+}
+
+// sendPktPoolGet returns a slice of length n from the pool.
+func sendPktPoolGet(n int) []byte {
+	b := sendPktPool.Get().([]byte)
+	if cap(b) < n {
+		b = make([]byte, n)
+	}
+	return b[:n]
+}
+
+// sendPktPoolPut returns a slice to the pool, restoring full capacity.
+func sendPktPoolPut(b []byte) {
+	if b == nil {
+		return
+	}
+	sendPktPool.Put(b[:cap(b)])
 }
 
 // recvPktPoolGet returns a slice of length n from the pool.

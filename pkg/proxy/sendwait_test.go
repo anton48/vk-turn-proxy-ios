@@ -170,7 +170,23 @@ func TestEverySendChDequeueFeedsTheInstrument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read proxy.go: %v", err)
 	}
-	lines := strings.Split(string(src), "\n")
+	// 🚨 STRIP `//` COMMENTS FIRST. This scan matches a literal that any comment
+	// ABOUT the dequeue sites also contains — and it went red on exactly that:
+	// the ownership note added with sendPktPool names "`case item := <-p.sendCh`
+	// bodies" while explaining where a Put must NOT go. That is the fourth time
+	// a source scan in this project has reddened on its own documentation, so
+	// the fix is the systematic one rather than rewording the prose.
+	// ⚠️ Naive by design: it also cuts inside a string literal containing `//`.
+	// Nothing this scan looks for lives in one.
+	var code strings.Builder
+	for _, ln := range strings.Split(string(src), "\n") {
+		if i := strings.Index(ln, "//"); i >= 0 {
+			ln = ln[:i]
+		}
+		code.WriteString(ln)
+		code.WriteString("\n")
+	}
+	lines := strings.Split(code.String(), "\n")
 	sites := 0
 	for i, ln := range lines {
 		if !strings.Contains(ln, "<-p.sendCh") {
