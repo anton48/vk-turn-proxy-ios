@@ -2132,12 +2132,6 @@ class TunnelManager: ObservableObject {
         }
     }
 
-    /// Push the current tunnel state to the Live Activity (GitHub issue #64).
-    /// No-op below iOS 16.1 and whenever no activity is warranted; see
-    /// LiveActivityController for the lifecycle. The server name is read fresh
-    /// each time, so switching the active server shows up on the next status
-    /// transition — which is exactly when a switch takes effect anyway, since
-    /// it requires a reconnect.
     /// Re-publish the Live Activity now. Used by Settings › Advanced when the
     /// master switch flips, so the card appears or disappears on the tap rather
     /// than at the next status change.
@@ -2157,11 +2151,22 @@ class TunnelManager: ObservableObject {
             selected: NamedServer(id: active.id, name: active.serverName))
     }
 
+    /// Push the current tunnel state to the Live Activity (GitHub issue #64).
+    /// No-op below iOS 16.1 and whenever no activity is warranted; see
+    /// LiveActivityController for the lifecycle.
+    ///
+    /// 🚨 THE CARD NAMES THE RUNNING SESSION, NOT THE SELECTION — so a change of
+    /// active server that has NOT reconnected must not reach it. This doc used
+    /// to say the opposite ("the server name is read fresh each time, so
+    /// switching the active server shows up on the next status transition"),
+    /// which was true while a switch could only happen through a reconnect and
+    /// became an argument FOR the defect the moment a tapped link could change
+    /// the selection under a live tunnel. *(Review-caught, 7ed59d5d — the same
+    /// species as the `873a927` comment that documented the opposite of what
+    /// its code did.)*
     private func syncLiveActivity() {
-        // 🚨 The SESSION's server, not the selected one. The card is the surface
-        // where the false claim is worst: it survives the app being closed, so
-        // "Connected to <a server that is not running>" can sit on the Lock
-        // Screen for hours. → SessionServer.swift.
+        // The one shared rule; an empty name means NAME NOTHING, never the
+        // selection. → SessionServer.swift.
         LiveActivityBridge.sync(status: status,
                                 connectedAt: live.connectedAt,
                                 serverName: serverCaption.cardName)

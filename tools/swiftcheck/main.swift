@@ -2726,6 +2726,64 @@ MainActor.assumeIsolated {
     reset()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+print("The Live Activity names the session, not the selection")
+
+// 37. 🚨 BOTH PUBLISHERS OF THE CARD'S NAME GO THROUGH THE ONE SHARED RULE.
+//
+//     The card is the worst surface for the session-vs-selection confusion,
+//     because it outlives the app: "Connected to <a server that is not
+//     running>" can sit on the Lock Screen for hours. Two places publish it —
+//     TunnelManager.syncLiveActivity and LiveActivityController.pushNow — and
+//     both used to read `ServerStore.activeServer` directly.
+//
+//     ⚖️ GUARDED IN THE CODE, NOT IN THE PROSE. A reviewer found the widget
+//     contract and the sync doc still describing the OLD rule, which is the
+//     `873a927` species — a comment that argues for the defect. The comments are
+//     fixed, but a scan over them cannot be the guard: the corrected text names
+//     `ServerStore.activeServer` as the thing it is NOT, so a prose scan would
+//     redden on correct code. What a later change would actually break is the
+//     ARGUMENT, so that is what this pins.
+//
+//     🚨 And it pins it as COUNT PLUS SOURCE rather than as an absence: banning
+//     `serverName: ServerStore` leaves `let n = ServerStore…; serverName: n`
+//     wide open — the instance-shaped hole this file now has five instances of.
+do {
+    func bodyOf(_ src: String, _ decl: String) -> String? {
+        guard let d = src.range(of: decl),
+              let e = src.range(of: "\n    }", range: d.upperBound..<src.endIndex) else { return nil }
+        return String(src[d.upperBound..<e.lowerBound])
+    }
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    let lac = codeWithoutComments("VKTurnProxy/VKTurnProxy/LiveActivityController.swift")
+
+    for (who, src, decl, expected) in [
+        ("TunnelManager.syncLiveActivity", tm, "private func syncLiveActivity() {", "serverName: serverCaption.cardName"),
+        ("LiveActivityController.pushNow", lac, "private func pushNow() {", "serverName: tunnel.serverCaption.cardName"),
+    ] {
+        guard let body = bodyOf(src, decl) else {
+            check(false, "could not find \(who) — the check below would be vacuous")
+            continue
+        }
+        check(body.components(separatedBy: "serverName:").count - 1 == 1 && body.contains(expected),
+              "🚨 \(who) names the card from the shared caption and from nothing else — the "
+              + "selection reaching this argument is a sentence about a session that is not "
+              + "running, on a surface that outlives the app")
+    }
+
+    // …and the caption itself still refuses to fall back when the session is
+    // unknown. The fixtures in §34 cover the rule; this covers the ONE call that
+    // feeds it, because a caller passing `selected` as `session` would satisfy
+    // every fixture while making the distinction vanish.
+    guard let caption = bodyOf(tm, "var serverCaption: ServerCaption {") else {
+        check(false, "could not find serverCaption — the check below would be vacuous")
+        exit(1)
+    }
+    check(caption.contains("session: sessionServer") && caption.contains("selected: NamedServer("),
+          "🚨 …and the caption is built with the SESSION in the session slot — passing the "
+          + "selection there satisfies every fixture and erases the distinction entirely")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")
