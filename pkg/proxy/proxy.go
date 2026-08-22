@@ -4803,12 +4803,17 @@ var recvPktPool = sync.Pool{
 // blamed on the relay. `-race` does not catch it. `sendpktpool_test.go` counts
 // the sites for exactly this reason.
 //
-// ⚖️ Two BOUNDED leaks are accepted rather than fixed, and they are written
-// down so nobody "fixes" them into the double above: a writer that dies on a
-// write error loses at most the one packet it held (writePacket's defer covers
-// it, so in fact this leaks nothing), and teardown GCs up to the 256 items
-// still sitting in sendCh, which is created once and never drained. Both
-// self-heal through New().
+// ⚖️ ONE bounded leak is accepted rather than fixed, and it is written down so
+// nobody "fixes" it into the double above: teardown GCs up to the 256 items
+// still sitting in sendCh, which is created once and never drained. It
+// self-heals through New(), and it must NOT be answered by draining the channel
+// with a Put in a writer loop.
+//
+// 🚫 The write-error branch is deliberately NOT on that list. It does not leak —
+// writePacket's defer covers it — and naming it as an accepted leak would point
+// at the exact branch where a "fix" is the double free above. *(Review-caught:
+// the earlier wording said "two leaks" and then retracted the first, which left
+// a phantom whose warning argued for the corruption it was meant to prevent.)*
 //
 // 🚨 AND IT MAKES A DEPENDENCY LOAD-BEARING that was previously irrelevant:
 // every transport must COPY the payload before its Write returns. Verified for

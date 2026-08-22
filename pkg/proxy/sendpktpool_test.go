@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -156,7 +157,7 @@ func TestExactlyTwoPutSitesExist(t *testing.T) {
 	// Strip `//` comments: this scan matches names that the ownership prose is
 	// full of, and a source scan reddening on its own documentation has already
 	// happened four times in this project.
-	countIn := func(path, needle string) int {
+	codeOf := func(path string) string {
 		src, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("reading %s — a scan over a missing file passes vacuously: %v", path, err)
@@ -169,8 +170,9 @@ func TestExactlyTwoPutSitesExist(t *testing.T) {
 			code.WriteString(line)
 			code.WriteString("\n")
 		}
-		return strings.Count(code.String(), needle)
+		return code.String()
 	}
+	countIn := func(path, needle string) int { return strings.Count(codeOf(path), needle) }
 
 	if n := countIn("proxy.go", "sendPktPoolPut("); n != 2 {
 		t.Errorf("proxy.go has %d sendPktPoolPut( occurrences, want 2 (the helper's own "+
@@ -188,6 +190,62 @@ func TestExactlyTwoPutSitesExist(t *testing.T) {
 	if countIn("writepacket.go", "sendPktPoolGet(") != 0 {
 		t.Error("writepacket.go takes from the pool — it must only ever RETURN")
 	}
+
+	// 🚨 THE RELEASE MUST BE A `defer`, AND THIS IS THE CORRUPTION DIRECTION.
+	// Counting the site says nothing about WHEN it runs: `sendPktPoolPut(item.buf)`
+	// immediately before `write(item.buf, now)` keeps the count at one, recycles
+	// the buffer exactly once, and passes every byte-based test above — while
+	// handing the array to another Get whose writer memcpys into it WHILE a
+	// transport is still reading it. A deferred call cannot run before the write,
+	// so asserting the form is what rules the whole direction out.
+	// *(Review-caught: no test in this file covered it.)*
+	if !strings.Contains(codeOf("writepacket.go"), "defer sendPktPoolPut(item.buf)") {
+		t.Error("writepacket.go's release is not `defer sendPktPoolPut(item.buf)` — a Put " +
+			"that is not deferred can run BEFORE the transport has finished reading the " +
+			"buffer, which is the one ordering that corrupts rather than leaks")
+	}
+
+	// 🚨 …AND THE CLAIM IS ABOUT THE WHOLE PACKAGE, so the scan must be too. The
+	// pool's own comment says "exactly two Put sites in the tree"; counting only
+	// two files would miss `sendPktPoolPut` added to uplinkpace.go or synth.go,
+	// and misses `sendPktPool.Put(` — bypassing the helper — anywhere at all.
+	// *(Review-caught: the check was narrower than the invariant it advertised.)*
+	files, err := filepath.Glob("*.go")
+	if err != nil || len(files) < 10 {
+		t.Fatalf("globbing pkg/proxy/*.go found %d files (err %v) — the sweep below "+
+			"would pass vacuously", len(files), err)
+	}
+	swept := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		swept++
+		code := codeOf(f)
+		if n := strings.Count(code, "sendPktPool.Put("); n != expectedDirectPuts(f) {
+			t.Errorf("%s has %d sendPktPool.Put( occurrences, want %d — the pool is "+
+				"returned to through sendPktPoolPut, never directly", f, n, expectedDirectPuts(f))
+		}
+		if f == "proxy.go" || f == "writepacket.go" {
+			continue
+		}
+		if n := strings.Count(code, "sendPktPoolPut("); n != 0 {
+			t.Errorf("%s has %d sendPktPoolPut( occurrences — ownership lives in "+
+				"SendPacket and writePacket ONLY, and a third site is a double free", f, n)
+		}
+	}
+	if swept < 10 {
+		t.Fatalf("swept only %d production files — the sweep is not finding the package", swept)
+	}
+}
+
+// expectedDirectPuts: the helper's own body is the single legitimate
+// sendPktPool.Put( in the package.
+func expectedDirectPuts(file string) int {
+	if file == "proxy.go" {
+		return 1
+	}
+	return 0
 }
 
 // BenchmarkSendPacketThroughWritePacket prices the hand-off the pool exists for:
