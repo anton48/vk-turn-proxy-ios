@@ -65,8 +65,21 @@ struct ConnectionLinkImporter: View {
             .onChange(of: inbox.queued) { _ in consume() }
             // A URL that arrives while an alert is up stays PARKED; these two
             // fire when that alert goes away and pick it up then.
-            .onChange(of: showConfirm) { _ in consume() }
-            .onChange(of: showResult) { _ in consume() }
+            .onChange(of: showConfirm) { _ in settle() }
+            .onChange(of: showResult) { _ in settle() }
+    }
+
+    /// An alert closed. Release whatever it was showing — so a later tap of the
+    /// SAME link counts as a new intent again — and then take the next one.
+    ///
+    /// 🚨 The order matters and the guard is what makes it safe: `finish()` must
+    /// not run while the other alert is still up (the Import button closes the
+    /// confirm and opens the result in one step), or the link on screen would
+    /// drop out of the dedupe window a step early — the very hole this closes.
+    private func settle() {
+        guard !showConfirm, !showResult else { return }
+        inbox.finish()
+        consume()
     }
 
     /// Take the oldest URL out of the inbox and act on it.

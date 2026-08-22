@@ -26,6 +26,17 @@ final class ConnectionLinkInbox: ObservableObject {
     /// in a row only the last survived, silently. Three taps are three intents.
     @Published private(set) var queued: [URL] = []
 
+    /// The URL the importer is currently PROMPTING for. It has left `queued` —
+    /// `take()` handed it over — but a repeat of it is still the same intent, so
+    /// the window deduplication covers has to include it.
+    ///
+    /// 🚨 WITHOUT THIS THE DEDUPE WINDOW ENDED AT `take()`: the link on screen
+    /// was no longer "already queued", so tapping it again while its own confirm
+    /// alert was up re-enqueued it, and answering Import produced a SECOND
+    /// prompt for the link just imported — and importing both adds the same
+    /// deployment twice ("Alpha" and "Alpha 2"). *(User-caught.)*
+    private(set) var inFlight: URL?
+
     /// Bounded, so a pathological producer cannot grow it without limit. Far
     /// past any real sequence of taps; beyond it the NEWEST is refused, because
     /// the ones already queued were asked for first.
@@ -35,8 +46,9 @@ final class ConnectionLinkInbox: ObservableObject {
 
     func deliver(_ url: URL) {
         // A double-tap on one link is ONE intent; two different links are two.
-        guard !queued.contains(url) else {
-            SharedLogger.shared.log("[AppDebug] connection link already queued — ignoring the repeat")
+        // The window is *queued OR on screen*, not *queued* — see `inFlight`.
+        guard url != inFlight, !queued.contains(url) else {
+            SharedLogger.shared.log("[AppDebug] connection link already queued or on screen — ignoring the repeat")
             return
         }
         guard queued.count < Self.capacity else {
@@ -46,9 +58,24 @@ final class ConnectionLinkInbox: ObservableObject {
         queued.append(url)
     }
 
-    /// Removes and returns the oldest queued URL. Taking is what stops a link
-    /// being replayed the next time the importer appears.
+    /// Removes and returns the oldest queued URL, and marks it IN FLIGHT until
+    /// `finish()`. Taking is what stops a link being replayed the next time the
+    /// importer appears.
     func take() -> URL? {
-        queued.isEmpty ? nil : queued.removeFirst()
+        guard !queued.isEmpty else { return nil }
+        let url = queued.removeFirst()
+        inFlight = url
+        return url
+    }
+
+    /// The importer has finished with whatever `take()` handed it — the prompt
+    /// was answered, cancelled, or the link was rejected as invalid.
+    ///
+    /// ⚖️ It must be called, and it must NOT be skipped as "tidier": leaving a
+    /// URL in flight for ever would make that exact link un-importable for the
+    /// rest of the session, which is the opposite failure and just as silent.
+    /// Re-tapping the same link later is a legitimate new intent.
+    func finish() {
+        inFlight = nil
     }
 }

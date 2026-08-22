@@ -2373,10 +2373,17 @@ do {
     // waits for an .onAppear this view may never get again. My sabotage deleted
     // the whole line, which is a stronger edit than the invariant: it proved that
     // SOME breakage is caught, not this one. *(Review-caught, 63f25071.)*
-    check(imp.contains(".onChange(of: showConfirm) { _ in consume() }")
-          && imp.contains(".onChange(of: showResult) { _ in consume() }"),
-          "…and each alert's dismissal CALLS consume(), or the parked URL would wait for an "
-          + ".onAppear that may never come")
+    //
+    // ⚖️ The handler is `settle()` rather than `consume()` since the in-flight
+    // link has to be RELEASED as well — this check followed that rename instead
+    // of being loosened, and it now pins both halves of what settle() does.
+    check(imp.contains(".onChange(of: showConfirm) { _ in settle() }")
+          && imp.contains(".onChange(of: showResult) { _ in settle() }"),
+          "…and each alert's dismissal re-enters the take path, or the parked URL would wait for "
+          + "an .onAppear that may never come")
+    check(imp.contains("inbox.finish()") && imp.contains("guard !showConfirm, !showResult else { return }\n        inbox.finish()"),
+          "🚨 …and it releases the link that was on screen ONLY once both alerts are closed — a "
+          + "link released a step early drops out of the dedupe window while still being shown")
     check(!content.contains("ConnectionLinkInbox"),
           "🚨 ContentView is not a second consumer of the inbox — two consumers race for one "
           + "pendingURL, so a prompt is swallowed or shown twice")
@@ -2471,8 +2478,27 @@ MainActor.assumeIsolated {
     inbox.deliver(first)
     inbox.deliver(first)
     check(inbox.queued.count == 1,
-          "a double-tap on ONE link is one intent, not two prompts")
+          "a double-tap on ONE link is one intent while it WAITS")
+    // 🚨 …AND WHILE IT IS ON SCREEN, which is where the window used to end. The
+    // check above passed on code where `take()` dropped the URL out of the
+    // dedupe set, so the link being confirmed could be re-enqueued by a second
+    // tap and prompted again the moment the user answered — importing the same
+    // deployment twice. The fixture claimed "not two prompts" and only covered
+    // the queued half. *(User-caught.)*
+    let shown = inbox.take()
+    check(shown == first && inbox.inFlight == first,
+          "taking a link marks it in flight")
+    inbox.deliver(first)
+    check(inbox.queued.isEmpty,
+          "🚨 a repeat of the link CURRENTLY BEING PROMPTED is refused — the dedupe window is "
+          + "*queued or on screen*, not *queued*")
+    inbox.finish()
+    inbox.deliver(first)
+    check(inbox.queued == [first],
+          "🚨 …and the window CLOSES when the prompt is answered: re-tapping the same link later "
+          + "is a new intent, or that link would be un-importable for the rest of the session")
     while inbox.take() != nil {}
+    inbox.finish()
 
     for i in 0..<(ConnectionLinkInbox.capacity + 4) {
         inbox.deliver(URL(string: "vkturnproxy://import?data=\(i)")!)
