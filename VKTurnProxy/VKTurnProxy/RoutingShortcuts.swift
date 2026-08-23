@@ -45,7 +45,10 @@ struct SetDirectRoutingIntent: AppIntent {
         // describing routing that has changed. `refreshDirectMode` inside
         // `setDirectMode` only calls the unawaited `refreshNow()`.
         // *(User-caught.)*
-        if #available(iOS 16.2, *) {
+        // 🚨 GATED: on `.noManager` the tunnel's state is unknown and `status` is
+        // still its initial `.disconnected`, which the controller answers by
+        // ENDING the card — irreversibly from the background.
+        if outcome.tunnelStateIsKnown, #available(iOS 16.2, *) {
             await LiveActivityController.shared.refreshNowAndWait()
         }
         if let failure = outcome.automationFailure {

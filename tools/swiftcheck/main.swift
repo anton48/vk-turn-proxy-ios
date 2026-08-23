@@ -2809,6 +2809,14 @@ do {
     // 🚨 THESE TWO ARE NOT THE SAME SITUATION. `init` only starts an unawaited
     // load, so a background-launched intent can find no manager while the tunnel
     // is up — and answering "not connected" there is a lie about a live tunnel.
+    // 🚨 …and the difference is not only what they SAY. With no manager the
+    // tunnel's state is unknown, and publishing the initial `.disconnected` ends
+    // a live card irreversibly from the background.
+    check(DirectOutcome.noManager.tunnelStateIsKnown == false
+          && [DirectOutcome.confirmed, .notConnected, .busy,
+              .failed("x"), .unconfirmed("y")].allSatisfy(\.tunnelStateIsKnown),
+          "🚨 only .noManager leaves the tunnel's state unknown — every other outcome has read "
+          + "the profile, so refusing to publish on those would hide real changes")
     check(DirectOutcome.noManager.automationFailure != DirectOutcome.notConnected.automationFailure,
           "🚨 no profile loaded and not connected say DIFFERENT things — they were collapsed "
           + "into one answer, which told an automation the live tunnel was down")
@@ -2854,9 +2862,12 @@ do {
           "🚨 …and it does not run from a locked device: the policy is stated, not defaulted")
     // 🚨 Same suspension the Live Activity's button has: perform() returns, the
     // process goes away, and an unawaited card push never lands.
-    check(inOrder(rs, ["Self.apply(direct)", "await LiveActivityController.shared.refreshNowAndWait()"]),
-          "🚨 …and it AWAITS the card refresh after the change, or the Lock Screen goes on "
-          + "describing routing that has moved — refreshDirectMode only calls the unawaited push")
+    check(inOrder(rs, ["Self.apply(direct)",
+                       "outcome.tunnelStateIsKnown",
+                       "await LiveActivityController.shared.refreshNowAndWait()"]),
+          "🚨 …and it AWAITS the card refresh after the change and ONLY when the tunnel's state "
+          + "is known — refreshDirectMode calls the unawaited push, and publishing an unknown "
+          + "state ENDS the card, which cannot be undone from the background")
 
     let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
     // Counted, not spelled: the invariant is that NOBODY reaches loadManager()

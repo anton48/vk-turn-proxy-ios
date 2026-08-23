@@ -20,6 +20,18 @@ enum DirectOutcome: Equatable {
     /// a possible leak — has already been awaited by the time this is returned.
     case unconfirmed(String)
 
+    /// Whether the app actually knows what the tunnel is doing.
+    ///
+    /// 🚨 `.noManager` means the profile could not be read, so `status` is still
+    /// its initial `.disconnected` — and publishing THAT ends a live card, which
+    /// from the background cannot be undone (`Activity.request` is
+    /// foreground-only). A caller that refreshes the card unconditionally would
+    /// destroy a card describing a running tunnel on exactly the outcome that
+    /// exists to say "unknown". *(User-caught.)*
+    var tunnelStateIsKnown: Bool {
+        self != .noManager
+    }
+
     /// 🚨 The message to fail an automation with, or nil ONLY when the extension
     /// confirmed the routes. Every other case leaves `directModeError` either
     /// unset (the early exits) or set to something the user needs, so "no error
