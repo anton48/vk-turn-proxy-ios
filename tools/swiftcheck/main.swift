@@ -2847,6 +2847,26 @@ do {
           + "the tunnel is not connected")
     check(rs.contains("from: .shortcut"),
           "the change is attributed to Shortcuts in the log, like every other call site")
+    // 🚨 The default authenticationPolicy is .alwaysAllowed — Apple defines it as
+    // running on a LOCKED device. Turning the VPN's protection off is not a
+    // decision to inherit from a default.
+    check(rs.contains("static var authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication"),
+          "🚨 …and it does not run from a locked device: the policy is stated, not defaulted")
+    // 🚨 Same suspension the Live Activity's button has: perform() returns, the
+    // process goes away, and an unawaited card push never lands.
+    check(inOrder(rs, ["Self.apply(direct)", "await LiveActivityController.shared.refreshNowAndWait()"]),
+          "🚨 …and it AWAITS the card refresh after the change, or the Lock Screen goes on "
+          + "describing routing that has moved — refreshDirectMode only calls the unawaited push")
+
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    // Counted, not spelled: the invariant is that NOBODY reaches loadManager()
+    // except the single-flight wrapper, so a new caller anywhere reddens. Two
+    // occurrences = its own declaration plus that one call.
+    check(tm.contains("if let inFlight = managerLoad {")
+          && tm.components(separatedBy: "loadManager()").count - 1 == 2,
+          "🚨 …and the manager load is SINGLE-FLIGHT, joined rather than restarted, with "
+          + "ensureManagerLoaded its ONLY caller: the first repair of the race started a second "
+          + "concurrent loadAllFromPreferences instead of awaiting the one already running")
 }
 
 print("")

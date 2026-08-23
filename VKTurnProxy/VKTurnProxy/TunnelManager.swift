@@ -324,7 +324,7 @@ class TunnelManager: ObservableObject {
 
     init() {
         Task {
-            await loadManager()
+            await ensureManagerLoaded()
         }
         // Restart stats polling when app returns from background
         foregroundObserver = NotificationCenter.default.addObserver(
@@ -1768,12 +1768,26 @@ class TunnelManager: ObservableObject {
 
     // MARK: - Private
 
-    /// Wait for the VPN manager, loading it if `init`'s unawaited Task has not
-    /// got there yet. A background-launched App Intent touches `shared` and asks
-    /// immediately, so it loses that race almost every time.
+    /// The load `init` starts, so a second caller joins it instead of racing it.
+    private var managerLoad: Task<Void, Never>?
+
+    /// Wait for the VPN manager, loading it only if nobody else already is.
+    ///
+    /// 🚨 SINGLE-FLIGHT, not "load if nil". `init` starts an unawaited load and a
+    /// background-launched App Intent asks immediately; the first version of this
+    /// fixed that race by starting a SECOND concurrent load — two
+    /// `loadAllFromPreferences` calls and two racing writes to `manager` and
+    /// `errorMessage`. *(User-caught.)*
     func ensureManagerLoaded() async {
         if manager != nil { return }
-        await loadManager()
+        if let inFlight = managerLoad {
+            await inFlight.value
+            return
+        }
+        let task = Task { await loadManager() }
+        managerLoad = task
+        await task.value
+        managerLoad = nil
     }
 
     private func loadManager() async {

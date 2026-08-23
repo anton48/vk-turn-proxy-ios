@@ -19,6 +19,14 @@ struct SetDirectRoutingIntent: AppIntent {
     /// them into this app to do it.
     static var openAppWhenRun: Bool = false
 
+    /// 🚨 EXPLICIT, because the default is `.alwaysAllowed` — which Apple defines
+    /// as running even on a LOCKED device. This intent turns the VPN's protection
+    /// off; that is not something a locked phone should do for whoever is holding
+    /// it. The automations this exists for fire when an app is opened, which the
+    /// device has to be unlocked for anyway. *(User-caught: it was the default,
+    /// i.e. a security decision nobody made.)*
+    static var authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
+
     @Parameter(title: "Bypass VPN")
     var direct: Bool
 
@@ -30,7 +38,17 @@ struct SetDirectRoutingIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult {
-        if let failure = await Self.apply(direct).automationFailure {
+        let outcome = await Self.apply(direct)
+        // 🚨 AWAITED, for the same reason the Live Activity's button awaits it:
+        // the process is suspended the moment perform() returns, so a card
+        // update left in flight may never happen — and the card would go on
+        // describing routing that has changed. `refreshDirectMode` inside
+        // `setDirectMode` only calls the unawaited `refreshNow()`.
+        // *(User-caught.)*
+        if #available(iOS 16.2, *) {
+            await LiveActivityController.shared.refreshNowAndWait()
+        }
+        if let failure = outcome.automationFailure {
             throw RoutingIntentError.message(failure)
         }
         return .result()
