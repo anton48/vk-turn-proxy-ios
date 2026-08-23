@@ -36,29 +36,26 @@ struct SetDirectRoutingIntent: AppIntent {
         return .result()
     }
 
-    /// Time-boxed, because one path inside `setDirectMode` is not: an
-    /// unconfirmed switch BACK to the tunnel may be a leak, and its repair is a
-    /// full reconnect of about 107 seconds. Shortcuts will not wait that long.
+    /// 🚨 NOT time-boxed, and the earlier version that was had it backwards.
     ///
-    /// 🚨 The work is deliberately NOT cancelled when the box expires — that
-    /// repair has to finish. What expires is only our willingness to report on
-    /// it, and the honest report then is that it was not confirmed.
+    /// The process is alive exactly while `perform()` has not returned — with
+    /// `openAppWhenRun` false there is no scene to keep it up — so returning
+    /// early is what abandons the work. And the work that must not be abandoned
+    /// is the dangerous one: an unconfirmed switch BACK to the tunnel may be a
+    /// leak, and its repair is a full reconnect (awaitTerminal up to 15 s, a
+    /// cred probe, awaitConnected up to 12 s) started inside `setDirectMode`,
+    /// well past any box worth putting on a Shortcut.
+    ///
+    /// ⚖️ `setDirectMode` already bounds the part that should be bounded: a 5 s
+    /// confirmation round trip plus a 2 s re-ask. The confirmed path measures
+    /// about 400 ms on device, so Shortcuts waits a moment normally, and in the
+    /// rare bad case it may time out on its own while the repair finishes.
     @MainActor
     private static func apply(_ direct: Bool) async -> DirectOutcome {
-        let work = Task { await TunnelManager.shared.setDirectMode(direct, from: .shortcut) }
-        let settled: DirectOutcome? = await withTaskGroup(
-            of: DirectOutcome?.self
-        ) { group in
-            group.addTask { await work.value }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: 12 * NSEC_PER_SEC)
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
-        }
-        return settled ?? .unconfirmed("The tunnel did not answer in time. Check the app.")
+        // `init` only kicks off an unawaited load, and a background-launched
+        // intent asks before it lands.
+        await TunnelManager.shared.ensureManagerLoaded()
+        return await TunnelManager.shared.setDirectMode(direct, from: .shortcut)
     }
 }
 

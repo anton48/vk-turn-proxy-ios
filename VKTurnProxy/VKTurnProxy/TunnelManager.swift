@@ -1233,7 +1233,7 @@ class TunnelManager: ObservableObject {
 
         guard let manager = self.manager else {
             note("no VPN manager loaded — ignored")
-            return .notConnected
+            return .noManager
         }
         guard manager.connection.status == .connected else {
             // Off a live tunnel the change would be pointless: the next connect
@@ -1767,6 +1767,14 @@ class TunnelManager: ObservableObject {
     }
 
     // MARK: - Private
+
+    /// Wait for the VPN manager, loading it if `init`'s unawaited Task has not
+    /// got there yet. A background-launched App Intent touches `shared` and asks
+    /// immediately, so it loses that race almost every time.
+    func ensureManagerLoaded() async {
+        if manager != nil { return }
+        await loadManager()
+    }
 
     private func loadManager() async {
         do {

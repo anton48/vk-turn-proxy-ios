@@ -2796,6 +2796,7 @@ do {
     check(DirectOutcome.confirmed.automationFailure == nil,
           "a confirmed switch is the only success")
     for (outcome, what) in [(DirectOutcome.notConnected, "not connected"),
+                            (.noManager, "no VPN profile loaded"),
                             (.busy, "already in flight"),
                             (.failed("the profile could not be saved"), "a failed save"),
                             (.unconfirmed("no answer from the tunnel"), "an unconfirmed switch")] {
@@ -2805,10 +2806,24 @@ do {
     check(DirectOutcome.failed("saving was refused").automationFailure == "saving was refused"
           && DirectOutcome.unconfirmed("no answer").automationFailure == "no answer",
           "…and the reason travels through rather than being replaced by a generic one")
+    // 🚨 THESE TWO ARE NOT THE SAME SITUATION. `init` only starts an unawaited
+    // load, so a background-launched intent can find no manager while the tunnel
+    // is up — and answering "not connected" there is a lie about a live tunnel.
+    check(DirectOutcome.noManager.automationFailure != DirectOutcome.notConnected.automationFailure,
+          "🚨 no profile loaded and not connected say DIFFERENT things — they were collapsed "
+          + "into one answer, which told an automation the live tunnel was down")
 }
 
 // 39. 🚨 THE INTENT'S THREE STRUCTURAL DECISIONS, none of which shows up in a run.
 do {
+    func inOrder(_ body: String, _ steps: [String]) -> Bool {
+        var from = body.startIndex
+        for step in steps {
+            guard let r = body.range(of: step, range: from..<body.endIndex) else { return false }
+            from = r.upperBound
+        }
+        return true
+    }
     let rs = codeWithoutComments("VKTurnProxy/VKTurnProxy/RoutingShortcuts.swift")
     check(rs.contains("struct SetDirectRoutingIntent: AppIntent") && !rs.contains("LiveActivityIntent"),
           "🚨 it is an AppIntent, NOT a LiveActivityIntent — that one forwards to a handler the "
@@ -2817,11 +2832,19 @@ do {
     check(rs.contains("static var openAppWhenRun: Bool = false"),
           "🚨 …and it does not open the app: an automation fires while the user is opening "
           + "something else")
-    check(rs.contains("let first = await group.next() ?? nil\n            group.cancelAll()")
-          && !rs.contains("work.cancel()"),
-          "🚨 …and the timeout does NOT cancel the work — an unconfirmed switch back to the "
-          + "tunnel is a possible leak whose repair is a full reconnect, and it has to finish; "
-          + "what expires is only our willingness to report on it")
+    // 🚨 AND IT AWAITS STRAIGHT THROUGH. An earlier version boxed the await at
+    // 12 s and let the work run on, which has it backwards: with no scene the
+    // process lives exactly as long as perform() has not returned, so an early
+    // return is what abandons the leak repair — a reconnect that outlasts any
+    // box worth putting on a Shortcut. The form that closes the class is having
+    // no concurrency machinery here at all.
+    check(!rs.contains("withTaskGroup") && !rs.contains("Task.sleep") && !rs.contains("Task {"),
+          "🚨 …and nothing races or boxes the call: with openAppWhenRun false the process is "
+          + "alive only while perform() runs, so returning early is what kills the leak repair")
+    check(inOrder(rs, ["ensureManagerLoaded()", "setDirectMode("]),
+          "🚨 …and it waits for the VPN manager BEFORE asking — init only kicks off an unawaited "
+          + "load, and a background-launched intent asks first and would be told, wrongly, that "
+          + "the tunnel is not connected")
     check(rs.contains("from: .shortcut"),
           "the change is attributed to Shortcuts in the log, like every other call site")
 }

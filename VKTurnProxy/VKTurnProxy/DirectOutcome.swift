@@ -10,6 +10,9 @@ import Foundation
 
 enum DirectOutcome: Equatable {
     case confirmed
+    /// No VPN profile is loaded yet. NOT the same as `notConnected`, and saying
+    /// so would be a lie to an automation running against a live tunnel.
+    case noManager
     case notConnected
     case busy
     case failed(String)
@@ -25,6 +28,8 @@ enum DirectOutcome: Equatable {
         switch self {
         case .confirmed:
             return nil
+        case .noManager:
+            return "VK Turn Proxy could not read its VPN configuration."
         case .notConnected:
             return "VK Turn Proxy is not connected, so there is nothing to route around."
         case .busy:
