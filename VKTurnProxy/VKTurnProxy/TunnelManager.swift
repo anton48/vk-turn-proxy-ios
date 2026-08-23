@@ -1218,31 +1218,33 @@ class TunnelManager: ObservableObject {
     enum DirectChangeSource: String {
         case advancedSwitch = "the Advanced switch"
         case liveActivity = "the Live Activity"
+        case shortcut = "Shortcuts"
     }
 
     /// 🚨 `from` is REQUIRED, deliberately. A defaulted parameter is a parameter
     /// call sites forget, and the whole point is that every call site says which
     /// surface it is — a compile error at each of them is the only thing that
     /// keeps that true as sites are added.
-    func setDirectMode(_ direct: Bool, from source: DirectChangeSource) async {
+    @discardableResult
+    func setDirectMode(_ direct: Bool, from source: DirectChangeSource) async -> DirectOutcome {
         func note(_ s: String) {
             SharedLogger.shared.log("[App] direct: \(s) [asked from \(source.rawValue)]")
         }
 
         guard let manager = self.manager else {
             note("no VPN manager loaded — ignored")
-            return
+            return .notConnected
         }
         guard manager.connection.status == .connected else {
             // Off a live tunnel the change would be pointless: the next connect
             // rebuilds the profile from scratch and puts IAN back.
             note("tunnel is not connected (status=\(manager.connection.status.rawValue)) — ignored")
             refreshDirectMode()
-            return
+            return .notConnected
         }
         if directModeBusy {
             note("a change is already in flight — ignored")
-            return
+            return .busy
         }
         directModeBusy = true
         defer { directModeBusy = false }
@@ -1256,7 +1258,7 @@ class TunnelManager: ObservableObject {
             try await manager.loadFromPreferences()
             guard let proto = manager.protocolConfiguration as? NETunnelProviderProtocol else {
                 note("protocolConfiguration is not an NETunnelProviderProtocol — aborting")
-                return
+                return .failed("The VPN profile could not be read.")
             }
             // 🚨 `proto` IS A CLASS, so the two assignments below mutate the very
             // object `manager.protocolConfiguration` — and `refreshDirectMode()`
@@ -1292,7 +1294,7 @@ class TunnelManager: ObservableObject {
             // fixes anything else that moved. Only then may the switch refresh.
             try? await manager.loadFromPreferences()
             refreshDirectMode()
-            return
+            return .failed(directModeError ?? "Could not switch routing.")
         }
 
         // 🎯 THE EXTENSION ALSO WATCHES THE PROFILE ITSELF (KVO on
@@ -1324,6 +1326,7 @@ class TunnelManager: ObservableObject {
             directModeError = nil
             note("confirmed by the extension: routes are "
                 + (actual ? "DIRECT — traffic goes around the tunnel" : "tunnelled"))
+            return .confirmed
         case .applied(let actual):
             note("🚨 the extension reports the routes are \(actual ? "DIRECT" : "tunnelled") "
                 + "while the profile now asks for \(direct ? "DIRECT" : "tunnelled")")
@@ -1349,6 +1352,7 @@ class TunnelManager: ObservableObject {
                     ? "Routing did not switch — traffic is still going through the tunnel."
                     : "Routing did not switch back — traffic was still going around the tunnel.",
                 from: source)
+            return .unconfirmed(directModeError ?? "Routing could not be confirmed.")
         case .silent:
             note("⚠️ the extension did not answer, twice — the state of the routes is UNKNOWN")
             await directChangeUnconfirmed(
@@ -1357,6 +1361,7 @@ class TunnelManager: ObservableObject {
                     ? "No answer from the tunnel — routing may not have switched."
                     : "No answer from the tunnel — routing may still be bypassed.",
                 from: source)
+            return .unconfirmed(directModeError ?? "Routing could not be confirmed.")
         }
     }
 

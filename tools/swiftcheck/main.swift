@@ -2784,6 +2784,48 @@ do {
           + "selection there satisfies every fixture and erases the distinction entirely")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+print("DIRECT mode in Shortcuts (GitHub #78)")
+
+// 38. 🚨 ONLY A CONFIRMATION IS SUCCESS.
+//
+//     Three of the five outcomes leave `directModeError` unset — the early exits
+//     take it — so an intent that reported failure by looking for a published
+//     error would answer "done" to an automation that changed nothing.
+do {
+    check(DirectOutcome.confirmed.automationFailure == nil,
+          "a confirmed switch is the only success")
+    for (outcome, what) in [(DirectOutcome.notConnected, "not connected"),
+                            (.busy, "already in flight"),
+                            (.failed("the profile could not be saved"), "a failed save"),
+                            (.unconfirmed("no answer from the tunnel"), "an unconfirmed switch")] {
+        check((outcome.automationFailure ?? "").isEmpty == false,
+              "🚨 \(what) fails the automation, with something to read")
+    }
+    check(DirectOutcome.failed("saving was refused").automationFailure == "saving was refused"
+          && DirectOutcome.unconfirmed("no answer").automationFailure == "no answer",
+          "…and the reason travels through rather than being replaced by a generic one")
+}
+
+// 39. 🚨 THE INTENT'S THREE STRUCTURAL DECISIONS, none of which shows up in a run.
+do {
+    let rs = codeWithoutComments("VKTurnProxy/VKTurnProxy/RoutingShortcuts.swift")
+    check(rs.contains("struct SetDirectRoutingIntent: AppIntent") && !rs.contains("LiveActivityIntent"),
+          "🚨 it is an AppIntent, NOT a LiveActivityIntent — that one forwards to a handler the "
+          + "app installs at launch, which is a silent no-op when an automation fires while the "
+          + "app is not running")
+    check(rs.contains("static var openAppWhenRun: Bool = false"),
+          "🚨 …and it does not open the app: an automation fires while the user is opening "
+          + "something else")
+    check(rs.contains("let first = await group.next() ?? nil\n            group.cancelAll()")
+          && !rs.contains("work.cancel()"),
+          "🚨 …and the timeout does NOT cancel the work — an unconfirmed switch back to the "
+          + "tunnel is a possible leak whose repair is a full reconnect, and it has to finish; "
+          + "what expires is only our willingness to report on it")
+    check(rs.contains("from: .shortcut"),
+          "the change is attributed to Shortcuts in the log, like every other call site")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")
