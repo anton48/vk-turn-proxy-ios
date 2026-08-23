@@ -16,8 +16,8 @@ enum DirectOutcome: Equatable {
     case notConnected
     case busy
     case failed(String)
-    /// Asked for, not confirmed. For OFF this has already started the ~107 s
-    /// reconnect that repairs a possible leak.
+    /// Asked for, not confirmed. For OFF, `switchAndReconnect` — the repair for
+    /// a possible leak — has already been awaited by the time this is returned.
     case unconfirmed(String)
 
     /// 🚨 The message to fail an automation with, or nil ONLY when the extension
