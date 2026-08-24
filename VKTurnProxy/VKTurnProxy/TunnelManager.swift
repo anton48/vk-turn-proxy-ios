@@ -1768,10 +1768,17 @@ class TunnelManager: ObservableObject {
 
     // MARK: - Private
 
-    /// Whether a VPN profile was found. Distinguishes "no profile" from "not
-    /// connected", which `status` alone cannot: with no manager it is still its
-    /// initial `.disconnected`.
-    var hasManager: Bool { manager != nil }
+    /// The tunnel's status read from the connection ITSELF, and nil when no
+    /// profile is loaded.
+    ///
+    /// 🚨 NOT the `@Published status` mirror. That is written at attach and then
+    /// only by `NEVPNStatusDidChange`, which a suspended process does not
+    /// receive — so an intent waking a warm app can read a value from hours ago,
+    /// and `ensureManagerLoaded` does not help because the manager is already
+    /// there. nil also distinguishes "no profile" from "not connected", which
+    /// the mirror cannot: with no manager it is still its initial
+    /// `.disconnected`. *(User-caught.)*
+    var liveStatus: NEVPNStatus? { manager?.connection.status }
 
     /// The load `init` starts, so a second caller joins it instead of racing it.
     private var managerLoad: Task<Void, Never>?

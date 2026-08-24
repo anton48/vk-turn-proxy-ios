@@ -2904,14 +2904,20 @@ do {
     // 🚨 COUNT PLUS ORDER. Order alone is satisfied by a SECOND read after the
     // load, which is exactly what the sabotage for this check did — the lesson
     // from two days ago, repeated in the check written to carry it.
-    check(body.components(separatedBy: "TunnelManager.shared.status").count - 1 == 1
-          && inOrder(body, ["ensureManagerLoaded()", "TunnelManager.shared.status"]),
+    check(body.components(separatedBy: "liveStatus").count - 1 == 1
+          && inOrder(body, ["ensureManagerLoaded()", "liveStatus"]),
           "🚨 it reads the status ONCE, and after waiting for the manager — init only starts an "
           + "unawaited load, and a background-launched intent would report a LIVE tunnel as "
           + "Disconnected")
-    check(inOrder(body, ["hasManager", "throw"]),
-          "🚨 …and an unreadable profile THROWS rather than answering Disconnected, which would "
-          + "be a guess dressed as a fact")
+    // 🚨 …AND FROM THE CONNECTION, NOT THE MIRROR. `@Published status` is written
+    // at attach and then only by NEVPNStatusDidChange, which a suspended process
+    // never receives — a warm launch would answer with a status from hours ago,
+    // and ensureManagerLoaded cannot help because the manager is already there.
+    check(!body.contains("TunnelManager.shared.status"),
+          "🚨 …and never from the published mirror, which a suspended app stops being told about")
+    check(inOrder(body, ["guard let status", "throw"]),
+          "🚨 …and no profile THROWS rather than answering Disconnected, which would be a guess "
+          + "dressed as a fact")
     check(body.contains("static var openAppWhenRun: Bool = false")
           && body.contains("IntentAuthenticationPolicy = .alwaysAllowed"),
           "…and both policies are stated rather than inherited")

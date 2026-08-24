@@ -112,12 +112,15 @@ struct GetConnectionStatusIntent: AppIntent {
         // unawaited load, and a background-launched intent asks first — which
         // would report a live tunnel as Disconnected.
         await TunnelManager.shared.ensureManagerLoaded()
-        guard await TunnelManager.shared.hasManager else {
-            // The profile could not be read, so the state is unknown. Answering
-            // "Disconnected" would be a guess dressed as a fact.
+        // 🚨 `liveStatus`, not the published mirror: that one is fed by
+        // notifications a suspended process never received, so a warm launch can
+        // answer with a status from hours ago. nil means the profile could not be
+        // read, and answering "Disconnected" there would be a guess dressed as a
+        // fact.
+        guard let status = await TunnelManager.shared.liveStatus else {
             throw RoutingIntentError.message("VK Turn Proxy could not read its VPN configuration.")
         }
-        return .result(value: ConnectionReport.text(for: await TunnelManager.shared.status))
+        return .result(value: ConnectionReport.text(for: status))
     }
 }
 
