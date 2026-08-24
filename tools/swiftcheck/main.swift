@@ -2921,6 +2921,28 @@ do {
     check(body.contains("static var openAppWhenRun: Bool = false")
           && body.contains("IntentAuthenticationPolicy = .alwaysAllowed"),
           "…and both policies are stated rather than inherited")
+
+    // 🚨 EVERY intent is surfaced. `AppShortcutsProvider` is what fills the app's
+    // page under Shortcuts › Library › Apps — an intent missing from it is
+    // invisible THERE while still turning up in the action search, which is how
+    // Get Connection Status shipped. Derived from the declarations, so a new
+    // intent that nobody surfaces reddens without anyone editing this check.
+    let declared = rs.components(separatedBy: "struct ").dropFirst().compactMap { part -> String? in
+        guard let colon = part.firstIndex(of: ":") else { return nil }
+        let name = String(part[part.startIndex..<colon])
+        return name.hasSuffix("Intent") ? name : nil
+    }
+    check(declared.count >= 2, "found \(declared.count) intents — the sweep below would be thin")
+    guard let ps = rs.range(of: "struct RoutingAppShortcuts") else {
+        check(false, "could not find the AppShortcutsProvider")
+        exit(1)
+    }
+    let provider = String(rs[ps.upperBound...])
+    for name in declared {
+        check(provider.contains("intent: \(name)("),
+              "🚨 \(name) has an AppShortcut entry — without one it is missing from the app's "
+              + "page in the Shortcuts library, however findable it is in the action search")
+    }
 }
 
 print("")

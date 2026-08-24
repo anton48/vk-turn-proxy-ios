@@ -123,11 +123,17 @@ struct GetConnectionStatusIntent: AppIntent {
         guard let status = await TunnelManager.shared.liveStatus else {
             throw RoutingIntentError.message("VK Turn Proxy could not read its VPN configuration.")
         }
-        return .result(value: ConnectionReport.text(for: status))
+        let text = ConnectionReport.text(for: status)
+        // The value is what a shortcut branches on; the dialog is what a spoken
+        // invocation actually hears back.
+        return .result(value: text, dialog: "\(text)")
     }
 }
 
-/// Two phrases for one intent, which is what "two buttons" means here.
+/// 🚨 EVERY intent in this file gets an entry. This provider is what fills the
+/// app's page under Shortcuts › Library › Apps, so an action left out of it is
+/// invisible there even though it is in the action search — which is exactly how
+/// Get Connection Status shipped. *(User-caught.)*
 @available(iOS 16.0, *)
 struct RoutingAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
@@ -142,6 +148,12 @@ struct RoutingAppShortcuts: AppShortcutsProvider {
             phrases: ["Route through the VPN in \(.applicationName)"],
             shortTitle: "Use VPN",
             systemImageName: "lock.shield"
+        )
+        AppShortcut(
+            intent: GetConnectionStatusIntent(),
+            phrases: ["Is \(.applicationName) connected"],
+            shortTitle: "Connection Status",
+            systemImageName: "antenna.radiowaves.left.and.right"
         )
     }
 }
