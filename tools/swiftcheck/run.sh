@@ -52,6 +52,7 @@ SOURCES=(
     "$S/SessionServer.swift"
     "$S/ConnectionLinkInbox.swift"
     "$S/DirectOutcome.swift"
+    "$S/ConnectionReport.swift"
 )
 
 require_tracked "$0" "${SOURCES[@]}"

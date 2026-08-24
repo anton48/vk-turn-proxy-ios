@@ -91,6 +91,19 @@ func codeWithoutComments(_ path: String) -> String {
         .joined(separator: "\n")
 }
 
+/// Do these snippets appear in this order? 🚨 Only meaningful beside a COUNT:
+/// a forward scan is satisfied by a duplicate between two markers.
+/// Defined ONCE — it had been copied into three `do` blocks, which is the
+/// second anchor problem in a different dress.
+func inOrder(_ body: String, _ steps: [String]) -> Bool {
+    var from = body.startIndex
+    for step in steps {
+        guard let r = body.range(of: step, range: from..<body.endIndex) else { return false }
+        from = r.upperBound
+    }
+    return true
+}
+
 print("UplinkPace — the production reset, and the shipped rate")
 
 // 5. 🚨 TWO DIAGNOSTIC REPRESENTATIONS, NOT ONE. Builds 296-298 wrote the Bool
@@ -2408,14 +2421,6 @@ do {
     // *(User-caught, fourth round on this one function: presence → order →
     // order in both directions → count. Each round a level finer, and the shape
     // of the previous fix is what admitted the next defect.)*
-    func inOrder(_ body: String, _ steps: [String]) -> Bool {
-        var from = body.startIndex
-        for step in steps {
-            guard let r = body.range(of: step, range: from..<body.endIndex) else { return false }
-            from = r.upperBound
-        }
-        return true
-    }
     func countIn(_ body: String, _ needle: String) -> Int {
         body.components(separatedBy: needle).count - 1
     }
@@ -2824,14 +2829,6 @@ do {
 
 // 39. 🚨 THE INTENT'S THREE STRUCTURAL DECISIONS, none of which shows up in a run.
 do {
-    func inOrder(_ body: String, _ steps: [String]) -> Bool {
-        var from = body.startIndex
-        for step in steps {
-            guard let r = body.range(of: step, range: from..<body.endIndex) else { return false }
-            from = r.upperBound
-        }
-        return true
-    }
     let rs = codeWithoutComments("VKTurnProxy/VKTurnProxy/RoutingShortcuts.swift")
     check(rs.contains("struct SetDirectRoutingIntent: AppIntent") && !rs.contains("LiveActivityIntent"),
           "🚨 it is an AppIntent, NOT a LiveActivityIntent — that one forwards to a handler the "
@@ -2878,6 +2875,46 @@ do {
           "🚨 …and the manager load is SINGLE-FLIGHT, joined rather than restarted, with "
           + "ensureManagerLoaded its ONLY caller: the first repair of the race started a second "
           + "concurrent loadAllFromPreferences instead of awaiting the one already running")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+print("Get Connection Status")
+
+// 40. WHAT AN AUTOMATION IS TOLD ABOUT THE TUNNEL.
+do {
+    check(ConnectionReport.text(for: .connected) == "Connected"
+          && ConnectionReport.text(for: .disconnected) == "Disconnected",
+          "the two states the action promises")
+    check(ConnectionReport.text(for: .reasserting) == ConnectionReport.connected,
+          "⚖️ reasserting is CONNECTED — the session is up and re-establishing a path, and "
+          + "calling that disconnected would have an automation tear down a tunnel that is fine")
+    check(ConnectionReport.text(for: .connecting) == ConnectionReport.disconnected
+          && ConnectionReport.text(for: .disconnecting) == ConnectionReport.disconnected
+          && ConnectionReport.text(for: .invalid) == ConnectionReport.disconnected,
+          "🚨 …and nothing else is: the question a shortcut asks is whether traffic is going "
+          + "through the tunnel NOW, which connecting and disconnecting are not")
+
+    let rs = codeWithoutComments("VKTurnProxy/VKTurnProxy/RoutingShortcuts.swift")
+    guard let d = rs.range(of: "struct GetConnectionStatusIntent"),
+          let e = rs.range(of: "\n}", range: d.upperBound..<rs.endIndex) else {
+        check(false, "could not isolate GetConnectionStatusIntent — the checks below would be vacuous")
+        exit(1)
+    }
+    let body = String(rs[d.upperBound..<e.lowerBound])
+    // 🚨 COUNT PLUS ORDER. Order alone is satisfied by a SECOND read after the
+    // load, which is exactly what the sabotage for this check did — the lesson
+    // from two days ago, repeated in the check written to carry it.
+    check(body.components(separatedBy: "TunnelManager.shared.status").count - 1 == 1
+          && inOrder(body, ["ensureManagerLoaded()", "TunnelManager.shared.status"]),
+          "🚨 it reads the status ONCE, and after waiting for the manager — init only starts an "
+          + "unawaited load, and a background-launched intent would report a LIVE tunnel as "
+          + "Disconnected")
+    check(inOrder(body, ["hasManager", "throw"]),
+          "🚨 …and an unreadable profile THROWS rather than answering Disconnected, which would "
+          + "be a guess dressed as a fact")
+    check(body.contains("static var openAppWhenRun: Bool = false")
+          && body.contains("IntentAuthenticationPolicy = .alwaysAllowed"),
+          "…and both policies are stated rather than inherited")
 }
 
 print("")

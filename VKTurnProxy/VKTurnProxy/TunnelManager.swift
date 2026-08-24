@@ -1768,6 +1768,11 @@ class TunnelManager: ObservableObject {
 
     // MARK: - Private
 
+    /// Whether a VPN profile was found. Distinguishes "no profile" from "not
+    /// connected", which `status` alone cannot: with no manager it is still its
+    /// initial `.disconnected`.
+    var hasManager: Bool { manager != nil }
+
     /// The load `init` starts, so a second caller joins it instead of racing it.
     private var managerLoad: Task<Void, Never>?
 

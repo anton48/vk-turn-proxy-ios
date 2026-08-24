@@ -91,6 +91,36 @@ enum RoutingIntentError: Swift.Error, CustomLocalizedStringResourceConvertible {
     }
 }
 
+/// Report whether traffic is going through the tunnel right now, so a shortcut
+/// can branch on it.
+@available(iOS 16.0, *)
+struct GetConnectionStatusIntent: AppIntent {
+    static var title: LocalizedStringResource = "Get Connection Status"
+    static var description = IntentDescription("Returns Connected or Disconnected.")
+    static var openAppWhenRun: Bool = false
+
+    /// ⚖️ STATED, not inherited. Unlike the bypass action this only READS, and
+    /// whether a VPN is up is not worth locking behind an unlock prompt — an
+    /// automation that checks the tunnel before doing something else would then
+    /// fail on a locked phone for no benefit.
+    static var authenticationPolicy: IntentAuthenticationPolicy = .alwaysAllowed
+
+    init() {}
+
+    func perform() async throws -> some IntentResult & ReturnsValue<String> {
+        // 🚨 The same race the bypass action lost: `init` only starts an
+        // unawaited load, and a background-launched intent asks first — which
+        // would report a live tunnel as Disconnected.
+        await TunnelManager.shared.ensureManagerLoaded()
+        guard await TunnelManager.shared.hasManager else {
+            // The profile could not be read, so the state is unknown. Answering
+            // "Disconnected" would be a guess dressed as a fact.
+            throw RoutingIntentError.message("VK Turn Proxy could not read its VPN configuration.")
+        }
+        return .result(value: ConnectionReport.text(for: await TunnelManager.shared.status))
+    }
+}
+
 /// Two phrases for one intent, which is what "two buttons" means here.
 @available(iOS 16.0, *)
 struct RoutingAppShortcuts: AppShortcutsProvider {
