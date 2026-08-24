@@ -2921,6 +2921,14 @@ do {
     check(body.contains("static var openAppWhenRun: Bool = false")
           && body.contains("IntentAuthenticationPolicy = .alwaysAllowed"),
           "…and both policies are stated rather than inherited")
+    // 🚨 A DIALOG THE RETURN TYPE DOES NOT ADVERTISE IS NEVER SHOWN.
+    // `.result(value:dialog:)` compiles against a plain `ReturnsValue`, and the
+    // action then runs, returns its value and displays NOTHING — in every state,
+    // with no warning. The error path still shows, which is what made it look
+    // like the intent was not running at all. *(User-caught on device.)*
+    check(!body.contains("dialog:") || body.contains("ProvidesDialog"),
+          "🚨 …and an intent that passes a dialog DECLARES ProvidesDialog in its return type, or "
+          + "the dialog is silently dropped")
 
     // 🚨 EVERY intent is surfaced. `AppShortcutsProvider` is what fills the app's
     // page under Shortcuts › Library › Apps — an intent missing from it is

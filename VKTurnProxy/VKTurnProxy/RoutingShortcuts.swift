@@ -110,7 +110,12 @@ struct GetConnectionStatusIntent: AppIntent {
 
     init() {}
 
-    func perform() async throws -> some IntentResult & ReturnsValue<String> {
+    /// 🚨 `ProvidesDialog` IS PART OF THE RETURN TYPE, not just an argument.
+    /// `.result(value:dialog:)` compiles against a plain `ReturnsValue`, and the
+    /// dialog is then simply never shown — the action runs, returns its value and
+    /// displays nothing at all, in every state. *(User-caught on device: the card
+    /// did nothing whether connected or not.)*
+    func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
         // 🚨 The same race the bypass action lost: `init` only starts an
         // unawaited load, and a background-launched intent asks first — which
         // would report a live tunnel as Disconnected.
@@ -124,9 +129,9 @@ struct GetConnectionStatusIntent: AppIntent {
             throw RoutingIntentError.message("VK Turn Proxy could not read its VPN configuration.")
         }
         let text = ConnectionReport.text(for: status)
-        // The value is what a shortcut branches on; the dialog is what a spoken
-        // invocation actually hears back.
-        return .result(value: text, dialog: "\(text)")
+        // The value is what a shortcut branches on; the dialog is what a tapped
+        // card or a spoken invocation actually shows back.
+        return .result(value: text, dialog: IntentDialog(stringLiteral: text))
     }
 }
 
