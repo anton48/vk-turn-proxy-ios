@@ -91,12 +91,15 @@ enum RoutingIntentError: Swift.Error, CustomLocalizedStringResourceConvertible {
     }
 }
 
-/// Report whether traffic is going through the tunnel right now, so a shortcut
-/// can branch on it.
+/// Report whether a tunnel SESSION exists, so a shortcut can branch on it.
+///
+/// ⚖️ A session, not a confirmed datapath: `.reasserting` is a live session
+/// re-establishing its path. → ConnectionReport for why the two-value answer
+/// carries the first question and not the second.
 @available(iOS 16.0, *)
 struct GetConnectionStatusIntent: AppIntent {
     static var title: LocalizedStringResource = "Get Connection Status"
-    static var description = IntentDescription("Returns Connected or Disconnected.")
+    static var description = IntentDescription("Returns Connected or Disconnected. Connected means a VPN session exists — it does not confirm that traffic is crossing it.")
     static var openAppWhenRun: Bool = false
 
     /// ⚖️ STATED, not inherited. Unlike the bypass action this only READS, and

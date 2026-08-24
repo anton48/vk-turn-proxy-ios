@@ -2891,8 +2891,8 @@ do {
     check(ConnectionReport.text(for: .connecting) == ConnectionReport.disconnected
           && ConnectionReport.text(for: .disconnecting) == ConnectionReport.disconnected
           && ConnectionReport.text(for: .invalid) == ConnectionReport.disconnected,
-          "🚨 …and nothing else is: the question a shortcut asks is whether traffic is going "
-          + "through the tunnel NOW, which connecting and disconnecting are not")
+          "🚨 …and nothing else is: the answer is about a SESSION existing, and connecting has "
+          + "none yet while disconnecting is losing one")
 
     let rs = codeWithoutComments("VKTurnProxy/VKTurnProxy/RoutingShortcuts.swift")
     guard let d = rs.range(of: "struct GetConnectionStatusIntent"),

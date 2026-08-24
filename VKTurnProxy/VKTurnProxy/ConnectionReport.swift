@@ -16,9 +16,8 @@ enum ConnectionReport {
     /// not claim a confirmed datapath — `.reasserting` is a live session
     /// re-establishing its path, and packets may not be crossing it at the
     /// instant this is read. Those are different questions and the two-value
-    /// answer can only carry one of them. *(An earlier version of this comment
-    /// said "is my traffic going through the tunnel right now", which is the
-    /// question it CANNOT answer. User-caught.)*
+    /// answer can only carry one of them, and the tempting phrasing — asking
+    /// whether traffic is crossing the tunnel — is the one it cannot deliver.
     ///
     /// `.reasserting` is reported as connected anyway because the alternative is
     /// worse: a hiccup would read as a gap and have an automation tear down a
