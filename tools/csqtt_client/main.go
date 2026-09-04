@@ -36,7 +36,6 @@ import (
 	"crypto/rand"
 
 	"github.com/pion/logging"
-	"github.com/pion/turn/v5"
 
 	"github.com/cacggghp/vk-turn-proxy/pkg/csqtt"
 	"github.com/cacggghp/vk-turn-proxy/pkg/proxy"
@@ -60,6 +59,18 @@ func main() {
 	verbose := flag.Bool("v", false, "hex-dump every datagram")
 	turnTransport := flag.String("turn-transport", "udp", "control transport to the VK relay: udp (the reference client's default) or tcp (what the iOS app ships)")
 	turnDebug := flag.Bool("turn-debug", false, "trace every STUN/TURN transaction (pion logger at trace level)")
+	tunMode := flag.Bool("tun", false, "stage 3: bring up a real tun with -workers workers and route -route hosts through it (FreeBSD)")
+	// 🚨 NOT "tun": wireguard-go creates tun0 and RENAMES it to the requested
+	// name, and renaming to the bare clone prefix double-faults the FreeBSD
+	// 15.1 kernel ("tun0: changing name to 'tun'" → "panic: double fault",
+	// 2026-09-04, the whole host rebooted). A normal name like wg0/csqtt0 is
+	// the path every wireguard-go user takes.
+	tunName := flag.String("tun-name", "csqtt0", "tun interface name; never a bare clone prefix such as \"tun\"")
+	mtu := flag.Int("mtu", 1300, "tunnel MTU (the server's TUN is 1300)")
+	routes := flag.String("route", "", "comma-separated hosts to route through the tunnel (IPs or names, resolved once)")
+	duration := flag.Duration("duration", 0, "-tun: stop after this long (0 = until Ctrl-C)")
+	statsEvery := flag.Duration("stats-every", 10*time.Second, "-tun: stats line interval")
+	allocsPerCred := flag.Int("allocs-per-cred", 8, "-tun: workers served by one minted VK credential before minting the next")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -92,6 +103,38 @@ func main() {
 	}
 	log.Printf("server %s → %s  device=%s gen=%d salt=%s mode=%s revision=%s", *server, peer, *deviceID, *generation, *salt, *modeName, *revision)
 
+	if *tunMode {
+		var manual *proxy.TURNCreds
+		if *turnCreds != "" {
+			if manual, err = parseManualCreds(*turnCreds); err != nil {
+				log.Fatal(err)
+			}
+		}
+		var hosts []string
+		for _, h := range strings.Split(*routes, ",") {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				continue
+			}
+			ips, err := net.LookupIP(h)
+			if err != nil {
+				log.Fatalf("resolve -route %s: %v", h, err)
+			}
+			for _, ip := range ips {
+				if ip4 := ip.To4(); ip4 != nil {
+					hosts = append(hosts, ip4.String())
+					break
+				}
+			}
+		}
+		os.Exit(runTunnel(ctx, tunnelOptions{
+			server: peer, password: *password, deviceID: *deviceID, generation: *generation, salt: *salt,
+			mode: mode, revision: *revision, workers: *workers, turnTransport: *turnTransport, turnDebug: *turnDebug,
+			vkLink: *vkLink, manualCreds: manual, allocsPerCred: *allocsPerCred,
+			tunName: *tunName, mtu: *mtu, routes: hosts, duration: *duration, statsEvery: *statsEvery,
+		}))
+	}
+
 	// ── credentials ──────────────────────────────────────────────────────
 	var creds *proxy.TURNCreds
 	if *turnCreds != "" {
@@ -107,11 +150,17 @@ func main() {
 	log.Printf("turn: relay %s (of %d) user=%s", creds.Address, len(creds.Addresses), creds.Username)
 
 	// ── allocation ───────────────────────────────────────────────────────
-	relay, closeRelay, err := allocate(creds, peer, *turnTransport, *turnDebug)
+	lvl := logging.LogLevelWarn
+	if *turnDebug {
+		lvl = logging.LogLevelTrace
+	}
+	t0 := time.Now()
+	relay, err := csqtt.DialRelay(csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: creds.Address}, peer, *turnTransport, lvl)
 	if err != nil {
 		log.Fatalf("allocate: %v", err)
 	}
-	defer closeRelay()
+	defer relay.Close()
+	log.Printf("turn: allocated %s in %d ms (%s control, local %s)", relay.Conn.LocalAddr(), time.Since(t0).Milliseconds(), *turnTransport, relay.Local)
 
 	// ── obfuscation ──────────────────────────────────────────────────────
 	key, err := csqtt.DeriveKey(*password)
@@ -127,7 +176,7 @@ func main() {
 		log.Fatal(err)
 	}
 	s := &session{
-		relay: relay, peer: peer, cipher: cipher, wrapper: wrapper, mode: mode,
+		relay: relay.Conn, peer: peer, cipher: cipher, wrapper: wrapper, mode: mode,
 		inbound: make(chan []byte, 256), verbose: *verbose,
 		wireBuf: make([]byte, 0, 2048),
 	}
@@ -361,88 +410,6 @@ func (s *session) idle(ctx context.Context, d time.Duration) {
 			}
 		}
 	}
-}
-
-// ─── TURN ─────────────────────────────────────────────────────────────────
-
-// allocate mirrors the app's UDP-control TURN setup: a local UDP socket, a
-// pion client with VK's realm, an allocation, and a permission for the
-// csqtt server. pion binds a channel lazily on the first write.
-func allocate(creds *proxy.TURNCreds, peer *net.UDPAddr, transport string, debug bool) (net.PacketConn, func(), error) {
-	var ctl net.PacketConn
-	switch transport {
-	case "udp":
-		// udp4, not udp: on FreeBSD a plain "udp" listener is a dual-stack [::]
-		// socket, pion then infers an IPv6 address family and asks the relay for
-		// an IPv6 allocation, and VK's relay answers that with silence.
-		uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-		if err != nil {
-			return nil, nil, fmt.Errorf("local udp: %w", err)
-		}
-		ctl = uc
-	case "tcp":
-		tcp, err := (&net.Dialer{Timeout: 5 * time.Second}).Dial("tcp4", creds.Address)
-		if err != nil {
-			return nil, nil, fmt.Errorf("dial tcp to relay: %w", err)
-		}
-		ctl = turn.NewSTUNConn(tcp)
-	default:
-		return nil, nil, fmt.Errorf("unknown -turn-transport %q", transport)
-	}
-	uc := ctl
-	lf := logging.NewDefaultLoggerFactory()
-	lf.DefaultLogLevel = logging.LogLevelWarn
-	if debug {
-		lf.DefaultLogLevel = logging.LogLevelTrace
-	}
-	tc, err := turn.NewClient(&turn.ClientConfig{
-		TURNServerAddr: creds.Address,
-		Conn:           uc,
-		Username:       creds.Username,
-		Password:       creds.Password,
-		Realm:          "okcdn.ru",
-		Software:       "vk-turn-srtp",
-		LoggerFactory:  lf,
-		// Stated, never inferred from the socket (issue #39 in the app): the
-		// relay must match the peer's family or the request is refused.
-		RequestedAddressFamily: addrFamilyFor(peer),
-	})
-	if err != nil {
-		_ = uc.Close()
-		return nil, nil, fmt.Errorf("turn.NewClient: %w", err)
-	}
-	if err := tc.Listen(); err != nil {
-		tc.Close()
-		_ = uc.Close()
-		return nil, nil, fmt.Errorf("turn listen: %w", err)
-	}
-	t0 := time.Now()
-	relay, err := tc.Allocate()
-	if err != nil {
-		tc.Close()
-		_ = uc.Close()
-		return nil, nil, fmt.Errorf("turn allocate: %w", err)
-	}
-	if err := tc.CreatePermission(peer); err != nil {
-		_ = relay.Close()
-		tc.Close()
-		_ = uc.Close()
-		return nil, nil, fmt.Errorf("turn create permission: %w", err)
-	}
-	log.Printf("turn: allocated %s in %d ms (%s control, local %s)", relay.LocalAddr(), time.Since(t0).Milliseconds(), transport, uc.LocalAddr())
-	closeAll := func() {
-		_ = relay.Close()
-		tc.Close()
-		_ = uc.Close()
-	}
-	return relay, closeAll, nil
-}
-
-func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
-	if peer != nil && peer.IP.To4() == nil {
-		return turn.RequestedAddressFamilyIPv6
-	}
-	return turn.RequestedAddressFamilyIPv4
 }
 
 func parseManualCreds(s string) (*proxy.TURNCreds, error) {
