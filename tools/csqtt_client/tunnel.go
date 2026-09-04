@@ -223,8 +223,8 @@ func printStats(client *csqtt.Client, tunRx, tunTx, tunErr int64) {
 		rx += w.RxPkts
 		restarts += w.Restarts
 	}
-	log.Printf("stats: workers %d/%d ready%s · relay tx=%d rx=%d restarts=%d repairs=%d · tun in=%d out=%d senderr=%d · framed=%d dup=%d reassembled=%d dropped=%d noworker=%d",
-		ready, len(s.Workers), deadList(dead), tx, rx, restarts, s.Repairs, tunRx, tunTx, tunErr, s.FramedTx, s.DupTx, s.Reassembled, s.Dropped, s.NoWorker)
+	log.Printf("stats: workers %d/%d ready%s · relay tx=%d rx=%d restarts=%d repairs=%d · tun in=%d out=%d senderr=%d · framed=%d dup=%d reassembled=%d dropped=%d noworker=%d · probes=%d descheduled=%d lost=%d",
+		ready, len(s.Workers), deadList(dead), tx, rx, restarts, s.Repairs, tunRx, tunTx, tunErr, s.FramedTx, s.DupTx, s.Reassembled, s.Dropped, s.NoWorker, s.Probes, s.Descheduled, s.LostWorkers)
 }
 
 func deadList(ids []int) string {

@@ -47,7 +47,7 @@ func main() {
 	vkLink := flag.String("vk-link", "", "VK call link for minting TURN credentials, e.g. https://vk.ru/call/join/<id>")
 	turnCreds := flag.String("turn-creds", "", "DIAGNOSTIC: skip VK and use user:pass@host:port for the relay")
 	deviceID := flag.String("device-id", "", "device id (default: random 16 hex; the server binds the password to the first one it sees)")
-	generation := flag.Uint64("gen", uint64(time.Now().Unix()), "generation id; a new (gen, salt) pair replaces every older session of this device")
+	generation := flag.Uint64("gen", 0, "generation id (default: from the clock); a new (gen, salt) pair replaces every older session of this device")
 	salt := flag.String("salt", "", "session salt (default: random 16 hex)")
 	modeName := flag.String("mode", "audio", "obfuscation mode: audio (PT 111, ChaCha) or video (PT 96, SRTP-like)")
 	revision := flag.String("revision", csqtt.WireRevision, "wire revision to announce ("+csqtt.WireRevision+" or "+csqtt.LegacyWireRevision+")")
@@ -75,6 +75,12 @@ func main() {
 	relayPolicy := flag.String("relay", "first", "which relay each worker gets: first (one relay host for all, as the app does anonymously) or rotate (spread over the addresses VK returned)")
 	chunksFlag := flag.String("chunks", "", "-tun: striping chunks small,medium,bulk (default 4,16,32); 1,1,1 is pure per-packet round robin")
 	flag.Parse()
+	genSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "gen" {
+			genSet = true
+		}
+	})
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if *server == "" || *password == "" {
@@ -93,8 +99,16 @@ func main() {
 	if *deviceID == "" {
 		*deviceID = randomHex(8)
 	}
-	if *salt == "" {
-		*salt = randomHex(16)
+	if *salt == "" || !genSet {
+		// A new connection carries a new (generation, salt) pair; the salt
+		// alone is not enough for the server's epoch rule.
+		gen, s := csqtt.NewIdentity(0)
+		if *salt == "" {
+			*salt = s
+		}
+		if !genSet {
+			*generation = gen
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -125,6 +125,12 @@ type Client struct {
 	repairs     atomic.Int64
 
 	dupCursor int // rotates the worker that carries the copy
+
+	gate    *startGate
+	anyRx   atomic.Int64 // last inbound on any worker, unix nanos
+	probes  atomic.Int64 // liveness probes sent
+	resets  atomic.Int64 // monitor ticks found late (descheduled)
+	lostToL atomic.Int64 // workers restarted by the liveness verdict
 }
 
 // Dial starts worker 1 and returns once it has a TUNCONF; the other workers
@@ -153,6 +159,7 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 		reasm:    NewReassembler[[]byte](),
 		out:      make(chan []byte, 1024),
 		confOnce: make(chan struct{}),
+		gate:     newStartGate(cfg.StartPacing),
 	}
 	c.striper.SetChunks(cfg.Chunks)
 	c.workers = make([]*worker, cfg.Workers)
@@ -178,13 +185,10 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	for i := 1; i < len(c.workers); i++ {
 		c.wg.Add(1)
-		go c.workers[i].run()
-		select {
-		case <-time.After(cfg.StartPacing):
-		case <-cctx.Done():
-			return c, nil
-		}
+		go c.workers[i].run() // paced by the start gate inside session()
 	}
+	c.wg.Add(1)
+	go c.monitor()
 	return c, nil
 }
 
@@ -338,6 +342,68 @@ func (c *Client) enqueue(p []byte) {
 	}
 }
 
+// restartAll kicks every worker — the server restarted and holds no
+// sessions, so each one has to GETCONF again (same identity: the server is
+// empty, and a new pair is for a NEW connection, see NewIdentity).
+func (c *Client) restartAll(reason string) {
+	for _, w := range c.workers {
+		w.restart(reason)
+	}
+}
+
+// monitor runs the liveness rule every livenessTick.
+func (c *Client) monitor() {
+	defer c.wg.Done()
+	tick := time.NewTicker(livenessTick)
+	defer tick.Stop()
+	var prev time.Time
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-tick.C:
+		}
+		now := time.Now()
+		anyRx := time.Unix(0, c.anyRx.Load())
+		reset := false
+		for _, w := range c.workers {
+			in := livenessInput{Now: now, PrevTick: prev, AnyRx: anyRx,
+				ReadyAt: nanosTime(w.readyAt.Load()), LastRx: nanosTime(w.lastRx.Load()),
+				ProbeSentAt: nanosTime(w.probeAt.Load())}
+			switch livenessVerdict(in) {
+			case livenessResetAll:
+				reset = true
+			case livenessProbe:
+				w.probeAt.Store(now.UnixNano())
+				c.probes.Add(1)
+				_ = w.send([]byte(ReadyRequest))
+			case livenessRestart:
+				c.lostToL.Add(1)
+				w.restart("liveness: no inbound after a probe while other workers are live")
+			}
+		}
+		if reset {
+			// The process was not running: nothing observed in that gap means
+			// anything. Every clock starts over from now.
+			c.resets.Add(1)
+			c.cfg.Logf("csqtt: monitor tick %.0fs late — descheduled, clocks reset, no verdict", now.Sub(prev).Seconds())
+			c.anyRx.Store(now.UnixNano())
+			for _, w := range c.workers {
+				w.lastRx.Store(now.UnixNano())
+				w.probeAt.Store(0)
+			}
+		}
+		prev = now
+	}
+}
+
+func nanosTime(ns int64) time.Time {
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
 // repair restarts the workers the server says it has not seen.
 func (c *Client) repair(cmd StreamCommand) {
 	c.repairs.Add(1)
@@ -370,6 +436,9 @@ type Stats struct {
 	DupTx       int64
 	Reassembled int64
 	Repairs     int64
+	Probes      int64 // liveness probes sent
+	Descheduled int64 // monitor ticks found late
+	LostWorkers int64 // workers restarted by the liveness verdict
 }
 
 // Stats snapshots the counters.
@@ -381,6 +450,9 @@ func (c *Client) Stats() Stats {
 		DupTx:       c.dupTx.Load(),
 		Reassembled: c.reassembled.Load(),
 		Repairs:     c.repairs.Load(),
+		Probes:      c.probes.Load(),
+		Descheduled: c.resets.Load(),
+		LostWorkers: c.lostToL.Load(),
 	}
 	for _, w := range c.workers {
 		s.Workers = append(s.Workers, w.stats())
@@ -415,6 +487,8 @@ type worker struct {
 	restarts atomic.Int64
 	lastRx   atomic.Int64 // unix nanos
 	lastTx   atomic.Int64
+	readyAt  atomic.Int64 // unix nanos; 0 while not ready
+	probeAt  atomic.Int64 // unix nanos of the probe for the current silence; 0 if none
 	relayStr atomic.Pointer[string]
 
 	kick chan string // restart requests with a reason
@@ -478,11 +552,20 @@ func (w *worker) run() {
 // session is one allocation's lifetime. It returns why it ended.
 func (w *worker) session() error {
 	ctx := w.c.ctx
+	// One start at a time, spaced from the end of the previous one — first
+	// starts and restarts alike, credentials and allocation both inside.
+	startDone := w.c.gate.begin()
+	if ctx.Err() != nil {
+		startDone()
+		return ctx.Err()
+	}
 	creds, err := w.c.cfg.Creds(ctx, w.id)
 	if err != nil {
+		startDone()
 		return fmt.Errorf("credentials: %w", err)
 	}
 	relay, err := DialRelay(creds, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel)
+	startDone()
 	if err != nil {
 		return err
 	}
@@ -498,6 +581,8 @@ func (w *worker) session() error {
 	w.relayStr.Store(&rs)
 	defer func() {
 		w.ready.Store(false)
+		w.readyAt.Store(0)
+		w.probeAt.Store(0)
 		w.mu.Lock()
 		w.relay, w.wrapper = nil, nil
 		w.mu.Unlock()
@@ -551,6 +636,7 @@ attempts:
 		return fmt.Errorf("READY send: %w", err)
 	}
 	w.ready.Store(true)
+	w.readyAt.Store(time.Now().UnixNano())
 	w.c.cfg.Logf("csqtt: worker %d: ready (%s)", w.id, conf.Raw)
 
 	// Serve: keepalives when idle, control messages as they come, until the
@@ -580,8 +666,8 @@ attempts:
 func (w *worker) handleControl(p []byte) {
 	switch {
 	case IsPanelRestart(p):
-		w.c.cfg.Logf("csqtt: worker %d: server is restarting", w.id)
-		w.restart("panel restart")
+		w.c.cfg.Logf("csqtt: worker %d: server is restarting — restarting every worker", w.id)
+		w.c.restartAll("panel restart")
 	case IsConfigResponse(p):
 		if conf, err := ParseConfigResponse(p); err == nil {
 			w.c.setConfig(conf) // a pushed TUNCONF (DNS change)
@@ -635,7 +721,10 @@ func (w *worker) readLoop(conn net.PacketConn, control chan<- []byte, readErr ch
 			continue
 		}
 		w.rx.Add(1)
-		w.lastRx.Store(time.Now().UnixNano())
+		now := time.Now().UnixNano()
+		w.lastRx.Store(now)
+		w.probeAt.Store(0) // any inbound answers the probe
+		w.c.anyRx.Store(now)
 		if IsIdleKeepalive(plain) {
 			continue
 		}
