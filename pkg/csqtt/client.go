@@ -342,6 +342,16 @@ func (c *Client) enqueue(p []byte) {
 	}
 }
 
+// Blackhole is FAULT INJECTION for the stand: from now on worker id drops
+// every inbound datagram of its current session, as if the relay had gone
+// silent. The liveness rule is expected to probe it and then restart it;
+// the restarted session is not blackholed. Not for production.
+func (c *Client) Blackhole(workerID int, on bool) {
+	if workerID >= 1 && workerID <= len(c.workers) {
+		c.workers[workerID-1].blackhole.Store(on)
+	}
+}
+
 // restartAll kicks every worker — the server restarted and holds no
 // sessions, so each one has to GETCONF again (same identity: the server is
 // empty, and a new pair is for a NEW connection, see NewIdentity).
@@ -482,14 +492,15 @@ type worker struct {
 	wireBuf  []byte
 	frameBuf []byte
 
-	ready    atomic.Bool
-	tx, rx   atomic.Int64
-	restarts atomic.Int64
-	lastRx   atomic.Int64 // unix nanos
-	lastTx   atomic.Int64
-	readyAt  atomic.Int64 // unix nanos; 0 while not ready
-	probeAt  atomic.Int64 // unix nanos of the probe for the current silence; 0 if none
-	relayStr atomic.Pointer[string]
+	ready     atomic.Bool
+	tx, rx    atomic.Int64
+	restarts  atomic.Int64
+	lastRx    atomic.Int64 // unix nanos
+	lastTx    atomic.Int64
+	readyAt   atomic.Int64 // unix nanos; 0 while not ready
+	blackhole atomic.Bool  // FAULT INJECTION: drop every inbound datagram of the current session
+	probeAt   atomic.Int64 // unix nanos of the probe for the current silence; 0 if none
+	relayStr  atomic.Pointer[string]
 
 	kick chan string // restart requests with a reason
 }
@@ -527,10 +538,12 @@ func (w *worker) run() {
 	defer w.c.wg.Done()
 	backoff := restartBackoff
 	for w.c.ctx.Err() == nil {
+		started := time.Now()
 		err := w.session()
 		if w.c.ctx.Err() != nil {
 			return
 		}
+		backoff = nextBackoff(backoff, time.Since(started))
 		var denied *DeniedError
 		if errors.As(err, &denied) || errors.Is(err, ErrNoConfig) {
 			w.c.fail(fmt.Errorf("worker %d: %w", w.id, err))
@@ -543,10 +556,28 @@ func (w *worker) run() {
 		case <-w.c.ctx.Done():
 			return
 		}
-		if backoff < maxBackoff {
-			backoff *= 2
-		}
 	}
+}
+
+// healthySession is how long a session must have lived for its end to
+// count as a fresh failure rather than the next in a run of them.
+const healthySession = 2 * readyGrace
+
+// nextBackoff is the restart delay after a session that lived `lived`:
+// a session that held for healthySession resets the run — the delay starts
+// over at restartBackoff — while a short-lived one doubles it up to
+// maxBackoff. Without the reset a worker restarted a few times over a day
+// (a panel restart, a liveness verdict, a relay refresh failing once) would
+// wait the full maxBackoff for every later blip, for ever.
+func nextBackoff(prev, lived time.Duration) time.Duration {
+	if lived >= healthySession {
+		return restartBackoff
+	}
+	next := prev * 2
+	if next > maxBackoff {
+		next = maxBackoff
+	}
+	return next
 }
 
 // session is one allocation's lifetime. It returns why it ended.
@@ -574,6 +605,7 @@ func (w *worker) session() error {
 		relay.Close()
 		return err
 	}
+	w.blackhole.Store(false) // a fresh allocation is a fresh path; an injected fault does not follow it
 	w.mu.Lock()
 	w.relay, w.wrapper = relay, wrapper
 	w.mu.Unlock()
@@ -713,6 +745,9 @@ func (w *worker) readLoop(conn net.PacketConn, control chan<- []byte, readErr ch
 			return
 		}
 		wire := buf[:n]
+		if w.blackhole.Load() {
+			continue // the fault: the relay path is dead from our point of view
+		}
 		if !IsRTP(wire) {
 			continue
 		}

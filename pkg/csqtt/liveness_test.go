@@ -158,3 +158,27 @@ func TestPanelRestartKicksEveryWorker(t *testing.T) {
 		}
 	}
 }
+
+// A long-lived session resets the restart delay; a run of short ones
+// doubles it up to the cap. (Seen live: worker 3 restarted once by the
+// liveness rule waited 2 s at the panel restart an hour later — without a
+// reset the delay would only ever grow.)
+func TestNextBackoffResetsAfterAHealthySession(t *testing.T) {
+	if got := nextBackoff(restartBackoff, time.Second); got != 2*restartBackoff {
+		t.Fatalf("short session: %v, want doubled", got)
+	}
+	if got := nextBackoff(16*restartBackoff, time.Second); got != maxBackoff {
+		t.Fatalf("cap: %v, want %v", got, maxBackoff)
+	}
+	if got := nextBackoff(maxBackoff, time.Second); got != maxBackoff {
+		t.Fatalf("at the cap: %v, want %v", got, maxBackoff)
+	}
+	// The threshold is 40 s, written as a literal on purpose: a fixture that
+	// derives it from the constant relaxes with the constant.
+	if got := nextBackoff(maxBackoff, 40*time.Second); got != restartBackoff {
+		t.Fatalf("40 s session: %v, want the reset %v", got, restartBackoff)
+	}
+	if got := nextBackoff(4*restartBackoff, 39*time.Second); got != 8*restartBackoff {
+		t.Fatalf("39 s session: %v, want doubled", got)
+	}
+}

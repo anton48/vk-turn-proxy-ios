@@ -44,7 +44,9 @@ type tunnelOptions struct {
 	statsEvery    time.Duration
 	chunks        [3]int
 	dupTCP        bool
-	relayPolicy   string // "first": every worker on Addresses[0], as the app does anonymously; "rotate": spread over what VK returned
+	relayPolicy   string        // "first": every worker on Addresses[0], as the app does anonymously; "rotate": spread over what VK returned
+	faultWorker   int           // fault injection: blackhole this worker…
+	faultAfter    time.Duration // …this long after the tunnel is up (0 = no fault)
 }
 
 // credPool mints a VK credential and reuses it for allocsPerCred workers,
@@ -187,6 +189,16 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 		}
 	}()
 
+	if o.faultWorker > 0 && o.faultAfter > 0 {
+		go func() {
+			select {
+			case <-rctx.Done():
+			case <-time.After(o.faultAfter):
+				log.Printf("FAULT: blackholing worker %d (inbound dropped until it is restarted)", o.faultWorker)
+				client.Blackhole(o.faultWorker, true)
+			}
+		}()
+	}
 	tick := time.NewTicker(o.statsEvery)
 	defer tick.Stop()
 	for {
