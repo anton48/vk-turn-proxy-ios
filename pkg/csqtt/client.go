@@ -33,6 +33,7 @@ type Config struct {
 	Salt       string
 
 	Workers   int    // 1..MaxWorkers
+	Chunks    [3]int // per-class striping chunks; zero keeps DefaultChunks
 	Mode      Mode   // ModeAudio unless told otherwise
 	Revision  string // WireRevision unless told otherwise
 	LocalPort string // echoed by the server; "9000" unless told otherwise
@@ -141,6 +142,7 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 		out:      make(chan []byte, 1024),
 		confOnce: make(chan struct{}),
 	}
+	c.striper.SetChunks(cfg.Chunks)
 	c.workers = make([]*worker, cfg.Workers)
 	for i := range c.workers {
 		c.workers[i] = newWorker(c, i+1, cipher)

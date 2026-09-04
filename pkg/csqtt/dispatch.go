@@ -21,8 +21,11 @@ const (
 	numClasses
 )
 
-// Chunk lengths per class: how many consecutive packets one worker takes.
-var classChunk = [numClasses]int{4, 16, 32}
+// DefaultChunks are the chunk lengths per class: how many consecutive
+// packets one worker takes. The reference client uses 4/16/32; whether 32
+// bulk packets back to back on one VK allocation survive its policer is an
+// open question this knob exists to measure.
+var DefaultChunks = [numClasses]int{4, 16, 32}
 
 const (
 	smallMaxLen = 164
@@ -84,14 +87,25 @@ func isControlLike(pkt []byte) bool {
 // Striper hands out worker indices, one cursor per class.
 type Striper struct {
 	n      int
+	chunk  [numClasses]int
 	cursor [numClasses]struct{ worker, remaining int }
 }
 
 // NewStriper creates a striper over n workers (indices 0..n-1).
 func NewStriper(n int) *Striper {
-	s := &Striper{}
+	s := &Striper{chunk: DefaultChunks}
 	s.Resize(n)
 	return s
+}
+
+// SetChunks overrides the per-class chunk lengths; values below 1 keep the
+// default for that class.
+func (s *Striper) SetChunks(chunks [numClasses]int) {
+	for c, v := range chunks {
+		if v >= 1 {
+			s.chunk[c] = v
+		}
+	}
 }
 
 // Resize changes the worker count; cursors are clamped.
@@ -119,7 +133,7 @@ func (s *Striper) Pick(c PacketClass, alive func(int) bool) int {
 			w := (start + i) % s.n
 			if alive(w) {
 				cur.worker = w
-				cur.remaining = classChunk[c]
+				cur.remaining = s.chunk[c]
 				break
 			}
 			if i == s.n {

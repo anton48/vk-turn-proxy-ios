@@ -63,18 +63,18 @@ func TestStriperChunksPerClassIndependently(t *testing.T) {
 	s := NewStriper(3)
 	all := func(int) bool { return true }
 	var bulk []int
-	for i := 0; i < 2*classChunk[ClassBulk]+1; i++ {
+	for i := 0; i < 2*DefaultChunks[ClassBulk]+1; i++ {
 		bulk = append(bulk, s.Pick(ClassBulk, all))
 	}
 	for i, w := range bulk {
-		want := (i/classChunk[ClassBulk] + 1) % 3
+		want := (i/DefaultChunks[ClassBulk] + 1) % 3
 		if w != want {
 			t.Fatalf("bulk pick %d → worker %d, want %d", i, w, want)
 		}
 	}
 	// Small cursor is untouched by the bulk run: its first chunk goes to
 	// worker 1 (cursor starts at 0 with nothing remaining → advances).
-	for i := 0; i < classChunk[ClassSmall]; i++ {
+	for i := 0; i < DefaultChunks[ClassSmall]; i++ {
 		if w := s.Pick(ClassSmall, all); w != 1 {
 			t.Fatalf("small pick %d → worker %d, want 1", i, w)
 		}
@@ -88,7 +88,7 @@ func TestStriperSkipsDeadWorkers(t *testing.T) {
 	s := NewStriper(4)
 	dead1 := func(w int) bool { return w != 1 }
 	seen := map[int]int{}
-	for i := 0; i < 4*classChunk[ClassMedium]; i++ {
+	for i := 0; i < 4*DefaultChunks[ClassMedium]; i++ {
 		seen[s.Pick(ClassMedium, dead1)]++
 	}
 	if seen[1] != 0 {
@@ -110,10 +110,29 @@ func TestStriperSkipsDeadWorkers(t *testing.T) {
 	}
 }
 
+func TestStriperSetChunksTakesEffect(t *testing.T) {
+	s := NewStriper(3)
+	s.SetChunks([3]int{1, 0, 2}) // small 1, medium unchanged, bulk 2
+	all := func(int) bool { return true }
+	if a, b := s.Pick(ClassSmall, all), s.Pick(ClassSmall, all); a == b {
+		t.Fatalf("small chunk 1 must alternate workers, got %d %d", a, b)
+	}
+	if a, b, c := s.Pick(ClassBulk, all), s.Pick(ClassBulk, all), s.Pick(ClassBulk, all); a != b || b == c {
+		t.Fatalf("bulk chunk 2: got %d %d %d", a, b, c)
+	}
+	picks := map[int]bool{}
+	for i := 0; i < DefaultChunks[ClassMedium]; i++ {
+		picks[s.Pick(ClassMedium, all)] = true
+	}
+	if len(picks) != 1 {
+		t.Fatalf("medium chunk must stay at the default %d, saw %d workers", DefaultChunks[ClassMedium], len(picks))
+	}
+}
+
 func TestStriperResizeClampsCursors(t *testing.T) {
 	s := NewStriper(4)
 	all := func(int) bool { return true }
-	for i := 0; i < 3*classChunk[ClassSmall]; i++ {
+	for i := 0; i < 3*DefaultChunks[ClassSmall]; i++ {
 		s.Pick(ClassSmall, all) // cursor now on worker 3
 	}
 	s.Resize(2)

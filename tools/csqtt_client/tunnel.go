@@ -42,6 +42,7 @@ type tunnelOptions struct {
 	routes        []string
 	duration      time.Duration
 	statsEvery    time.Duration
+	chunks        [3]int
 }
 
 // credPool mints a VK credential and reuses it for allocsPerCred workers,
@@ -94,7 +95,7 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 	client, err := csqtt.Dial(ctx, csqtt.Config{
 		Server: o.server, Password: o.password,
 		DeviceID: o.deviceID, Generation: o.generation, Salt: o.salt,
-		Workers: o.workers, Mode: o.mode, Revision: o.revision,
+		Workers: o.workers, Mode: o.mode, Revision: o.revision, Chunks: o.chunks,
 		Creds: pool.creds, TURNTransport: o.turnTransport, TURNLogLevel: lvl,
 		Logf: log.Printf,
 	})
@@ -104,7 +105,7 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 	}
 	defer client.Close()
 	conf := client.Config()
-	log.Printf("tunnel up in %d ms: ip %s dns %s frames=%v", time.Since(t0).Milliseconds(), conf.TunnelIP, conf.DNS, conf.FramesData())
+	log.Printf("tunnel up in %d ms: ip %s dns %s frames=%v workers=%d chunks=%v", time.Since(t0).Milliseconds(), conf.TunnelIP, conf.DNS, conf.FramesData(), o.workers, o.chunks)
 
 	dev, err := openTUN(o.tunName, o.mtu)
 	if err != nil {
