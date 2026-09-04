@@ -72,6 +72,7 @@ func main() {
 	statsEvery := flag.Duration("stats-every", 10*time.Second, "-tun: stats line interval")
 	allocsPerCred := flag.Int("allocs-per-cred", 8, "-tun: workers served by one minted VK credential before minting the next")
 	dupTCP := flag.Bool("dup-tcp", false, "EXPERIMENT: send a copy of every CQF1-framed TCP packet through a second worker")
+	relayPolicy := flag.String("relay", "first", "which relay each worker gets: first (one relay host for all, as the app does anonymously) or rotate (spread over the addresses VK returned)")
 	chunksFlag := flag.String("chunks", "", "-tun: striping chunks small,medium,bulk (default 4,16,32); 1,1,1 is pure per-packet round robin")
 	flag.Parse()
 
@@ -139,7 +140,7 @@ func main() {
 			server: peer, password: *password, deviceID: *deviceID, generation: *generation, salt: *salt,
 			mode: mode, revision: *revision, workers: *workers, turnTransport: *turnTransport, turnDebug: *turnDebug,
 			vkLink: *vkLink, manualCreds: manual, allocsPerCred: *allocsPerCred,
-			tunName: *tunName, mtu: *mtu, routes: hosts, duration: *duration, statsEvery: *statsEvery, chunks: chunks, dupTCP: *dupTCP,
+			tunName: *tunName, mtu: *mtu, routes: hosts, duration: *duration, statsEvery: *statsEvery, chunks: chunks, dupTCP: *dupTCP, relayPolicy: *relayPolicy,
 		}))
 	}
 

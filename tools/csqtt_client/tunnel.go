@@ -44,15 +44,22 @@ type tunnelOptions struct {
 	statsEvery    time.Duration
 	chunks        [3]int
 	dupTCP        bool
+	relayPolicy   string // "first": every worker on Addresses[0], as the app does anonymously; "rotate": spread over what VK returned
 }
 
 // credPool mints a VK credential and reuses it for allocsPerCred workers,
-// alternating the relay addresses VK returned, then mints the next one.
+// then mints the next one. Which of the relay addresses VK returned a worker
+// gets is the relay policy: "first" keeps every allocation on ONE relay host
+// (the app's anonymous mode — the ~10-per-identity quota is per relay, and a
+// fresh identity every allocsPerCred workers keeps under it), "rotate" spreads
+// them over both, which the reference client does and which puts two relay
+// hosts' latency skew between a flow's own packets.
 type credPool struct {
 	mu            sync.Mutex
 	link          string
 	manual        *proxy.TURNCreds
 	allocsPerCred int
+	policy        string
 	cur           *proxy.TURNCreds
 	used          int
 	next          int
@@ -78,7 +85,7 @@ func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentia
 		p.used = 0
 	}
 	addr := p.cur.Address
-	if len(p.cur.Addresses) > 0 {
+	if p.policy == "rotate" && len(p.cur.Addresses) > 0 {
 		addr = p.cur.Addresses[p.next%len(p.cur.Addresses)]
 		p.next++
 	}
@@ -87,7 +94,7 @@ func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentia
 }
 
 func runTunnel(ctx context.Context, o tunnelOptions) int {
-	pool := &credPool{link: o.vkLink, manual: o.manualCreds, allocsPerCred: o.allocsPerCred}
+	pool := &credPool{link: o.vkLink, manual: o.manualCreds, allocsPerCred: o.allocsPerCred, policy: o.relayPolicy}
 	lvl := logging.LogLevelWarn
 	if o.turnDebug {
 		lvl = logging.LogLevelTrace
@@ -107,7 +114,7 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 	}
 	defer client.Close()
 	conf := client.Config()
-	log.Printf("tunnel up in %d ms: ip %s dns %s frames=%v workers=%d chunks=%v dup-tcp=%v", time.Since(t0).Milliseconds(), conf.TunnelIP, conf.DNS, conf.FramesData(), o.workers, o.chunks, o.dupTCP)
+	log.Printf("tunnel up in %d ms: ip %s dns %s frames=%v workers=%d chunks=%v dup-tcp=%v relay=%s", time.Since(t0).Milliseconds(), conf.TunnelIP, conf.DNS, conf.FramesData(), o.workers, o.chunks, o.dupTCP, o.relayPolicy)
 
 	dev, err := openTUN(o.tunName, o.mtu)
 	if err != nil {
