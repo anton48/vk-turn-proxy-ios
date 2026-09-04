@@ -140,3 +140,35 @@ func TestStriperResizeClampsCursors(t *testing.T) {
 		t.Fatalf("after Resize(2) picked worker %d", w)
 	}
 }
+
+// The duplicate never rides the worker that carried the original, only a
+// ready one, and it rotates so the copies spread across the pool.
+func TestSecondWorkerIsAnotherReadyWorker(t *testing.T) {
+	c := &Client{workers: make([]*worker, 4)}
+	for i := range c.workers {
+		c.workers[i] = &worker{id: i + 1}
+	}
+	for _, w := range c.workers {
+		w.ready.Store(true)
+	}
+	c.workers[2].ready.Store(false)
+	seen := map[int]int{}
+	for i := 0; i < 12; i++ {
+		w2 := c.secondWorker(0)
+		if w2 == 0 {
+			t.Fatal("duplicate sent through the same worker as the original")
+		}
+		if w2 == 2 {
+			t.Fatal("duplicate sent through a worker that is not ready")
+		}
+		seen[w2]++
+	}
+	if seen[1] == 0 || seen[3] == 0 {
+		t.Fatalf("copies did not rotate over the ready workers: %v", seen)
+	}
+	c.workers[1].ready.Store(false)
+	c.workers[3].ready.Store(false)
+	if w2 := c.secondWorker(0); w2 != -1 {
+		t.Fatalf("with no other ready worker expected -1, got %d", w2)
+	}
+}

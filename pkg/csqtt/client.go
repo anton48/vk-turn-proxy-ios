@@ -32,11 +32,20 @@ type Config struct {
 	Generation uint64
 	Salt       string
 
-	Workers   int    // 1..MaxWorkers
-	Chunks    [3]int // per-class striping chunks; zero keeps DefaultChunks
-	Mode      Mode   // ModeAudio unless told otherwise
-	Revision  string // WireRevision unless told otherwise
-	LocalPort string // echoed by the server; "9000" unless told otherwise
+	Workers int    // 1..MaxWorkers
+	Chunks  [3]int // per-class striping chunks; zero keeps DefaultChunks
+
+	// DuplicateTCP (EXPERIMENT) sends a second copy of every CQF1-framed
+	// packet through a different worker. The server keys reassembly on
+	// (sender, flow, sequence), so whichever copy lands first is delivered
+	// and the other is dropped as a duplicate — a lever against the ~1 %
+	// random loss of the relay leg, at the price of doubled TCP-data bytes
+	// on the uplink. Unframed packets are never duplicated: the server would
+	// hand both copies to its TUN.
+	DuplicateTCP bool
+	Mode         Mode   // ModeAudio unless told otherwise
+	Revision     string // WireRevision unless told otherwise
+	LocalPort    string // echoed by the server; "9000" unless told otherwise
 
 	// Creds mints a relay credential for a worker. Called with a worker id
 	// (1-based) each time that worker (re)starts; the pool policy is the
@@ -111,8 +120,11 @@ type Client struct {
 	dropped     atomic.Int64 // out queue full
 	noWorker    atomic.Int64 // WritePacket with nothing alive
 	framedTx    atomic.Int64
+	dupTx       atomic.Int64 // second copies sent (DuplicateTCP)
 	reassembled atomic.Int64
 	repairs     atomic.Int64
+
+	dupCursor int // rotates the worker that carries the copy
 }
 
 // Dial starts worker 1 and returns once it has a TUNCONF; the other workers
@@ -210,13 +222,35 @@ func (c *Client) WritePacket(pkt []byte) error {
 	if c.Config().FramesData() {
 		if framed, ok := c.seq.Frame(wk.frameBuf, pkt); ok {
 			c.framedTx.Add(1)
-			return wk.send(framed)
+			err := wk.send(framed)
+			if c.cfg.DuplicateTCP {
+				if w2 := c.secondWorker(w); w2 >= 0 {
+					if c.workers[w2].send(framed) == nil {
+						c.dupTx.Add(1)
+					}
+				}
+			}
+			return err
 		}
 	}
 	return wk.send(pkt)
 }
 
 var errNoWorker = errors.New("csqtt: no worker is ready")
+
+// secondWorker picks a ready worker other than first for the duplicate,
+// rotating so the copies spread over the pool; -1 when none qualifies.
+func (c *Client) secondWorker(first int) int {
+	n := len(c.workers)
+	for i := 0; i < n; i++ {
+		c.dupCursor = (c.dupCursor + 1) % n
+		w := c.dupCursor
+		if w != first && c.alive(w) {
+			return w
+		}
+	}
+	return -1
+}
 
 // ReadPacket returns the next IP packet for the TUN, or ctx's error, or the
 // client's fatal error once it has stopped.
@@ -333,6 +367,7 @@ type Stats struct {
 	Dropped     int64 // inbound packets the TUN side did not take in time
 	NoWorker    int64 // outbound packets with no ready worker
 	FramedTx    int64
+	DupTx       int64
 	Reassembled int64
 	Repairs     int64
 }
@@ -343,6 +378,7 @@ func (c *Client) Stats() Stats {
 		Dropped:     c.dropped.Load(),
 		NoWorker:    c.noWorker.Load(),
 		FramedTx:    c.framedTx.Load(),
+		DupTx:       c.dupTx.Load(),
 		Reassembled: c.reassembled.Load(),
 		Repairs:     c.repairs.Load(),
 	}

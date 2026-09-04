@@ -43,6 +43,7 @@ type tunnelOptions struct {
 	duration      time.Duration
 	statsEvery    time.Duration
 	chunks        [3]int
+	dupTCP        bool
 }
 
 // credPool mints a VK credential and reuses it for allocsPerCred workers,
@@ -97,7 +98,8 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 		DeviceID: o.deviceID, Generation: o.generation, Salt: o.salt,
 		Workers: o.workers, Mode: o.mode, Revision: o.revision, Chunks: o.chunks,
 		Creds: pool.creds, TURNTransport: o.turnTransport, TURNLogLevel: lvl,
-		Logf: log.Printf,
+		DuplicateTCP: o.dupTCP,
+		Logf:         log.Printf,
 	})
 	if err != nil {
 		log.Printf("dial: %v", err)
@@ -105,7 +107,7 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 	}
 	defer client.Close()
 	conf := client.Config()
-	log.Printf("tunnel up in %d ms: ip %s dns %s frames=%v workers=%d chunks=%v", time.Since(t0).Milliseconds(), conf.TunnelIP, conf.DNS, conf.FramesData(), o.workers, o.chunks)
+	log.Printf("tunnel up in %d ms: ip %s dns %s frames=%v workers=%d chunks=%v dup-tcp=%v", time.Since(t0).Milliseconds(), conf.TunnelIP, conf.DNS, conf.FramesData(), o.workers, o.chunks, o.dupTCP)
 
 	dev, err := openTUN(o.tunName, o.mtu)
 	if err != nil {
@@ -214,8 +216,8 @@ func printStats(client *csqtt.Client, tunRx, tunTx, tunErr int64) {
 		rx += w.RxPkts
 		restarts += w.Restarts
 	}
-	log.Printf("stats: workers %d/%d ready%s · relay tx=%d rx=%d restarts=%d repairs=%d · tun in=%d out=%d senderr=%d · framed=%d reassembled=%d dropped=%d noworker=%d",
-		ready, len(s.Workers), deadList(dead), tx, rx, restarts, s.Repairs, tunRx, tunTx, tunErr, s.FramedTx, s.Reassembled, s.Dropped, s.NoWorker)
+	log.Printf("stats: workers %d/%d ready%s · relay tx=%d rx=%d restarts=%d repairs=%d · tun in=%d out=%d senderr=%d · framed=%d dup=%d reassembled=%d dropped=%d noworker=%d",
+		ready, len(s.Workers), deadList(dead), tx, rx, restarts, s.Repairs, tunRx, tunTx, tunErr, s.FramedTx, s.DupTx, s.Reassembled, s.Dropped, s.NoWorker)
 }
 
 func deadList(ids []int) string {
