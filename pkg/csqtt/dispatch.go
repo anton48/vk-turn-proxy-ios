@@ -22,10 +22,16 @@ const (
 )
 
 // DefaultChunks are the chunk lengths per class: how many consecutive
-// packets one worker takes. The reference client uses 4/16/32; whether 32
-// bulk packets back to back on one VK allocation survive its policer is an
-// open question this knob exists to measure.
-var DefaultChunks = [numClasses]int{4, 16, 32}
+// packets one worker takes. The reference client uses 4/16/32. Bulk is 64
+// here, from a measurement (2026-09-04, tcp8/tcp9): the csqtt server
+// reassembles a flow with a 12 ms gap window, and allocations on one relay
+// jitter against each other by more than that, so every chunk boundary is
+// a chance to lose the packets still in flight on the slower allocation —
+// 1-packet chunks cut TCP upload 5–6×, 64 beat 32 by 20–25 % at 4–8 flows
+// (paired arms), and 128 turned down at 8 flows because 160 KB in one
+// allocation's turn is a burst its policer clips. 64 sits on the good side
+// of both.
+var DefaultChunks = [numClasses]int{4, 16, 64}
 
 const (
 	smallMaxLen = 164

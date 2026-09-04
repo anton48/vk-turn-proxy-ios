@@ -172,3 +172,12 @@ func TestSecondWorkerIsAnotherReadyWorker(t *testing.T) {
 		t.Fatalf("with no other ready worker expected -1, got %d", w2)
 	}
 }
+
+// The bulk default is a MEASURED number (tcp9, 2026-09-04): 64 beat 32 by
+// 20–25 % at 4–8 flows and 128 turned down. Anyone moving it should be
+// moving it with a palindrome in hand, so the value is pinned here.
+func TestBulkChunkDefaultIsTheMeasuredOne(t *testing.T) {
+	if DefaultChunks != [numClasses]int{4, 16, 64} {
+		t.Fatalf("DefaultChunks = %v; 4/16/64 is the measured default", DefaultChunks)
+	}
+}
