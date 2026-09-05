@@ -71,6 +71,7 @@ type credPool struct {
 	next          int
 	minted        int
 	hosts         map[string]bool
+	onNewHost     func(string) // called under mu with each relay host the first time it is handed out
 }
 
 func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentials, error) {
@@ -98,7 +99,12 @@ func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentia
 	}
 	p.used++
 	if host, _, err := net.SplitHostPort(addr); err == nil {
-		p.hosts[host] = true
+		if !p.hosts[host] {
+			p.hosts[host] = true
+			if p.onNewHost != nil {
+				p.onNewHost(host)
+			}
+		}
 	}
 	return csqtt.TURNCredentials{Username: p.cur.Username, Password: p.cur.Password, Address: addr}, nil
 }
@@ -174,6 +180,30 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 		log.Printf("routes via %s: %s", gw, strings.Join(added, ", "))
 	}
 	if o.defaultRoute {
+		// Only once EVERY worker is up: until then credentials are still being
+		// minted, and a default route through the tunnel would send those VK
+		// API calls through the tunnel itself (seen: 4/30 ready at the switch,
+		// 8/30 a minute later).
+		waitAll := time.NewTimer(90 * time.Second)
+		for {
+			ready := 0
+			for _, w := range client.Stats().Workers {
+				if w.Ready {
+					ready++
+				}
+			}
+			if ready == o.workers {
+				break
+			}
+			select {
+			case <-waitAll.C:
+				log.Printf("default route: only %d/%d workers ready after 90 s — switching anyway", ready, o.workers)
+			case <-time.After(500 * time.Millisecond):
+				continue
+			}
+			break
+		}
+		waitAll.Stop()
 		// The order matters: pin everything that must NOT go through the tunnel
 		// to the old gateway first — every relay host the workers use, and the
 		// SSH sources — then move the default. Undone in reverse on exit.
@@ -195,6 +225,9 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 			for _, h := range pool.relayHosts() {
 				pin(h)
 			}
+			// A worker restarted later may mint credentials naming a relay host
+			// nobody has pinned yet; the pool pins it the moment it appears.
+			pool.onNewHost = func(h string) { pin(h) }
 			for _, h := range o.keepHosts {
 				pin(h)
 			}

@@ -32,7 +32,9 @@ func main() {
 	timeout := flag.Duration("timeout", 90*time.Second, "per-download timeout")
 	repeat := flag.Int("n", 1, "repeat each download this many times")
 	label := flag.String("label", "", "label for the output lines")
+	initial := flag.Uint("initial-size", 1200, "QUIC initial packet size in bytes; quic-go's default is 1280, browsers use ~1250 — a tunnel with MTU 1300 fits at most 1272")
 	flag.Parse()
+	initialSize = uint16(*initial)
 	log.SetFlags(log.Ltime)
 
 	for i := 0; i < *repeat; i++ {
@@ -65,10 +67,12 @@ func report(label, kind string, r result) {
 		label, kind, r.proto, float64(r.bytes)/1e6, r.total.Seconds(), mbit, r.ttfb.Milliseconds(), r.remote, r.details)
 }
 
+var initialSize uint16 = 1200
+
 func fetchH3(url string, timeout time.Duration) result {
 	tr := &http3.Transport{
 		TLSClientConfig: &tls.Config{NextProtos: []string{http3.NextProtoH3}},
-		QUICConfig:      &quic.Config{MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second},
+		QUICConfig:      &quic.Config{MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second, InitialPacketSize: initialSize},
 	}
 	defer tr.Close()
 	return fetch(&http.Client{Transport: tr}, url, timeout)
