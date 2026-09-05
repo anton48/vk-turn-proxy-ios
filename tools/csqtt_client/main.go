@@ -74,6 +74,8 @@ func main() {
 	dupTCP := flag.Bool("dup-tcp", false, "EXPERIMENT: send a copy of every CQF1-framed TCP packet through a second worker")
 	faultWorker := flag.Int("fault-worker", 0, "FAULT INJECTION: blackhole this worker id (1-based) -fault-after after the tunnel is up")
 	faultAfter := flag.Duration("fault-after", 0, "FAULT INJECTION: when to blackhole -fault-worker")
+	defaultRoute := flag.Bool("default-route", false, "-tun: send the DEFAULT route through the tunnel; relay hosts, -keep-hosts and $SSH_CLIENT are pinned to the old gateway and everything is restored on exit")
+	keepHosts := flag.String("keep-hosts", "", "-default-route: comma-separated IPs that must stay on the old gateway (your SSH source, monitoring)")
 	relayPolicy := flag.String("relay", "first", "which relay each worker gets: first (one relay host for all, as the app does anonymously) or rotate (spread over the addresses VK returned)")
 	chunksFlag := flag.String("chunks", "", "-tun: striping chunks small,medium,bulk (default 4,16,32); 1,1,1 is pure per-packet round robin")
 	flag.Parse()
@@ -158,6 +160,7 @@ func main() {
 			vkLink: *vkLink, manualCreds: manual, allocsPerCred: *allocsPerCred,
 			tunName: *tunName, mtu: *mtu, routes: hosts, duration: *duration, statsEvery: *statsEvery, chunks: chunks, dupTCP: *dupTCP, relayPolicy: *relayPolicy,
 			faultWorker: *faultWorker, faultAfter: *faultAfter,
+			defaultRoute: *defaultRoute, keepHosts: splitCSV(*keepHosts),
 		}))
 	}
 
@@ -536,3 +539,13 @@ func randomBytes(n int) []byte {
 }
 
 func randomHex(n int) string { return hex.EncodeToString(randomBytes(n)) }
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}

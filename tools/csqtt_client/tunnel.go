@@ -11,7 +11,9 @@ import (
 	"context"
 	"log"
 	"net"
+	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +49,8 @@ type tunnelOptions struct {
 	relayPolicy   string        // "first": every worker on Addresses[0], as the app does anonymously; "rotate": spread over what VK returned
 	faultWorker   int           // fault injection: blackhole this worker…
 	faultAfter    time.Duration // …this long after the tunnel is up (0 = no fault)
+	defaultRoute  bool          // send the DEFAULT route through the tunnel (host routes keep the relay and the SSH sources reachable)
+	keepHosts     []string      // hosts that must stay on the old default gateway when defaultRoute is on
 }
 
 // credPool mints a VK credential and reuses it for allocsPerCred workers,
@@ -66,6 +70,7 @@ type credPool struct {
 	used          int
 	next          int
 	minted        int
+	hosts         map[string]bool
 }
 
 func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentials, error) {
@@ -92,11 +97,30 @@ func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentia
 		p.next++
 	}
 	p.used++
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		p.hosts[host] = true
+	}
 	return csqtt.TURNCredentials{Username: p.cur.Username, Password: p.cur.Password, Address: addr}, nil
 }
 
+// relayHosts lists every relay host handed to a worker so far.
+func (p *credPool) relayHosts() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return keys(p.hosts)
+}
+
+func keys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func runTunnel(ctx context.Context, o tunnelOptions) int {
-	pool := &credPool{link: o.vkLink, manual: o.manualCreds, allocsPerCred: o.allocsPerCred, policy: o.relayPolicy}
+	pool := &credPool{link: o.vkLink, manual: o.manualCreds, allocsPerCred: o.allocsPerCred, policy: o.relayPolicy, hosts: map[string]bool{}}
 	lvl := logging.LogLevelWarn
 	if o.turnDebug {
 		lvl = logging.LogLevelTrace
@@ -148,6 +172,51 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 	}
 	if len(added) > 0 {
 		log.Printf("routes via %s: %s", gw, strings.Join(added, ", "))
+	}
+	if o.defaultRoute {
+		// The order matters: pin everything that must NOT go through the tunnel
+		// to the old gateway first — every relay host the workers use, and the
+		// SSH sources — then move the default. Undone in reverse on exit.
+		oldGW, err := defaultGateway()
+		if err != nil {
+			log.Printf("default route: %v — not changing it", err)
+		} else {
+			pinned := map[string]bool{}
+			pin := func(h string) {
+				if h == "" || pinned[h] {
+					return
+				}
+				if err := addHostRoute(h, oldGW); err != nil {
+					log.Printf("pin %s via %s: %v", h, oldGW, err)
+					return
+				}
+				pinned[h] = true
+			}
+			for _, h := range pool.relayHosts() {
+				pin(h)
+			}
+			for _, h := range o.keepHosts {
+				pin(h)
+			}
+			if sc := os.Getenv("SSH_CLIENT"); sc != "" {
+				pin(strings.Fields(sc)[0])
+			}
+			if err := setDefaultGateway(gw); err != nil {
+				log.Printf("default route → %s: %v", gw, err)
+			} else {
+				log.Printf("DEFAULT ROUTE → %s (old %s); pinned to the old gateway: %v", gw, oldGW, keys(pinned))
+				defer func() {
+					if err := setDefaultGateway(oldGW); err != nil {
+						log.Printf("RESTORE default route → %s FAILED: %v", oldGW, err)
+					} else {
+						log.Printf("default route restored → %s", oldGW)
+					}
+					for h := range pinned {
+						_ = deleteHostRoute(h)
+					}
+				}()
+			}
+		}
 	}
 
 	rctx, cancel := context.WithCancel(ctx)

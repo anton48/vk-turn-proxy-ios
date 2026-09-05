@@ -21,3 +21,5 @@ func (*tunDev) Close() error                        { return nil }
 func (*tunDev) configure(string, string, int) error { return errors.New("no tun") }
 func addHostRoute(string, string) error             { return errors.New("no tun") }
 func deleteHostRoute(string) error                  { return errors.New("no tun") }
+func defaultGateway() (string, error)               { return "", errors.New("no tun") }
+func setDefaultGateway(string) error                { return errors.New("no tun") }

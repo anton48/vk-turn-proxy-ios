@@ -93,3 +93,21 @@ func run(name string, args ...string) error {
 	}
 	return nil
 }
+
+// defaultGateway reads the current IPv4 default gateway.
+func defaultGateway() (string, error) {
+	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("route get default: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && f[0] == "gateway:" {
+			return f[1], nil
+		}
+	}
+	return "", fmt.Errorf("route get default: no gateway in %q", strings.TrimSpace(string(out)))
+}
+
+// setDefaultGateway points the default route at gw.
+func setDefaultGateway(gw string) error { return run("route", "-q", "change", "default", gw) }
