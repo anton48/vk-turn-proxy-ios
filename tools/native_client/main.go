@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -279,17 +280,31 @@ func run(ctx context.Context, o options) int {
 // to the old gateway first: the relay host, -keep-hosts and the SSH source.
 // Returns the function that undoes it, or nil when nothing was changed.
 func switchDefaultRoute(ctx context.Context, p *proxy.Proxy, o options) func() {
+	// Wait until every connection is up AND at least one relay host is known,
+	// then pin the relay(s) BEFORE moving the default. 🚨 A fast (cached-cred)
+	// start reaches ActiveConns==conns within a second — before TURNServerIP is
+	// published — and switching then routes the proxy's OWN relay sockets into
+	// the tunnel, which kills it (seen 2026-09-05: `pinned: []`, tunnel dead).
+	// So the relay is discovered from the proxy AND from the OS (sockstat of our
+	// own connections), and if neither yields a host we do NOT switch.
 	waitAll := time.NewTimer(o.defaultRouteWait)
 	defer waitAll.Stop()
+	var relays []string
 	for {
 		s := p.GetStats()
-		if int(s.ActiveConns) >= o.conns {
+		relays = relayHosts(p)
+		if int(s.ActiveConns) >= o.conns && len(relays) > 0 {
 			break
 		}
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-waitAll.C:
+			relays = relayHosts(p)
+			if len(relays) == 0 {
+				log.Printf("default route: no relay host discovered after %s — NOT switching (it would kill the tunnel)", o.defaultRouteWait)
+				return nil
+			}
 			log.Printf("default route: only %d/%d connections up after %s — switching anyway", s.ActiveConns, o.conns, o.defaultRouteWait)
 		case <-time.After(500 * time.Millisecond):
 			continue
@@ -301,21 +316,27 @@ func switchDefaultRoute(ctx context.Context, p *proxy.Proxy, o options) func() {
 		log.Printf("default route: %v — not changing it", err)
 		return nil
 	}
-	pinned := map[string]bool{}
+	// added = routes we created (delete on exit); a route that already exists is
+	// forced to the old gateway with `route change` and left in place.
+	added := map[string]bool{}
 	pin := func(h string) {
-		if h == "" || pinned[h] {
+		if h == "" || added[h] {
 			return
 		}
-		if err := addHostRoute(h, oldGW); err != nil {
+		switch err := addHostRoute(h, oldGW); {
+		case err == nil:
+			added[h] = true
+		case strings.Contains(err.Error(), "File exists"):
+			if cerr := changeHostRoute(h, oldGW); cerr != nil {
+				log.Printf("pin %s: route exists and change to %s failed: %v", h, oldGW, cerr)
+			}
+		default:
 			log.Printf("pin %s via %s: %v", h, oldGW, err)
-			return
 		}
-		pinned[h] = true
 	}
-	// Anonymously the app puts every allocation on ONE relay host, and the
-	// proxy reports that host; a reconnect that lands on another relay after
-	// the switch would reach it through the tunnel, which works but is slower.
-	pin(p.TURNServerIP())
+	for _, h := range relays {
+		pin(h)
+	}
 	for _, h := range o.keepHosts {
 		pin(h)
 	}
@@ -324,22 +345,40 @@ func switchDefaultRoute(ctx context.Context, p *proxy.Proxy, o options) func() {
 	}
 	if err := setDefaultGateway(o.gateway); err != nil {
 		log.Printf("default route → %s: %v", o.gateway, err)
-		for h := range pinned {
+		for h := range added {
 			_ = deleteHostRoute(h)
 		}
 		return nil
 	}
-	log.Printf("DEFAULT ROUTE → %s (old %s); pinned to the old gateway: %v", o.gateway, oldGW, keys(pinned))
+	log.Printf("DEFAULT ROUTE → %s (old %s); relays %v; host routes added: %v", o.gateway, oldGW, relays, keys(added))
 	return func() {
 		if err := setDefaultGateway(oldGW); err != nil {
 			log.Printf("RESTORE default route → %s FAILED: %v", oldGW, err)
 		} else {
 			log.Printf("default route restored → %s", oldGW)
 		}
-		for h := range pinned {
+		for h := range added {
 			_ = deleteHostRoute(h)
 		}
 	}
+}
+
+// relayHosts is every relay IP that must stay off the tunnel: the proxy's
+// reported TURN server, plus every remote host the proxy holds a TURN socket
+// to (discovered from the OS), so a switch that fires before TURNServerIP is
+// published still finds the relay. Anonymously the app uses ONE relay host,
+// so this is normally a single address.
+func relayHosts(p *proxy.Proxy) []string {
+	set := map[string]bool{}
+	if ip := p.TURNServerIP(); ip != "" {
+		set[ip] = true
+	}
+	for _, ip := range relayHostsFromOS() {
+		set[ip] = true
+	}
+	out := keys(set)
+	sort.Strings(out)
+	return out
 }
 
 // wgState is what the device reports over UAPI for its single peer.

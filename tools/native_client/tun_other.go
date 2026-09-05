@@ -21,3 +21,6 @@ func addHostRoute(string, string) error               { return errFreeBSDOnly }
 func deleteHostRoute(string) error                    { return errFreeBSDOnly }
 func defaultGateway() (string, error)                 { return "", errFreeBSDOnly }
 func setDefaultGateway(string) error                  { return errFreeBSDOnly }
+
+func changeHostRoute(string, string) error { return errFreeBSDOnly }
+func relayHostsFromOS() []string           { return nil }

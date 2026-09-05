@@ -10,7 +10,10 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"golang.zx2c4.com/wireguard/tun"
@@ -67,4 +70,43 @@ func execCmd(name string, args ...string) error {
 		return fmt.Errorf("%s %s: %v: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// changeHostRoute repoints an existing host route at gw (for a pin that hit
+// "File exists": a leftover from an earlier run or an operator's own route).
+func changeHostRoute(host, gw string) error {
+	return execCmd("route", "-q", "change", "-host", host, gw)
+}
+
+// relayHostsFromOS lists the remote hosts THIS process holds TURN sockets to,
+// read from sockstat: the relay(s) the proxy is actually talking to, whatever
+// the proxy itself has published so far. TCP transport shows them as
+// connected tcp4 sockets; an unconnected UDP socket shows no peer, in which
+// case the proxy's TURNServerIP is the only source.
+func relayHostsFromOS() []string {
+	out, err := exec.Command("sockstat", "-4", "-c").CombinedOutput()
+	if err != nil {
+		return nil
+	}
+	pid := strconv.Itoa(os.Getpid())
+	set := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		// USER COMMAND PID FD PROTO LOCAL FOREIGN
+		if len(f) < 7 || f[2] != pid {
+			continue
+		}
+		host, port, err := net.SplitHostPort(f[6])
+		if err != nil {
+			continue
+		}
+		if port == "19302" || port == "3478" {
+			set[host] = true
+		}
+	}
+	var hosts []string
+	for h := range set {
+		hosts = append(hosts, h)
+	}
+	return hosts
 }
