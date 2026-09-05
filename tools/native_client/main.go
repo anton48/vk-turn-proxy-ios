@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -292,7 +293,7 @@ func switchDefaultRoute(ctx context.Context, p *proxy.Proxy, o options) func() {
 	var relays []string
 	for {
 		s := p.GetStats()
-		relays = relayHosts(p)
+		relays = relayHosts(p, o.credCache)
 		if int(s.ActiveConns) >= o.conns && len(relays) > 0 {
 			break
 		}
@@ -300,7 +301,7 @@ func switchDefaultRoute(ctx context.Context, p *proxy.Proxy, o options) func() {
 		case <-ctx.Done():
 			return nil
 		case <-waitAll.C:
-			relays = relayHosts(p)
+			relays = relayHosts(p, o.credCache)
 			if len(relays) == 0 {
 				log.Printf("default route: no relay host discovered after %s — NOT switching (it would kill the tunnel)", o.defaultRouteWait)
 				return nil
@@ -363,12 +364,14 @@ func switchDefaultRoute(ctx context.Context, p *proxy.Proxy, o options) func() {
 	}
 }
 
-// relayHosts is every relay IP that must stay off the tunnel: the proxy's
-// reported TURN server, plus every remote host the proxy holds a TURN socket
-// to (discovered from the OS), so a switch that fires before TURNServerIP is
-// published still finds the relay. Anonymously the app uses ONE relay host,
-// so this is normally a single address.
-func relayHosts(p *proxy.Proxy) []string {
+// relayHosts is every relay IP that must stay off the tunnel, from three
+// sources because each one has a hole: the proxy's TURNServerIP is published
+// only on a FRESH credential mint (empty on a warm cache); the OS shows the
+// relay only for CONNECTED sockets (tcp transport — pion's udp socket has no
+// peer); the credential cache file names every relay the pool holds whatever
+// happened this session. Anonymously the app uses ONE relay host, so this is
+// normally a single address.
+func relayHosts(p *proxy.Proxy, credCache string) []string {
 	set := map[string]bool{}
 	if ip := p.TURNServerIP(); ip != "" {
 		set[ip] = true
@@ -376,9 +379,40 @@ func relayHosts(p *proxy.Proxy) []string {
 	for _, ip := range relayHostsFromOS() {
 		set[ip] = true
 	}
+	for _, ip := range relayHostsFromCache(credCache) {
+		set[ip] = true
+	}
 	out := keys(set)
 	sort.Strings(out)
 	return out
+}
+
+// relayHostsFromCache reads the relay hosts out of the proxy's credential
+// cache (the same creds-pool.json the app keeps): {"creds":[{"address":
+// "host:port", ...}]}. Only the addresses are read.
+func relayHostsFromCache(path string) []string {
+	if path == "" {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var cache struct {
+		Creds []struct {
+			Address string `json:"address"`
+		} `json:"creds"`
+	}
+	if err := json.Unmarshal(b, &cache); err != nil {
+		return nil
+	}
+	var hosts []string
+	for _, c := range cache.Creds {
+		if h, _, err := net.SplitHostPort(c.Address); err == nil && h != "" {
+			hosts = append(hosts, h)
+		}
+	}
+	return hosts
 }
 
 // wgState is what the device reports over UAPI for its single peer.
