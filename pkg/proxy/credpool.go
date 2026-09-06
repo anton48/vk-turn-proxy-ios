@@ -12,13 +12,16 @@ package proxy
 // (NewProxy → newCredPool with p.fetchFreshCreds; growCredPool unchanged),
 // and this wrapper reuses the same credPool type with an injected fetcher.
 //
-// What the wrapper's fetcher does NOT carry is the WebView captcha round trip
-// (Proxy.RefreshCaptchaURL / SolveCaptcha keep their tokens in Proxy fields):
-// a blocking CaptchaSolver is honoured, a captcha without one fails the fetch
-// and the slot cools down. Stage-5 step 3 (csqtt as a Proxy session mode)
-// removes that difference by construction. ⚠️ Grow duplicates the state
-// machine of Proxy.growCredPool so that proxy.go stays untouched; step 3
-// makes Proxy delegate here and deletes the copy.
+// What the wrapper's fetcher does NOT carry is the captcha: the WebView round
+// trip keeps its tokens in Proxy fields, and every acquire here is
+// non-blocking (get(…, false) / tryFill(…, false)), so a captcha fails the
+// fetch with CaptchaRequiredError and the slot cools down — the transport
+// reports "authentication required". No solver is wired on this path by
+// design (a field that is never consulted would be a lie); stage-5 step D
+// (csqtt as a Proxy session mode) brings the app's captcha flow by
+// construction. ⚠️ Grow duplicates the state machine of Proxy.growCredPool
+// so that proxy.go stays untouched; step D makes Proxy delegate here and
+// deletes the copy.
 
 import (
 	"context"
@@ -43,9 +46,6 @@ type CredPoolConfig struct {
 	CachePath  string        // on-disk JSON cache (the app's creds-pool.json); empty disables persistence
 	TurnServer string        // optional TURN host override applied to every fresh mint
 	TurnPort   string        // optional TURN port override
-	// CaptchaSolver is called when VK requires a captcha and the acquire
-	// allows blocking; nil → the fetch fails and the slot cools down.
-	CaptchaSolver CaptchaSolver
 	// Fetch replaces the standard VK fetcher (tests, or another minter). It
 	// must return ("host:port", creds, nil) with creds.Addresses non-empty.
 	Fetch func(allowCaptchaBlock bool, slot int) (string, *TURNCreds, error)
@@ -56,8 +56,9 @@ type CredPool struct {
 	cp       *credPool
 	numConns int
 	linkID   string
-	relayIP  atomic.Value // string: first host of the last fresh mint
-	pace     growPace     // set before Grow starts; tests shrink it
+	relayIP  atomic.Value    // string: first host of the last fresh mint
+	pace     growPace        // set before Grow starts; tests shrink it
+	ctx      context.Context // the pool's own lifetime: the saver, Grow; ended by Close
 	cancel   context.CancelFunc
 }
 
@@ -81,7 +82,7 @@ func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 		cfg.NumConns = 1
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	p := &CredPool{numConns: cfg.NumConns, linkID: parseVKLinkID(cfg.VKLink), pace: defaultGrowPace, cancel: cancel}
+	p := &CredPool{numConns: cfg.NumConns, linkID: parseVKLinkID(cfg.VKLink), pace: defaultGrowPace, ctx: ctx, cancel: cancel}
 	fetch := cfg.Fetch
 	if fetch == nil {
 		fetch = p.standardFetch(cfg)
@@ -91,8 +92,9 @@ func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 }
 
 // Close is the transport's stop path: it writes the cache now (so the stop
-// does not depend on the background saver's timing), then ends the saver
-// and any Grow loop. Safe to call more than once.
+// does not depend on the background saver's timing), then ends the pool's
+// lifetime — the periodic saver and Grow both stop. Safe to call more than
+// once; nothing is minted after it.
 func (p *CredPool) Close() {
 	if p.cp.cachePath != "" {
 		p.cp.saveToDisk()
@@ -114,12 +116,13 @@ func parseVKLinkID(link string) string {
 	return id
 }
 
-// standardFetch is Proxy.fetchFreshCreds without the WebView captcha token
-// bookkeeping: cookie auth when enabled (package-level, shared with Proxy),
-// otherwise the anonymous VK Calls path; then the TURN override, then the
-// relay host is published.
+// standardFetch is Proxy.fetchFreshCreds without the captcha bookkeeping:
+// cookie auth when enabled (package-level, shared with Proxy), otherwise the
+// anonymous VK Calls path with no solver — a captcha surfaces as
+// CaptchaRequiredError; then the TURN override, then the relay host is
+// published.
 func (p *CredPool) standardFetch(cfg CredPoolConfig) func(bool, int) (string, *TURNCreds, error) {
-	return func(allowCaptchaBlock bool, slot int) (string, *TURNCreds, error) {
+	return func(_ bool, slot int) (string, *TURNCreds, error) {
 		var creds *TURNCreds
 		if cookieAuthEnabled.Load() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -134,11 +137,7 @@ func (p *CredPool) standardFetch(cfg CredPoolConfig) func(bool, int) (string, *T
 			clearCookieAuthFatal()
 			creds = c
 		} else {
-			var solver CaptchaSolver
-			if allowCaptchaBlock {
-				solver = cfg.CaptchaSolver
-			}
-			c, err := GetVKCreds(p.linkID, solver, "", "", 0, 0, "", "")
+			c, err := GetVKCreds(p.linkID, nil, "", "", 0, 0, "", "")
 			if err != nil {
 				return "", nil, fmt.Errorf("get VK creds: %w", err)
 			}
@@ -280,13 +279,15 @@ var defaultGrowPace = growPace{
 	bootstrap: 2 * time.Minute,
 }
 
-// Grow runs the background fill loop until ctx ends: it waits for `ready`
-// (the transport's first live connection; nil = start now), then fills
+// Grow runs the background fill loop for the pool's lifetime (Close ends
+// it): it waits for `ready` (the transport's first live connection; nil =
+// start now), then fills
 // slots fast until ceil(NumConns/10) are usable — the cold-start target — and
 // from then on adds one slot every 120–300 s so credential expiries stay
 // spread. Fetches never block on a captcha. This is Proxy.growCredPool's
 // state machine without the captcha-pending check (no captcha UI here).
-func (p *CredPool) Grow(ctx context.Context, ready <-chan struct{}) {
+func (p *CredPool) Grow(ready <-chan struct{}) {
+	ctx := p.ctx
 	if ready != nil {
 		select {
 		case <-ready:

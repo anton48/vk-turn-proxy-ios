@@ -145,21 +145,21 @@ func TestCredPoolRelayHostsSurviveAWarmCache(t *testing.T) {
 }
 
 // The grower fills fast until ceil(NumConns/10) slots are usable, then adds
-// one slot per stagger interval. Run in milliseconds; the production pace
-// is pinned separately. Sabotage seen red: Grow never leaving cold start
-// (the fourth mint follows the third at the fast interval).
+// one slot per stagger interval, and Close ends it: nothing is minted after
+// Close. Run in milliseconds; the production pace is pinned separately.
+// Sabotages seen red: Grow never leaving cold start (the fourth mint follows
+// the third at the fast interval); Grow running on context.Background()
+// instead of the pool's lifetime (mints continue after Close).
 func TestCredPoolGrowFastUntilTargetThenStaggers(t *testing.T) {
 	m := &fakeMinter{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p := NewCredPool(ctx, CredPoolConfig{NumConns: 30, Fetch: m.fetch}) // target = 3 slots of 12
+	p := NewCredPool(context.Background(), CredPoolConfig{NumConns: 30, Fetch: m.fetch}) // target = 3 slots of 12
 	// Set before the goroutine starts — the go statement orders it.
 	p.pace = growPace{fast: 3 * time.Millisecond, slow: 20 * time.Millisecond, staggerMin: 150 * time.Millisecond, staggerMax: 200 * time.Millisecond, bootstrap: time.Second}
 	staggerMin := p.pace.staggerMin
 	ready := make(chan struct{})
 	close(ready)
 	t0 := time.Now()
-	go p.Grow(ctx, ready)
+	go p.Grow(ready)
 
 	deadline := time.After(2 * time.Second)
 	for p.Stats().Available < 3 {
@@ -184,6 +184,12 @@ func TestCredPoolGrowFastUntilTargetThenStaggers(t *testing.T) {
 	at := m.stamps()
 	if gap := at[3].Sub(at[2]); gap < staggerMin-10*time.Millisecond {
 		t.Fatalf("fourth mint %s after the third — maintenance should wait at least %s", gap, staggerMin)
+	}
+	p.Close()
+	after := m.count()
+	time.Sleep(3 * p.pace.staggerMax)
+	if m.count() != after {
+		t.Fatalf("Close did not stop the grower: %d mints after Close (was %d)", m.count()-after, after)
 	}
 }
 
