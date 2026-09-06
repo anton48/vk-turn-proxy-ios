@@ -1942,7 +1942,17 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		//
 		// The original burst case is untouched: there the slots are empty, so
 		// availableAt is zero and both predicates agree.
-		ready := cp.countFreshLocked()
+		// 🚨 COUNT BY THE PREDICATE PHASE 1 HANDS OUT BY — and Phase 1 refuses
+		// a VK-saturated slot (see pickAcquireSlotLocked's "skipping slot N
+		// (VK-saturated …)"), so a saturated slot is NOT ready. Build 204
+		// fixed the cooldown half of this rule; the saturation half bit on
+		// 2026-09-06 (build 360, an LTE→Wi-Fi switch): the path-change marking
+		// saturated the three in-use slots, this line counted them as "3
+		// ready ≥ 3 target — parking", Phase 1 skipped them, and thirty
+		// connections parked for 40 s (then 3 min 20 s on the next switch)
+		// with an EMPTY slot in the pool. A fresh fetch is a new VK identity
+		// with its own quota; the saturated creds' allocations are dead.
+		ready := cp.countAvailableLocked()
 		inFlight := 0
 		for i := range cp.pool {
 			if cp.pool[i].fetching {
@@ -1987,9 +1997,27 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	}
 
 	if target == -1 {
-		// Every slot is either saturated, on cooldown, or being fetched
-		// by someone else. Return a descriptive error so the caller's
-		// reconnect loop knows to back off and try again later.
+		// Second pass: a VK-saturated slot that NO connection is bound to
+		// any more. The "must not be replaced" above protects the ten conns
+		// bound to a saturated cred; with active == 0 there are none — after a
+		// path-change restart that is every marked slot, and its allocations
+		// are dead at VK anyway. Replacing the cred forgets it on our side
+		// only; a fresh mint is a new identity with its own quota. Without
+		// this pass a full pool (every slot saturated or pending) has nowhere
+		// to mint and thirty connections wait out a 10-minute cooldown.
+		for _, slot := range candidatesOrdered() {
+			e := cp.pool[slot]
+			if e.creds != nil && now.Before(e.saturatedUntil) && e.active == 0 && !e.fetching && !now.Before(e.cooldownUntil) {
+				target = slot
+				break
+			}
+		}
+	}
+	if target == -1 {
+		// Every slot is either saturated with conns still bound, pending, on
+		// cooldown, or being fetched by someone else. Return a descriptive
+		// error so the caller's reconnect loop knows to back off and try
+		// again later.
 		cp.mu.Unlock()
 		return "", nil, -1, fmt.Errorf("credpool: no slot available (all saturated, cooling down, or fetching)")
 	}
