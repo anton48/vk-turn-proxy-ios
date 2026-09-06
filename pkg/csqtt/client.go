@@ -53,7 +53,10 @@ type Config struct {
 	// caller (cold-start cap, path-change settle) stalls only this worker;
 	// ctx ends the wait. The pool policy is the caller's. The Release in the
 	// result is called exactly once — when the allocation obtained with the
-	// credential is gone, or at once when the allocation failed.
+	// credential is gone, or at once when the allocation failed; Failed, if
+	// set, is called first with DialRelay's error whenever the allocation
+	// failed, so the pool can act on a refusal — a 486 must move this worker
+	// to another credential, and a pool that only hears Release cannot.
 	Creds func(ctx context.Context, workerID int) (Credential, error)
 
 	TURNTransport string           // "udp" or "tcp"
@@ -148,14 +151,24 @@ type Client struct {
 	allocRTT    atomic.Int64 // the last relay allocation, nanoseconds
 }
 
-// Credential is what Creds returns: the relay credential and the release
+// Credential is what Creds returns: the relay credential and the two calls
 // the pool wants back. Release is called exactly once per successful Creds
 // — when the allocation obtained with it is gone (the session ended for any
 // reason, including Close), or at once when the allocation never came up.
-// A nil Release means no bookkeeping (a manual credential).
+// Failed is called at most once, BEFORE that Release, with DialRelay's
+// error whenever the allocation did not come up — the relay refused it,
+// never answered, or a step around it failed (the local socket, the TCP
+// dial, the permission). The POOL decides what the error means: a 486
+// (quota) marks the slot so the next Creds hands out another credential,
+// a 401/403 invalidates it, anything else changes nothing. A worker that
+// only released handed the same exhausted credential back to itself on
+// every retry (the user's review, 2026-09-06: two 486s, one mint, zero
+// saturated slots). nil callbacks mean no bookkeeping (a manual
+// credential).
 type Credential struct {
 	TURNCredentials
 	Release func()
+	Failed  func(err error)
 }
 
 // dialRelay is DialRelay, replaceable by tests with a loopback relay.
@@ -815,6 +828,13 @@ func (w *worker) session() error {
 	relay, err := dialRelay(cred.TURNCredentials, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel)
 	startDone()
 	if err != nil {
+		// The relay refused or never answered: the lease hears it BEFORE
+		// the deferred release, while the pool still counts this worker on
+		// the slot — a 486 must not come back to this worker as the same
+		// credential on the next attempt.
+		if cred.Failed != nil {
+			cred.Failed(err)
+		}
 		return err
 	}
 	w.c.allocRTT.Store(int64(time.Since(t0)))

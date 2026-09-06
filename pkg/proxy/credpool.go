@@ -230,6 +230,22 @@ func (p *CredPool) MarkSaturated(slot int) time.Duration { return p.cp.markSatur
 // RecordAuthError counts a 401/403 on the slot (pre-kill attribution).
 func (p *CredPool) RecordAuthError(slot int) { p.cp.recordAuthError(slot) }
 
+// InvalidateSlot drops the credential in ONE slot — a 401/403 at
+// allocation means the credential is dead; the pool re-mints into the slot.
+// This is what Proxy's own SRTP session does on an auth error at setup.
+func (p *CredPool) InvalidateSlot(slot int) { p.cp.invalidateEntry(slot) }
+
+// IsQuotaError reports a 486 Allocation Quota Reached from the relay: the
+// credential is fine, its allocations are used up — mark the slot
+// saturated, never invalidate it. IsAuthError reports a 401/403: the
+// credential is dead. Both read pion's error text, the same way Proxy's
+// session paths classify their own allocation failures, so a second owner
+// of the pool (csqtt) answers a refusal exactly as Proxy does.
+func IsQuotaError(err error) bool { return isQuotaError(err) }
+
+// IsAuthError — see IsQuotaError.
+func IsAuthError(err error) bool { return isAuthError(err) }
+
 // Invalidate drops every cached credential (a wholesale re-fetch follows).
 func (p *CredPool) Invalidate() { p.cp.invalidate() }
 

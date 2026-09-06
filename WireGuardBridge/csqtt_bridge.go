@@ -286,6 +286,7 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 			return csqtt.Credential{
 				TURNCredentials: csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: addr},
 				Release:         func() { once.Do(func() { a.pool.Release(slot) }) },
+				Failed:          func(err error) { a.refused(workerID, slot, err) },
 			}, nil
 		}
 		if terminal := csqttTerminalCredError(err); terminal != nil {
@@ -301,6 +302,27 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 		if wait < csqttAcquireBackstopMax {
 			wait *= 2
 		}
+	}
+}
+
+// refused is Credential.Failed: the relay's refusal becomes the pool's own
+// bookkeeping, exactly as Proxy's SRTP session does — a 486 marks the slot
+// saturated (its allocations are used up; the next Creds comes from another
+// slot or a fresh mint), a 401/403 invalidates it (the credential is dead).
+// Anything else (a dead relay, a timeout) is the worker's to retry. 🚨
+// Without this the pool never hears of the refusal and hands the same
+// exhausted credential back to the same worker on every retry — its slot
+// selection cannot act on what it is not told (the user's review,
+// 2026-09-06: two 486s, one mint, zero saturated slots).
+func (a *csqttPoolAdapter) refused(workerID, slot int, err error) {
+	switch {
+	case proxy.IsQuotaError(err):
+		cd := a.pool.MarkSaturated(slot)
+		log.Printf("csqtt: worker %d: TURN allocate quota error (486) on slot %d (cooldown %s) — the next credential comes from another slot",
+			workerID, slot, cd.Round(time.Second))
+	case proxy.IsAuthError(err):
+		a.pool.InvalidateSlot(slot)
+		log.Printf("csqtt: worker %d: TURN auth error on slot %d — invalidated", workerID, slot)
 	}
 }
 

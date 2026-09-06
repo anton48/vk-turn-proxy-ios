@@ -814,3 +814,55 @@ func TestSessionTeardownFreesABlockedWriter(t *testing.T) {
 		return st.Restarts == before+1 && st.Ready == 1 && relays.nth(1) != nil
 	})
 }
+
+// A refused allocation reaches the lease BEFORE the release, with the
+// relay's error, and the worker's next attempt asks the pool again: the
+// pool is what decides that a 486 means "another credential next time" —
+// a worker that only released handed the same exhausted credential back to
+// itself for ever (the user's review, 2026-09-06: two 486s, one mint, zero
+// saturated slots). Sabotage seen red: the Failed call dropped from
+// session() (the lease sees "released" first and never the error).
+func TestRefusedAllocationReachesTheLeaseBeforeRelease(t *testing.T) {
+	srv := newFakeServer(t)
+	quota := errors.New("turn allocate: Allocate error response (error 486: Allocation Quota Reached)")
+	loopbackRelay(t, func(creds TURNCredentials) error {
+		if creds.Username == "exhausted" {
+			return quota
+		}
+		return nil
+	})
+	var mu sync.Mutex
+	var events []string
+	handed := 0
+	creds := func(ctx context.Context, workerID int) (Credential, error) {
+		mu.Lock()
+		handed++
+		name := "fresh"
+		if handed == 1 {
+			name = "exhausted"
+		}
+		mu.Unlock()
+		return Credential{
+			TURNCredentials: TURNCredentials{Username: name, Password: "p", Address: "127.0.0.1:19302"},
+			Failed: func(err error) {
+				mu.Lock()
+				events = append(events, "failed: "+err.Error())
+				mu.Unlock()
+			},
+			Release: func() {
+				mu.Lock()
+				events = append(events, "released")
+				mu.Unlock()
+			},
+		}, nil
+	}
+	c := dialReady(t, testConfig(srv, 1, creds))
+	defer c.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"failed: " + quota.Error(), "released"}
+	if handed != 2 || len(events) != 2 || events[0] != want[0] || events[1] != want[1] {
+		t.Fatalf("handed %d credentials, lease saw %q — want 2 handed and %q (the refusal first, with the relay's error, then the release)", handed, events, want)
+	}
+}
