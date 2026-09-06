@@ -59,7 +59,7 @@ struct VKTurnProxyApp: App {
                 // scheme, so we're the sole handler. Any other scheme is ignored.
                 .onOpenURL { url in
                     let scheme = url.scheme?.lowercased()
-                    if scheme == "vkturnproxy" || scheme == "wdtt" || scheme == "freeturn" {
+                    if scheme == "vkturnproxy" || scheme == "wdtt" || scheme == "freeturn" || scheme == "csqtt" {
                         ConnectionLinkInbox.shared.deliver(url)
                     }
                 }

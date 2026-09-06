@@ -29,6 +29,7 @@ struct ServerEditView: View {
     private var mode: Binding<ServerMode> {
         Binding(
             get: {
+                if draft.useCsqtt { return .csqtt }
                 if draft.useWrapS { return .srtpWrapS }
                 if draft.useWrapA { return .srtpWrapA }
                 if draft.useSrtp { return .srtp }
@@ -36,10 +37,16 @@ struct ServerEditView: View {
                 return .legacy
             },
             set: { m in
+                draft.useCsqtt = (m == .csqtt)
                 draft.useWrapS = (m == .srtpWrapS)
                 draft.useWrapA = (m == .srtpWrapA)
                 draft.useSrtp  = (m == .srtp)
                 draft.useWrap  = (m == .srtpWrap)
+                // csqtt binds the password to ONE device identity: mint it the
+                // first time the mode is chosen and keep it from then on.
+                if m == .csqtt && draft.csqttDeviceID.isEmpty {
+                    draft.csqttDeviceID = UUID().uuidString
+                }
                 if m == .srtpWrapS && draft.clientID.isEmpty {
                     draft.clientID = UUID().uuidString
                 }
@@ -127,6 +134,18 @@ struct ServerEditView: View {
                         TextField("Device ID", text: $draft.deviceID)
                             .autocapitalization(.none).disableAutocorrection(true)
                     }
+                    if mode.wrappedValue == .csqtt {
+                        SecureField("Server password", text: $draft.csqttPassword)
+                            .autocapitalization(.none).disableAutocorrection(true)
+                        hint(ConfigValidation.csqttPassword(draft.csqttPassword))
+                        // The server binds an unbound password to this value;
+                        // a second device on the same password is refused.
+                        TextField("Device ID", text: $draft.csqttDeviceID)
+                            .autocapitalization(.none).disableAutocorrection(true)
+                        Text("csqtt has no key exchange: the password is the tunnel's only key, so traffic recorded today can be decrypted by anyone who learns it later (no forward secrecy). The other modes do not have this property.")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
                     if mode.wrappedValue == .srtpWrapS {
                         SecureField("WRAP key (64 hex chars)", text: $draft.wrapKeyHex)
                             .autocapitalization(.none).disableAutocorrection(true)
@@ -149,8 +168,9 @@ struct ServerEditView: View {
 
             // WireGuard keys/address are user-entered for Legacy / SRTP /
             // SRTP+WRAP / SRTP-WRAP-S. In SRTP-WRAP-A they are minted by the
-            // server via GETCONF, so hide the whole section in that mode.
-            if mode.wrappedValue != .srtpWrapA {
+            // server via GETCONF, and csqtt has no WireGuard at all (the server
+            // hands out the tunnel IP and DNS), so hide the section in both.
+            if mode.wrappedValue != .srtpWrapA && mode.wrappedValue != .csqtt {
                 Section("WireGuard") {
                     SecureField("Private Key (base64)", text: $draft.privateKey)
                         .autocapitalization(.none).disableAutocorrection(true)

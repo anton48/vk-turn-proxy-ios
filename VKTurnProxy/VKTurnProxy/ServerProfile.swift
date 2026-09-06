@@ -60,9 +60,22 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     /// config, this is device identity, so an imported link mints a fresh one.
     var deviceID: String = ""
 
+    // csqtt (amurcanov's csqtt server, stage 5 — 2026-09-06). A SIXTH
+    // transport with its OWN fields: WRAP-A (wdtt) is alive and in use, so its
+    // fields are never reused for this. The server hands out the tunnel IP and
+    // DNS; the user enters no WireGuard keys. One HKDF(password) key, no key
+    // exchange — hence the no-forward-secrecy notice in the UI.
+    var useCsqtt: Bool = false
+    var csqttPassword: String = ""
+    /// Device identity the csqtt server binds an unbound password to (a second
+    /// device on the same password is DENIED:device_mismatch). Minted per
+    /// server like WRAP-A's deviceID; never carried in connection links.
+    var csqttDeviceID: String = ""
+
     /// Human-readable transport mode, matching the ServerMode picker labels.
     /// Used in log lines and import confirmations.
     var modeLabel: String {
+        if useCsqtt { return "csqtt" }
         if useWrapS { return "SRTP-WRAP-S" }
         if useWrapA { return "SRTP-WRAP-A" }
         if useSrtp { return "SRTP" }
@@ -82,6 +95,7 @@ struct ServerProfile: Codable, Identifiable, Equatable {
         case useSrtp, useWrap, useWrapA, useWrapS
         case wrapKeyHex, obfProfile, clientID
         case wrapAPassword, deviceID
+        case useCsqtt, csqttPassword, csqttDeviceID
     }
 }
 
@@ -121,6 +135,9 @@ extension ServerProfile {
         if let v = try c.decodeIfPresent(String.self, forKey: .clientID) { clientID = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .wrapAPassword) { wrapAPassword = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .deviceID) { deviceID = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .useCsqtt) { useCsqtt = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .csqttPassword) { csqttPassword = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .csqttDeviceID) { csqttDeviceID = v }
     }
 }
 
@@ -151,20 +168,26 @@ extension ServerProfile {
         if let v = s.obfProfile { obfProfile = v }
         if let v = s.clientID { clientID = v }
         if let v = s.wrapAPassword { wrapAPassword = v }
-        // Transport mode is ONE enum spread over four flags: resolve it as a
+        if let v = s.csqttPassword { csqttPassword = v }
+        // Transport mode is ONE enum spread over five flags: resolve it as a
         // coupled set with the serverModeBinding precedence
-        // (useWrapS > useWrapA > useSrtp > useWrap). A link that specifies none
-        // of them keeps the ServerProfile default (SRTP).
-        if s.useWrapS != nil || s.useWrapA != nil || s.useSrtp != nil || s.useWrap != nil {
+        // (useCsqtt > useWrapS > useWrapA > useSrtp > useWrap). A link that
+        // specifies none of them keeps the ServerProfile default (SRTP).
+        if s.useCsqtt != nil || s.useWrapS != nil || s.useWrapA != nil || s.useSrtp != nil || s.useWrap != nil {
+            let csqtt = s.useCsqtt ?? false
             let wrapS = s.useWrapS ?? false
             let wrapA = s.useWrapA ?? false
             let srtp = s.useSrtp ?? false
             let wrap = s.useWrap ?? false
-            useWrapS = wrapS
-            useWrapA = !wrapS && wrapA
-            useSrtp = !wrapS && !wrapA && srtp
-            useWrap = !wrapS && !wrapA && !srtp && wrap
+            useCsqtt = csqtt
+            useWrapS = !csqtt && wrapS
+            useWrapA = !csqtt && !wrapS && wrapA
+            useSrtp = !csqtt && !wrapS && !wrapA && srtp
+            useWrap = !csqtt && !wrapS && !wrapA && !srtp && wrap
         }
+        // csqtt binds the password to ONE device: mint the identity here, never
+        // take it from a link (two people importing one link must not collide).
+        if useCsqtt && csqttDeviceID.isEmpty { csqttDeviceID = UUID().uuidString }
         // SRTP-WRAP-S needs a stable per-stream Client-ID; mint one when the
         // link didn't carry it (mirrors the mode picker).
         if useWrapS && clientID.isEmpty { clientID = UUID().uuidString }
@@ -207,6 +230,11 @@ struct ServerSettings: Codable {
     /// other per-server field so restoring onto the same (or a replacement)
     /// device keeps the WireGuard peer the server already minted for it.
     var deviceID: String? = nil
+    /// csqtt (stage 5): the mode, its password and the device identity the
+    /// server bound the password to — backed up so a restore keeps working.
+    var useCsqtt: Bool? = nil
+    var csqttPassword: String? = nil
+    var csqttDeviceID: String? = nil
 
     init(_ p: ServerProfile) {
         serverName = p.serverName
@@ -230,6 +258,9 @@ struct ServerSettings: Codable {
         clientID = p.clientID
         wrapAPassword = p.wrapAPassword
         deviceID = p.deviceID
+        useCsqtt = p.useCsqtt
+        csqttPassword = p.csqttPassword
+        csqttDeviceID = p.csqttDeviceID
     }
 
     /// Rebuild a profile, filling every absent field with the ServerProfile
@@ -257,6 +288,9 @@ struct ServerSettings: Codable {
         if let v = clientID { p.clientID = v }
         if let v = wrapAPassword { p.wrapAPassword = v }
         if let v = deviceID { p.deviceID = v }
+        if let v = useCsqtt { p.useCsqtt = v }
+        if let v = csqttPassword { p.csqttPassword = v }
+        if let v = csqttDeviceID { p.csqttDeviceID = v }
         return p
     }
 }

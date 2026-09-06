@@ -230,7 +230,9 @@ private struct ActiveServerControls: View {
             ConfigValidation.peerAddress(s.peerAddress),
             ConfigValidation.turnOverride(s.turnServerOverride),
         ]
-        if s.useWrapA {
+        if s.useCsqtt {
+            issues.append(ConfigValidation.csqttPassword(s.csqttPassword))
+        } else if s.useWrapA {
             issues.append(ConfigValidation.wrapAPassword(s.wrapAPassword))
         } else {
             issues.append(ConfigValidation.wgKey(s.privateKey, label: "Private key", required: true))
@@ -398,6 +400,12 @@ enum ServerMode: Int, CaseIterable, Identifiable {
     // rtpopus3) + a Client-ID record inside DTLS. Same DTLS+WireGuard data path
     // as SRTP+WRAP (the user still enters WG keys), just a richer obf layer.
     case srtpWrapS = 4
+    // csqtt (stage 5, 2026-09-06): amurcanov's csqtt server. Gated by the
+    // per-server `useCsqtt` flag. No DTLS, no WireGuard: RTP-framed
+    // ChaCha20-Poly1305 over N TURN allocations carrying raw IP; the server
+    // hands out the tunnel IP and DNS. One HKDF(password) key for the life of
+    // the password — no forward secrecy, and the UI says so.
+    case csqtt = 5
 
     var id: Int { rawValue }
 
@@ -408,6 +416,7 @@ enum ServerMode: Int, CaseIterable, Identifiable {
         case .srtpWrap: return "SRTP+WRAP"
         case .srtpWrapA: return "SRTP-WRAP-A"
         case .srtpWrapS: return "SRTP-WRAP-S"
+        case .csqtt: return "csqtt"
         }
     }
 }
@@ -884,7 +893,7 @@ struct SettingsView: View {
         let raw = UIPasteboard.general.string ?? ""
         if raw.isEmpty {
             alertTitle = "Clipboard Empty"
-            alertMessage = "Copy a vkturnproxy://, wdtt:// or freeturn:// link to the clipboard first, then tap this again."
+            alertMessage = "Copy a vkturnproxy://, wdtt://, freeturn:// or csqtt:// link to the clipboard first, then tap this again."
             return
         }
         do {

@@ -4,7 +4,10 @@ import os.log
 
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
-    private var tunnelHandle: Int32 = -1
+    /// The running tunnel, if any. The kind travels with the handle (stage 5,
+    /// variant B): every per-handle bridge call goes through TunnelBackend, so
+    /// a csqtt handle can never be handed to a wg* export or the reverse.
+    private var backend: TunnelBackend?
     private let log = OSLog(subsystem: "com.vkturnproxy.tunnel", category: "PacketTunnel")
 
     // The inputs the tunnel settings were built from, kept so DIRECT mode
@@ -134,6 +137,48 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         authErrorTimer = nil
     }
 
+    // csqtt: a terminal failure after start (the server DENIED the session, a
+    // captcha on a re-mint) stops the client inside Go; nobody in the app is
+    // guaranteed to be polling stats at that moment, so the extension asks
+    // every 5 s and stops the tunnel itself with the reason.
+    private var csqttWatchdog: DispatchSourceTimer?
+
+    private func startCsqttWatchdog(_ backend: TunnelBackend) {
+        stopCsqttWatchdog()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let msg = backend.terminalError()
+            guard !msg.isEmpty else { return }
+            self.logMsg("csqtt: terminal failure (\(msg)) — stopping tunnel")
+            self.stopCsqttWatchdog()
+            self.cancelTunnelWithError(Self.csqttStopError(msg))
+        }
+        timer.resume()
+        csqttWatchdog = timer
+    }
+
+    private func stopCsqttWatchdog() {
+        csqttWatchdog?.cancel()
+        csqttWatchdog = nil
+    }
+
+    /// A csqtt stop reason as iOS carries it to the app: an NSError with the
+    /// text IN userInfo, exactly like the cookie watchdog's. A Swift error's
+    /// `errorDescription` is computed on access and does not cross the
+    /// process boundary — the app's fetchLastDisconnectError would read a bare
+    /// "(PacketTunnel.VPNError error N)" instead of the reason.
+    static func csqttStopError(_ reason: String) -> NSError {
+        NSError(domain: "VKTurnProxy", code: 2, userInfo: [NSLocalizedDescriptionKey: "csqtt: \(reason)"])
+    }
+
+    /// The proxy config for the log, with the csqtt password blanked: the line
+    /// is what users send us, and csqtt's password is the tunnel's only key.
+    static func redactedProxyConfig(_ json: String) -> String {
+        json.replacingOccurrences(of: #""csqtt_password":"[^"]*""#, with: #""csqtt_password":"…""#, options: .regularExpression)
+    }
+
     // MARK: - Tunnel Lifecycle
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
@@ -191,9 +236,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // (wgWaitWrapAProvision) and override wg_config + address/dns/mtu — the
         // user entered none of those.
         let isWrapA = (config["use_wrap_a"] as? Bool) ?? false
+        // csqtt (stage 5): no WireGuard at all — the server hands out the
+        // tunnel IP and DNS (csqttProvision) and the bridge pumps raw IP
+        // packets; wg_config is a placeholder on this path, like WRAP-A's.
+        let isCSQTT = (config["use_csqtt"] as? Bool) ?? false
 
         logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)\(mtuExplicit ? " (user-set)" : "")")
-        logMsg("proxyConfig=\(proxyConfigJSON)")
+        logMsg("proxyConfig=\(Self.redactedProxyConfig(proxyConfigJSON))")
 
         // 🚧 DIAGNOSTIC (issue #72). Watch the PROFILE, not just our own
         // messages: Apple's DTS answer on changing NEVPNProtocol properties
@@ -285,17 +334,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
 
-        logMsg("wgStartVKBootstrap: launching VK bootstrap goroutine...")
-        let handle = proxyConfigJSON.withCString { proxyPtr in
-            wgStartVKBootstrap(UnsafeMutablePointer(mutating: proxyPtr))
-        }
-        if handle < 0 {
-            logMsg("ERROR: wgStartVKBootstrap returned \(handle)")
-            completionHandler(VPNError.backendFailed(code: handle))
+        logMsg((isCSQTT ? "csqttStart" : "wgStartVKBootstrap") + ": launching bootstrap goroutine...")
+        let (started, code) = TunnelBackend.start(csqtt: isCSQTT, proxyConfigJSON: proxyConfigJSON)
+        guard let backend = started else {
+            logMsg("ERROR: \(isCSQTT ? "csqttStart" : "wgStartVKBootstrap") returned \(code)")
+            completionHandler(VPNError.backendFailed(code: code))
             return
         }
-        self.tunnelHandle = handle
-        logMsg("wgStartVKBootstrap OK, handle=\(handle)")
+        self.backend = backend
+        logMsg("\(isCSQTT ? "csqttStart" : "wgStartVKBootstrap") OK, handle=\(backend.handle)")
 
         // Wait for bootstrap in the background so completionHandler isn't
         // held for the entire (possibly captcha-solving) duration from the
@@ -304,24 +351,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            let ready = wgWaitBootstrapReady(handle, 120_000)
+            let ready = backend.waitReady(timeoutMs: 120_000)
             switch ready {
             case 1:
-                self.logMsg("wgWaitBootstrapReady: ready")
+                self.logMsg("waitReady: ready")
                 if useCookieAuth {
                     self.startAuthErrorWatchdog()
                 }
             case 0:
-                self.logMsg("wgWaitBootstrapReady: timeout after 120s — aborting")
-                wgTurnOff(handle)
-                self.tunnelHandle = -1
+                self.logMsg("waitReady: timeout after 120s — aborting")
+                backend.turnOff()
+                self.backend = nil
                 completionHandler(VPNError.bootstrapTimeout)
                 return
             default:
-                self.logMsg("wgWaitBootstrapReady: failed with code \(ready) — aborting")
-                wgTurnOff(handle)
-                self.tunnelHandle = -1
-                completionHandler(VPNError.backendFailed(code: ready))
+                // csqtt names its terminal reason (a captcha it cannot show, a
+                // DENIED, an unusable call link); the WireGuard path has only
+                // the code.
+                let reason = backend.terminalError()
+                self.logMsg("waitReady: failed with code \(ready)\(reason.isEmpty ? "" : " (\(reason))") — aborting")
+                backend.turnOff()
+                self.backend = nil
+                completionHandler(reason.isEmpty ? VPNError.backendFailed(code: ready) : Self.csqttStopError(reason))
                 return
             }
 
@@ -335,30 +386,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             var effMTU = mtu
             if isWrapA {
                 self.logMsg("WRAP-A: fetching GETCONF provision...")
-                guard let provPtr = wgWaitWrapAProvision(handle, 30_000) else {
+                guard let provJSON = backend.waitWrapAProvision(timeoutMs: 30_000) else {
                     self.logMsg("ERROR: wgWaitWrapAProvision returned null — aborting")
-                    wgTurnOff(handle)
-                    self.tunnelHandle = -1
+                    backend.turnOff()
+                    self.backend = nil
                     completionHandler(VPNError.backendFailed(code: -100))
                     return
                 }
-                let provJSON = String(cString: provPtr)
-                free(UnsafeMutableRawPointer(mutating: provPtr))
                 guard !provJSON.isEmpty,
                       let provData = provJSON.data(using: .utf8),
                       let prov = (try? JSONSerialization.jsonObject(with: provData)) as? [String: Any],
                       let uapi = prov["uapi"] as? String, !uapi.isEmpty,
                       let addr = prov["address"] as? String, !addr.isEmpty else {
                     self.logMsg("ERROR: WRAP-A provision empty/invalid — aborting")
-                    wgTurnOff(handle)
-                    self.tunnelHandle = -1
+                    backend.turnOff()
+                    self.backend = nil
                     completionHandler(VPNError.invalidConfiguration)
                     return
                 }
                 guard self.isValidTunnelAddress(addr) else {
                     self.logMsg("ERROR: WRAP-A provision address is not a valid ip/prefix — aborting")
-                    wgTurnOff(handle)
-                    self.tunnelHandle = -1
+                    backend.turnOff()
+                    self.backend = nil
                     completionHandler(VPNError.invalidConfiguration)
                     return
                 }
@@ -373,15 +422,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 self.logMsg("WRAP-A provisioned: address=\(effAddress) dns=\(effDNS) mtu=\(effMTU)")
             }
+            // csqtt: the server's TUNCONF — address, DNS and the fixed 1300
+            // MTU — the same override WRAP-A gets, guarded the same way (the
+            // address comes from the network). The user's explicit MTU still
+            // wins; wg_config stays a placeholder (no device on this path).
+            if isCSQTT {
+                guard let provJSON = backend.csqttProvisionJSON(), !provJSON.isEmpty,
+                      let provData = provJSON.data(using: .utf8),
+                      let prov = (try? JSONSerialization.jsonObject(with: provData)) as? [String: Any],
+                      let addr = prov["address"] as? String, !addr.isEmpty,
+                      self.isValidTunnelAddress(addr) else {
+                    self.logMsg("ERROR: csqtt provision empty/invalid — aborting")
+                    backend.turnOff()
+                    self.backend = nil
+                    completionHandler(VPNError.invalidConfiguration)
+                    return
+                }
+                effAddress = addr
+                if let d = prov["dns"] as? String, !d.isEmpty { effDNS = d }
+                if !mtuExplicit, let m = prov["mtu"] as? Int, m > 0 {
+                    effMTU = String(TunnelMTU.clamp(m))
+                }
+                self.logMsg("csqtt provisioned: address=\(effAddress) dns=\(effDNS) mtu=\(effMTU)")
+            }
 
             // Read the TURN server IP that Go picked during bootstrap and
             // persist it to the AppGroup so TunnelManager.connect() can use
             // it as NEVPNProtocol.serverAddress on the NEXT connect (Step 3).
-            var turnIP = ""
-            if let turnIPPtr = wgGetTURNServerIP(handle) {
-                turnIP = String(cString: turnIPPtr)
-                free(UnsafeMutableRawPointer(mutating: turnIPPtr))
-            }
+            let turnIP = backend.relayIP()
             if turnIP.isEmpty {
                 self.logMsg("WARNING: bootstrap ready but TURN IP empty — using placeholder for tunnelRemoteAddress")
             } else {
@@ -438,8 +506,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.setTunnelNetworkSettings(finalSettings) { error in
                     if let error = error {
                         self.logMsg("setTunnelNetworkSettings ERROR: \(error)")
-                        wgTurnOff(handle)
-                        self.tunnelHandle = -1
+                        backend.turnOff()
+                        self.backend = nil
                         completionHandler(error)
                         return
                     }
@@ -450,25 +518,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     // WireGuard can attach to the already-running proxy.
                     guard let tunFd = self.findTunFileDescriptor() else {
                         self.logMsg("ERROR: could not find TUN fd after setTunnelNetworkSettings")
-                        wgTurnOff(handle)
-                        self.tunnelHandle = -1
+                        backend.turnOff()
+                        self.backend = nil
                         completionHandler(VPNError.noTunDevice)
                         return
                     }
                     self.attachedTunFd = tunFd
-                    self.logMsg("TUN fd=\(tunFd), calling wgAttachWireGuard...")
+                    self.logMsg("TUN fd=\(tunFd), calling \(isCSQTT ? "csqttAttach" : "wgAttachWireGuard")...")
 
-                    let rc = effWGConfig.withCString { cfgPtr in
-                        wgAttachWireGuard(handle, UnsafeMutablePointer(mutating: cfgPtr), tunFd)
-                    }
+                    let rc = backend.attach(wgConfig: effWGConfig, tunFd: tunFd)
                     if rc < 0 {
-                        self.logMsg("ERROR: wgAttachWireGuard returned \(rc)")
-                        wgTurnOff(handle)
-                        self.tunnelHandle = -1
+                        self.logMsg("ERROR: attach returned \(rc)")
+                        backend.turnOff()
+                        self.backend = nil
                         completionHandler(VPNError.backendFailed(code: rc))
                         return
                     }
-                    self.logMsg("wgAttachWireGuard OK — tunnel fully up")
+                    self.logMsg("attach OK — tunnel fully up")
+                    if isCSQTT {
+                        self.startCsqttWatchdog(backend)
+                    }
                     completionHandler(nil)
 
                     // Hand the machine the mode the tunnel actually came up in.
@@ -488,13 +557,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         if msg == "get_stats" {
-            guard tunnelHandle >= 0 else {
+            guard let backend = backend else {
                 completionHandler?(nil)
                 return
             }
-            if let ptr = wgGetStats(tunnelHandle) {
-                let json = String(cString: ptr)
-                free(UnsafeMutableRawPointer(mutating: ptr))
+            if let json = backend.stats() {
                 completionHandler?(json.data(using: .utf8))
             } else {
                 completionHandler?(nil)
@@ -516,11 +583,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         } else if msg.hasPrefix("solve_captcha:") {
             let answer = String(msg.dropFirst("solve_captcha:".count))
             logMsg("handleAppMessage: captcha answer received (\(answer.count) chars)")
-            if tunnelHandle >= 0 {
-                answer.withCString { ptr in
-                    wgSolveCaptcha(tunnelHandle, UnsafeMutablePointer(mutating: ptr))
-                }
-            }
+            backend?.solveCaptcha(answer)
             completionHandler?("ok".data(using: .utf8))
         } else if msg == "refresh_captcha_url" {
             // Main app asks the extension to hit the VK API again and
@@ -529,13 +592,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // UI to rotate the captcha session without tearing the
             // WebView down.
             logMsg("handleAppMessage: refresh_captcha_url")
-            var freshURL = ""
-            if tunnelHandle >= 0 {
-                if let ptr = wgRefreshCaptchaURL(tunnelHandle) {
-                    freshURL = String(cString: ptr)
-                    free(UnsafeMutableRawPointer(mutating: ptr))
-                    logMsg("refreshCaptchaURL: got fresh URL (\(freshURL.prefix(80))...)")
-                }
+            let freshURL = backend?.refreshCaptchaURL() ?? ""
+            if !freshURL.isEmpty {
+                logMsg("refreshCaptchaURL: got fresh URL (\(freshURL.prefix(80))...)")
             }
             completionHandler?(freshURL.data(using: .utf8))
         } else if msg.hasPrefix("set_memstats_fast:") {
@@ -646,9 +705,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // handoff doesn't require re-applying tunnel settings. The Go
         // watchdog handles post-wake reconnect if any TURN session
         // actually died during freeze.
-        if tunnelHandle >= 0 {
-            wgWakeHealthCheck(tunnelHandle)
-        }
+        backend?.wakeHealthCheck()
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
@@ -657,6 +714,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         logMsg("stopTunnel: entered (reason=\(reason.rawValue))")
         stopPathMonitoring()
         stopAuthErrorWatchdog()
+        stopCsqttWatchdog()
 
         // Safety net: ensure completionHandler is called exactly once
         // within 3 seconds even if wgTurnOff hangs. Without this, iOS
@@ -680,13 +738,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             callOnce("safety-net 3s timeout")
         }
 
-        if tunnelHandle >= 0 {
-            logMsg("stopTunnel: calling wgTurnOff(\(tunnelHandle))")
-            wgTurnOff(tunnelHandle)
-            tunnelHandle = -1
-            logMsg("stopTunnel: wgTurnOff returned (\(elapsedMs())ms total)")
+        if let backend = backend {
+            logMsg("stopTunnel: calling turnOff(\(backend.isCSQTT ? "csqtt" : "wg") \(backend.handle))")
+            backend.turnOff()
+            self.backend = nil
+            logMsg("stopTunnel: turnOff returned (\(elapsedMs())ms total)")
         } else {
-            logMsg("stopTunnel: no active tunnelHandle, skipping wgTurnOff")
+            logMsg("stopTunnel: no active tunnel, skipping turnOff")
         }
         callOnce("normal path")
     }
@@ -717,11 +775,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     // any desc-change (including flag-only flips, which are
                     // diagnostically interesting even though we skip the
                     // bridge call below).
-                    if self.tunnelHandle >= 0 {
-                        let label = desc
-                        label.withCString { cstr in
-                            wgLogPathSnapshot(self.tunnelHandle, cstr)
-                        }
+                    if let backend = self.backend {
+                        backend.logPathSnapshot(desc)
 
                         // Essential-identity gate: skip the bridge call
                         // when only flag attributes (dns/expensive/
@@ -766,14 +821,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             // Extend pause-acquire only, no smart-pause
                             // re-marking. See wgPathInTransition in
                             // bridge.go.
-                            wgPathInTransition(self.tunnelHandle)
+                            backend.pathInTransition()
                         } else {
                             // Pre-emptive saturation marking — tell Go
                             // side that a path change just happened so
                             // it marks in-use slots as quota-locked
                             // BEFORE the inevitable 486 burst. See
                             // wgPathChanged in bridge.go.
-                            wgPathChanged(self.tunnelHandle)
+                            backend.pathChanged()
                         }
                     }
                 }

@@ -150,6 +150,9 @@ extension TunnelConfig {
             useWrapS: s.useWrapS,
             obfProfile: s.obfProfile,
             clientID: s.clientID,
+            useCsqtt: s.useCsqtt,
+            csqttPassword: s.csqttPassword,
+            csqttDeviceID: s.csqttDeviceID,
             useUDP: s.useUDP,
             forceLegacyCaptcha: d.bool(forKey: "forceLegacyCaptcha"),
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
@@ -952,6 +955,10 @@ class TunnelManager: ObservableObject {
                 // config (wgWaitWrapAProvision) and override wg_config +
                 // address/dns/mtu after bootstrap, since the user entered none.
                 "use_wrap_a": config.useWrapA,
+                // csqtt: tells the extension to start pkg/csqtt (csqttStart)
+                // instead of the WireGuard bootstrap and to take the tunnel
+                // address/DNS from the server's TUNCONF (csqttProvision).
+                "use_csqtt": config.useCsqtt,
                 // VKAuth: tells the extension to read the logged-in cookie from
                 // the shared Keychain and push it via wgSetVKCookieAuth before
                 // bootstrap (the cookie itself is NOT in this config).
@@ -2587,6 +2594,11 @@ class TunnelManager: ObservableObject {
         if config.useWrapA {
             return ""
         }
+        // csqtt: no WireGuard device at all — the extension pumps raw IP
+        // between the TUN and the csqtt client; the same placeholder.
+        if config.useCsqtt {
+            return ""
+        }
         var lines: [String] = []
         lines.append("private_key=\(try parseWireGuardKey(config.privateKey, field: "Private Key"))")
         lines.append("replace_peers=true")
@@ -2679,6 +2691,16 @@ class TunnelManager: ObservableObject {
             // GETCONF as a blank identity.
             let devID = config.deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
             dict["device_id"] = devID.isEmpty ? wrapADeviceID() : devID
+        }
+        // csqtt (stage 5): the extension routes this config to csqttStart
+        // instead of wgStartVKBootstrap; peer_addr is the csqtt server. The
+        // device identity is per server (minted when the mode is chosen) and
+        // must stay constant — the server binds the password to it.
+        if config.useCsqtt {
+            dict["use_csqtt"] = true
+            dict["csqtt_password"] = config.csqttPassword
+            let devID = config.csqttDeviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+            dict["csqtt_device_id"] = devID.isEmpty ? UUID().uuidString : devID
         }
         // SRTP-WRAP-S (samosvalishe/free-turn-proxy): obf profile + Client-ID on
         // the SRTP+WRAP data path. wrap_key_hex is already set above.
@@ -3161,6 +3183,14 @@ struct TunnelConfig {
     var useWrapS: Bool = false
     var obfProfile: String = "rtpopus"
     var clientID: String = ""
+    // csqtt (stage 5, 2026-09-06): amurcanov's csqtt server. The sixth
+    // transport, with its OWN fields — WRAP-A (wdtt) is alive and keeps its
+    // own. No WireGuard: the extension starts pkg/csqtt through csqttStart,
+    // the server hands out the tunnel IP and DNS, and the user enters only
+    // peerAddress + the password. The password rides proxy_config like WRAP-A's.
+    var useCsqtt: Bool = false
+    var csqttPassword: String = ""
+    var csqttDeviceID: String = ""
     // 2026-05-18 empirical: VK's new per-cred TURN allocation-rate
     // throttle (introduced ~16:00 MSK that day) applies ONLY to UDP-
     // transport allocations. 11×10 = 110 TCP-control allocations on a

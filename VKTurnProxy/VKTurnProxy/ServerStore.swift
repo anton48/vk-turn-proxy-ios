@@ -33,11 +33,13 @@ final class ServerStore: ObservableObject {
         ("turnServerOverride", \.turnServerOverride), ("wrapKeyHex", \.wrapKeyHex),
         ("obfProfile", \.obfProfile), ("clientID", \.clientID),
         ("wrapAPassword", \.wrapAPassword), ("deviceID", \.deviceID),
+        ("csqttPassword", \.csqttPassword), ("csqttDeviceID", \.csqttDeviceID),
     ]
     private static let boolKeyPaths: [(String, WritableKeyPath<ServerProfile, Bool>, Bool)] = [
         ("useUDP", \.useUDP, false), ("useDTLS", \.useDTLS, true),
         ("useSrtp", \.useSrtp, true), ("useWrap", \.useWrap, false),
         ("useWrapA", \.useWrapA, false), ("useWrapS", \.useWrapS, false),
+        ("useCsqtt", \.useCsqtt, false),
     ]
     private static let intKeyPaths: [(String, WritableKeyPath<ServerProfile, Int>, Int)] = [
         ("numConnections", \.numConnections, 30),

@@ -66,6 +66,13 @@ run "root module — go test ${goflags[*]} ./..." \
 run "vendored fork — separate module, not reached by the root ./..." \
     env -C third_party/speedtest-go go test "${goflags[@]}" ./speedtest/
 
+# 🚨 A FOURTH place since stage 5: the Go bridge is its own module (its go.mod
+# replaces the root module with `..`), so the root ./... never sees
+# csqtt_bridge_test.go — the descriptor-ownership, pump and cleanup checks. Built
+# with the same tag the xcframework is.
+run "WireGuardBridge — separate module, the csqtt bridge lifecycle" \
+    env -C WireGuardBridge go test "${goflags[@]}" -tags ios .
+
 run "swiftcheck — Swift value types and source scans" \
     ./tools/swiftcheck/run.sh
 

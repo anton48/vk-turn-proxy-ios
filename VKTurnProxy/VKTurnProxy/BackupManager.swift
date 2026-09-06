@@ -398,6 +398,10 @@ enum BackupManager {
         if url.scheme?.lowercased() == "freeturn" {
             return try parseFreeturnLink(url.absoluteString)
         }
+        // amurcanov csqtt compat: csqtt://connect?… and csqtt://<pw>@<host>:<port>.
+        if url.scheme?.lowercased() == "csqtt" {
+            return try parseCsqttLink(url.absoluteString)
+        }
         guard url.scheme?.lowercased() == "vkturnproxy" else {
             throw BackupError.decodeFailed("URL scheme is not vkturnproxy://")
         }
@@ -427,6 +431,10 @@ enum BackupManager {
         // samosvalishe free-turn-proxy compat: a pasted freeturn:// link.
         if trimmed.lowercased().hasPrefix("freeturn://") {
             return try parseFreeturnLink(trimmed)
+        }
+        // amurcanov csqtt compat: a pasted csqtt:// link, either form.
+        if trimmed.lowercased().hasPrefix("csqtt://") {
+            return try parseCsqttLink(trimmed)
         }
         if let url = URL(string: trimmed), url.scheme?.lowercased() == "vkturnproxy" {
             return try parseConnectionLink(from: url)
@@ -570,6 +578,80 @@ enum BackupManager {
         if let q = s.firstIndex(of: "?") { s = String(s[..<q]) }
         if let h = s.firstIndex(of: "#") { s = String(s[..<h]) }
         return s.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+    }
+
+    // MARK: - amurcanov csqtt:// compat link
+
+    /// Parses an amurcanov `csqtt://` link into our ConnectionLink (csqtt mode).
+    /// Two forms, both from his Android app (reference_csqtt_protocol_v3 §6):
+    ///
+    ///   csqtt://connect?v=2&host=<h>&peer=<port>&password=<p>[&hashes=<h1>+<h2>…]
+    ///   csqtt://<password>@<host>:<port>            (legacy)
+    ///
+    /// host+peer → peerAddress, password → csqttPassword, the FIRST hash (a
+    /// bare VK call hash, percent-encoded; `+` separates several) → vkLink =
+    /// vkCallJoinBase + hash, as parseWdttLink does. Nothing else is carried:
+    /// the server assigns the tunnel address and DNS, and the device identity
+    /// is minted on import. A link without hashes keeps the device's current
+    /// VK call link (vkLink "" → applyConnectionLink does not clobber it).
+    static func parseCsqttLink(_ raw: String) throws -> ConnectionLink {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("csqtt://") else {
+            throw BackupError.decodeFailed("URL scheme is not csqtt://")
+        }
+        var host = "", port = "", password = "", firstHash = ""
+        if trimmed.lowercased().hasPrefix("csqtt://connect") {
+            guard let comps = URLComponents(string: trimmed) else {
+                throw BackupError.decodeFailed("csqtt:// link is not a valid URL")
+            }
+            let q = Dictionary((comps.queryItems ?? []).map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { a, _ in a })
+            if let v = q["v"], let n = Int(v), n != 2 {
+                throw BackupError.decodeFailed("Unsupported csqtt:// version \(n) (expected 2)")
+            }
+            host = q["host"] ?? ""
+            port = q["peer"] ?? ""
+            password = q["password"] ?? ""
+            // `+` is the separator in his hashes list; URLComponents already
+            // percent-decoded the values (a `+` stays a `+`).
+            firstHash = (q["hashes"] ?? "").split(separator: "+").first.map(String.init) ?? ""
+        } else {
+            // csqtt://<password>@<host>:<port> — split on the LAST "@" so a
+            // password containing "@" survives, then on the last ":".
+            let body = String(trimmed.dropFirst("csqtt://".count))
+            guard let at = body.lastIndex(of: "@") else {
+                throw BackupError.decodeFailed("csqtt:// link needs <password>@<host>:<port>")
+            }
+            password = String(body[..<at]).removingPercentEncoding ?? String(body[..<at])
+            let hp = String(body[body.index(after: at)...])
+            guard let colon = hp.lastIndex(of: ":") else {
+                throw BackupError.decodeFailed("csqtt:// link needs <host>:<port>")
+            }
+            host = String(hp[..<colon])
+            port = String(hp[hp.index(after: colon)...])
+        }
+        host = stripControlChars(host.trimmingCharacters(in: .whitespaces))
+        port = port.trimmingCharacters(in: .whitespaces)
+        firstHash = stripVkUrl(firstHash)
+        guard !host.isEmpty, Int(port) != nil else {
+            throw BackupError.decodeFailed("csqtt:// link has an invalid host or port")
+        }
+        guard !password.isEmpty else {
+            throw BackupError.decodeFailed("csqtt:// link is missing the password")
+        }
+        var settings = ConnectionSettings(
+            privateKey: nil, peerPublicKey: nil, presharedKey: nil,
+            tunnelAddress: nil, allowedIPs: nil,
+            vkLink: firstHash.isEmpty ? "" : vkCallJoinBase + firstHash,
+            peerAddress: "\(host):\(port)",
+            useDTLS: nil, useWrap: nil, wrapKeyHex: nil,
+            useSrtp: nil, useUDP: nil,
+            useWrapA: nil, wrapAPassword: nil,
+            turnServerOverride: nil,
+            dnsServers: nil, numConnections: nil
+        )
+        settings.useCsqtt = true
+        settings.csqttPassword = password
+        return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }
 
     // MARK: - samosvalishe free-turn-proxy freeturn:// compat link

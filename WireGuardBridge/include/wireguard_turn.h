@@ -259,4 +259,77 @@ void wgSpeedtestCancel(void);
 typedef void (*logger_fn_t)(int level, const char *msg);
 void wgSetLogger(logger_fn_t fn);
 
+/// ─── csqtt — the sixth transport (stage 5, variant B) ──────────────────────
+///
+/// A csqtt tunnel has its OWN handle space and its own exports: these handles
+/// are never valid for the wg* functions above, nor the other way round. The
+/// Swift side keeps the kind next to the number (TunnelBackend) and never
+/// searches one registry with the other's handle. There is no WireGuard
+/// device on this path — the server hands out the tunnel IP and DNS, and the
+/// bridge pumps raw IP packets between the TUN and N TURN allocations.
+/// Credentials come from the same pool policy as the native transport.
+///
+/// Every returned string is a C string the CALLER MUST free().
+
+/// Start a csqtt tunnel: the credential pool now, the client in a background
+/// goroutine (credentials, N allocations, GETCONF → TUNCONF). Does NOT touch
+/// the TUN. Takes the SAME proxy_config JSON as wgStartVKBootstrap plus
+/// "csqtt_password" and "csqtt_device_id"; "peer_addr" is the csqtt server.
+/// @return handle (>0); -1 invalid JSON; -2 server or password missing
+int32_t csqttStart(const char *proxyConfigJSON);
+
+/// Block up to timeoutMs for the first worker's TUNCONF.
+/// @return 1 ready, 0 still connecting, -1 terminal failure (csqttGetError
+///         has the reason) or unknown handle
+int32_t csqttWaitReady(int32_t handle, int32_t timeoutMs);
+
+/// The provision the server handed the first worker, for the network
+/// settings: {"address":"<ip>/24","dns":"<a>[,<b>]","mtu":1300,"stream":"…"}.
+/// "" before ready or on an unknown handle. The user's explicit MTU still
+/// outranks "mtu", as it does for WRAP-A.
+const char *csqttProvision(int32_t handle);
+
+/// Attach the TUN after setTunnelNetworkSettings returned: duplicates tunFd
+/// (the caller keeps its own descriptor) and starts the packet pumps.
+/// @return 1 ok; -1 unknown handle; -2 not ready or already attached;
+///         -3 dup failed; -4 the device could not be opened
+int32_t csqttAttach(int32_t handle, int32_t tunFd);
+
+/// Stop a csqtt tunnel within a bounded time: the client (DISCONNECT
+/// best-effort, relays closed), the device, the pumps, then the credential
+/// pool writes its cache and stops minting. Safe on an unknown handle.
+void csqttTurnOff(int32_t handle);
+
+/// Path change (a real interface): the pool marks its in-use slots and
+/// pauses acquires briefly, the client takes a NEW identity and restarts
+/// every worker — the csqtt shape of wgPathChanged.
+void csqttPathChanged(int32_t handle);
+
+/// The iface=other transition: extends the pool's acquire pause only, as
+/// wgPathInTransition does.
+void csqttPathInTransition(int32_t handle);
+
+/// Wake: every clock resets, every ready worker is probed at once. Never
+/// waits for a relay write.
+void csqttWakeHealthCheck(int32_t handle);
+
+/// One log line on demand (workers ready, restarts, repairs, pump counters),
+/// the csqtt shape of wgLogPathSnapshot.
+void csqttLogPathSnapshot(int32_t handle, const char *label);
+
+/// Stats as JSON in the SAME shape wgGetStats returns (Swift's TunnelStats):
+/// active/total conns are ready/total workers, turn_rtt_ms the last relay
+/// allocation, reconnects the worker restarts; a terminal error rides
+/// auth_error, which the app already shows and stops on. "{}" if unknown.
+const char *csqttGetStats(int32_t handle);
+
+/// The relay host to publish as serverAddress next time — non-empty after a
+/// warm-cache start too (the pool answers, not the last fresh mint). "" if
+/// unknown.
+const char *csqttGetRelayIP(int32_t handle);
+
+/// The terminal error, or "". Non-empty once csqttWaitReady answered -1, or
+/// later when the client stopped on its own (a DENIED from the server).
+const char *csqttGetError(int32_t handle);
+
 #endif /* WIREGUARD_TURN_H */

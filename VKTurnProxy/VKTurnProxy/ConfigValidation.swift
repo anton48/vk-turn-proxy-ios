@@ -134,6 +134,15 @@ enum ConfigValidation {
         return nil
     }
 
+    /// Only meaningful in csqtt mode: the one secret, HKDF input for the wire
+    /// key and GETCONF authentication (a wrong one is answered with silence).
+    static func csqttPassword(_ s: String) -> Issue? {
+        if s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return Issue(.error, "Server password is required — it is the tunnel's only key.")
+        }
+        return nil
+    }
+
     /// Only meaningful in SRTP-WRAP-A mode.
     static func wrapAPassword(_ s: String) -> Issue? {
         if s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

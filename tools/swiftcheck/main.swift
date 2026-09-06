@@ -2953,6 +2953,56 @@ do {
     }
 }
 
+print("The tunnel backend — every handle-bound bridge call goes through one enum")
+
+// 🚨 TWO HANDLE SPACES, ONE NUMBER. Since stage 5 (csqtt, variant B) the Go
+//    bridge has two registries — wg* and csqtt* — and a handle is a plain
+//    Int32 in either. A csqtt handle passed to a wg* export finds nothing (or,
+//    worse, a WireGuard tunnel with the same number). The rule that keeps
+//    them apart is structural: the provider holds a `TunnelBackend`, whose
+//    case carries the kind, and NO handle-bound export is called anywhere else.
+//    A source scan is the only guard that can see a direct call creeping back.
+do {
+    let provider = codeWithoutComments("VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift")
+    let backend = codeWithoutComments("VKTurnProxy/PacketTunnel/TunnelBackend.swift")
+    // Every export that takes a tunnel handle, both families. Process-global
+    // exports (wgSetLogFilePath, wgSetVKCookieAuth, wgSetUplinkPace,
+    // wgGetAuthError, …) take no handle and are deliberately NOT listed.
+    let handleBound = [
+        "wgStartVKBootstrap", "wgWaitBootstrapReady", "wgAttachWireGuard", "wgTurnOff",
+        "wgPathChanged", "wgPathInTransition", "wgWakeHealthCheck", "wgLogPathSnapshot",
+        "wgGetStats", "wgGetTURNServerIP", "wgWaitWrapAProvision", "wgSolveCaptcha",
+        "wgRefreshCaptchaURL", "wgPause", "wgResume",
+        "csqttStart", "csqttWaitReady", "csqttProvision", "csqttAttach", "csqttTurnOff",
+        "csqttPathChanged", "csqttPathInTransition", "csqttWakeHealthCheck",
+        "csqttLogPathSnapshot", "csqttGetStats", "csqttGetRelayIP", "csqttGetError",
+    ]
+    for name in handleBound {
+        check(!provider.contains(name + "("),
+              "🚨 PacketTunnelProvider calls \(name)( directly — a handle-bound export must go "
+              + "through TunnelBackend, whose case says which registry the number belongs to")
+    }
+    // Not vacuous: the provider does hold a backend and route through it, and
+    // the enum does reach both families.
+    check(provider.contains("private var backend: TunnelBackend?") && provider.contains("backend.attach(")
+          && provider.contains("backend.turnOff()") && provider.contains("backend.waitReady("),
+          "the provider holds a TunnelBackend and starts/attaches/stops through it — else the scan above proves nothing")
+    check(!provider.contains("tunnelHandle"),
+          "🚨 a bare `tunnelHandle` is back in the provider — the number without its kind")
+    for name in ["wgWaitBootstrapReady", "csqttWaitReady", "wgAttachWireGuard", "csqttAttach",
+                 "wgTurnOff", "csqttTurnOff", "wgGetStats", "csqttGetStats",
+                 "wgPathChanged", "csqttPathChanged", "wgWakeHealthCheck", "csqttWakeHealthCheck"] {
+        check(backend.contains(name + "("), "TunnelBackend reaches \(name) — both families, one enum")
+    }
+    // 🚨 THE csqtt PASSWORD MUST NOT REACH THE LOG. The provider logs the whole
+    //    proxy config at start; that line is what users send us. The redaction
+    //    has to sit on that very line, not exist somewhere.
+    check(provider.contains("proxyConfig=\\(Self.redactedProxyConfig(proxyConfigJSON))"),
+          "🚨 the proxy-config log line is not redacted — csqtt_password would land in vpn.log")
+    check(!provider.contains("proxyConfig=\\(proxyConfigJSON)"),
+          "🚨 the raw proxy-config log line is back")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

@@ -300,6 +300,12 @@ struct ConnectionSettings: Codable {
     var useWrapS: Bool? = nil
     var obfProfile: String? = nil
     var clientID: String? = nil
+    /// csqtt (stage 5, 2026-09-06): the mode and its password. A csqtt:// link
+    /// carries {peerAddress, csqttPassword, vkLink} and nothing else — the
+    /// server provisions the tunnel IP and DNS, and the device identity is
+    /// minted on import, never carried. `var … = nil` like the fields above.
+    var useCsqtt: Bool? = nil
+    var csqttPassword: String? = nil
     /// Name for the server this link creates (build 179+). Importing a link now
     /// ADDS a named server instead of overwriting the current configuration.
     /// Absent (older vkturnproxy:// links, and wdtt:// which has no name field)

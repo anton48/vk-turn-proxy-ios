@@ -115,6 +115,16 @@ the importer's current value with empty):
                        its current value (default false).
     wrapAPassword    — string. The amurcanov shared secret (obfuscation key +
                        GETCONF auth). Required when useWrapA=True.
+    useCsqtt         — bool, added 2026-09-06 (iOS csqtt mode, stage 5). True =
+                       connect to amurcanov's csqtt server. The server hands
+                       out the tunnel IP and DNS, so a csqtt link carries NO
+                       WG keys — DELETE privateKey / peerPublicKey /
+                       tunnelAddress / allowedIPs from CONFIG. Only vkLink,
+                       peerAddress (the csqtt server host:port, UDP) and
+                       csqttPassword are required. The device identity is
+                       minted by the app on import, never carried.
+    csqttPassword    — string. The csqtt shared secret (the tunnel's only key;
+                       no forward secrecy). Required when useCsqtt=True.
     turnServerOverride — optional "IP:port" (added 2026-06-08). Forces fresh
                        conns onto this TURN relay instead of VK's returned
                        address; disk-cached creds keep their stored address.
@@ -234,6 +244,12 @@ REQUIRED_WRAPA = (
     "wrapAPassword", "vkLink", "peerAddress",
 )
 
+# csqtt links carry NO WireGuard keys either — the server hands out the tunnel
+# IP and DNS. Selected when CONFIG sets useCsqtt=True.
+REQUIRED_CSQTT = (
+    "csqttPassword", "vkLink", "peerAddress",
+)
+
 # Schema version must match BackupManager.supportedConfigVersion in the
 # iOS app. Bump on the Swift side first, then mirror here.
 SCHEMA_VERSION = 1
@@ -309,7 +325,7 @@ def load_config(argv):
 def validate(settings):
     # WRAP-A links carry no WG keys (server-provisioned via GETCONF), so
     # validate the smaller required set when useWrapA is on.
-    required = REQUIRED_WRAPA if settings.get("useWrapA") else REQUIRED
+    required = REQUIRED_CSQTT if settings.get("useCsqtt") else (REQUIRED_WRAPA if settings.get("useWrapA") else REQUIRED)
     missing = []
     for key in required:
         val = settings.get(key)
@@ -364,7 +380,7 @@ def validate(settings):
 # WireGuard peer + IP it mints on it, so two people importing a link that
 # carried one would collide on the same peer. The app mints a fresh device ID
 # whenever it imports a WRAP-A link, so dropping it here is all that's needed.
-LINK_EXCLUDED = ("deviceID",)
+LINK_EXCLUDED = ("deviceID", "csqttDeviceID")
 
 
 def build_link(settings):

@@ -180,6 +180,14 @@ enum ConnectionLinkPrompt {
                  + "Sets the server, WRAP key, obf profile (\(prof)) and Client-ID, and makes it "
                  + "active. WireGuard keys and the VK call link are NOT included — enter them manually."
         }
+        // csqtt: say what the user is signing up for — the password is the
+        // tunnel's only key, so there is no forward secrecy on this transport.
+        if created.useCsqtt {
+            return "Add \(name) as csqtt for \(s.peerAddress)\(extrasText) and make it active? "
+                 + "The server assigns the tunnel address and DNS. Note: csqtt has no key exchange — "
+                 + "the password is the tunnel's only key, so recorded traffic can be decrypted by "
+                 + "anyone who learns it later (no forward secrecy)."
+        }
         return "Add \(name) [\(created.modeLabel)] for \(s.peerAddress)\(extrasText) and make it "
              + "active? Your existing servers are kept; the VK call link is global and will be updated."
     }
