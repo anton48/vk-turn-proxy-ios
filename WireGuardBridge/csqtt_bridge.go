@@ -168,6 +168,13 @@ var csqttSeededSettle = 1500 * time.Millisecond
 // the client and the device are closed.
 const csqttPumpJoinBudget = 2 * time.Second
 
+// csqttDialJoinBudget bounds how long csqttTurnOff waits for a dial still in
+// flight to come back after the cancel, so that the client it may return is
+// closed BEFORE TurnOff returns (a stop in .connecting is exactly that
+// moment). Dial answers a cancel at once; only the resolver is not
+// cancellable. A variable so a test can shrink it.
+var csqttDialJoinBudget = 2 * time.Second
+
 // csqttEntry is one csqtt tunnel: its pool, its client once dialed, its
 // device once attached, and the terminal error if it has one.
 type csqttEntry struct {
@@ -455,6 +462,16 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 			e.fail(fmt.Errorf("csqtt: %w", err))
 			return
 		}
+		// 🚨 A client that came back AFTER the tunnel was cancelled — TurnOff
+		// during the dial, or Dial's select choosing TUNCONF over the
+		// cancel when both were ready — has its own lifetime (Dial's ctx
+		// only bounds the dial): nobody else will close it, and thirty
+		// relays and their workers would live until jetsam.
+		if ctx.Err() != nil {
+			log.Printf("csqttStart: tunnel %d: dial finished after the stop — closing the client", e.id)
+			_ = client.Close()
+			return
+		}
 		e.client = client
 		// The first worker is live: the grower may fill the pool from here,
 		// at the same pace the native transport's does.
@@ -668,6 +685,16 @@ func csqttTurnOffImpl(handle int32) {
 	started := time.Now()
 	log.Printf("csqttTurnOff: tunnel %d stopping", e.id)
 	e.cancel()
+	// The client is set by the start goroutine after Dial returns; a stop
+	// during the dial must wait for that goroutine to finish (it closes
+	// `dialed` on its way out, after the assignment) or it would read nil
+	// and leave a live client behind. Bounded: a dial answers the cancel at
+	// once, and a dial that outlives the budget closes its own client.
+	select {
+	case <-e.dialed:
+	case <-time.After(csqttDialJoinBudget):
+		log.Printf("csqttTurnOff: tunnel %d: the dial is still in flight after %s — its client will close itself", e.id, csqttDialJoinBudget)
+	}
 	if e.client != nil {
 		t := time.Now()
 		_ = e.client.Close()

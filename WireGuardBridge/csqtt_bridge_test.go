@@ -270,6 +270,72 @@ func startCsqtt(t *testing.T, extra string) int32 {
 
 // ─── the checks ───────────────────────────────────────────────────────────
 
+// installGatedDial makes csqttDial block until `release` is closed, then
+// return `c` ALIVE whatever the ctx says — the shape of a dial that
+// finished after the stop (a stop in .connecting, or Dial's select picking
+// TUNCONF over the cancel).
+func installGatedDial(t *testing.T, c *fakeClient, release chan struct{}) {
+	t.Helper()
+	prev := csqttDial
+	csqttDial = func(ctx context.Context, cfg csqtt.Config) (csqttClient, error) {
+		<-release
+		return c, nil
+	}
+	t.Cleanup(func() { csqttDial = prev })
+}
+
+// A stop during the dial: TurnOff waits for the dial to come back and
+// closes the client it returns BEFORE returning — the extension's
+// stopTunnel then really has everything down. Sabotage seen red: the wait
+// on `dialed` dropped from TurnOff (it returns at once, the client is still
+// open when it does — the goroutine closes it later, which is the next
+// test's claim, not this one's).
+func TestCsqttTurnOffDuringTheDialClosesTheClientBeforeReturning(t *testing.T) {
+	var mints atomic.Int32
+	installFakePool(t, mintingFetch(&mints))
+	fc := newFakeClient()
+	release := make(chan struct{})
+	installGatedDial(t, fc, release)
+	csqttSeededSettle = 0
+
+	h := startCsqtt(t, "")
+	done := make(chan struct{})
+	go func() { csqttTurnOffImpl(h); close(done) }()
+	time.Sleep(100 * time.Millisecond) // TurnOff is now inside its wait
+	close(release)                     // the dial comes back with a live client
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("TurnOff did not return after the dial came back")
+	}
+	if !fc.closed.Load() {
+		t.Fatal("the client the dial returned is still open after TurnOff returned")
+	}
+}
+
+// A dial that outlives TurnOff's wait closes its own client: the tunnel was
+// cancelled, nobody else will. Sabotage seen red: the ctx check after Dial
+// dropped from the start goroutine (the client stays open for ever).
+func TestCsqttDialFinishingAfterTheStopClosesItsClient(t *testing.T) {
+	var mints atomic.Int32
+	installFakePool(t, mintingFetch(&mints))
+	fc := newFakeClient()
+	release := make(chan struct{})
+	installGatedDial(t, fc, release)
+	csqttSeededSettle = 0
+	prev := csqttDialJoinBudget
+	csqttDialJoinBudget = 20 * time.Millisecond
+	defer func() { csqttDialJoinBudget = prev }()
+
+	h := startCsqtt(t, "")
+	csqttTurnOffImpl(h) // gives up on the dial after 20 ms
+	if fc.closed.Load() {
+		t.Fatal("the fixture is wrong: the client cannot be closed before the dial returned it")
+	}
+	close(release) // the dial comes back into a cancelled tunnel
+	waitFor(t, "the late client to be closed", func() bool { return fc.closed.Load() })
+}
+
 // The whole life of a tunnel on the host: start → ready → provision → attach
 // on a DUPLICATE of the caller's fd → packets both ways with the darwin
 // address-family header → stop joins the pumps, closes the device, leaves the

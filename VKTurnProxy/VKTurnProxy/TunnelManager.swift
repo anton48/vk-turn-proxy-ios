@@ -2649,6 +2649,23 @@ class TunnelManager: ObservableObject {
         return id
     }
 
+    /// Per-install fallback for a csqtt profile whose Device ID is EMPTY (a
+    /// restored backup or an old `servers_v1` blob — the edit screen and the
+    /// link importer mint one, `init(from:)` cannot). The csqtt server binds
+    /// the password to the first device id it sees, so a fresh UUID per
+    /// connect would work exactly once and then be DENIED:device_mismatch
+    /// (user-caught 2026-09-06); this is WRAP-A's wrapADeviceID() for csqtt.
+    private func csqttFallbackDeviceID() -> String {
+        let suite = UserDefaults(suiteName: "group.com.vkturnproxy.app")
+        if let existing = suite?.string(forKey: "csqttDeviceID"), !existing.isEmpty {
+            return existing
+        }
+        let id = UUID().uuidString
+        suite?.set(id, forKey: "csqttDeviceID")
+        SharedLogger.shared.log("[AppDebug] csqtt: generated stable fallback deviceID \(id)")
+        return id
+    }
+
     private func buildProxyConfig(
         config: TunnelConfig,
         vkHostIPs: [String: [String]] = [:],
@@ -2699,8 +2716,10 @@ class TunnelManager: ObservableObject {
         if config.useCsqtt {
             dict["use_csqtt"] = true
             dict["csqtt_password"] = config.csqttPassword
+            // Empty → the PERSISTENT fallback, never a one-shot UUID: the
+            // server binds the password to whatever id connects first.
             let devID = config.csqttDeviceID.trimmingCharacters(in: .whitespacesAndNewlines)
-            dict["csqtt_device_id"] = devID.isEmpty ? UUID().uuidString : devID
+            dict["csqtt_device_id"] = devID.isEmpty ? csqttFallbackDeviceID() : devID
         }
         // SRTP-WRAP-S (samosvalishe/free-turn-proxy): obf profile + Client-ID on
         // the SRTP+WRAP data path. wrap_key_hex is already set above.

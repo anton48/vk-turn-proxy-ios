@@ -3019,6 +3019,30 @@ do {
     }
     check(provider.contains("self.attachedTunName = self.utunName(of: tunFd)"),
           "the attach records the utun's name, or the check above compares against \"\"")
+
+    // 🚨 stopTunnel stops BOTH watchdogs. The csqtt one polls csqttGetError on a
+    //    5 s timer; left running past turnOff it asks a dead handle for the
+    //    life of the appex — harmless in outcome ("" on an unknown handle), a
+    //    leak in fact.
+    if let stop = provider.range(of: "override func stopTunnel(") {
+        let body = String(provider[stop.upperBound...].prefix(600))
+        check(body.contains("stopAuthErrorWatchdog()") && body.contains("stopCsqttWatchdog()"),
+              "🚨 stopTunnel must stop the cookie watchdog AND the csqtt watchdog")
+    } else {
+        check(false, "could not find stopTunnel")
+    }
+
+    // 🚨 AN EMPTY csqtt DEVICE ID FALLS BACK TO A PERSISTENT ONE, NEVER A
+    //    ONE-SHOT UUID. The server binds the password to the first device id
+    //    that connects; a fresh UUID per connect works once and is then
+    //    DENIED:device_mismatch for ever. WRAP-A's wrapADeviceID() is the model.
+    let tunnelManager = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(tunnelManager.contains("dict[\"csqtt_device_id\"] = devID.isEmpty ? csqttFallbackDeviceID() : devID"),
+          "🚨 csqtt_device_id must fall back to csqttFallbackDeviceID(), the per-install persistent one")
+    check(!tunnelManager.contains("csqtt_device_id\"] = devID.isEmpty ? UUID()"),
+          "🚨 a one-shot UUID is back as the csqtt device id fallback")
+    check(tunnelManager.contains("suite?.string(forKey: \"csqttDeviceID\")") && tunnelManager.contains("suite?.set(id, forKey: \"csqttDeviceID\")"),
+          "the fallback reads and writes the App Group key — or it is not persistent")
 }
 
 print("")
