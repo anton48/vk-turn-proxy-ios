@@ -5,6 +5,7 @@ package csqtt
 import (
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/pion/logging"
@@ -26,10 +27,13 @@ type Relay struct {
 	Conn  net.PacketConn
 	Local net.Addr
 	close func()
+	once  sync.Once
 }
 
 // Close tears down the relayed conn, the TURN client and the control socket.
-func (r *Relay) Close() { r.close() }
+// Close ends the allocation; idempotent, so the session's deferred close and
+// Client.Close's forced close do not collide.
+func (r *Relay) Close() { r.once.Do(r.close) }
 
 // DialRelay allocates a VK TURN relay and creates a permission for the csqtt
 // server. transport is "udp" (the reference client's default) or "tcp"

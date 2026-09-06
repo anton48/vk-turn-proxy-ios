@@ -74,7 +74,7 @@ type credPool struct {
 	onNewHost     func(string) // called under mu with each relay host the first time it is handed out
 }
 
-func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentials, error) {
+func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.Credential, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cur == nil || p.used >= p.allocsPerCred {
@@ -84,7 +84,7 @@ func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentia
 			linkID := path.Base(mustURL(p.link).Path)
 			c, err := proxy.GetVKCreds(linkID, nil, "", "", 0, 0, "", "")
 			if err != nil {
-				return csqtt.TURNCredentials{}, err
+				return csqtt.Credential{}, err
 			}
 			p.cur = c
 			p.minted++
@@ -106,7 +106,8 @@ func (p *credPool) creds(ctx context.Context, workerID int) (csqtt.TURNCredentia
 			}
 		}
 	}
-	return csqtt.TURNCredentials{Username: p.cur.Username, Password: p.cur.Password, Address: addr}, nil
+	// No per-slot lease here: this pool counts hand-outs, not live allocations.
+	return csqtt.Credential{TURNCredentials: csqtt.TURNCredentials{Username: p.cur.Username, Password: p.cur.Password, Address: addr}}, nil
 }
 
 // relayHosts lists every relay host handed to a worker so far.

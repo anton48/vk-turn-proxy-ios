@@ -47,10 +47,14 @@ type Config struct {
 	Revision     string // WireRevision unless told otherwise
 	LocalPort    string // echoed by the server; "9000" unless told otherwise
 
-	// Creds mints a relay credential for a worker. Called with a worker id
-	// (1-based) each time that worker (re)starts; the pool policy is the
-	// caller's.
-	Creds func(ctx context.Context, workerID int) (TURNCredentials, error)
+	// Creds mints a relay credential for a worker. Called with the worker id
+	// (1-BASED — a pool indexed from 0 maps worker k to k−1) each time that
+	// worker (re)starts, BEFORE the start gate, so a pool that parks the
+	// caller (cold-start cap, path-change settle) stalls only this worker;
+	// ctx ends the wait. The pool policy is the caller's. The Release in the
+	// result is called exactly once — when the allocation obtained with the
+	// credential is gone, or at once when the allocation failed.
+	Creds func(ctx context.Context, workerID int) (Credential, error)
 
 	TURNTransport string           // "udp" or "tcp"
 	TURNLogLevel  logging.LogLevel // pion verbosity
@@ -126,11 +130,84 @@ type Client struct {
 
 	dupCursor int // rotates the worker that carries the copy
 
-	gate    *startGate
-	anyRx   atomic.Int64 // last inbound on any worker, unix nanos
-	probes  atomic.Int64 // liveness probes sent
-	resets  atomic.Int64 // monitor ticks found late (descheduled)
-	lostToL atomic.Int64 // workers restarted by the liveness verdict
+	gate     *startGate
+	anyRx    atomic.Int64 // last inbound on any worker, unix nanos
+	probes   atomic.Int64 // liveness probes sent
+	resets   atomic.Int64 // monitor ticks found late (descheduled)
+	lostToL  atomic.Int64 // workers restarted by the liveness verdict
+	lastTick atomic.Int64 // the monitor's previous tick (or a WakeHealthCheck), unix nanos
+
+	// identity is the (generation, salt) pair every worker's GETCONF carries.
+	// OnPathChange replaces it ONCE for the whole client — the server's
+	// epoch rule then drops every session of the old pair — and every worker
+	// re-announces under the new one. A REPAIR or a panel restart keeps it.
+	identMu     sync.Mutex
+	gen         uint64
+	salt        string
+	pathChanges atomic.Int64
+	allocRTT    atomic.Int64 // the last relay allocation, nanoseconds
+}
+
+// Credential is what Creds returns: the relay credential and the release
+// the pool wants back. Release is called exactly once per successful Creds
+// — when the allocation obtained with it is gone (the session ended for any
+// reason, including Close), or at once when the allocation never came up.
+// A nil Release means no bookkeeping (a manual credential).
+type Credential struct {
+	TURNCredentials
+	Release func()
+}
+
+// dialRelay is DialRelay, replaceable by tests with a loopback relay.
+var dialRelay = DialRelay
+
+// identity is the pair the next GETCONF must carry.
+func (c *Client) identity() (uint64, string) {
+	c.identMu.Lock()
+	defer c.identMu.Unlock()
+	return c.gen, c.salt
+}
+
+// OnPathChange is the app's path-change hook: the network underneath every
+// allocation changed, so the whole session is replaced under a NEW
+// identity (one pair for all workers) and every worker restarts. Each old
+// session's credential is released as it ends; the new starts acquire
+// afresh, so the pool's own path-change marking spreads them.
+func (c *Client) OnPathChange() {
+	c.identMu.Lock()
+	c.gen, c.salt = NewIdentity(c.gen)
+	gen := c.gen
+	c.identMu.Unlock()
+	c.pathChanges.Add(1)
+	c.cfg.Logf("csqtt: path change — new identity gen=%d, restarting every worker", gen)
+	c.restartAll("path change")
+}
+
+// WakeHealthCheck is the app's wake hook. The process may have been
+// suspended for any length of time, so nothing observed before now means
+// anything: every clock restarts here (as a late monitor tick does), and
+// every ready worker is probed at once — a dead one is then given up on
+// deadAfterProbe later instead of probeAfter+deadAfterProbe. The monitor's
+// tick mark moves too, so the tick that follows does not read the wake gap
+// as a deschedule and wipe the probes.
+func (c *Client) WakeHealthCheck() {
+	now := time.Now()
+	ns := now.UnixNano()
+	c.anyRx.Store(ns)
+	probed := 0
+	for _, w := range c.workers {
+		w.lastRx.Store(ns)
+		w.probeAt.Store(0)
+		if w.ready.Load() {
+			w.probeAt.Store(ns)
+			if w.send([]byte(ReadyRequest)) == nil {
+				probed++
+			}
+		}
+	}
+	c.probes.Add(int64(probed))
+	c.lastTick.Store(ns)
+	c.cfg.Logf("csqtt: wake — clocks reset, %d ready worker(s) probed", probed)
 }
 
 // Dial starts worker 1 and returns once it has a TUNCONF; the other workers
@@ -162,6 +239,7 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 		gate:     newStartGate(cfg.StartPacing),
 	}
 	c.striper.SetChunks(cfg.Chunks)
+	c.gen, c.salt = cfg.Generation, cfg.Salt
 	c.workers = make([]*worker, cfg.Workers)
 	for i := range c.workers {
 		c.workers[i] = newWorker(c, i+1, cipher)
@@ -274,21 +352,55 @@ func (c *Client) ReadPacket(ctx context.Context) ([]byte, error) {
 
 // Close tells the server to drop this (device, salt) and releases every
 // relay. Safe to call more than once.
+// Close stops the client within a bounded time: DISCONNECT is best-effort
+// (a write that blocks — a full TCP buffer to the relay — must not hold the
+// stop), then every relay is closed to unblock pending reads and writes,
+// then the goroutines are joined with a budget; whatever is still stuck
+// dies with the process, as Proxy.StopWithTimeout accepts.
 func (c *Client) Close() error {
 	if !c.closing.CompareAndSwap(false, true) {
 		return nil
 	}
-	req := []byte(DisconnectRequest(c.cfg.DeviceID, c.cfg.Salt))
-	for _, w := range c.workers {
-		if w.ready.Load() {
-			_ = w.send(req)
-			break
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		_, salt := c.identity()
+		req := []byte(DisconnectRequest(c.cfg.DeviceID, salt))
+		for _, w := range c.workers {
+			if w.ready.Load() {
+				_ = w.send(req)
+				return
+			}
 		}
+	}()
+	select {
+	case <-sent:
+	case <-time.After(closeDisconnectBudget):
+		c.cfg.Logf("csqtt: close: DISCONNECT did not go out within %s", closeDisconnectBudget)
 	}
 	c.stop()
-	c.wg.Wait()
+	for _, w := range c.workers {
+		w.closeRelay()
+	}
+	joined := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-time.After(closeJoinBudget):
+		c.cfg.Logf("csqtt: close: goroutines still running after %s — returning anyway", closeJoinBudget)
+	}
 	return nil
 }
+
+// The stop budgets: how long DISCONNECT may take to go out, and how long the
+// goroutines may take to end after the relays are closed.
+const (
+	closeDisconnectBudget = 500 * time.Millisecond
+	closeJoinBudget       = 2 * time.Second
+)
 
 func (c *Client) alive(i int) bool { return c.workers[i].ready.Load() }
 
@@ -366,7 +478,6 @@ func (c *Client) monitor() {
 	defer c.wg.Done()
 	tick := time.NewTicker(livenessTick)
 	defer tick.Stop()
-	var prev time.Time
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -374,6 +485,7 @@ func (c *Client) monitor() {
 		case <-tick.C:
 		}
 		now := time.Now()
+		prev := nanosTime(c.lastTick.Load())
 		anyRx := time.Unix(0, c.anyRx.Load())
 		reset := false
 		for _, w := range c.workers {
@@ -403,7 +515,7 @@ func (c *Client) monitor() {
 				w.probeAt.Store(0)
 			}
 		}
-		prev = now
+		c.lastTick.Store(now.UnixNano())
 	}
 }
 
@@ -437,8 +549,18 @@ type WorkerStats struct {
 	LastRx   time.Time
 }
 
-// Stats is a snapshot of the client.
+// Stats is a snapshot of the client. The first block is what the app's
+// Stats carries (bytes, connections, RTT, reconnects); the rest is csqtt's own.
 type Stats struct {
+	TxBytes     int64         // plaintext bytes sent through the relays (IP packets + control)
+	RxBytes     int64         // plaintext bytes received
+	Ready       int           // workers with a live session
+	Total       int           // workers configured
+	Restarts    int64         // worker restarts, all reasons
+	AllocateRTT time.Duration // the last relay allocation
+	Generation  uint64
+	PathChanges int64
+
 	Workers     []WorkerStats
 	Dropped     int64 // inbound packets the TUN side did not take in time
 	NoWorker    int64 // outbound packets with no ready worker
@@ -464,8 +586,19 @@ func (c *Client) Stats() Stats {
 		Descheduled: c.resets.Load(),
 		LostWorkers: c.lostToL.Load(),
 	}
+	s.AllocateRTT = time.Duration(c.allocRTT.Load())
+	s.Generation, _ = c.identity()
+	s.PathChanges = c.pathChanges.Load()
+	s.Total = len(c.workers)
 	for _, w := range c.workers {
-		s.Workers = append(s.Workers, w.stats())
+		ws := w.stats()
+		s.Workers = append(s.Workers, ws)
+		s.TxBytes += w.txBytes.Load()
+		s.RxBytes += w.rxBytes.Load()
+		s.Restarts += ws.Restarts
+		if ws.Ready {
+			s.Ready++
+		}
 	}
 	return s
 }
@@ -494,6 +627,8 @@ type worker struct {
 
 	ready     atomic.Bool
 	tx, rx    atomic.Int64
+	txBytes   atomic.Int64
+	rxBytes   atomic.Int64
 	restarts  atomic.Int64
 	lastRx    atomic.Int64 // unix nanos
 	lastTx    atomic.Int64
@@ -501,6 +636,7 @@ type worker struct {
 	blackhole atomic.Bool  // FAULT INJECTION: drop every inbound datagram of the current session
 	probeAt   atomic.Int64 // unix nanos of the probe for the current silence; 0 if none
 	relayStr  atomic.Pointer[string]
+	relayRef  atomic.Pointer[Relay] // the live allocation, for closeRelay — no mutex, a blocked send holds mu
 
 	kick chan string // restart requests with a reason
 }
@@ -532,6 +668,15 @@ func (w *worker) restart(reason string) {
 	}
 }
 
+// closeRelay ends the current allocation from outside the session (Close):
+// the read loop and any blocked write fail at once. Relay.Close is
+// idempotent, so the session's own deferred close is harmless afterwards.
+func (w *worker) closeRelay() {
+	if r := w.relayRef.Load(); r != nil {
+		r.Close()
+	}
+}
+
 // run is the worker's life: dial, handshake, serve, and on any failure
 // back off and dial again until the client stops.
 func (w *worker) run() {
@@ -543,13 +688,22 @@ func (w *worker) run() {
 		if w.c.ctx.Err() != nil {
 			return
 		}
-		backoff = nextBackoff(backoff, time.Since(started))
 		var denied *DeniedError
 		if errors.As(err, &denied) || errors.Is(err, ErrNoConfig) {
 			w.c.fail(fmt.Errorf("worker %d: %w", w.id, err))
 			return
 		}
 		w.restarts.Add(1)
+		// A restart WE asked for (path change, panel restart, REPAIR, the
+		// liveness verdict) is not a failure of the path: re-dial at once —
+		// the start gate spaces the allocations — and leave the backoff
+		// where it was. Only a session that ended on its own backs off.
+		var asked *restartRequest
+		if errors.As(err, &asked) {
+			w.c.cfg.Logf("csqtt: worker %d: restarting now (%s)", w.id, asked.reason)
+			continue
+		}
+		backoff = nextBackoff(backoff, time.Since(started))
 		w.c.cfg.Logf("csqtt: worker %d: %v — restarting in %s", w.id, err, backoff)
 		select {
 		case <-time.After(backoff):
@@ -558,6 +712,12 @@ func (w *worker) run() {
 		}
 	}
 }
+
+// restartRequest is how a session reports that it ended because someone
+// asked (worker.restart), as opposed to failing.
+type restartRequest struct{ reason string }
+
+func (r *restartRequest) Error() string { return "restart requested: " + r.reason }
 
 // healthySession is how long a session must have lived for its end to
 // count as a fresh failure rather than the next in a run of them.
@@ -583,23 +743,38 @@ func nextBackoff(prev, lived time.Duration) time.Duration {
 // session is one allocation's lifetime. It returns why it ended.
 func (w *worker) session() error {
 	ctx := w.c.ctx
-	// One start at a time, spaced from the end of the previous one — first
-	// starts and restarts alike, credentials and allocation both inside.
+	// The credential first, OUTSIDE the start gate: a pool may park this
+	// worker (cold-start cap, path-change settle) and a park inside the gate
+	// would stall every other start. The lease is released exactly once,
+	// whatever ends the session — or right here if the allocation fails.
+	cred, err := w.c.cfg.Creds(ctx, w.id)
+	if err != nil {
+		return fmt.Errorf("credentials: %w", err)
+	}
+	released := false
+	release := func() {
+		if cred.Release != nil && !released {
+			released = true
+			cred.Release()
+		}
+	}
+	defer release()
+	// One allocation at a time, spaced from the end of the previous one —
+	// first starts and restarts alike. Credentials that finished together
+	// still allocate 100 ms apart.
 	startDone := w.c.gate.begin()
 	if ctx.Err() != nil {
 		startDone()
 		return ctx.Err()
 	}
-	creds, err := w.c.cfg.Creds(ctx, w.id)
-	if err != nil {
-		startDone()
-		return fmt.Errorf("credentials: %w", err)
-	}
-	relay, err := DialRelay(creds, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel)
+	t0 := time.Now()
+	relay, err := dialRelay(cred.TURNCredentials, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel)
 	startDone()
 	if err != nil {
 		return err
 	}
+	w.c.allocRTT.Store(int64(time.Since(t0)))
+	creds := cred.TURNCredentials
 	wrapper, err := NewWrapper(w.cipher, w.c.cfg.Mode)
 	if err != nil {
 		relay.Close()
@@ -609,6 +784,7 @@ func (w *worker) session() error {
 	w.mu.Lock()
 	w.relay, w.wrapper = relay, wrapper
 	w.mu.Unlock()
+	w.relayRef.Store(relay)
 	rs := relay.Conn.LocalAddr().String()
 	w.relayStr.Store(&rs)
 	defer func() {
@@ -618,6 +794,7 @@ func (w *worker) session() error {
 		w.mu.Lock()
 		w.relay, w.wrapper = nil, nil
 		w.mu.Unlock()
+		w.relayRef.Store(nil)
 		relay.Close()
 	}()
 	w.c.cfg.Logf("csqtt: worker %d: relay %s via %s", w.id, rs, creds.Address)
@@ -628,9 +805,10 @@ func (w *worker) session() error {
 	readErr := make(chan error, 1)
 	go w.readLoop(relay.Conn, control, readErr)
 
-	// GETCONF with the reference schedule.
+	// GETCONF with the reference schedule, under the client's CURRENT identity.
+	gen, salt := w.c.identity()
 	req := []byte(ConfigRequest(w.c.cfg.LocalPort, w.c.cfg.DeviceID, w.c.cfg.Password,
-		w.c.cfg.Generation, w.c.cfg.Salt, w.id, w.c.cfg.Workers, w.c.cfg.Revision))
+		gen, salt, w.id, w.c.cfg.Workers, w.c.cfg.Revision))
 	var conf ConfigResponse
 	got := false
 attempts:
@@ -680,7 +858,7 @@ attempts:
 		case <-ctx.Done():
 			return ctx.Err()
 		case reason := <-w.kick:
-			return errors.New(reason)
+			return &restartRequest{reason: reason}
 		case err := <-readErr:
 			return fmt.Errorf("relay read: %w", err)
 		case p := <-control:
@@ -730,6 +908,7 @@ func (w *worker) send(plain []byte) error {
 		return err
 	}
 	w.tx.Add(1)
+	w.txBytes.Add(int64(len(plain)))
 	w.lastTx.Store(time.Now().UnixNano())
 	return nil
 }
@@ -756,6 +935,7 @@ func (w *worker) readLoop(conn net.PacketConn, control chan<- []byte, readErr ch
 			continue
 		}
 		w.rx.Add(1)
+		w.rxBytes.Add(int64(len(plain)))
 		now := time.Now().UnixNano()
 		w.lastRx.Store(now)
 		w.probeAt.Store(0) // any inbound answers the probe

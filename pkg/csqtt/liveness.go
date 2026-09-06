@@ -46,12 +46,15 @@ func NewIdentity(prev uint64) (generation uint64, salt string) {
 // would otherwise re-dial as one burst — sixteen credential mints and
 // sixteen allocations in the same instant, which is how a relay says 486.
 //
-// 🚨 The slot is held for the WHOLE start (credentials AND allocation) and
-// the spacing is measured from the END of the previous start. The first
-// version stamped the moment a worker entered the start: workers queued
-// behind a slow credential mint then left it together, and the second
-// eight allocations of a 16-worker run landed within 35 ms of each other
-// (2026-09-04, live1) — paced on paper, a burst on the wire.
+// 🚨 The slot is held for the WHOLE step inside it and the spacing is
+// measured from the END of the previous one. The first version stamped the
+// moment a worker entered the start: workers queued behind a slow step then
+// left it together, and the second eight allocations of a 16-worker run
+// landed within 35 ms of each other (2026-09-04, live1) — paced on paper, a
+// burst on the wire. Since 2026-09-06 the step inside is the ALLOCATION
+// only: credentials are taken before the gate, because a pool that parks a
+// worker (the app's cold-start cap, its path-change settle) would otherwise
+// stall every other start behind that one worker.
 type startGate struct {
 	mu    sync.Mutex
 	every time.Duration
