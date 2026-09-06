@@ -77,7 +77,7 @@ func main() {
 	defaultRoute := flag.Bool("default-route", false, "-tun: send the DEFAULT route through the tunnel; relay hosts, -keep-hosts and $SSH_CLIENT are pinned to the old gateway and everything is restored on exit")
 	keepHosts := flag.String("keep-hosts", "", "-default-route: comma-separated IPs that must stay on the old gateway (your SSH source, monitoring)")
 	relayPolicy := flag.String("relay", "first", "which relay each worker gets: first (one relay host for all, as the app does anonymously) or rotate (spread over the addresses VK returned)")
-	chunksFlag := flag.String("chunks", "", "-tun: striping chunks small,medium,bulk (default 4,16,32); 1,1,1 is pure per-packet round robin")
+	chunksFlag := flag.String("chunks", "", "-tun: striping chunks small,medium,bulk (default 4,16,64); 1,1,1 is pure per-packet round robin")
 	flag.Parse()
 	genSet := false
 	flag.Visit(func(f *flag.Flag) {

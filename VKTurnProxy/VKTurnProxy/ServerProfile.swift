@@ -69,7 +69,8 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     var csqttPassword: String = ""
     /// Device identity the csqtt server binds an unbound password to (a second
     /// device on the same password is DENIED:device_mismatch). Minted per
-    /// server like WRAP-A's deviceID; never carried in connection links.
+    /// server like WRAP-A's deviceID; a `csqtt://connect?…&device=<id>` link
+    /// may carry it (the server binds the password to ONE id) — parseCsqttLink.
     var csqttDeviceID: String = ""
 
     /// Human-readable transport mode, matching the ServerMode picker labels.

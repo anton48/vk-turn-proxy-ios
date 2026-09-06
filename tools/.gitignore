@@ -33,3 +33,11 @@ turn_quota_test/
 turn_srtp_server/turn_srtp_server
 turn_srtp_test/turn_srtp_test
 wrapa_test/
+
+# Bare-name binaries of the stand tools whose SOURCE is tracked (2026-09-07:
+# `go build ./...` inside tools/h3get wrote one beside its main.go).
+csqtt_client/csqtt_client
+native_client/native_client
+h3get/h3get
+udpreorder/udpreorder
+speedtest_cli/speedtest_cli

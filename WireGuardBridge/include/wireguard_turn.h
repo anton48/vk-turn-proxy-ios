@@ -328,8 +328,9 @@ void csqttLogPathSnapshot(int32_t handle, const char *label);
 
 /// Stats as JSON in the SAME shape wgGetStats returns (Swift's TunnelStats):
 /// active/total conns are ready/total workers, turn_rtt_ms the last relay
-/// allocation, reconnects the worker restarts; a terminal error rides
-/// auth_error, which the app already shows and stops on. "{}" if unknown.
+/// allocation, reconnects the worker restarts. auth_error stays the cookie
+/// latch as on the native path; a csqtt terminal reason is csqttGetError's,
+/// which the extension's watchdog turns into a stop. "{}" if unknown.
 const char *csqttGetStats(int32_t handle);
 
 /// The relay host to publish as serverAddress next time — non-empty after a
