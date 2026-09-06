@@ -3484,6 +3484,11 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		return fmt.Errorf("TURN allocate: %w", err)
 	}
 	defer relayConn.Close()
+	// Registered AFTER relayConn.Close's defer, so LIFO runs it FIRST: the
+	// deallocate that Close writes goes out under relayCloseWriteBudget on
+	// the control socket, instead of holding this goroutine (and the socket
+	// below it) for ever on a TCP relay that stopped taking bytes.
+	defer func() { _ = turnConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget)) }()
 	p.turnRTTns.Store(int64(time.Since(allocStart)))
 
 	// Log turnConn.LocalAddr() too — this is the source address the OS kernel
@@ -5432,11 +5437,29 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 type srtpSessionConn struct {
 	net.Conn  // SRTP-wrapped conn
 	relayConn net.PacketConn
-	tc        *turn.Client
+	tc        turnSessionClient // *turn.Client; an interface so a test can close without a server
 	ctlConn   net.PacketConn
 
 	closeOnce sync.Once
 }
+
+// turnSessionClient is what srtpSessionConn needs from *turn.Client.
+type turnSessionClient interface {
+	Close()
+	SendBindingRequest() (net.Addr, error)
+}
+
+// relayCloseWriteBudget bounds the ONE write pion makes when an allocation
+// is closed — the deallocate (Refresh with lifetime 0, sent without waiting
+// for the answer; the write itself is synchronous) — on the CONTROL socket.
+// pion's relay conn has no write deadline of its own (a stub), and on the
+// TCP transport a relay that stopped taking bytes leaves that write blocked
+// for ever: the goroutine closing the session hangs past StopWithTimeout,
+// with the socket it holds (seen with a real pion allocation and a blocked
+// WriteTo, 2026-09-06). The deadline goes on the socket we own — STUNConn
+// forwards it to the TCP conn, a UDP socket honours it directly — so a
+// healthy relay still hears the deallocate and a dead one costs the budget.
+const relayCloseWriteBudget = 500 * time.Millisecond
 
 func (s *srtpSessionConn) Close() error {
 	var firstErr error
@@ -5444,6 +5467,7 @@ func (s *srtpSessionConn) Close() error {
 		if err := s.Conn.Close(); err != nil {
 			firstErr = err
 		}
+		_ = s.ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
 		if err := s.relayConn.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
