@@ -111,6 +111,15 @@ void wgLogPathSnapshot(int32_t tunnelHandle, const char *label);
 /// See Proxy.OnPathChange / credPool.MarkInUseSlotsForPathChange.
 void wgPathChanged(int32_t tunnelHandle);
 
+/// Path UP: a SATISFIED real interface (wifi/cellular/wired), after
+/// wgPathChanged. The proxy rotates its group session id at once and, one
+/// settle (1 s) later, restarts every session that announced the old one —
+/// after a switch the old sessions are dead but the server keeps them in this
+/// client's downlink group for 150 s and they steal half the downlink onto
+/// dead allocations. Not for the unsatisfied event (no path to rebuild on)
+/// nor for iface=other (see wgPathInTransition). See pkg/proxy/pathrestart.go.
+void wgPathUp(int32_t tunnelHandle);
+
 /// Pause-only path event handler for iOS satisfied events with iface=other
 /// (recursive-routing fallback through our own TUN — typically observed
 /// during the gap between physical interface changes). Extends the

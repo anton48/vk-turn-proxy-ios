@@ -80,6 +80,18 @@ enum TunnelBackend {
         }
     }
 
+    /// A real interface is UP (satisfied wifi/cellular/wired). WireGuard: the
+    /// proxy rotates its group id and restarts the old sessions after a settle
+    /// (the post-switch downlink hole). csqtt: nothing extra — its pathChanged
+    /// already replaces the whole session under a new identity, which is the
+    /// same cure done by the protocol itself.
+    func pathUp() {
+        switch self {
+        case .wireguard(let h): wgPathUp(h)
+        case .csqtt: break
+        }
+    }
+
     func pathInTransition() {
         switch self {
         case .wireguard(let h): wgPathInTransition(h)

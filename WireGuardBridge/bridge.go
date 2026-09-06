@@ -936,6 +936,27 @@ func wgPathChanged(tunnelHandle C.int32_t) {
 // See Proxy.OnPathTransition + credPool.ExtendPauseAcquireForTransition
 // for full rationale.
 //
+// Path UP: a satisfied real interface (the path monitor's satisfied event on
+// wifi/cellular/wired — NOT the unsatisfied one, and not iface=other). The
+// proxy rotates its group session id at once and, one settle later,
+// restarts every session that announced the old one: after a switch the old
+// sessions are dead but the server keeps them in this client's downlink
+// group for 150 s and they steal half the downlink onto dead allocations
+// (variant A of the 2026-09-06 post-switch hole, pkg/proxy/pathrestart.go).
+// wgPathChanged still runs for every event and does the pool marking.
+//
+//export wgPathUp
+func wgPathUp(tunnelHandle C.int32_t) {
+	id := int32(tunnelHandle)
+	tunnelsMu.Lock()
+	entry, ok := tunnels[id]
+	tunnelsMu.Unlock()
+	if !ok {
+		return
+	}
+	entry.proxy.OnPathUp()
+}
+
 //export wgPathInTransition
 func wgPathInTransition(tunnelHandle C.int32_t) {
 	id := int32(tunnelHandle)

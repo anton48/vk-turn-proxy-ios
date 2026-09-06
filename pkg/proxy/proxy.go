@@ -267,6 +267,15 @@ type Proxy struct {
 	sessCtx    context.Context
 	sessCancel context.CancelFunc
 
+	// Per-conn session bookkeeping for the path-up restart (pathrestart.go):
+	// the epoch each running session stamped at its start and the cancel that
+	// restarts it, both under connMu so a restart never hits a session that
+	// started after its epoch.
+	connMu      sync.Mutex
+	connEpoch   []int64
+	connCancel  []func()
+	pathRestart pathRestart
+
 	// TURN server IP discovered after connecting to VK
 	turnServerIP atomic.Value // stores string
 
@@ -440,11 +449,11 @@ type Proxy struct {
 	connRxBytes []atomic.Int64
 
 	// groupHello is this tunnel's M3 group hello (0xff 'G' 'R' 'P' + a 16-byte
-	// session id), pre-built once and sent verbatim on every conn so the server
-	// can group this client's connections onto one socket toward WireGuard.
-	// nil when the peer is not our server (WRAP-A / WRAP-S) — see
-	// groupHelloMagic. Immutable after NewProxy, so no lock.
-	groupHello []byte
+	// session id), sent verbatim on every conn so the server can group this
+	// client's connections onto one socket toward WireGuard. nil when the peer
+	// is not our server (WRAP-A / WRAP-S) — see groupHelloMagic. Built once in
+	// NewProxy and ROTATED on a path-up (pathrestart.go), hence the atomic.
+	groupHello atomic.Pointer[[]byte]
 
 	// Per-conn last-activity timestamps (UnixNano) for skip-on-recent-tx
 	// wake-probe optimization. Updated alongside connTxBytes/connRxBytes
@@ -548,9 +557,12 @@ func NewProxy(cfg Config) *Proxy {
 		lastTxAt:          make([]atomic.Int64, cfg.NumConns),
 		lastRxAt:          make([]atomic.Int64, cfg.NumConns),
 		connLocalIPs:      make([]atomic.Value, cfg.NumConns),
+		connEpoch:         make([]int64, cfg.NumConns),
+		connCancel:        make([]func(), cfg.NumConns),
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
 	}
+	p.pathRestart.fire = func(olderThan int64) { p.restartSessionsOlderThan(olderThan, "path change") }
 	// Wire up WRAP-A state on the constructed proxy (key + provision channel).
 	if cfg.UseWrapA {
 		p.wrapAKey = wrapAKey
@@ -2062,16 +2074,41 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		// would inherit the dead allocation's token debt and be denied its opening
 		// burst. One site, all four transport modes. See uplinkpace.go.
 		PaceResetConn(connIdx)
+		// One context per SESSION under the shared sessCtx, so a path-up can
+		// restart this conn alone (pathrestart.go) while Pause/Resume keep
+		// cancelling everything through the parent.
+		connCtx, connCancel := context.WithCancel(sessCtx)
+		p.beginConnSession(connIdx, connCancel)
 		var err error
 		switch {
 		case p.config.UseWrapA:
-			err = p.runWrapASession(sessCtx, linkID, readyCh, &signaled, connIdx)
+			err = p.runWrapASession(connCtx, linkID, readyCh, &signaled, connIdx)
 		case p.config.UseSrtp:
-			err = p.runSRTPSession(sessCtx, linkID, readyCh, &signaled, connIdx)
+			err = p.runSRTPSession(connCtx, linkID, readyCh, &signaled, connIdx)
 		case p.config.UseDTLS:
-			err = p.runDTLSSession(sessCtx, linkID, readyCh, &signaled, connIdx)
+			err = p.runDTLSSession(connCtx, linkID, readyCh, &signaled, connIdx)
 		default:
-			err = p.runDirectSession(sessCtx, linkID, readyCh, &signaled, connIdx)
+			err = p.runDirectSession(connCtx, linkID, readyCh, &signaled, connIdx)
+		}
+		// A restart WE asked for (a path-up) ended this session, not the
+		// path: no failure count, no dormancy, a sub-second stagger so the
+		// thirty re-dials do not land in one instant, and on to a session
+		// that announces the new group.
+		asked := connCtx.Err() != nil && sessCtx.Err() == nil && p.ctx.Err() == nil
+		connCancel()
+		p.endConnSession(connIdx)
+		if asked {
+			log.Printf("proxy: [conn %d] session ended after %s by request (path change) — restarting now",
+				connIdx, time.Since(start).Round(time.Second))
+			shortFailures = 0
+			select {
+			case <-time.After(time.Duration(mathrand.Intn(1000)) * time.Millisecond):
+			case <-sessCtx.Done():
+				return sessCtx.Err()
+			case <-p.ctx.Done():
+				return p.ctx.Err()
+			}
+			continue
 		}
 		if err != nil {
 			duration := time.Since(start)
@@ -4752,9 +4789,17 @@ func (p *Proxy) initGroupHello(cfg Config) {
 	hello := make([]byte, 0, groupHelloLen)
 	hello = append(hello, groupHelloMagic...)
 	hello = append(hello, id[:]...)
-	p.groupHello = hello
+	p.groupHello.Store(&hello)
 	log.Printf("proxy: group hello %s (sent on every conn so the server can "+
 		"schedule this client's downlink as one group)", id)
+}
+
+// groupHelloBytes is the CURRENT hello, or nil when grouping is off.
+func (p *Proxy) groupHelloBytes() []byte {
+	if h := p.groupHello.Load(); h != nil {
+		return *h
+	}
+	return nil
 }
 
 // sendGroupHello writes this tunnel's group hello to one conn, if the peer is
@@ -4762,10 +4807,9 @@ func (p *Proxy) initGroupHello(cfg Config) {
 // it is repeated every probe interval, and a server that never sees one simply
 // keeps the connection on its own socket.
 func (p *Proxy) sendGroupHello(w io.Writer) {
-	if p.groupHello == nil {
-		return
+	if h := p.groupHelloBytes(); h != nil {
+		_, _ = w.Write(h)
 	}
-	_, _ = w.Write(p.groupHello)
 }
 
 // recvPktPool recycles []byte slices used to hand off freshly-read packets

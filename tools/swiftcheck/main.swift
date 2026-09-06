@@ -2970,7 +2970,7 @@ do {
     // wgGetAuthError, …) take no handle and are deliberately NOT listed.
     let handleBound = [
         "wgStartVKBootstrap", "wgWaitBootstrapReady", "wgAttachWireGuard", "wgTurnOff",
-        "wgPathChanged", "wgPathInTransition", "wgWakeHealthCheck", "wgLogPathSnapshot",
+        "wgPathChanged", "wgPathUp", "wgPathInTransition", "wgWakeHealthCheck", "wgLogPathSnapshot",
         "wgGetStats", "wgGetTURNServerIP", "wgWaitWrapAProvision", "wgSolveCaptcha",
         "wgRefreshCaptchaURL", "wgPause", "wgResume",
         "csqttStart", "csqttWaitReady", "csqttProvision", "csqttAttach", "csqttTurnOff",
@@ -2989,6 +2989,19 @@ do {
           "the provider holds a TunnelBackend and starts/attaches/stops through it — else the scan above proves nothing")
     check(!provider.contains("tunnelHandle"),
           "🚨 a bare `tunnelHandle` is back in the provider — the number without its kind")
+    // 🚨 THE PATH-UP HOOK FIRES ONLY ON A SATISFIED REAL INTERFACE, right after
+    //    pathChanged. On an unsatisfied event there is no path to rebuild the
+    //    sessions on; on iface=other the transition branch runs instead. Without
+    //    the hook the post-switch hole (150 s of half the downlink onto dead
+    //    allocations) is back.
+    if let pc = provider.range(of: "backend.pathChanged()") {
+        let window = String(provider[pc.upperBound...].prefix(400))
+        check(window.contains("if path.status == .satisfied {") && window.contains("backend.pathUp()"),
+              "🚨 backend.pathUp() must follow backend.pathChanged() under `path.status == .satisfied`")
+    } else {
+        check(false, "could not find backend.pathChanged() in the provider")
+    }
+    check(backend.contains("wgPathUp("), "TunnelBackend reaches wgPathUp")
     for name in ["wgWaitBootstrapReady", "csqttWaitReady", "wgAttachWireGuard", "csqttAttach",
                  "wgTurnOff", "csqttTurnOff", "wgGetStats", "csqttGetStats",
                  "wgPathChanged", "csqttPathChanged", "wgWakeHealthCheck", "csqttWakeHealthCheck"] {

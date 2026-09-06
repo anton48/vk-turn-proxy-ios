@@ -839,6 +839,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                             // BEFORE the inevitable 486 burst. See
                             // wgPathChanged in bridge.go.
                             backend.pathChanged()
+                            // A satisfied real interface is a path the sessions
+                            // can be rebuilt on; an unsatisfied one is not.
+                            if path.status == .satisfied {
+                                backend.pathUp()
+                            }
                         }
                     }
                 }

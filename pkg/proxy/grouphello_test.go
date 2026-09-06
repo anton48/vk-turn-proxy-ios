@@ -11,16 +11,16 @@ import (
 func TestGroupHelloConstruction(t *testing.T) {
 	ours := &Proxy{}
 	ours.initGroupHello(Config{})
-	if ours.groupHello == nil {
+	if ours.groupHelloBytes() == nil {
 		t.Fatal("no hello built for our own server")
 	}
-	if len(ours.groupHello) != groupHelloLen {
-		t.Fatalf("hello is %d bytes, server accepts exactly %d", len(ours.groupHello), groupHelloLen)
+	if len(ours.groupHelloBytes()) != groupHelloLen {
+		t.Fatalf("hello is %d bytes, server accepts exactly %d", len(ours.groupHelloBytes()), groupHelloLen)
 	}
-	if !bytes.HasPrefix(ours.groupHello, groupHelloMagic) {
-		t.Fatalf("hello does not start with the magic: %x", ours.groupHello)
+	if !bytes.HasPrefix(ours.groupHelloBytes(), groupHelloMagic) {
+		t.Fatalf("hello does not start with the magic: %x", ours.groupHelloBytes())
 	}
-	if ours.groupHello[0] != 0xff {
+	if ours.groupHelloBytes()[0] != 0xff {
 		t.Fatal("the first byte must be 0xff — that is what makes an old server " +
 			"hand the packet to WireGuard, which drops it, instead of treating " +
 			"it as data")
@@ -30,7 +30,7 @@ func TestGroupHelloConstruction(t *testing.T) {
 	// group and spray each one's downlink into the other's connections.
 	other := &Proxy{}
 	other.initGroupHello(Config{})
-	if bytes.Equal(ours.groupHello, other.groupHello) {
+	if bytes.Equal(ours.groupHelloBytes(), other.groupHelloBytes()) {
 		t.Fatal("two tunnels produced the same session id")
 	}
 
@@ -44,7 +44,7 @@ func TestGroupHelloConstruction(t *testing.T) {
 	} {
 		p := &Proxy{}
 		p.initGroupHello(cfg)
-		if p.groupHello != nil {
+		if p.groupHelloBytes() != nil {
 			t.Fatalf("%s: a hello was built for a third-party server", name)
 		}
 	}
@@ -63,8 +63,8 @@ func TestSendGroupHelloIsSafeWhenDisabled(t *testing.T) {
 	p.initGroupHello(Config{})
 	buf.Reset()
 	p.sendGroupHello(&buf)
-	if !bytes.Equal(buf.Bytes(), p.groupHello) {
-		t.Fatalf("sent %x, want %x", buf.Bytes(), p.groupHello)
+	if !bytes.Equal(buf.Bytes(), p.groupHelloBytes()) {
+		t.Fatalf("sent %x, want %x", buf.Bytes(), p.groupHelloBytes())
 	}
 }
 
@@ -73,7 +73,7 @@ func TestSendGroupHelloIsSafeWhenDisabled(t *testing.T) {
 func TestHelloIsNotAProbePacket(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
-	if isProbePacket(p.groupHello) {
+	if isProbePacket(p.groupHelloBytes()) {
 		t.Fatal("the group hello is being recognised as a probe pong — the " +
 			"zombie detector would treat it as proof the server answered")
 	}
