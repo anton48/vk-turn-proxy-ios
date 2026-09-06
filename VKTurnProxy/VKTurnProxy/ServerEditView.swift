@@ -140,8 +140,12 @@ struct ServerEditView: View {
                         hint(ConfigValidation.csqttPassword(draft.csqttPassword))
                         // The server binds an unbound password to this value;
                         // a second device on the same password is refused.
+                        // Empty blocks Connect (ConfigValidation) — the id that
+                        // goes out must be the one on screen, never a hidden
+                        // fallback; onAppear below fills an empty one.
                         TextField("Device ID", text: $draft.csqttDeviceID)
                             .autocapitalization(.none).disableAutocorrection(true)
+                        hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID))
                         Text("csqtt has no key exchange: the password is the tunnel's only key, so traffic recorded today can be decrypted by anyone who learns it later (no forward secrecy). The other modes do not have this property.")
                             .font(.caption)
                             .foregroundColor(.orange)
@@ -209,6 +213,15 @@ struct ServerEditView: View {
             }
         }
         .dismissKeyboardOnDrag()
+        // A csqtt server without a Device ID (a restored backup, an older
+        // blob) gets a VISIBLE one here, so what connects is what is shown.
+        // Cleared by hand it stays empty — and Connect stays blocked — until
+        // this screen is opened again.
+        .onAppear {
+            if draft.useCsqtt && draft.csqttDeviceID.isEmpty {
+                draft.csqttDeviceID = UUID().uuidString
+            }
+        }
         .navigationTitle(draft.serverName.isEmpty ? "Server" : draft.serverName)
         .navigationBarTitleDisplayMode(.inline)
         // Persist every edit through the store (projects onto the flat keys when

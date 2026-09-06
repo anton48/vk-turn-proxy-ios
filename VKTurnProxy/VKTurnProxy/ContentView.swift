@@ -232,6 +232,7 @@ private struct ActiveServerControls: View {
         ]
         if s.useCsqtt {
             issues.append(ConfigValidation.csqttPassword(s.csqttPassword))
+            issues.append(ConfigValidation.csqttDeviceID(s.csqttDeviceID))
         } else if s.useWrapA {
             issues.append(ConfigValidation.wrapAPassword(s.wrapAPassword))
         } else {

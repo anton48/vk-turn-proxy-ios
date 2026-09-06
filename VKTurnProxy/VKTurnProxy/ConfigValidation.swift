@@ -143,6 +143,18 @@ enum ConfigValidation {
         return nil
     }
 
+    /// csqtt: the server binds the password to ONE device id, so the id the
+    /// user can SEE is the one that must go out — never a hidden fallback
+    /// (2026-09-06: a cleared field connected with an invisible UUID and was
+    /// DENIED:device_mismatch with nothing to correct on screen). Empty blocks
+    /// Connect; the edit screen fills an empty field with a visible one.
+    static func csqttDeviceID(_ s: String) -> Issue? {
+        if s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return Issue(.error, "Device ID is required — the server binds the password to it. Use the one registered on the server, or open this screen again to generate one.")
+        }
+        return nil
+    }
+
     /// Only meaningful in SRTP-WRAP-A mode.
     static func wrapAPassword(_ s: String) -> Issue? {
         if s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

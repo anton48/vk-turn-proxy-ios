@@ -3043,6 +3043,24 @@ do {
           "🚨 a one-shot UUID is back as the csqtt device id fallback")
     check(tunnelManager.contains("suite?.string(forKey: \"csqttDeviceID\")") && tunnelManager.contains("suite?.set(id, forKey: \"csqttDeviceID\")"),
           "the fallback reads and writes the App Group key — or it is not persistent")
+
+    // 🚨 …AND THE FALLBACK IS NOT WHAT THE USER MEETS: an empty csqtt Device ID
+    //    BLOCKS Connect, because the id that goes out must be the one on screen
+    //    (the user has to match the server's). 2026-09-06: a cleared field
+    //    connected with an invisible UUID and was denied with nothing to fix.
+    let contentView = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+    if let gate = contentView.range(of: "private var configValidationError: String? {") {
+        let body = String(contentView[gate.upperBound...].prefix(1500))
+        check(body.contains("ConfigValidation.csqttPassword(") && body.contains("ConfigValidation.csqttDeviceID("),
+              "🚨 the Connect gate must require BOTH the csqtt password and the Device ID")
+    } else {
+        check(false, "could not find configValidationError")
+    }
+    let editView = codeWithoutComments("VKTurnProxy/VKTurnProxy/ServerEditView.swift")
+    check(editView.contains("hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID))"),
+          "the edit screen shows the Device ID requirement under the field")
+    check(editView.contains("if draft.useCsqtt && draft.csqttDeviceID.isEmpty {"),
+          "the edit screen fills an empty csqtt Device ID with a visible one")
 }
 
 print("")
