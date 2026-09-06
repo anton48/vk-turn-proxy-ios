@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -380,7 +381,8 @@ func TestWakeHealthCheckProbesEveryReadyWorker(t *testing.T) {
 
 // blockableConn is a relay socket whose writes can be made to hang, as a
 // full TCP buffer toward a relay would. A hung write returns when the test
-// unblocks it or when the conn is closed — as a real socket's does.
+// unblocks it, when the conn is closed, or when a write deadline set BEFORE
+// OR DURING the hang passes — as a real socket's does.
 type blockableConn struct {
 	net.PacketConn
 	block                atomic.Bool
@@ -388,27 +390,63 @@ type blockableConn struct {
 	closed               chan struct{}
 	entered              chan struct{} // closed once a write has blocked
 	closeOnce, enterOnce sync.Once
+
+	dmu             sync.Mutex
+	deadline        time.Time
+	deadlineChanged chan struct{} // closed and replaced on every SetWriteDeadline
 }
 
 func newBlockableConn(pc net.PacketConn) *blockableConn {
-	return &blockableConn{PacketConn: pc, unblock: make(chan struct{}), closed: make(chan struct{}), entered: make(chan struct{})}
+	return &blockableConn{PacketConn: pc, unblock: make(chan struct{}), closed: make(chan struct{}), entered: make(chan struct{}),
+		deadlineChanged: make(chan struct{})}
+}
+
+func (b *blockableConn) SetWriteDeadline(t time.Time) error {
+	b.dmu.Lock()
+	b.deadline = t
+	close(b.deadlineChanged)
+	b.deadlineChanged = make(chan struct{})
+	b.dmu.Unlock()
+	return nil
 }
 
 func (b *blockableConn) WriteTo(p []byte, a net.Addr) (int, error) {
-	if b.block.Load() {
-		b.enterOnce.Do(func() { close(b.entered) })
+	if !b.block.Load() {
+		return b.PacketConn.WriteTo(p, a)
+	}
+	b.enterOnce.Do(func() { close(b.entered) })
+	for {
+		b.dmu.Lock()
+		deadline, changed := b.deadline, b.deadlineChanged
+		b.dmu.Unlock()
+		var expire <-chan time.Time
+		if !deadline.IsZero() {
+			expire = time.After(time.Until(deadline))
+		}
 		select {
 		case <-b.unblock:
+			return 0, net.ErrClosed
 		case <-b.closed:
+			return 0, net.ErrClosed
+		case <-expire:
+			return 0, os.ErrDeadlineExceeded
+		case <-changed:
 		}
-		return 0, net.ErrClosed
 	}
-	return b.PacketConn.WriteTo(p, a)
 }
 
 func (b *blockableConn) Close() error {
 	b.closeOnce.Do(func() { close(b.closed) })
 	return b.PacketConn.Close()
+}
+
+// deallocating is pion's relay conn as Close sees it: Close WRITES the
+// deallocate through the control socket before anything else.
+type deallocating struct{ ctl net.PacketConn }
+
+func (d deallocating) Close() error {
+	_, err := d.ctl.WriteTo([]byte("deallocate"), nil)
+	return err
 }
 
 // blockableRelays replaces DialRelay: every dial gets a fresh blockableConn,
@@ -431,7 +469,9 @@ func installBlockableRelays(t *testing.T) *blockableRelays {
 		r.mu.Lock()
 		r.conns = append(r.conns, bc)
 		r.mu.Unlock()
-		return &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { bc.Close() }}, nil
+		// The production close order over the fake: the deallocate write
+		// through the (blockable) control socket, then the socket.
+		return &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { closeRelayBounded(bc, deallocating{bc}, nil) }}, nil
 	}
 	t.Cleanup(func() { dialRelay = prev })
 	return r
@@ -446,10 +486,73 @@ func (r *blockableRelays) nth(i int) *blockableConn {
 	return r.conns[i]
 }
 
+// A relay's own Close is bounded when the deallocate pion writes on it
+// blocks (a TCP relay that stopped taking bytes): the write deadline goes
+// on the control socket we own, and the close returns within the budget
+// instead of hanging behind the write — the session teardown, the liveness
+// restart and Client.Close all sit behind this one call. Sabotage seen red:
+// the deadline dropped from closeRelayBounded (Close never returns).
+func TestRelayCloseIsBoundedWhenTheDeallocateBlocks(t *testing.T) {
+	uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bc := newBlockableConn(uc)
+	bc.block.Store(true)
+	r := &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { closeRelayBounded(bc, deallocating{bc}, nil) }}
+	done := make(chan struct{})
+	t0 := time.Now()
+	go func() { r.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(relayCloseWriteBudget + 2*time.Second):
+		t.Fatal("Relay.Close did not return: the deallocate write hung the close")
+	}
+	if took := time.Since(t0); took < relayCloseWriteBudget/2 {
+		t.Fatalf("Relay.Close returned in %s — it did not even try the deallocate under its deadline", took)
+	}
+}
+
+// With EVERY session stuck in its own keepalive write (the idle worker on a
+// dead TCP relay — the production shape), Close still returns within its
+// budgets: a session blocked in a write cannot reach its own teardown, so
+// Close's closeRelay is what frees each one, and it runs them concurrently
+// — each costs the deallocate's deadline, and eight in a row would be four
+// seconds, past the join budget. Sabotage seen red: the relays closed one
+// after another. (With idle sessions the sabotage stays green: each session
+// closes its own relay in its teardown the moment the ctx ends, which is why
+// this test parks them in a write first.)
+func TestCloseIsBoundedWhenEveryRelayIsStuck(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installBlockableRelays(t)
+	prevKeepalive := keepaliveEvery
+	keepaliveEvery = 20 * time.Millisecond
+	defer func() { keepaliveEvery = prevKeepalive }()
+	const workers = 8
+	c := dialReady(t, testConfig(srv, workers, (&lease{}).creds))
+	for i := 0; i < workers; i++ {
+		relays.nth(i).block.Store(true)
+	}
+	for i := 0; i < workers; i++ {
+		<-relays.nth(i).entered // every session is now inside a keepalive write
+	}
+	done := make(chan struct{})
+	t0 := time.Now()
+	go func() { c.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(closeDisconnectBudget + closeJoinBudget + time.Second):
+		t.Fatal("Close did not return with every relay stuck")
+	}
+	if took := time.Since(t0); took > closeDisconnectBudget+closeJoinBudget {
+		t.Fatalf("Close took %s — the relays were closed one after another, not within the join budget", took)
+	}
+}
+
 // Close returns within its budget even when a write to the relay hangs:
-// DISCONNECT is best-effort, the relays are closed, the join is bounded.
-// Sabotage seen red: the join budget dropped (Close waits for the hung
-// goroutine for ever).
+// DISCONNECT is best-effort, the relays are closed (their own deallocate
+// write under its deadline), the join is bounded. Sabotage seen red: the
+// join budget dropped (Close waits for the hung goroutine for ever).
 func TestCloseIsBoundedWhenAWriteBlocks(t *testing.T) {
 	srv := newFakeServer(t)
 	relays := installBlockableRelays(t)

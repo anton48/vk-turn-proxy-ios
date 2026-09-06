@@ -4,6 +4,7 @@ package csqtt
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -32,8 +33,34 @@ type Relay struct {
 
 // Close tears down the relayed conn, the TURN client and the control socket.
 // Close ends the allocation; idempotent, so the session's deferred close and
-// Client.Close's forced close do not collide.
+// Client.Close's forced close do not collide. Bounded: see closeRelayBounded.
 func (r *Relay) Close() { r.once.Do(r.close) }
+
+// relayCloseWriteBudget bounds the ONE write pion makes on Close — the
+// deallocate (Refresh with lifetime 0, sent without waiting for the answer;
+// the write itself is synchronous) — on the CONTROL socket. pion's relay
+// conn has no write deadline of its own (SetWriteDeadline is a stub), and on
+// the TCP transport a relay that stopped taking bytes leaves that write
+// blocked for ever: the session teardown, the liveness restart and
+// Client.Close would all sit behind it (seen with a real pion allocation and
+// a blocked WriteTo, 2026-09-06 — the close was still hung after three
+// seconds and ended only when the control socket was forced shut). The
+// deadline goes on the socket WE own; the STUNConn forwards it to the TCP
+// conn, and a UDP socket honours it directly.
+const relayCloseWriteBudget = 500 * time.Millisecond
+
+// closeRelayBounded is Relay.close: the deallocate under a bounded write,
+// the TURN client, then the control socket — in that order, so a healthy
+// relay still hears the deallocate and a dead one costs at most the budget.
+// The deadline also frees a data write blocked on the same socket.
+func closeRelayBounded(ctl net.PacketConn, relayConn io.Closer, tcClose func()) {
+	_ = ctl.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
+	_ = relayConn.Close()
+	if tcClose != nil {
+		tcClose()
+	}
+	_ = ctl.Close()
+}
 
 // DialRelay allocates a VK TURN relay and creates a permission for the csqtt
 // server. transport is "udp" (the reference client's default) or "tcp"
@@ -99,11 +126,7 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 	return &Relay{
 		Conn:  relay,
 		Local: ctl.LocalAddr(),
-		close: func() {
-			_ = relay.Close()
-			tc.Close()
-			_ = ctl.Close()
-		},
+		close: func() { closeRelayBounded(ctl, relay, tc.Close) },
 	}, nil
 }
 

@@ -351,9 +351,11 @@ func (c *Client) ReadPacket(ctx context.Context) ([]byte, error) {
 // relay. Safe to call more than once.
 // Close stops the client within a bounded time: DISCONNECT is best-effort
 // (a write that blocks — a full TCP buffer to the relay — must not hold the
-// stop), then every relay is closed to unblock pending reads and writes,
-// then the goroutines are joined with a budget; whatever is still stuck
-// dies with the process, as Proxy.StopWithTimeout accepts.
+// stop), then every relay is closed CONCURRENTLY and INSIDE the join budget
+// — a relay's own close writes the deallocate under relayCloseWriteBudget,
+// and thirty of those in a row would be fifteen seconds — then the
+// goroutines are joined with the same budget; whatever is still stuck dies
+// with the process, as Proxy.StopWithTimeout accepts.
 func (c *Client) Close() error {
 	if !c.closing.CompareAndSwap(false, true) {
 		return nil
@@ -376,11 +378,17 @@ func (c *Client) Close() error {
 		c.cfg.Logf("csqtt: close: DISCONNECT did not go out within %s", closeDisconnectBudget)
 	}
 	c.stop()
+	var closers sync.WaitGroup
 	for _, w := range c.workers {
-		w.closeRelay()
+		closers.Add(1)
+		go func(w *worker) {
+			defer closers.Done()
+			w.closeRelay()
+		}(w)
 	}
 	joined := make(chan struct{})
 	go func() {
+		closers.Wait()
 		c.wg.Wait()
 		close(joined)
 	}()
@@ -601,11 +609,14 @@ func (c *Client) Stats() Stats {
 // ─── worker ───────────────────────────────────────────────────────────────
 
 const (
-	keepaliveEvery = 10 * time.Second
 	readyWait      = 3 * time.Second
 	restartBackoff = time.Second
 	maxBackoff     = 30 * time.Second
 )
+
+// keepaliveEvery is the idle keepalive cadence (the reference client's 10 s).
+// A variable so a test can park every session in its own keepalive write.
+var keepaliveEvery = 10 * time.Second
 
 var getconfSchedule = []time.Duration{750 * time.Millisecond, 1500 * time.Millisecond, 3 * time.Second}
 
