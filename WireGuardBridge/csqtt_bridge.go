@@ -184,9 +184,10 @@ type csqttEntry struct {
 	pool    *proxy.CredPool
 	started time.Time
 
-	dialed chan struct{} // closed when csqttDial returned, either way
-	client csqttClient   // set before dialed is closed on success; nil on failure
-	fatal  atomic.Pointer[string]
+	dialed   chan struct{} // closed when csqttDial returned, either way
+	clientMu sync.Mutex
+	client   csqttClient // guarded by clientMu: set once by the start goroutine on success, nil before and on failure
+	fatal    atomic.Pointer[string]
 
 	devMu sync.Mutex
 	dev   packetDevice
@@ -249,6 +250,47 @@ var (
 	csqttTunnelsMu sync.Mutex
 	csqttNextID    int32 = 1
 )
+
+// publishClient makes the client the dial returned visible to the handle's
+// readers — unless the tunnel was cancelled first, in which case it stays
+// the goroutine's to close. 🚨 The start goroutine publishes while Swift may
+// already be calling wake / path-change / stats / snapshot / provision on
+// the handle from its own callbacks (the race detector flagged
+// WakeHealthCheck against the assignment, 2026-09-06), so every reader goes
+// through clientNow; `dialed` orders only the readers that waited on it.
+// And TurnOff cancels BEFORE it reads the field: this check-and-set is
+// atomic with that read, so exactly one of them closes the client in every
+// interleaving — a stop that lands between the dial's return and the
+// publication included, which a check outside the lock left as a leak.
+// The pumps take the client once, at attach, and never read the field.
+func (e *csqttEntry) publishClient(ctx context.Context, c csqttClient) bool {
+	e.clientMu.Lock()
+	defer e.clientMu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
+	if csqttAfterPublishCheck != nil {
+		csqttAfterPublishCheck()
+	}
+	e.client = c
+	return true
+}
+
+// Test hooks, nil in production. csqttAfterPublishCheck runs right after
+// publishClient's ctx check and before the assignment — the instant a stop
+// must not be able to slip into; csqttAfterAttachLookup runs in csqttAttach
+// after the handle was resolved and before the device section — the same
+// instant for the device.
+var (
+	csqttAfterPublishCheck func()
+	csqttAfterAttachLookup func()
+)
+
+func (e *csqttEntry) clientNow() csqttClient {
+	e.clientMu.Lock()
+	defer e.clientMu.Unlock()
+	return e.client
+}
 
 func csqttLookup(handle int32) *csqttEntry {
 	csqttTunnelsMu.Lock()
@@ -489,12 +531,11 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 		// cancel when both were ready — has its own lifetime (Dial's ctx
 		// only bounds the dial): nobody else will close it, and thirty
 		// relays and their workers would live until jetsam.
-		if ctx.Err() != nil {
+		if !e.publishClient(ctx, client) {
 			log.Printf("csqttStart: tunnel %d: dial finished after the stop — closing the client", e.id)
 			_ = client.Close()
 			return
 		}
-		e.client = client
 		// The first worker is live: the grower may fill the pool from here,
 		// at the same pace the native transport's does.
 		go pool.Grow(nil)
@@ -534,7 +575,7 @@ func csqttWaitReadyImpl(handle int32, timeout time.Duration) int32 {
 	case <-time.After(timeout):
 		return 0
 	}
-	if e.errText() != "" || e.client == nil {
+	if e.errText() != "" || e.clientNow() == nil {
 		return -1
 	}
 	return 1
@@ -551,10 +592,14 @@ func csqttProvision(handle C.int32_t) *C.char {
 
 func csqttProvisionImpl(handle int32) string {
 	e := csqttLookup(handle)
-	if e == nil || e.client == nil {
+	if e == nil {
 		return ""
 	}
-	return csqttProvisionJSON(e.client.Config())
+	c := e.clientNow()
+	if c == nil {
+		return ""
+	}
+	return csqttProvisionJSON(c.Config())
 }
 
 func csqttProvisionJSON(conf csqtt.ConfigResponse) string {
@@ -578,7 +623,7 @@ func csqttProvisionJSON(conf csqtt.ConfigResponse) string {
 // duplicate as a utun device and starts the two pumps — ONE tun reader that
 // is the only WritePacket caller, ONE ReadPacket loop writing to the tun —
 // plus a drain of the device's event channel. 1 on success; -1 unknown
-// handle, -2 already attached or not ready, -3 dup failed, -4 the device.
+// handle, -2 already attached, not ready, or stopped, -3 dup failed, -4 the device.
 //
 //export csqttAttach
 func csqttAttach(handle C.int32_t, tunFd C.int32_t) C.int32_t {
@@ -590,12 +635,25 @@ func csqttAttachImpl(handle int32, tunFd int) int32 {
 	if e == nil {
 		return -1
 	}
-	if e.client == nil {
+	client := e.clientNow()
+	if client == nil {
 		log.Printf("csqttAttach: tunnel %d is not ready", e.id)
 		return -2
 	}
+	if csqttAfterAttachLookup != nil {
+		csqttAfterAttachLookup()
+	}
 	e.devMu.Lock()
 	defer e.devMu.Unlock()
+	// A stop that landed between the lookup above and this lock: TurnOff has
+	// cancelled the ctx and read `dev` (nil) under devMu already, so a device
+	// installed now would be nobody's to close — the dup'd TUN descriptor and
+	// two pumps until jetsam. The check sits under the lock TurnOff reads
+	// under, so exactly one of them owns the device.
+	if e.ctx.Err() != nil {
+		log.Printf("csqttAttach: tunnel %d is stopped — not attaching", e.id)
+		return -2
+	}
 	if e.dev != nil {
 		log.Printf("csqttAttach: tunnel %d already has a device", e.id)
 		return -2
@@ -621,8 +679,8 @@ func csqttAttachImpl(handle int32, tunFd int) int32 {
 	}
 	e.dev = dev
 	e.pumps.Add(3)
-	go e.pumpUp(dev)
-	go e.pumpDown(dev)
+	go e.pumpUp(dev, client)
+	go e.pumpDown(dev, client)
 	go e.drainEvents(dev)
 	log.Printf("csqttAttach: tunnel %d attached (fd %d → dup %d)", e.id, tunFd, dupFd)
 	return 1
@@ -631,7 +689,7 @@ func csqttAttachImpl(handle int32, tunFd int) int32 {
 // pumpUp: TUN → relays. The only caller of WritePacket (not concurrency-safe
 // by contract). A packet the server would drop for size is counted and
 // dropped here.
-func (e *csqttEntry) pumpUp(dev packetDevice) {
+func (e *csqttEntry) pumpUp(dev packetDevice, client csqttClient) {
 	defer e.pumps.Done()
 	bufs := [][]byte{make([]byte, csqttTunOffset+csqttMaxPacket)}
 	sizes := make([]int, 1)
@@ -648,7 +706,7 @@ func (e *csqttEntry) pumpUp(dev packetDevice) {
 		}
 		pkt := bufs[0][csqttTunOffset : csqttTunOffset+sizes[0]]
 		e.tunIn.Add(1)
-		if err := e.client.WritePacket(pkt); err != nil {
+		if err := client.WritePacket(pkt); err != nil {
 			e.sendErr.Add(1)
 		}
 	}
@@ -656,11 +714,11 @@ func (e *csqttEntry) pumpUp(dev packetDevice) {
 
 // pumpDown: relays → TUN. csqtt's own out-queue (1024 packets, Dropped in
 // its stats) is the bound on this side.
-func (e *csqttEntry) pumpDown(dev packetDevice) {
+func (e *csqttEntry) pumpDown(dev packetDevice, client csqttClient) {
 	defer e.pumps.Done()
 	wbuf := make([]byte, csqttTunOffset+csqttMaxPacket)
 	for {
-		p, err := e.client.ReadPacket(e.ctx)
+		p, err := client.ReadPacket(e.ctx)
 		if err != nil {
 			return
 		}
@@ -707,19 +765,23 @@ func csqttTurnOffImpl(handle int32) {
 	started := time.Now()
 	log.Printf("csqttTurnOff: tunnel %d stopping", e.id)
 	e.cancel()
-	// The client is set by the start goroutine after Dial returns; a stop
-	// during the dial must wait for that goroutine to finish (it closes
-	// `dialed` on its way out, after the assignment) or it would read nil
-	// and leave a live client behind. Bounded: a dial answers the cancel at
-	// once, and a dial that outlives the budget closes its own client.
+	// Ownership of the client is settled by publishClient's check-and-set
+	// against the cancel above: a client published before the cancel is
+	// closed HERE (its `dialed` is already closed, no wait), a client the
+	// dial returns after the cancel is refused by publishClient and closed
+	// by the start goroutine — never by both. The wait on `dialed` is so
+	// that this call RETURNS only after that goroutine's own Close has run
+	// (close(dialed) is deferred behind it): Swift's stopTunnel then
+	// completes with the client down. Bounded: a dial that outlives the
+	// budget closes its own client a moment later.
 	select {
 	case <-e.dialed:
 	case <-time.After(csqttDialJoinBudget):
 		log.Printf("csqttTurnOff: tunnel %d: the dial is still in flight after %s — its client will close itself", e.id, csqttDialJoinBudget)
 	}
-	if e.client != nil {
+	if c := e.clientNow(); c != nil {
 		t := time.Now()
-		_ = e.client.Close()
+		_ = c.Close()
 		log.Printf("csqttTurnOff: tunnel %d client.Close took %s", e.id, time.Since(t).Round(time.Millisecond))
 	}
 	e.devMu.Lock()
@@ -757,8 +819,8 @@ func csqttPathChangedImpl(handle int32) {
 		return
 	}
 	e.pool.OnPathChange()
-	if e.client != nil {
-		e.client.OnPathChange()
+	if c := e.clientNow(); c != nil {
+		c.OnPathChange()
 	}
 }
 
@@ -779,8 +841,10 @@ func csqttPathInTransition(handle C.int32_t) {
 func csqttWakeHealthCheck(handle C.int32_t) { csqttWakeHealthCheckImpl(int32(handle)) }
 
 func csqttWakeHealthCheckImpl(handle int32) {
-	if e := csqttLookup(handle); e != nil && e.client != nil {
-		e.client.WakeHealthCheck()
+	if e := csqttLookup(handle); e != nil {
+		if c := e.clientNow(); c != nil {
+			c.WakeHealthCheck()
+		}
 	}
 }
 
@@ -793,11 +857,12 @@ func csqttLogPathSnapshot(handle C.int32_t, label *C.char) {
 		return
 	}
 	l := C.GoString(label)
-	if e.client == nil {
+	c := e.clientNow()
+	if c == nil {
 		log.Printf("csqtt: pathstats %s: not ready yet", l)
 		return
 	}
-	s := e.client.Stats()
+	s := c.Stats()
 	log.Printf("csqtt: pathstats %s: workers %d/%d ready, restarts %d, repairs %d, probes %d, lost %d; tun in=%d out=%d",
 		l, s.Ready, s.Total, s.Restarts, s.Repairs, s.Probes, s.LostWorkers, e.tunIn.Load(), e.tunOut.Load())
 }
@@ -839,8 +904,8 @@ func csqttAppStats(e *csqttEntry) proxy.Stats {
 		// extension's watchdog turns into a stop with THAT reason.
 		AuthError: proxy.CookieAuthFatalError(),
 	}
-	if e.client != nil {
-		cs := e.client.Stats()
+	if c := e.clientNow(); c != nil {
+		cs := c.Stats()
 		s.TxBytes = cs.TxBytes
 		s.RxBytes = cs.RxBytes
 		s.ActiveConns = int32(cs.Ready)

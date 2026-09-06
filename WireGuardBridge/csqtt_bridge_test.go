@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -613,5 +614,251 @@ func TestCsqttPathChangeAndWakeReachTheClient(t *testing.T) {
 	csqttWakeHealthCheckImpl(h)
 	if fc.pathChg.Load() != 1 || fc.wakes.Load() != 1 {
 		t.Fatalf("path changes %d wakes %d, want 1 and 1", fc.pathChg.Load(), fc.wakes.Load())
+	}
+}
+
+// Swift calls wake / path-change / stats / provision on the handle from its
+// own callbacks while the start goroutine is still dialling; the assignment
+// of the client the dial returns must be synchronised with every one of
+// those readers (the race detector flagged WakeHealthCheck against the
+// assignment, 2026-09-06). The race detector IS the check. 🚨 ONE GOROUTINE
+// PER READER: a goroutine that makes a LOCKED read (clientNow) after the
+// publication is ordered after it, and a bare read later in the same
+// goroutine is invisible to -race — a single loop over all readers caught a
+// bare Wake in ~1 run of 4 and a bare PathChanged almost never (the review
+// of 2026-09-06). Alone in its goroutine, a bare reader's reads are
+// unordered against the assignment and -race reports the pair (mostly the
+// write against an earlier bare read). Probabilistic, not certain: with
+// each of the four readers on the bare field in turn, separate processes
+// read red 10/10, 9/10, 10/10, 10/10 on a quiet host and 80–95 % per
+// reader with other suites running beside it — the detector's shadow cells
+// are finite. The source scans below are the deterministic guard.
+func TestCsqttReadersDuringTheBootstrapDoNotRaceTheDial(t *testing.T) {
+	var mints atomic.Int32
+	installFakePool(t, mintingFetch(&mints))
+	fc := newFakeClient()
+	release := make(chan struct{})
+	installGatedDial(t, fc, release)
+	csqttSeededSettle = 0
+
+	h := startCsqtt(t, "")
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	for _, read := range []func(){
+		func() { csqttWakeHealthCheckImpl(h) },
+		func() { _ = csqttGetStatsImpl(h) },
+		func() { _ = csqttProvisionImpl(h) },
+		func() { csqttPathChangedImpl(h) },
+	} {
+		readers.Add(1)
+		go func(read func()) {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				read()
+			}
+		}(read)
+	}
+	time.Sleep(30 * time.Millisecond)
+	close(release) // the dial returns and the client is assigned under the readers
+	if rc := csqttWaitReadyImpl(h, 3*time.Second); rc != 1 {
+		t.Fatalf("csqttWaitReady: %d (error %q)", rc, csqttGetErrorImpl(h))
+	}
+	time.Sleep(30 * time.Millisecond)
+	close(stop)
+	readers.Wait()
+	if fc.wakes.Load() == 0 {
+		t.Fatal("fixture: no wake reached the client after the dial — the readers did not overlap the assignment")
+	}
+}
+
+// Every read of the entry's client goes through clientNow() — a source
+// scan beside the -race test, because -race sees a bare read only when it
+// is unordered against the assignment in ITS goroutine (a test that mixed
+// readers in one loop missed most of them, the review of 2026-09-06), and a
+// scan does not depend on the interleaving.
+// The -race test above proves the mechanism dynamically; this scan pins
+// every reader by its spelling, whatever the interleaving. Sabotage seen
+// red: csqttAppStats reading e.client directly.
+func TestCsqttClientFieldReadsGoThroughTheAccessor(t *testing.T) {
+	// Every non-test file of the package (bridge.go shares it), any receiver
+	// spelling — `x.client` or `(*x).client` — the field itself (not
+	// clientMu); tracked per enclosing function, so the two legitimate lines
+	// are pinned to THEIR functions and counted exactly once each.
+	field := regexp.MustCompile(`(?:\b[A-Za-z_][A-Za-z0-9_]*|\))\.client\b`)
+	funcLine := regexp.MustCompile(`^func (?:\([^)]*\) )?([A-Za-z0-9_]+)\(`)
+	allowed := map[string]string{"publishClient": "e.client = c", "clientNow": "return e.client"}
+	seen := map[string]int{}
+	for _, name := range packageSources(t) {
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		current := ""
+		for i, line := range strings.Split(string(src), "\n") {
+			if m := funcLine.FindStringSubmatch(line); m != nil {
+				current = m[1]
+			}
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") || !field.MatchString(trimmed) {
+				continue
+			}
+			if name == "csqtt_bridge.go" && allowed[current] == trimmed {
+				seen[current]++
+				continue
+			}
+			t.Errorf("%s:%d touches the client field outside publishClient/clientNow (in %s): %q — the start goroutine assigns it while Swift's callbacks read it", name, i+1, current, trimmed)
+		}
+	}
+	if seen["publishClient"] != 1 || seen["clientNow"] != 1 {
+		t.Errorf("want exactly one assignment in publishClient and one read in clientNow, saw %v", seen)
+	}
+}
+
+// packageSources lists the package's non-test Go files (the test runs in
+// the package directory).
+func packageSources(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if n := e.Name(); strings.HasSuffix(n, ".go") && !strings.HasSuffix(n, "_test.go") {
+			out = append(out, n)
+		}
+	}
+	if len(out) < 2 {
+		t.Fatalf("found only %v — the scan must run in the package directory", out)
+	}
+	return out
+}
+
+// The stop checks sit UNDER the locks TurnOff reads under — pinned by
+// spelling, because a hook can only freeze the goroutine where the hook is:
+// a check hoisted out of the lock with the hook left inside still passes
+// the interleaving tests (the re-check of 2026-09-06). publishClient:
+// Lock → ctx.Err → the assignment; csqttAttachImpl: devMu.Lock → e.ctx.Err
+// → dupFD. Sabotage seen red: either check hoisted above its Lock.
+func TestCsqttStopChecksSitUnderTheLocks(t *testing.T) {
+	src, err := os.ReadFile("csqtt_bridge.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fn := func(pattern string) string {
+		m := regexp.MustCompile(pattern).FindString(string(src))
+		if m == "" {
+			t.Fatalf("function not found: %s", pattern)
+		}
+		return m
+	}
+	ordered := func(name, body string, steps ...string) {
+		last := -1
+		for _, step := range steps {
+			i := strings.Index(body, step)
+			if i < 0 {
+				t.Errorf("%s: %q not found", name, step)
+				return
+			}
+			if i < last {
+				t.Errorf("%s: %q comes BEFORE the previous step — the check is outside the lock", name, step)
+			}
+			last = i
+		}
+	}
+	ordered("publishClient", fn(`(?ms)^func \(e \*csqttEntry\) publishClient\(.*?^}`), "e.clientMu.Lock()", "ctx.Err()", "e.client = c")
+	ordered("csqttAttachImpl", fn(`(?ms)^func csqttAttachImpl\(.*?^}`), "e.devMu.Lock()", "e.ctx.Err()", "dupFD(")
+}
+
+// A stop that lands between publishClient's ctx check and its assignment —
+// the instant the lock exists for. The goroutine is held there (the hook
+// runs under clientMu, after the check); TurnOff cancels, spends its budget
+// and then reads the field: with the check-and-set it BLOCKS on the lock,
+// the assignment completes, TurnOff reads the client and closes it. With
+// the check hoisted out of the lock (the review's "natural regression" —
+// the hook stays after the check, now outside the lock) TurnOff reads nil at
+// once, returns, and the assignment lands on a stopped tunnel nobody owns.
+// Sabotage seen red: exactly that hoist.
+func TestCsqttStopBetweenTheCheckAndThePublicationLeavesOneOwner(t *testing.T) {
+	var mints atomic.Int32
+	installFakePool(t, mintingFetch(&mints))
+	fc := newFakeClient()
+	release := make(chan struct{})
+	installGatedDial(t, fc, release)
+	hold := make(chan struct{})
+	prevHook := csqttAfterPublishCheck
+	csqttAfterPublishCheck = func() { <-hold }
+	defer func() { csqttAfterPublishCheck = prevHook }()
+	prev := csqttDialJoinBudget
+	csqttDialJoinBudget = 20 * time.Millisecond
+	defer func() { csqttDialJoinBudget = prev }()
+	csqttSeededSettle = 0
+
+	h := startCsqtt(t, "")
+	close(release) // the dial returns; the goroutine passes the ctx check and holds at the hook
+	time.Sleep(20 * time.Millisecond)
+	done := make(chan struct{})
+	go func() { csqttTurnOffImpl(h); close(done) }() // cancels, spends its budget, then reads the field
+	time.Sleep(60 * time.Millisecond)
+	if fc.closed.Load() {
+		t.Fatal("fixture: the client was closed before it was even published")
+	}
+	close(hold) // the assignment completes beside the stop
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("TurnOff did not return")
+	}
+	if !fc.closed.Load() {
+		t.Fatal("the client published beside the stop is still open — nobody owns it")
+	}
+}
+
+// A stop that lands between csqttAttach's handle lookup and its device
+// section: TurnOff has cancelled and already read `dev` (nil) under devMu,
+// so an attach that went on would install a device nobody closes — the
+// dup'd fd and two pumps until jetsam. The check-and-install under devMu
+// against TurnOff's cancel-then-read. Sabotage seen red: the ctx check
+// dropped from the devMu section (attach answers 1, a device is open on a
+// stopped tunnel).
+func TestCsqttAttachBesideTheStopInstallsNoDevice(t *testing.T) {
+	var mints atomic.Int32
+	installFakePool(t, mintingFetch(&mints))
+	fc := newFakeClient()
+	installFakeDial(t, fc)
+	opened := installPairTun(t)
+	csqttSeededSettle = 0
+	hold := make(chan struct{})
+	prevHook := csqttAfterAttachLookup
+	csqttAfterAttachLookup = func() { <-hold }
+	defer func() { csqttAfterAttachLookup = prevHook }()
+
+	h := startCsqtt(t, "")
+	if rc := csqttWaitReadyImpl(h, 3*time.Second); rc != 1 {
+		t.Fatalf("csqttWaitReady: %d (error %q)", rc, csqttGetErrorImpl(h))
+	}
+	mine, theirs := socketPair(t)
+	defer unix.Close(theirs)
+	defer unix.Close(mine)
+	rc := make(chan int32, 1)
+	go func() { rc <- csqttAttachImpl(h, mine) }()
+	time.Sleep(20 * time.Millisecond) // attach resolved the handle and holds at the hook
+	csqttTurnOffImpl(h)               // cancels, reads dev == nil, returns
+	close(hold)                       // attach goes on into its device section
+	select {
+	case got := <-rc:
+		if got != -2 {
+			t.Fatalf("attach beside the stop answered %d, want -2 (stopped)", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("attach did not return")
+	}
+	if opened.Load() != nil {
+		t.Fatal("a device was opened on a stopped tunnel — nobody will close it")
 	}
 }
