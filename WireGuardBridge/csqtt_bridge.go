@@ -196,11 +196,38 @@ func (e *csqttEntry) fail(err error) {
 	if err == nil {
 		return
 	}
-	msg := err.Error()
+	msg := csqttReason(err)
 	if e.fatal.CompareAndSwap(nil, &msg) {
 		log.Printf("csqtt: tunnel %d: TERMINAL: %s", e.id, msg)
 	}
 	e.cancel()
+}
+
+// csqttReason turns the client's terminal errors into what the user must
+// DO — the app shows this text on the main screen. The server's own reasons
+// are one word each (reference_csqtt_protocol_v3): device_mismatch is the
+// one a link recipient hits, because a csqtt:// link carries no device id
+// while the server may already have bound the password to one.
+func csqttReason(err error) string {
+	var denied *csqtt.DeniedError
+	if errors.As(err, &denied) {
+		switch denied.Reason {
+		case "device_mismatch":
+			return "the server has this password bound to ANOTHER Device ID. Enter that Device ID in this server's settings (Settings › server › Device ID), or ask the server's admin for a fresh password."
+		case "wrong_password":
+			return "the server rejected the password."
+		case "expired":
+			return "this password has expired on the server."
+		case "invalid_worker_count":
+			return "the server refuses this many connections — lower Connections in the server's settings."
+		default:
+			return "the server refused the session (" + denied.Reason + ")."
+		}
+	}
+	if errors.Is(err, csqtt.ErrNoConfig) {
+		return "the server has no tunnel address left for this device (its pool is full)."
+	}
+	return err.Error()
 }
 
 func (e *csqttEntry) errText() string {

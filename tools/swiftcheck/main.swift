@@ -3001,6 +3001,24 @@ do {
           "🚨 the proxy-config log line is not redacted — csqtt_password would land in vpn.log")
     check(!provider.contains("proxyConfig=\\(proxyConfigJSON)"),
           "🚨 the raw proxy-config log line is back")
+
+    // 🚨 "THE TUN MOVED" IS DECIDED BY THE utun's NAME, NOT BY A DESCRIPTOR
+    //    NUMBER. The bridge dup(2)s the descriptor it is handed, and a dup is
+    //    the same utun under another number; on 2026-09-06 the csqtt attach
+    //    dup'd fd 6 to fd 5, the lowest-fd scan answered 5, and a healthy DIRECT
+    //    switch was reported as a moved descriptor and the tunnel torn down.
+    if let apply = provider.range(of: "private func performDirectApply(") {
+        let body = String(provider[apply.upperBound...].prefix(4000))
+        check(body.contains("attachedTunName") && body.contains("utunDescriptors()"),
+              "🚨 performDirectApply must compare the utun NAME over every utun descriptor")
+        check(!body.contains("fdAfter != self.attachedTunFd"),
+              "🚨 the descriptor-NUMBER comparison is back in performDirectApply — a dup of the "
+              + "attached fd below its number reads as a move")
+    } else {
+        check(false, "could not find performDirectApply — the name check would be vacuous")
+    }
+    check(provider.contains("self.attachedTunName = self.utunName(of: tunFd)"),
+          "the attach records the utun's name, or the check above compares against \"\"")
 }
 
 print("")

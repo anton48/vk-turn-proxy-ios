@@ -590,8 +590,11 @@ enum BackupManager {
     ///
     /// host+peer → peerAddress, password → csqttPassword, the FIRST hash (a
     /// bare VK call hash, percent-encoded; `+` separates several) → vkLink =
-    /// vkCallJoinBase + hash, as parseWdttLink does. Nothing else is carried:
-    /// the server assigns the tunnel address and DNS, and the device identity
+    /// vkCallJoinBase + hash, as parseWdttLink does. The server assigns the
+    /// tunnel address and DNS. `device=<id>` is OUR extension of the connect
+    /// form: the server binds a password to one device id and the admin may
+    /// have set it on the panel (2026-09-06: the phone's minted id was
+    /// DENIED:device_mismatch until it was typed in by hand) — absent, the id
     /// is minted on import. A link without hashes keeps the device's current
     /// VK call link (vkLink "" → applyConnectionLink does not clobber it).
     static func parseCsqttLink(_ raw: String) throws -> ConnectionLink {
@@ -599,7 +602,7 @@ enum BackupManager {
         guard trimmed.lowercased().hasPrefix("csqtt://") else {
             throw BackupError.decodeFailed("URL scheme is not csqtt://")
         }
-        var host = "", port = "", password = "", firstHash = ""
+        var host = "", port = "", password = "", firstHash = "", device = ""
         if trimmed.lowercased().hasPrefix("csqtt://connect") {
             guard let comps = URLComponents(string: trimmed) else {
                 throw BackupError.decodeFailed("csqtt:// link is not a valid URL")
@@ -611,6 +614,7 @@ enum BackupManager {
             host = q["host"] ?? ""
             port = q["peer"] ?? ""
             password = q["password"] ?? ""
+            device = stripControlChars(q["device"] ?? "")
             // `+` is the separator in his hashes list; URLComponents already
             // percent-decoded the values (a `+` stays a `+`).
             firstHash = (q["hashes"] ?? "").split(separator: "+").first.map(String.init) ?? ""
@@ -651,6 +655,7 @@ enum BackupManager {
         )
         settings.useCsqtt = true
         settings.csqttPassword = password
+        if !device.isEmpty { settings.csqttDeviceID = device }
         return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }
 

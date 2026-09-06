@@ -125,6 +125,11 @@ the importer's current value with empty):
                        minted by the app on import, never carried.
     csqttPassword    — string. The csqtt shared secret (the tunnel's only key;
                        no forward secrecy). Required when useCsqtt=True.
+                       NOTE: the csqtt server binds a password to ONE device id;
+                       a base64 link never carries the id (LINK_EXCLUDED), so
+                       hand a pre-bound client's id out as
+                       csqtt://connect?…&device=<id> instead, or leave the
+                       server-side id unset so the phone's minted one binds.
     turnServerOverride — optional "IP:port" (added 2026-06-08). Forces fresh
                        conns onto this TURN relay instead of VK's returned
                        address; disk-cached creds keep their stored address.

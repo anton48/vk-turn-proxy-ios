@@ -465,8 +465,11 @@ func TestCsqttCaptchaIsTerminalForTheStart(t *testing.T) {
 }
 
 // A client that stops on its own after start (DENIED is fatal for the whole
-// client) reaches Swift: csqttGetError names it and the stats carry it as
-// auth_error. Sabotage seen red: the Done watcher dropped from csqttStart.
+// client) reaches Swift as what the user must DO: device_mismatch — the one
+// a link recipient hits, since a csqtt:// link carries no device id while the
+// server may have bound the password to one — names the Device ID setting.
+// Sabotages seen red: the Done watcher dropped from csqttStart (no error at
+// all); the reason mapping dropped (the raw "csqtt: denied: device_mismatch").
 func TestCsqttClientDeathReachesSwift(t *testing.T) {
 	var mints atomic.Int32
 	installFakePool(t, mintingFetch(&mints))
@@ -481,10 +484,10 @@ func TestCsqttClientDeathReachesSwift(t *testing.T) {
 	if e := csqttGetErrorImpl(h); e != "" {
 		t.Fatalf("error before any failure: %q", e)
 	}
-	fc.stop(&csqtt.DeniedError{Reason: "wrong_password"})
+	fc.stop(&csqtt.DeniedError{Reason: "device_mismatch"})
 	waitFor(t, "the terminal error", func() bool { return csqttGetErrorImpl(h) != "" })
-	if e := csqttGetErrorImpl(h); !strings.Contains(e, "wrong_password") {
-		t.Fatalf("error %q does not carry the server's reason", e)
+	if e := csqttGetErrorImpl(h); !strings.Contains(e, "Device ID") {
+		t.Fatalf("error %q does not tell the user what to do about the device id", e)
 	}
 }
 

@@ -185,8 +185,10 @@ extension ServerProfile {
             useSrtp = !csqtt && !wrapS && !wrapA && srtp
             useWrap = !csqtt && !wrapS && !wrapA && !srtp && wrap
         }
-        // csqtt binds the password to ONE device: mint the identity here, never
-        // take it from a link (two people importing one link must not collide).
+        // csqtt binds the password to ONE device: the link's `device=` (the
+        // admin bound the password to it on the panel) wins; otherwise mint —
+        // two people importing one link must not collide on a made-up id.
+        if let v = s.csqttDeviceID?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty { csqttDeviceID = v }
         if useCsqtt && csqttDeviceID.isEmpty { csqttDeviceID = UUID().uuidString }
         // SRTP-WRAP-S needs a stable per-stream Client-ID; mint one when the
         // link didn't carry it (mirrors the mode picker).

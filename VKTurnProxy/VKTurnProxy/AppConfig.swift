@@ -306,6 +306,11 @@ struct ConnectionSettings: Codable {
     /// minted on import, never carried. `var … = nil` like the fields above.
     var useCsqtt: Bool? = nil
     var csqttPassword: String? = nil
+    /// The csqtt server BINDS a password to one device id, and an admin may
+    /// have set that id on the panel — then a link recipient's minted id is
+    /// DENIED:device_mismatch. `csqtt://connect?…&device=<id>` (our extension
+    /// of his link) carries the admin's id; absent → minted on import.
+    var csqttDeviceID: String? = nil
     /// Name for the server this link creates (build 179+). Importing a link now
     /// ADDS a named server instead of overwriting the current configuration.
     /// Absent (older vkturnproxy:// links, and wdtt:// which has no name field)

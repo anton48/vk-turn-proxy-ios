@@ -183,8 +183,12 @@ enum ConnectionLinkPrompt {
         // csqtt: say what the user is signing up for — the password is the
         // tunnel's only key, so there is no forward secrecy on this transport.
         if created.useCsqtt {
+            let dev = (s.csqttDeviceID ?? "").isEmpty
+                ? "A Device ID will be generated; if the server already binds this password to a device, "
+                  + "enter that Device ID in the server's settings. "
+                : "Device ID \(s.csqttDeviceID ?? "") from the link. "
             return "Add \(name) as csqtt for \(s.peerAddress)\(extrasText) and make it active? "
-                 + "The server assigns the tunnel address and DNS. Note: csqtt has no key exchange — "
+                 + "The server assigns the tunnel address and DNS. \(dev)Note: csqtt has no key exchange — "
                  + "the password is the tunnel's only key, so recorded traffic can be decrypted by "
                  + "anyone who learns it later (no forward secrecy)."
         }

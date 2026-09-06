@@ -21,6 +21,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// if it ever moves, wireguard-go is holding a dead one and the tunnel is
     /// finished in silence. Measured stable across seven applies on 2026-08-17.
     private var attachedTunFd: Int32 = -1
+    /// The utun INTERFACE the attached descriptor named at attach (`utunN`).
+    /// 🚨 This, not the descriptor NUMBER, is what a re-apply must be checked
+    /// against: the bridge dup(2)s the descriptor it is given, and a dup is
+    /// the same utun under another number — on 2026-09-06 the csqtt attach
+    /// dup'd fd 6 to fd 5, the lowest-fd scan then answered 5, and a healthy
+    /// DIRECT switch was reported as "the TUN fd moved" and the tunnel torn
+    /// down. The native path had escaped only because its dup happened to
+    /// land ABOVE the original.
+    private var attachedTunName = ""
     private var protoObservation: NSKeyValueObservation?
 
     // NWPathMonitor: passively logs every meaningful network state change so
@@ -524,6 +533,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         return
                     }
                     self.attachedTunFd = tunFd
+                    self.attachedTunName = self.utunName(of: tunFd) ?? ""
                     self.logMsg("TUN fd=\(tunFd), calling \(isCSQTT ? "csqttAttach" : "wgAttachWireGuard")...")
 
                     let rc = backend.attach(wgConfig: effWGConfig, tunFd: tunFd)
@@ -1150,17 +1160,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 // across seven applies on device, so this is the branch that
                 // should never run; if it ever does, a reconnect is the only
                 // thing that can rebuild the descriptor.
-                let fdAfter = self.findTunFileDescriptor() ?? -1
-                if fdAfter != self.attachedTunFd {
-                    self.logMsg("direct: 🚨🚨 THE TUN FD MOVED (attached=\(self.attachedTunFd), "
-                        + "now \(fdAfter)) after \(ms) ms — wireguard-go holds a dead descriptor. "
-                        + "Reporting failure and reconnecting rather than claiming success.")
+                // Decided by the utun's NAME, seen through every descriptor
+                // that names one: the attached descriptor must still name the
+                // interface it was attached to, and no OTHER interface may have
+                // appeared. A duplicate of the attached descriptor (the bridge
+                // dup(2)s it) names the same utun and is not a move.
+                let names = self.utunDescriptors()
+                let attachedNow = names[self.attachedTunFd] ?? "<gone>"
+                let strangers = names.values.filter { $0 != self.attachedTunName }
+                if attachedNow != self.attachedTunName || !strangers.isEmpty {
+                    self.logMsg("direct: 🚨🚨 THE TUN MOVED (attached fd \(self.attachedTunFd) was "
+                        + "\(self.attachedTunName), now \(attachedNow); utun fds \(names)) after \(ms) ms "
+                        + "— Go holds a dead descriptor. Reporting failure and reconnecting rather "
+                        + "than claiming success.")
                     self.afterDirectApply(ok: false)
                     self.cancelTunnelWithError(VPNError.tunDescriptorMoved)
                     return
                 }
                 self.logMsg("direct: \(direct ? "ON" : "OFF") applied in \(ms) ms; "
-                    + "fd \(fdAfter) unchanged ✅ Go's descriptor is still valid")
+                    + "fd \(self.attachedTunFd) still \(self.attachedTunName) (utun fds \(names)) ✅ "
+                    + "Go's descriptor is still valid")
                 self.afterDirectApply(ok: true)
             }
         }
@@ -1209,17 +1228,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - TUN File Descriptor Discovery
 
     private func findTunFileDescriptor() -> Int32? {
-        var buf = [CChar](repeating: 0, count: Int(IFNAMSIZ))
         for fd: Int32 in 0...1024 {
-            var len = socklen_t(buf.count)
-            if getsockopt(fd, 2 /* SYSPROTO_CONTROL */, 2 /* UTUN_OPT_IFNAME */, &buf, &len) == 0 {
-                let name = String(cString: buf)
-                if name.hasPrefix("utun") {
-                    return fd
-                }
+            if utunName(of: fd) != nil {
+                return fd
             }
         }
         return nil
+    }
+
+    /// The utun interface name a descriptor is bound to, or nil if it is not
+    /// a utun control socket.
+    private func utunName(of fd: Int32) -> String? {
+        var buf = [CChar](repeating: 0, count: Int(IFNAMSIZ))
+        var len = socklen_t(buf.count)
+        guard getsockopt(fd, 2 /* SYSPROTO_CONTROL */, 2 /* UTUN_OPT_IFNAME */, &buf, &len) == 0 else {
+            return nil
+        }
+        let name = String(cString: buf)
+        return name.hasPrefix("utun") ? name : nil
+    }
+
+    /// Every descriptor in this process that names a utun, with its name —
+    /// the attached one, its duplicate in Go, and any stranger.
+    private func utunDescriptors() -> [Int32: String] {
+        var out: [Int32: String] = [:]
+        for fd: Int32 in 0...1024 {
+            if let name = utunName(of: fd) { out[fd] = name }
+        }
+        return out
     }
 }
 
