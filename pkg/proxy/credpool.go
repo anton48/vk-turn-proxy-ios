@@ -5,9 +5,12 @@ package proxy
 // Stage-5 step 1 (2026-09-06): a second transport (csqtt, pkg/csqtt) must
 // mint, share, pace and cache VK TURN credentials by the SAME policy the
 // native transport does — one pool slot per ~10 connections (VK's quota is
-// per (identity, relay), see connsPerSlot), the cold-start cap inside get(),
-// the grower's fast-then-staggered fill, the on-disk cache, cookie auth and
-// the TURN override — without that transport living inside Proxy. This file
+// per (identity, relay), see connsPerSlot), in cookie mode one slot per
+// relay (2 per call link, no 4× reserve — extra slots would duplicate a
+// relay and 486), the cold-start cap inside get(), the grower's
+// fast-then-staggered fill, the on-disk cache, the pre-bootstrap seed in
+// slot 0, cookie auth and the TURN override — without that transport living
+// inside Proxy. This file
 // is ADDITIONS ONLY: Proxy keeps building its own pool exactly as before
 // (NewProxy → newCredPool with p.fetchFreshCreds; growCredPool unchanged),
 // and this wrapper reuses the same credPool type with an injected fetcher.
@@ -46,6 +49,12 @@ type CredPoolConfig struct {
 	CachePath  string        // on-disk JSON cache (the app's creds-pool.json); empty disables persistence
 	TurnServer string        // optional TURN host override applied to every fresh mint
 	TurnPort   string        // optional TURN port override
+	// SeededTURN pre-fills slot 0 (the app's pre-bootstrap captcha flow hands
+	// it over), so the first acquire needs no VK call — without it the
+	// captcha lands inside iOS's .connecting window. Used VERBATIM: the
+	// TurnServer/TurnPort override does not apply to a seed, exactly as in
+	// NewProxy ("a setting must not affect cached creds").
+	SeededTURN *TURNCreds
 	// Fetch replaces the standard VK fetcher (tests, or another minter). It
 	// must return ("host:port", creds, nil) with creds.Addresses non-empty.
 	Fetch func(allowCaptchaBlock bool, slot int) (string, *TURNCreds, error)
@@ -74,9 +83,11 @@ type CredPoolStats struct {
 	SaturatedLongest time.Duration
 }
 
-// NewCredPool builds a standalone pool. The periodic cache saver (when
-// CachePath is set) runs until Close or until ctx ends, and writes the cache
-// once more on its way out.
+// NewCredPool builds a standalone pool sized as NewProxy sizes its own —
+// poolSizeForNumConns, or one slot per relay in cookie mode — seeded from
+// SeededTURN when given. The periodic cache saver (when CachePath is set)
+// runs until Close or until ctx ends, and writes the cache once more on its
+// way out.
 func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 	if cfg.NumConns <= 0 {
 		cfg.NumConns = 1
@@ -87,14 +98,30 @@ func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 	if fetch == nil {
 		fetch = p.standardFetch(cfg)
 	}
-	p.cp = newCredPool(ctx, poolSizeForNumConns(cfg.NumConns), cfg.Cooldown, cfg.CachePath, fetch)
+	size := poolSizeForNumConns(cfg.NumConns)
+	if cookieAuthEnabled.Load() {
+		if n := len(cookieLinks()); n > 0 {
+			size = 2 * n
+		}
+	}
+	p.cp = newCredPool(ctx, size, cfg.Cooldown, cfg.CachePath, fetch)
+	if cfg.SeededTURN != nil {
+		if host, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
+			p.cp.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
+			p.relayIP.Store(host)
+		} else {
+			log.Printf("credpool: SeededTURN address %q is not host:port (%v) — ignoring", cfg.SeededTURN.Address, err)
+		}
+	}
 	return p
 }
 
 // Close is the transport's stop path: it writes the cache now (so the stop
 // does not depend on the background saver's timing), then ends the pool's
-// lifetime — the periodic saver and Grow both stop. Safe to call more than
-// once; nothing is minted after it.
+// lifetime — the periodic saver and Grow stop, and Acquire refuses from here
+// on. A fetch already in flight (a worker's own or the grower's) completes
+// and lands in its slot: VK has the request anyway, and the cache is the
+// better place for its answer than nowhere. Safe to call more than once.
 func (p *CredPool) Close() {
 	if p.cp.cachePath != "" {
 		p.cp.saveToDisk()
@@ -183,8 +210,12 @@ func applyTURNOverride(creds *TURNCreds, server, port string) (string, error) {
 // mint when allowed by the cold-start cap. The error cases ("paused for
 // path-change settle", "cold-start cap … parking", "no slot available")
 // are the pool's own; the caller parks on SlotAvailable() or a short timer
-// and retries, as Proxy's connections do. Never blocks on a captcha.
+// and retries, as Proxy's connections do. Never blocks on a captcha; refuses
+// after Close so a worker racing the stop cannot mint.
 func (p *CredPool) Acquire(connIdx int) (addr string, creds *TURNCreds, slot int, err error) {
+	if p.ctx.Err() != nil {
+		return "", nil, -1, errors.New("credpool: closed")
+	}
 	return p.cp.get(connIdx, false)
 }
 

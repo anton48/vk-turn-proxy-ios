@@ -223,3 +223,70 @@ func TestApplyTURNOverride(t *testing.T) {
 		t.Fatalf("parseVKLinkID = %q", got)
 	}
 }
+
+// Cookie (VKAuth) mode sizes the pool as NewProxy does: one slot per relay,
+// two per call link, no 4× reserve — extra slots would duplicate an
+// (okcdn_userid, relay) pair and 486. Sabotage seen red: the cookie branch
+// dropped (30 connections → 12 slots again).
+func TestCredPoolCookieModeSizesOneSlotPerRelay(t *testing.T) {
+	t.Cleanup(func() { SetVKCookieAuth(false, "", nil) })
+	for _, tc := range []struct {
+		links []string
+		size  int
+	}{
+		{[]string{"https://vk.ru/call/join/abcdef"}, 2},
+		{[]string{"https://vk.ru/call/join/abcdef", "https://vk.ru/call/join/ghijkl"}, 4},
+	} {
+		SetVKCookieAuth(true, "remixsid=x", tc.links)
+		p := NewCredPool(context.Background(), CredPoolConfig{NumConns: 30, Fetch: (&fakeMinter{}).fetch})
+		if got := p.Stats().Size; got != tc.size {
+			t.Errorf("cookie mode with %d link(s): pool size %d, want %d", len(tc.links), got, tc.size)
+		}
+		p.Close()
+	}
+}
+
+// A seed (the app's pre-bootstrap captcha flow) serves the first acquire
+// without a VK call and names the relay at once — without it the captcha
+// would land inside iOS's .connecting window. Sabotage seen red: the seed
+// ignored (the first acquire mints).
+func TestCredPoolSeedServesTheFirstAcquireWithoutAMint(t *testing.T) {
+	m := &fakeMinter{}
+	seed := &TURNCreds{
+		Username:  fmt.Sprintf("%d:seed", time.Now().Add(8*time.Hour).Unix()),
+		Password:  "pw",
+		Address:   "95.163.34.181:19302",
+		Addresses: []string{"95.163.34.181:19302"},
+	}
+	p := NewCredPool(context.Background(), CredPoolConfig{NumConns: 30, SeededTURN: seed, TurnPort: "3478", Fetch: m.fetch})
+	defer p.Close()
+	if ip := p.RelayIP(); ip != "95.163.34.181" {
+		t.Fatalf("RelayIP before any acquire = %q, want the seed's host", ip)
+	}
+	addr, creds, slot, err := p.Acquire(0)
+	if err != nil {
+		t.Fatalf("Acquire(0): %v", err)
+	}
+	// Verbatim: the port override must NOT touch the seed (a cached cred keeps
+	// its stored address, as in NewProxy).
+	if slot != 0 || addr != "95.163.34.181:19302" || creds == nil || creds.Username != seed.Username {
+		t.Fatalf("Acquire(0) = slot %d addr %q creds %+v, want the seed in slot 0 untouched", slot, addr, creds)
+	}
+	if m.count() != 0 {
+		t.Fatalf("the first acquire minted %d time(s) despite the seed", m.count())
+	}
+}
+
+// After Close a late acquire (a worker racing the stop) must not reach VK.
+// Sabotage seen red: the closed check dropped (the acquire mints).
+func TestCredPoolAcquireRefusedAfterClose(t *testing.T) {
+	m := &fakeMinter{}
+	p := NewCredPool(context.Background(), CredPoolConfig{NumConns: 30, Fetch: m.fetch})
+	p.Close()
+	if _, _, _, err := p.Acquire(0); err == nil {
+		t.Fatal("Acquire after Close returned no error")
+	}
+	if m.count() != 0 {
+		t.Fatalf("Acquire after Close minted %d time(s)", m.count())
+	}
+}
