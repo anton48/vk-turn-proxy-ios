@@ -132,7 +132,7 @@ type Client struct {
 
 	gate     *startGate
 	anyRx    atomic.Int64 // last inbound on any worker, unix nanos
-	probes   atomic.Int64 // liveness probes sent
+	probes   atomic.Int64 // liveness probes marked
 	resets   atomic.Int64 // monitor ticks found late (descheduled)
 	lostToL  atomic.Int64 // workers restarted by the liveness verdict
 	lastTick atomic.Int64 // the monitor's previous tick (or a WakeHealthCheck), unix nanos
@@ -189,23 +189,20 @@ func (c *Client) OnPathChange() {
 // every ready worker is probed at once — a dead one is then given up on
 // deadAfterProbe later instead of probeAfter+deadAfterProbe. The monitor's
 // tick mark moves too, so the tick that follows does not read the wake gap
-// as a deschedule and wipe the probes.
+// as a deschedule and wipe the probes. The hook never waits for a relay
+// write (see worker.probe): it runs on the extension's wake/path callback.
 func (c *Client) WakeHealthCheck() {
-	now := time.Now()
-	ns := now.UnixNano()
+	ns := time.Now().UnixNano()
 	c.anyRx.Store(ns)
 	probed := 0
 	for _, w := range c.workers {
 		w.lastRx.Store(ns)
 		w.probeAt.Store(0)
 		if w.ready.Load() {
-			w.probeAt.Store(ns)
-			if w.send([]byte(ReadyRequest)) == nil {
-				probed++
-			}
+			w.probe(ns)
+			probed++
 		}
 	}
-	c.probes.Add(int64(probed))
 	c.lastTick.Store(ns)
 	c.cfg.Logf("csqtt: wake — clocks reset, %d ready worker(s) probed", probed)
 }
@@ -496,9 +493,7 @@ func (c *Client) monitor() {
 			case livenessResetAll:
 				reset = true
 			case livenessProbe:
-				w.probeAt.Store(now.UnixNano())
-				c.probes.Add(1)
-				_ = w.send([]byte(ReadyRequest))
+				w.probe(now.UnixNano())
 			case livenessRestart:
 				c.lostToL.Add(1)
 				w.restart("liveness: no inbound after a probe while other workers are live")
@@ -568,7 +563,7 @@ type Stats struct {
 	DupTx       int64
 	Reassembled int64
 	Repairs     int64
-	Probes      int64 // liveness probes sent
+	Probes      int64 // liveness probes marked (the send is asynchronous)
 	Descheduled int64 // monitor ticks found late
 	LostWorkers int64 // workers restarted by the liveness verdict
 }
@@ -635,6 +630,7 @@ type worker struct {
 	readyAt   atomic.Int64 // unix nanos; 0 while not ready
 	blackhole atomic.Bool  // FAULT INJECTION: drop every inbound datagram of the current session
 	probeAt   atomic.Int64 // unix nanos of the probe for the current silence; 0 if none
+	probing   atomic.Bool  // a READY probe is in its write (at most one goroutine behind a blocked relay)
 	relayStr  atomic.Pointer[string]
 	relayRef  atomic.Pointer[Relay] // the live allocation, for closeRelay — no mutex, a blocked send holds mu
 
@@ -666,6 +662,28 @@ func (w *worker) restart(reason string) {
 	case w.kick <- reason:
 	default:
 	}
+}
+
+// probe marks a READY probe as sent at `now` and sends it WITHOUT holding
+// the caller. On the TCP transport a full buffer toward a relay that
+// stopped taking bytes blocks WriteTo, and the callers are the app's wake
+// hook and the monitor: the first must return to the extension, the second
+// must not arrive late at its own next tick and read the stall as a
+// deschedule — which wipes every probe mark. The mark goes first, so a
+// write that never completes is an unanswered probe: the liveness rule
+// restarts the worker, and the teardown closes the relay, which frees the
+// write. One probe in flight per worker — a second wake does not queue
+// another goroutine behind the same blocked write.
+func (w *worker) probe(now int64) {
+	w.probeAt.Store(now)
+	w.c.probes.Add(1)
+	if !w.probing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer w.probing.Store(false)
+		_ = w.send([]byte(ReadyRequest))
+	}()
 }
 
 // closeRelay ends the current allocation from outside the session (Close):
@@ -707,6 +725,12 @@ func (w *worker) run() {
 		w.c.cfg.Logf("csqtt: worker %d: %v — restarting in %s", w.id, err, backoff)
 		select {
 		case <-time.After(backoff):
+		case reason := <-w.kick:
+			// The path changed (or the server asked) while we were backing
+			// off from a failure this makes moot: re-dial now. The kick is
+			// consumed here — left in its buffer through the sleep, it would
+			// restart the next session the moment it was ready.
+			w.c.cfg.Logf("csqtt: worker %d: restarting now (%s) — backoff cut short", w.id, reason)
 		case <-w.c.ctx.Done():
 			return
 		}
@@ -767,6 +791,15 @@ func (w *worker) session() error {
 		startDone()
 		return ctx.Err()
 	}
+	// A kick older than this allocation is answered by the session that
+	// starts now: whatever asked (REPAIR, a panel restart, a path change
+	// while the pool parked us in Creds) wanted a fresh GETCONF, and this is
+	// one under the current identity. From here on a kick names THIS
+	// allocation and is honoured — in the GETCONF wait and the serve loop.
+	select {
+	case <-w.kick:
+	default:
+	}
 	t0 := time.Now()
 	relay, err := dialRelay(cred.TURNCredentials, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel)
 	startDone()
@@ -791,11 +824,15 @@ func (w *worker) session() error {
 		w.ready.Store(false)
 		w.readyAt.Store(0)
 		w.probeAt.Store(0)
+		// The relay FIRST: a writer blocked in WriteTo (a probe, the TUN
+		// pump) holds w.mu, and the close is what frees it — a restart of a
+		// worker whose relay stopped taking bytes must not wait behind the
+		// write it is meant to end. Then the fields, under the lock.
+		relay.Close()
 		w.mu.Lock()
 		w.relay, w.wrapper = nil, nil
 		w.mu.Unlock()
 		w.relayRef.Store(nil)
-		relay.Close()
 	}()
 	w.c.cfg.Logf("csqtt: worker %d: relay %s via %s", w.id, rs, creds.Address)
 
@@ -805,14 +842,29 @@ func (w *worker) session() error {
 	readErr := make(chan error, 1)
 	go w.readLoop(relay.Conn, control, readErr)
 
-	// GETCONF with the reference schedule, under the client's CURRENT identity.
-	gen, salt := w.c.identity()
-	req := []byte(ConfigRequest(w.c.cfg.LocalPort, w.c.cfg.DeviceID, w.c.cfg.Password,
-		gen, salt, w.id, w.c.cfg.Workers, w.c.cfg.Revision))
+	// GETCONF with the reference schedule. The identity is read for EVERY
+	// attempt and a kick ends the wait: the server keys the epoch on the
+	// pair alone — a different pair replaces the device's sessions whatever
+	// its generation — so a retry under a pair the client has already
+	// replaced, landing after a neighbour announced the new one, would roll
+	// every worker back to a dead epoch. iOS delivers a path change as a
+	// cascade of 2–3 events ~500 ms apart; a worker still in this loop from
+	// the first event is the norm. (A kick that lands between identity()
+	// and the write can still put one stale GETCONF on the wire — the
+	// select then restarts the worker; that window is microseconds where
+	// the old one was the whole schedule.)
 	var conf ConfigResponse
 	got := false
 attempts:
 	for _, wait := range getconfSchedule {
+		select {
+		case reason := <-w.kick:
+			return &restartRequest{reason: reason}
+		default:
+		}
+		gen, salt := w.c.identity()
+		req := []byte(ConfigRequest(w.c.cfg.LocalPort, w.c.cfg.DeviceID, w.c.cfg.Password,
+			gen, salt, w.id, w.c.cfg.Workers, w.c.cfg.Revision))
 		if err := w.send(req); err != nil {
 			return fmt.Errorf("GETCONF send: %w", err)
 		}
@@ -831,6 +883,8 @@ attempts:
 				break attempts
 			case err := <-readErr:
 				return fmt.Errorf("relay read: %w", err)
+			case reason := <-w.kick:
+				return &restartRequest{reason: reason}
 			case <-deadline:
 				continue attempts
 			case <-ctx.Done():

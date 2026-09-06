@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,16 +34,28 @@ type getconfSeen struct {
 }
 
 type fakeServer struct {
-	t       *testing.T
-	conn    *net.UDPConn
-	Addr    *net.UDPAddr
-	cipher  *Cipher
-	wrapper *Wrapper
-	mu      sync.Mutex
-	getconf []getconfSeen
-	readies int
-	discons int
-	closed  chan struct{}
+	t        *testing.T
+	conn     *net.UDPConn
+	Addr     *net.UDPAddr
+	cipher   *Cipher
+	wrapper  *Wrapper
+	mu       sync.Mutex
+	getconf  []getconfSeen
+	readies  int
+	discons  int
+	withhold map[string]int // worker id → GETCONFs still to leave unanswered
+	closed   chan struct{}
+}
+
+// withholdTUNCONF leaves the next n GETCONFs of a worker unanswered, so the
+// worker sits in its GETCONF schedule.
+func (s *fakeServer) withholdTUNCONF(worker string, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.withhold == nil {
+		s.withhold = map[string]int{}
+	}
+	s.withhold[worker] = n
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -105,12 +118,19 @@ func (s *fakeServer) loop() {
 		switch p := string(plain); {
 		case strings.HasPrefix(p, "GETCONF:"):
 			f := strings.Split(strings.TrimPrefix(p, "GETCONF:"), "|")
+			answer := true
 			if len(f) >= 6 {
 				s.mu.Lock()
 				s.getconf = append(s.getconf, getconfSeen{gen: f[3], salt: f[4], worker: f[5]})
+				if s.withhold[f[5]] > 0 {
+					s.withhold[f[5]]--
+					answer = false
+				}
 				s.mu.Unlock()
 			}
-			s.reply(from, "TUNCONF:10.66.67.3:77.88.8.8:9000:stream-v2")
+			if answer {
+				s.reply(from, "TUNCONF:10.66.67.3:77.88.8.8:9000:stream-v2")
+			}
 		case p == ReadyRequest:
 			s.mu.Lock()
 			s.readies++
@@ -359,19 +379,71 @@ func TestWakeHealthCheckProbesEveryReadyWorker(t *testing.T) {
 }
 
 // blockableConn is a relay socket whose writes can be made to hang, as a
-// full TCP buffer toward a relay would.
+// full TCP buffer toward a relay would. A hung write returns when the test
+// unblocks it or when the conn is closed — as a real socket's does.
 type blockableConn struct {
 	net.PacketConn
-	block   atomic.Bool
-	unblock chan struct{}
+	block                atomic.Bool
+	unblock              chan struct{}
+	closed               chan struct{}
+	entered              chan struct{} // closed once a write has blocked
+	closeOnce, enterOnce sync.Once
+}
+
+func newBlockableConn(pc net.PacketConn) *blockableConn {
+	return &blockableConn{PacketConn: pc, unblock: make(chan struct{}), closed: make(chan struct{}), entered: make(chan struct{})}
 }
 
 func (b *blockableConn) WriteTo(p []byte, a net.Addr) (int, error) {
 	if b.block.Load() {
-		<-b.unblock
+		b.enterOnce.Do(func() { close(b.entered) })
+		select {
+		case <-b.unblock:
+		case <-b.closed:
+		}
 		return 0, net.ErrClosed
 	}
 	return b.PacketConn.WriteTo(p, a)
+}
+
+func (b *blockableConn) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return b.PacketConn.Close()
+}
+
+// blockableRelays replaces DialRelay: every dial gets a fresh blockableConn,
+// kept in order of dialing.
+type blockableRelays struct {
+	mu    sync.Mutex
+	conns []*blockableConn
+}
+
+func installBlockableRelays(t *testing.T) *blockableRelays {
+	t.Helper()
+	r := &blockableRelays{}
+	prev := dialRelay
+	dialRelay = func(TURNCredentials, *net.UDPAddr, string, logging.LogLevel) (*Relay, error) {
+		uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			return nil, err
+		}
+		bc := newBlockableConn(uc)
+		r.mu.Lock()
+		r.conns = append(r.conns, bc)
+		r.mu.Unlock()
+		return &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { bc.Close() }}, nil
+	}
+	t.Cleanup(func() { dialRelay = prev })
+	return r
+}
+
+func (r *blockableRelays) nth(i int) *blockableConn {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i >= len(r.conns) {
+		return nil
+	}
+	return r.conns[i]
 }
 
 // Close returns within its budget even when a write to the relay hangs:
@@ -380,18 +452,9 @@ func (b *blockableConn) WriteTo(p []byte, a net.Addr) (int, error) {
 // goroutine for ever).
 func TestCloseIsBoundedWhenAWriteBlocks(t *testing.T) {
 	srv := newFakeServer(t)
-	bc := &blockableConn{unblock: make(chan struct{})}
-	prev := dialRelay
-	dialRelay = func(TURNCredentials, *net.UDPAddr, string, logging.LogLevel) (*Relay, error) {
-		uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			return nil, err
-		}
-		bc.PacketConn = uc
-		return &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { uc.Close() }}, nil
-	}
-	t.Cleanup(func() { dialRelay = prev })
+	relays := installBlockableRelays(t)
 	c := dialReady(t, testConfig(srv, 1, (&lease{}).creds))
+	bc := relays.nth(0)
 	bc.block.Store(true)
 	defer close(bc.unblock)
 
@@ -438,4 +501,213 @@ func TestStatsCarryBytesAndReady(t *testing.T) {
 	if st.TxBytes < int64(len(pkt)) || st.RxBytes < int64(len(pkt)) || st.Ready != 1 || st.Total != 1 || st.AllocateRTT <= 0 {
 		t.Fatalf("stats: %+v", st)
 	}
+}
+
+// A kick that arrives while the worker waits in its GETCONF schedule is
+// honoured there, and no GETCONF after a path change carries the old pair.
+// The server keys the epoch on the pair ALONE — a different pair replaces
+// the device's sessions whatever its generation — so a retry under a pair
+// the client has already replaced, landing after a neighbour announced the
+// new one, rolls every worker back to a dead epoch. iOS delivers a path
+// change as a cascade of 2–3 events ~500 ms apart, so a worker still in
+// GETCONF from the first event is the norm. Sabotage seen red: the kick
+// case dropped from the GETCONF wait (worker 2 waits out the 750 ms and
+// retries under the old pair).
+func TestKickDuringGetconfIsHonoured(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.withholdTUNCONF("2", 1) // worker 2's first GETCONF goes unanswered: it sits in its 750 ms wait
+	loopbackRelay(t, nil)
+	cfg := testConfig(srv, 2, (&lease{}).creds)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+	waitFor(t, "worker 2's first GETCONF at the server", func() bool {
+		for _, g := range srv.seen() {
+			if g.worker == "2" {
+				return true
+			}
+		}
+		return false
+	})
+	before := srv.seen()
+	old := before[0]
+	t0 := time.Now()
+	c.OnPathChange()
+	waitFor(t, "both workers ready under the new identity", func() bool { return c.Stats().Ready == 2 })
+	if took := time.Since(t0); took > 500*time.Millisecond {
+		t.Fatalf("workers ready %s after the path change — worker 2 waited out its GETCONF schedule before noticing the kick", took)
+	}
+	time.Sleep(200 * time.Millisecond) // room for a stale retry to show up
+	for _, g := range srv.seen()[len(before):] {
+		if g.gen == old.gen || g.salt == old.salt {
+			t.Fatalf("GETCONF from worker %s under the OLD pair (gen %s) after the path change — an epoch rollback at the server", g.worker, g.gen)
+		}
+	}
+}
+
+// A kick during the failure backoff re-dials at once — the path changed, so
+// the failure being backed off from is moot — and is consumed by that
+// re-dial: left in its buffer through the sleep it would restart the next
+// session the moment it was ready (an extra allocation and lease for
+// nothing). Sabotage seen red: the kick case dropped from the backoff wait
+// (ready only after the 2 s backoff, then a second GETCONF from worker 2).
+func TestKickDuringFailureBackoffRedialsAtOnceAndOnce(t *testing.T) {
+	srv := newFakeServer(t)
+	failed := make(chan struct{})
+	var dials atomic.Int32
+	loopbackRelay(t, func(TURNCredentials) error {
+		if dials.Add(1) == 2 { // worker 2's first allocation
+			close(failed)
+			return errors.New("relay allocate: injected failure")
+		}
+		return nil
+	})
+	cfg := testConfig(srv, 2, (&lease{}).creds)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+	<-failed
+	waitFor(t, "worker 2 in its backoff", func() bool { return c.Stats().Restarts == 1 })
+	before, _, _ := srv.counts()
+	t0 := time.Now()
+	c.OnPathChange()
+	waitFor(t, "both workers ready", func() bool { return c.Stats().Ready == 2 })
+	if took := time.Since(t0); took > 500*time.Millisecond {
+		t.Fatalf("workers ready %s after the path change — the kick waited out worker 2's backoff", took)
+	}
+	time.Sleep(300 * time.Millisecond) // room for the extra cycle to show up
+	n := 0
+	for _, g := range srv.seen()[before:] {
+		if g.worker == "2" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("GETCONFs from worker 2 after the path change: %d, want exactly 1 — the kick was not consumed by the re-dial", n)
+	}
+}
+
+// A kick older than the allocation is answered by the session that starts:
+// a worker parked in Creds (the pool's cold-start cap, its path-change
+// settle) when the path changes reads the new identity anyway, and its
+// GETCONF is the re-announce — the buffered kick must cost neither a second
+// allocation (and lease) nor a second GETCONF. Sabotage seen red: the drain
+// before the dial dropped (worker 2 allocates twice — the buffered kick is
+// found by the GETCONF wait's own check and the first allocation is thrown
+// away).
+func TestKickOlderThanTheAllocationIsAnsweredByIt(t *testing.T) {
+	srv := newFakeServer(t)
+	var dials2 atomic.Int32
+	loopbackRelay(t, func(creds TURNCredentials) error {
+		if creds.Username == "2" {
+			dials2.Add(1)
+		}
+		return nil
+	})
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	var parks atomic.Int32
+	l := &lease{}
+	creds := func(ctx context.Context, id int) (Credential, error) {
+		if id == 2 && parks.Add(1) == 1 { // worker 2's first mint parks until the test releases it
+			close(parked)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return Credential{}, ctx.Err()
+			}
+		}
+		cr, err := l.creds(ctx, id)
+		cr.Username = strconv.Itoa(id) // so the relay hook can tell the workers apart
+		return cr, err
+	}
+	cfg := testConfig(srv, 2, creds)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+	<-parked
+	c.OnPathChange() // worker 1 re-announces; worker 2's kick waits in its buffer
+	close(release)
+	waitFor(t, "both workers ready", func() bool { return c.Stats().Ready == 2 })
+	time.Sleep(300 * time.Millisecond) // room for the extra cycle to show up
+	n := 0
+	for _, g := range srv.seen() {
+		if g.worker == "2" {
+			n++
+			if g.gen == strconv.FormatUint(cfg.Generation, 10) || g.salt == cfg.Salt {
+				t.Fatalf("worker 2 announced under the OLD pair (gen %s) after the path change", g.gen)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("GETCONFs from worker 2: %d, want exactly 1 — a kick older than its allocation restarted the session", n)
+	}
+	if d := dials2.Load(); d != 1 {
+		t.Fatalf("allocations for worker 2: %d, want exactly 1 — a kick older than its allocation threw the allocation away", d)
+	}
+}
+
+// WakeHealthCheck never waits for a relay write: on the TCP transport a full
+// buffer toward a relay that stopped taking bytes blocks WriteTo, and the
+// wake hook runs on the extension's wake/path callback. The probe mark is
+// set before the send, so a write that never completes is an unanswered
+// probe and the liveness rule restarts the worker. The monitor's own probe
+// takes the same path (blocked there, it would arrive late at its next
+// tick and read the stall as a deschedule — wiping the mark that would
+// have caught it). Sabotage seen red: the probe sent synchronously (the
+// wake returns only when the write is released).
+func TestWakeHealthCheckDoesNotWaitForABlockedWrite(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installBlockableRelays(t)
+	c := dialReady(t, testConfig(srv, 1, (&lease{}).creds))
+	defer c.Close()
+	bc := relays.nth(0)
+	bc.block.Store(true)
+	defer close(bc.unblock)
+	done := make(chan struct{})
+	go func() { c.WakeHealthCheck(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("WakeHealthCheck did not return: a blocked relay write held the wake hook")
+	}
+	<-bc.entered // the probe is in the write, marked
+	if st := c.Stats(); st.Probes != 1 {
+		t.Fatalf("probes marked by the wake: %d, want 1", st.Probes)
+	}
+}
+
+// A session's teardown closes the relay BEFORE taking the worker lock: a
+// writer blocked in WriteTo (a probe, the TUN pump) holds that lock, and the
+// close is what frees it. Otherwise restarting a worker whose relay stopped
+// taking bytes — the liveness verdict's whole purpose — waits behind the
+// very write it is meant to end. Sabotage seen red: the lock taken before
+// the close in the deferred teardown (the kicked worker never comes back).
+func TestSessionTeardownFreesABlockedWriter(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installBlockableRelays(t)
+	c := dialReady(t, testConfig(srv, 1, (&lease{}).creds))
+	defer c.Close()
+	first := relays.nth(0)
+	first.block.Store(true)
+	c.WakeHealthCheck()
+	<-first.entered // the probe now sits in WriteTo holding the worker's lock
+	before := c.Stats().Restarts
+	c.workers[0].restart("test: the relay stopped taking bytes")
+	waitFor(t, "the worker back on a fresh relay", func() bool {
+		st := c.Stats()
+		return st.Restarts == before+1 && st.Ready == 1 && relays.nth(1) != nil
+	})
 }
