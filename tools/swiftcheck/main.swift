@@ -3010,10 +3010,16 @@ do {
     // 🚨 THE csqtt PASSWORD MUST NOT REACH THE LOG. The provider logs the whole
     //    proxy config at start; that line is what users send us. The redaction
     //    has to sit on that very line, not exist somewhere.
-    check(provider.contains("proxyConfig=\\(Self.redactedProxyConfig(proxyConfigJSON))"),
+    check(provider.contains("proxyConfig=\\(ProxyConfigRedaction.redacted(proxyConfigJSON))"),
           "🚨 the proxy-config log line is not redacted — csqtt_password would land in vpn.log")
     check(!provider.contains("proxyConfig=\\(proxyConfigJSON)"),
           "🚨 the raw proxy-config log line is back")
+    // 🚨 And the masking is STRUCTURAL: the provider names no secret key and
+    //    edits no text. Build 355's regex over the serialized JSON stopped at
+    //    the \" of a password containing a quote and logged the rest of it.
+    check(!provider.contains("csqtt_password") && !provider.contains("replacingOccurrences"),
+          "🚨 the provider names a secret key or edits the config text itself — the key list and the "
+          + "masking live in ProxyConfigRedaction (parsed JSON, masked by key)")
 
     // 🚨 "THE TUN MOVED" IS DECIDED BY THE utun's NAME, NOT BY A DESCRIPTOR
     //    NUMBER. The bridge dup(2)s the descriptor it is handed, and a dup is
@@ -3074,6 +3080,94 @@ do {
           "the edit screen shows the Device ID requirement under the field")
     check(editView.contains("if draft.useCsqtt && draft.csqttDeviceID.isEmpty {"),
           "the edit screen fills an empty csqtt Device ID with a visible one")
+}
+
+print("The proxy-config log line — secrets leave it STRUCTURALLY, never by a pattern over the text")
+
+// 🚨 THE csqtt PASSWORD IS THE TUNNEL'S ONLY KEY, AND THE LOG LINE IS WHAT
+//    USERS SEND US. Build 355 masked it with a regular expression over the
+//    serialized JSON; JSON writes a quote inside a string as \" and the
+//    pattern stopped there, so a password containing a quote leaked its tail
+//    (user, 2026-09-07: `"SECRET_AFTER_QUOTE` → `"…"SECRET_AFTER_QUOTE"`).
+//    These checks RUN the real redaction (compiled in by run.sh) on real
+//    encodings — the same JSONSerialization the app builds the config with —
+//    and on hand-written JSON the app never writes but a future producer
+//    might. A text scan of the provider cannot see any of this.
+do {
+    func encode(_ dict: [String: Any]) -> String {
+        let data = try! JSONSerialization.data(withJSONObject: dict)
+        return String(data: data, encoding: .utf8)!
+    }
+    let marker = "SECRET_AFTER_QUOTE"
+    let base: [String: Any] = ["use_csqtt": true, "peer_addr": "1.2.3.4:46000",
+                               "csqtt_device_id": "iphoneSE3", "num_conns": 30]
+
+    // The user's case: a password that starts with a double quote.
+    var cfg = base
+    cfg["csqtt_password"] = "\"" + marker
+    let encoded = encode(cfg)
+    check(encoded.contains("\\\"" + marker),
+          "fixture: the encoding carries \\\" right before the secret — where the regex stopped")
+    let line = ProxyConfigRedaction.redacted(encoded)
+    check(!line.contains(marker), "🚨 a csqtt password containing a quote leaks past the redaction")
+    check(line.contains("\"csqtt_password\":\"…\""), "the password field stays on the line, masked")
+    check(line.contains("\"peer_addr\":\"1.2.3.4:46000\"") && line.contains("\"num_conns\":30")
+              && line.contains("\"csqtt_device_id\":\"iphoneSE3\"") && line.contains("\"use_csqtt\":true"),
+          "the non-secret fields keep their values — the line stays a diagnostic")
+
+    // Every shape a string value can take: escapes, unicode, JSON punctuation, NUL.
+    for pw in ["a\\\"b", "back\\slash", "line\nbreak", "tab\there", "юникод", "}\",\"x\":\"",
+               "\u{1F511}", "\"\"", "\u{0000}"] {
+        cfg["csqtt_password"] = pw + marker
+        let out = ProxyConfigRedaction.redacted(encode(cfg))
+        check(!out.contains(marker) && out.contains("\"csqtt_password\":\"…\""),
+              "a password of the shape \(pw.debugDescription) is masked whole")
+    }
+    // An EMPTY password is not a secret, and is the diagnostic the line is for.
+    cfg["csqtt_password"] = ""
+    check(ProxyConfigRedaction.redacted(encode(cfg)).contains("\"csqtt_password\":\"\""),
+          "an empty password reads as empty, not as masked")
+
+    // The other secrets that ride the same config, the nested one included.
+    let native: [String: Any] = [
+        "use_srtp": true, "use_wrap_a": true, "peer_addr": "5.6.7.8:443",
+        "wrap_a_password": "A" + marker, "wrap_key_hex": "B" + marker,
+        "seeded_turn": ["address": "9.9.9.9:3478", "username": "1700000000:u1", "password": "C" + marker],
+        "vk_host_ips": ["login.vk.ru": ["1.1.1.1"]]]
+    let nat = ProxyConfigRedaction.redacted(encode(native))
+    check(!nat.contains(marker), "🚨 wrap_a_password / wrap_key_hex / seeded_turn.password leak past the redaction")
+    check(nat.contains("\"wrap_a_password\":\"…\"") && nat.contains("\"wrap_key_hex\":\"…\"")
+              && nat.contains("\"password\":\"…\""),
+          "every secret key stays on the line, masked")
+    check(nat.contains("\"username\":\"1700000000:u1\"") && nat.contains("\"address\":\"9.9.9.9:3478\"")
+              && nat.contains("\"login.vk.ru\":[\"1.1.1.1\"]"),
+          "the seeded credential's identity and the host map survive")
+
+    // Hand-written JSON the app never writes: \u0022 for the quote, whitespace
+    // and newlines between tokens, another key order.
+    let hand = "{ \"seeded_turn\" : { \"password\" : \"\(marker)2\", \"username\" : \"u\" },\n"
+        + " \"csqtt_password\" : \"\\u0022\(marker)\" , \"peer_addr\":\"h:1\" }"
+    let handOut = ProxyConfigRedaction.redacted(hand)
+    check(!handOut.contains(marker) && handOut.contains("\"csqtt_password\":\"…\"")
+              && handOut.contains("\"peer_addr\":\"h:1\""),
+          "a \\u0022 escape and free-form whitespace are still just a value under a key")
+
+    // Not a JSON object → nothing of the input reaches the line.
+    for bad in ["{\"csqtt_password\":\"\(marker)", "[\"\(marker)\"]", "\"\(marker)\"", "",
+                "csqtt_password=\(marker)"] {
+        let out = ProxyConfigRedaction.redacted(bad)
+        check(!out.contains(marker) && out.hasPrefix("<proxy config not logged"),
+              "🚨 unparseable input \(String(bad.prefix(12)).debugDescription)… is replaced whole, never echoed")
+    }
+
+    // The same input gives the same line, keys sorted — greppable across logs.
+    check(ProxyConfigRedaction.redacted(encoded) == line, "the redaction is deterministic")
+    if let a = line.range(of: "\"csqtt_device_id\""), let b = line.range(of: "\"csqtt_password\""),
+       let c = line.range(of: "\"num_conns\"") {
+        check(a.lowerBound < b.lowerBound && b.lowerBound < c.lowerBound, "keys are sorted")
+    } else {
+        check(false, "could not find the three keys on the redacted line")
+    }
 }
 
 print("")

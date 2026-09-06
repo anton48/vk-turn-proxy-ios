@@ -35,6 +35,7 @@
 		6481DAB30DAF3572C55089E0 /* TunnelMTU.swift in Sources */ = {isa = PBXBuildFile; fileRef = C80CE8603F45C625FABAC090 /* TunnelMTU.swift */; };
 		652C39DB65907355CDF83B99 /* UplinkPace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 422D7F513A45A12E8A142AA1 /* UplinkPace.swift */; };
 		6795B707AE033110D01EB135 /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 41F2E4485000AF848A0CFE03 /* AppIntents.framework */; };
+		69634039BA6025FF5BECEBF7 /* ProxyConfigRedaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C7C4C08873404E9AB6C562A /* ProxyConfigRedaction.swift */; };
 		6C715D35A7DE938BCED16E7A /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC7905B75584E8ECB5B29CDF /* ServerStore.swift */; };
 		74676C96495AC72E7D7C7EB5 /* TunnelMTU.swift in Sources */ = {isa = PBXBuildFile; fileRef = C80CE8603F45C625FABAC090 /* TunnelMTU.swift */; };
 		7CA072A4E64691BE582D450C /* RoutingShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41B2D2BACDE5E78E1E2E72C2 /* RoutingShortcuts.swift */; };
@@ -121,6 +122,7 @@
 		16894D17BB018EECDC8F01FF /* ServerEditView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerEditView.swift; sourceTree = "<group>"; };
 		17FC00C95995BA91DADA2EB3 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		196C853F06BE5F3D3202EA2D /* VKTurnProxyWidget.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = VKTurnProxyWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		1C7C4C08873404E9AB6C562A /* ProxyConfigRedaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyConfigRedaction.swift; sourceTree = "<group>"; };
 		284043E2EA6CAC284FF241D3 /* VPNActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPNActivityAttributes.swift; sourceTree = "<group>"; };
 		2842251868A37320A5C238F2 /* UplinkPaceSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UplinkPaceSync.swift; sourceTree = "<group>"; };
 		2ED7D00C3274E16741E0FFE0 /* SpeedTestWire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeedTestWire.swift; sourceTree = "<group>"; };
@@ -217,6 +219,7 @@
 				F16CAECB3D91AC18F93D32C0 /* Info.plist */,
 				A01BE3EACAF5D00A44A0D32E /* PacketTunnel.entitlements */,
 				4D06132B25271A4E9DA8F0C6 /* PacketTunnelProvider.swift */,
+				1C7C4C08873404E9AB6C562A /* ProxyConfigRedaction.swift */,
 				0637E9F13ED224A520932604 /* TunnelBackend.swift */,
 			);
 			path = PacketTunnel;
@@ -446,6 +449,7 @@
 				E81C2A079BD562EA18ED30FF /* DirectRouteSync.swift in Sources */,
 				90CBABBC0C21BE682CF22ACF /* OSLogReader.swift in Sources */,
 				B1B5B221672B08CCCC35BE51 /* PacketTunnelProvider.swift in Sources */,
+				69634039BA6025FF5BECEBF7 /* ProxyConfigRedaction.swift in Sources */,
 				3F33AE79B74735B536FE1D31 /* SharedLogger.swift in Sources */,
 				EC655ABF39382FEE687B5F44 /* TunnelBackend.swift in Sources */,
 				6481DAB30DAF3572C55089E0 /* TunnelMTU.swift in Sources */,

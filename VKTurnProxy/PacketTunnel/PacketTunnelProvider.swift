@@ -182,12 +182,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         NSError(domain: "VKTurnProxy", code: 2, userInfo: [NSLocalizedDescriptionKey: "csqtt: \(reason)"])
     }
 
-    /// The proxy config for the log, with the csqtt password blanked: the line
-    /// is what users send us, and csqtt's password is the tunnel's only key.
-    static func redactedProxyConfig(_ json: String) -> String {
-        json.replacingOccurrences(of: #""csqtt_password":"[^"]*""#, with: #""csqtt_password":"…""#, options: .regularExpression)
-    }
-
     // MARK: - Tunnel Lifecycle
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
@@ -251,7 +245,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let isCSQTT = (config["use_csqtt"] as? Bool) ?? false
 
         logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)\(mtuExplicit ? " (user-set)" : "")")
-        logMsg("proxyConfig=\(Self.redactedProxyConfig(proxyConfigJSON))")
+        // The config carries secrets (csqtt's password, WRAP-A's, the wrap key,
+        // the seeded TURN password). ProxyConfigRedaction masks them by KEY —
+        // never by a pattern over the text: build 355's regex stopped at the
+        // \" of a password with a quote in it and logged the rest.
+        logMsg("proxyConfig=\(ProxyConfigRedaction.redacted(proxyConfigJSON))")
 
         // 🚧 DIAGNOSTIC (issue #72). Watch the PROFILE, not just our own
         // messages: Apple's DTS answer on changing NEVPNProtocol properties
