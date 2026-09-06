@@ -70,8 +70,14 @@ run "vendored fork — separate module, not reached by the root ./..." \
 # replaces the root module with `..`), so the root ./... never sees
 # csqtt_bridge_test.go — the descriptor-ownership, pump and cleanup checks. Built
 # with the same tag the xcframework is.
+# GODEBUG pinned in the ENVIRONMENT: the bridge's C constructor sets
+# asyncpreemptoff=1 for the iOS runtime, and on the macOS host that setenv can
+# lose the race with the Go runtime's own startup — "signal 16 received on
+# thread with no signal stack / non-Go code disabled sigaltstack" before the
+# first test runs (seen twice on 2026-09-06 under -race). The variable set
+# here is read before either.
 run "WireGuardBridge — separate module, the csqtt bridge lifecycle" \
-    env -C WireGuardBridge go test "${goflags[@]}" -tags ios .
+    env -C WireGuardBridge GODEBUG=asyncpreemptoff=1 go test "${goflags[@]}" -tags ios .
 
 run "swiftcheck — Swift value types and source scans" \
     ./tools/swiftcheck/run.sh
