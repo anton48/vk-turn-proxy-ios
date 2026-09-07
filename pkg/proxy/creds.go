@@ -857,6 +857,20 @@ type credPoolEntry struct {
 	// fetch path for this slot and fall back instead of duplicating work.
 	fetching bool
 
+	// gen is the claim stamp of the fetch that owns this slot. A fetch
+	// (tryFill, get()'s Phase 2) takes a fresh value from cp.nextGen when it
+	// sets `fetching` (claimForFetchLocked) and presents it again before
+	// publishing (ownsLocked). Every other write leaves the zero value and
+	// invalidate() rebuilds the slice from zero entries, so a fetch that
+	// began BEFORE a Resume reset the pool — or before invalidateEntry
+	// cleared the slot, or before a later claim took it — finds its stamp
+	// gone and does not overwrite what is there now. 🚨 2026-09-08, user's
+	// review: without this a late grower fetch replaced a slot the new
+	// connections had refilled and reset its active 10 → 0 — the sessions
+	// lived on, unaccounted, and every later release, quota check and
+	// path-change marking worked on a count that was wrong.
+	gen uint64
+
 	// active: number of conns currently using this slot's cred (i.e.
 	// holding an active TURN allocation against it). VK enforces a strict
 	// quota of 10 simultaneous allocations per cred set, so get() refuses
@@ -1165,6 +1179,7 @@ type credCacheEntry struct {
 type credPool struct {
 	mu       sync.Mutex
 	pool     []credPoolEntry // indexed by slot index; grown lazily up to size
+	nextGen  uint64          // last claim stamp handed out — see credPoolEntry.gen
 	size     int             // pool capacity, derived from NumConns via poolSizeForNumConns
 	cooldown time.Duration   // post-failure skip-fetch window (default 5m)
 
@@ -2054,38 +2069,67 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		cp.mu.Unlock()
 		return "", nil, -1, fmt.Errorf("credpool: no slot available (all saturated, cooling down, or fetching)")
 	}
-	cp.pool[target].fetching = true
+	gen := cp.claimForFetchLocked(target)
 	cp.mu.Unlock()
 
 	// Inline fetch — runs WITHOUT mu so get() on other slots stays fast.
 	addr, creds, fetchErr := cp.fetch(allowCaptchaBlock, target)
 
 	cp.mu.Lock()
-	cp.pool[target].fetching = false
+	// The slot may have changed hands during the fetch (a Resume reset the
+	// pool, invalidateEntry cleared it, a later claim took it): then what
+	// sits there is not ours to overwrite or to put on cooldown. A credential
+	// we did get goes into an empty slot with our seat on it; with none free
+	// this fetch is lost (one VK solve) and the failure path below falls back
+	// through the pool as on any failed fetch.
+	owns := cp.ownsLocked(target, gen)
+	if owns {
+		cp.pool[target].fetching = false
+	}
 	if fetchErr == nil {
-		// Replacing an empty/stale slot — active was 0, now 1 (us).
-		cp.pool[target] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: 1}
-		filled := cp.countFreshLocked()
-		cp.mu.Unlock()
-		log.Printf("credpool: conn %d fetched fresh cred into slot %d (%d/%d slots filled)",
-			connIdx, target, filled, cp.size)
-		if target >= 0 && target < len(cp.authErrors) {
-			cp.authErrors[target].Store(0)
+		got := target
+		if owns {
+			// Replacing an empty/stale slot — active was 0, now 1 (us).
+			cp.pool[target] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: 1, gen: gen}
+		} else {
+			got = cp.placeIntoEmptySlotLocked(addr, creds, 1)
 		}
-		cp.saveToDisk()
-		// Inline fetch placed a fresh cred into a previously empty/
-		// stale slot. The current conn took capacity 1/connsPerSlot;
-		// the remaining connsPerSlot-1 slots of capacity are open for
-		// other parked conns that lost the race for ownSlot.
-		cp.broadcastSlotAvailable()
-		return addr, creds, target, nil
+		if got < 0 {
+			// Nowhere to keep it: fall through to the failure path with an
+			// error of our own — it puts no cooldown on a slot that is not ours
+			// and looks for a seat in the pool as after any failed fetch.
+			log.Printf("credpool: conn %d: slot %d changed hands during the fetch and no slot is empty — fetched cred dropped", connIdx, target)
+			fetchErr = fmt.Errorf("credpool: slot %d changed hands during the fetch, no empty slot for the fetched cred", target)
+		} else {
+			filled := cp.countFreshLocked()
+			cp.mu.Unlock()
+			if got == target {
+				log.Printf("credpool: conn %d fetched fresh cred into slot %d (%d/%d slots filled)",
+					connIdx, target, filled, cp.size)
+			} else {
+				log.Printf("credpool: conn %d: slot %d changed hands during the fetch — fresh cred placed into slot %d (%d/%d slots filled)",
+					connIdx, target, got, filled, cp.size)
+			}
+			if got < len(cp.authErrors) {
+				cp.authErrors[got].Store(0)
+			}
+			cp.saveToDisk()
+			// Inline fetch placed a fresh cred into a previously empty/
+			// stale slot. The current conn took capacity 1/connsPerSlot;
+			// the remaining connsPerSlot-1 slots of capacity are open for
+			// other parked conns that lost the race for ownSlot.
+			cp.broadcastSlotAvailable()
+			return addr, creds, got, nil
+		}
 	}
 
 	// Fetch failed. Set cooldown on the target so we don't hammer it
 	// every reconnect. Then check once more for a fresh-and-available
 	// slot — background grower may have filled one while we were
 	// blocked on VK.
-	cp.pool[target].cooldownUntil = time.Now().Add(cp.cooldown)
+	if owns {
+		cp.pool[target].cooldownUntil = time.Now().Add(cp.cooldown)
+	}
 	// Compact-fill applies here too: if the grower or another conn
 	// filled a slot during our fetch window, prefer the most-active
 	// one. logSkips=false because Phase 1's initial scan already
@@ -2586,18 +2630,45 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 		cp.mu.Unlock()
 		return false
 	}
-	cp.pool[slot].fetching = true
+	gen := cp.claimForFetchLocked(slot)
 	cp.mu.Unlock()
 
 	addr, creds, err := cp.fetch(allowCaptchaBlock, slot)
 
 	cp.mu.Lock()
+	if !cp.ownsLocked(slot, gen) {
+		// The slot changed hands while we fetched — a Resume reset the pool
+		// (invalidate), invalidateEntry cleared it, or a later claim took it.
+		// Whatever sits there now (a conn-filled cred with its active count, a
+		// fetch in flight) is not ours: no write, no `fetching` reset, no
+		// cooldown. A credential we did get is kept in an empty slot if any.
+		if err != nil {
+			cp.mu.Unlock()
+			log.Printf("credpool: background fill slot %d failed (%v) after the slot changed hands — nothing recorded", slot, err)
+			return false
+		}
+		placed := cp.placeIntoEmptySlotLocked(addr, creds, 0)
+		filled := cp.countFreshLocked()
+		cp.mu.Unlock()
+		if placed < 0 {
+			log.Printf("credpool: slot %d changed hands during the background fetch and no slot is empty — fetched cred dropped", slot)
+			return false
+		}
+		log.Printf("credpool: slot %d changed hands during the background fetch — fetched cred placed into slot %d (%d/%d slots filled)", slot, placed, filled, cp.size)
+		if placed < len(cp.authErrors) {
+			cp.authErrors[placed].Store(0)
+		}
+		cp.saveToDisk()
+		cp.broadcastSlotAvailable()
+		return true
+	}
 	cp.pool[slot].fetching = false
 	if err == nil {
-		// No second checkpoint here: the fetch happened, the credential is
-		// paid for, it goes into the slot whatever the count is now (see the
-		// doc comment — the discard this replaced cost more than it saved).
-		cp.pool[slot] = credPoolEntry{addr: addr, creds: creds, ts: time.Now()}
+		// No count-based checkpoint here: the fetch happened, the credential
+		// is paid for, it goes into the slot whatever the count is now (see
+		// the doc comment — the discard this replaced cost more than it
+		// saved). The ownership check above is the only gate.
+		cp.pool[slot] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), gen: gen}
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()
 		log.Printf("credpool: background filled slot %d (%d/%d slots filled)", slot, filled, cp.size)
@@ -2616,6 +2687,43 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 	cp.mu.Unlock()
 	log.Printf("credpool: background fill slot %d failed (%v), cooldown %s", slot, err, cp.cooldown)
 	return false
+}
+
+// claimForFetchLocked marks slot as being fetched and returns the claim
+// stamp the fetch must present when it publishes (ownsLocked). Caller holds
+// cp.mu. Stamps are never reused, so a stamp taken before invalidate()
+// rebuilt the pool can never match the zero entries it left.
+func (cp *credPool) claimForFetchLocked(slot int) uint64 {
+	cp.nextGen++
+	cp.pool[slot].fetching = true
+	cp.pool[slot].gen = cp.nextGen
+	return cp.nextGen
+}
+
+// ownsLocked reports whether slot still carries the claim stamp gen, i.e.
+// nothing has reset, cleared or re-claimed it since the fetch began. Caller
+// holds cp.mu.
+func (cp *credPool) ownsLocked(slot int, gen uint64) bool {
+	return slot >= 0 && slot < len(cp.pool) && cp.pool[slot].gen == gen
+}
+
+// placeIntoEmptySlotLocked stores a credential whose original slot changed
+// hands during its fetch into the first slot nobody holds (no credential, no
+// fetch in flight) and returns that index, or -1 when the pool has none — the
+// credential is then dropped, which costs one VK solve and nothing else. The
+// entry gets its own fresh stamp. Caller holds cp.mu.
+func (cp *credPool) placeIntoEmptySlotLocked(addr string, creds *TURNCreds, active int) int {
+	for len(cp.pool) < cp.size {
+		cp.pool = append(cp.pool, credPoolEntry{})
+	}
+	for i := range cp.pool {
+		if cp.pool[i].creds == nil && !cp.pool[i].fetching {
+			cp.nextGen++
+			cp.pool[i] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: active, gen: cp.nextGen}
+			return i
+		}
+	}
+	return -1
 }
 
 // pickSlotToFill returns the index of a slot that is eligible for the
