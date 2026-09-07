@@ -3588,6 +3588,18 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	context.AfterFunc(turnCtx, func() {
 		relayConn.SetDeadline(time.Now())
 		conn2.SetDeadline(time.Now())
+		// The forwarder toward the relay may be INSIDE a write the relay
+		// will never complete — a full TCP send buffer toward the interface
+		// a path change just took away. Neither deadline above reaches it
+		// (pion's relay conn maps SetDeadline to reads only), and the
+		// deallocate's deadline defer runs only after wg.Wait, which that
+		// very forwarder holds; the session above restarts without waiting
+		// and the goroutine, this socket and the pion client would leak
+		// until the kernel failed the write. So the write is bounded HERE,
+		// at the cancel, on the control socket we own (user's review,
+		// 2026-09-07: the defer was unreachable while the sender sat in
+		// Write). This path carries DTLS, WRAP, WRAP-A and WRAP-S.
+		_ = turnConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
 	})
 
 	var peerAddr atomic.Value
