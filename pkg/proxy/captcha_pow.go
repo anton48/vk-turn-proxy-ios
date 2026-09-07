@@ -518,10 +518,11 @@ var (
 
 // sessionClientHolder is one client's lifetime. `used` is set once a request
 // completed on it: only a client that has answered can hold a dead pooled
-// connection, so vkCallsPost retries on a fresh client only after a failure
-// on a USED one — a never-used client that fails dialled fresh and got the
-// network's verdict, and a second dial would merely double the wait before
-// the caller's fallback.
+// connection, so vkCallsPost retries on a fresh client after a failure on a
+// USED one — or on a never-used one that a path event has already replaced
+// (the network changed under its first request). A never-used client that is
+// still current dialled fresh and got the network's verdict; a second dial
+// would merely double the wait before the caller's fallback.
 type sessionClientHolder struct {
 	c    tls_client.HttpClient
 	used atomic.Bool

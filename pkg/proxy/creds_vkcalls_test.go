@@ -512,3 +512,54 @@ func TestANeverUsedClientDoesNotRetry(t *testing.T) {
 		t.Fatalf("took %s — want one client timeout, not two", took.Round(time.Millisecond))
 	}
 }
+
+// The network changes DURING a fresh client's first request: the path event
+// installs a replacement, the first request times out on the old path, and
+// the old client is never-used — but it is no longer current, so the retry
+// goes through the replacement instead of falling to the legacy path (the
+// user's case, 2026-09-07).
+//
+// Sabotage seen red: the never-used gate without the "still current" test.
+func TestASwitchDuringTheFirstRequestRetriesOnTheReplacement(t *testing.T) {
+	f := newFakeVK(t)
+	useFakeVK(t, f)
+	f.hangAll.Store(true) // the old path: nothing answers
+	if GetSessionClient() == nil {
+		t.Fatal("no session client")
+	}
+	h0 := sessionClient.Load()
+
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		_, err := vkCallsPost(fakeVKURL, "ua") // the first request of a never-used client
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // its stream is in flight on the old path
+	RotateVKSessionClient()            // the path event: a replacement is current
+	f.hangAll.Store(false)             // the new path works (the in-flight request stays hung)
+	h1 := sessionClient.Load()
+	if h1 == h0 {
+		t.Fatal("the path event did not replace the never-used client")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the first request failed after %s: %v — a never-used client that a path event replaced must retry on the replacement, not fall to legacy", time.Since(started).Round(time.Millisecond), err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first request never returned")
+	}
+	if took := time.Since(started); took < 600*time.Millisecond || took > 3*time.Second {
+		t.Fatalf("took %s — want one timeout on the old path and a fresh request on the replacement", took.Round(time.Millisecond))
+	}
+	if d := f.dials.Load(); d != 2 {
+		t.Fatalf("dials = %d, want 2 (the old path's and the replacement's)", d)
+	}
+	// On the REPLACEMENT — not on a third client built by the retry: the path
+	// event's client is still current and carries the completed request.
+	if sessionClient.Load() != h1 || !h1.used.Load() {
+		t.Fatalf("the retry did not run on the path event's replacement (current == replacement: %v, replacement used: %v)", sessionClient.Load() == h1, h1.used.Load())
+	}
+}

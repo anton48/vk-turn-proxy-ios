@@ -284,14 +284,24 @@ func vkCallsPost(url, ua string) (map[string]interface{}, error) {
 		h.used.Store(true)
 		return resp, nil
 	}
-	if !isNetworkClassError(err) || !h.used.Load() {
-		// VK's own answer — or a client that never completed a request, whose
-		// pool cannot hold a dead connection: it dialled fresh and got the
-		// network's verdict, and a second dial would only double the wait
-		// before the caller's fallback.
+	if !isNetworkClassError(err) {
+		return resp, err // VK's own answer reaches the caller after one request
+	}
+	if !h.used.Load() && sessionClient.Load() == h {
+		// A client that never completed a request AND is still the current
+		// one cannot hold a dead pooled connection: it dialled fresh and got
+		// the network's verdict, and a second dial would only double the wait
+		// before the caller's fallback. A never-used client that a path event
+		// has already REPLACED is another matter — the network changed under
+		// its first request (the user's case, 2026-09-07), the replacement is
+		// on the new path, and that is where the retry belongs.
 		return resp, err
 	}
-	log.Printf("vkcalls: request failed at the network level (%s) — rotating the session client, retrying once on a fresh connection", networkErrorKind(err))
+	if sessionClient.Load() != h {
+		log.Printf("vkcalls: request failed at the network level (%s) — a path event already replaced the client, retrying once on the replacement", networkErrorKind(err))
+	} else {
+		log.Printf("vkcalls: request failed at the network level (%s) — rotating the session client, retrying once on a fresh connection", networkErrorKind(err))
+	}
 	fresh := rotateVKSessionClient(h, "network error on a pooled connection")
 	if fresh == nil {
 		return resp, err // no client at all (a test's reset; never after construction in production)
