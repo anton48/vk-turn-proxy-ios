@@ -669,8 +669,11 @@ func wgAttachWireGuardImpl(id int32, goSettings string, tunFd int) int32 {
 	// NewFile whether reads go through its poller. On a blocking descriptor
 	// the device's TUN reader sits in read(2) and device.Close waits for it
 	// until the utun delivers a packet — the stopped-during-attach path
-	// below, and every wgTurnOff before this (device.Close took ~330 ms on
-	// the phone where csqtt's, non-blocking since build 355, takes 12 ms).
+	// below (a review probe: > 4 s on a blocking dup) and an idle tunnel's
+	// stop. 🚫 It was NOT the ~330 ms of device.Close on every native stop
+	// up to build 367 (367 on the phone: 329 ms, unchanged) — that was the
+	// bind reporting the stopped proxy as context.Canceled, which
+	// wireguard-go answers with a ⅓-s sleep; see pkg/turnbind.
 	// The flag lives on the open file description, shared with Swift's fd —
 	// exactly as on csqtt's path and in wireguard-apple.
 	if err := unix.SetNonblock(dupFd, true); err != nil {
