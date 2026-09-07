@@ -4403,6 +4403,9 @@ func pathSnapshotOSDefault() string {
 // as pre-emptively saturated. See credPool.MarkInUseSlotsForPathChange
 // for the full rationale.
 func (p *Proxy) OnPathChange() {
+	// The VK client's pooled connections may be bound to the interface this
+	// event took away — replace the client before anything mints.
+	RotateVKSessionClient()
 	if p.credPool != nil {
 		p.credPool.MarkInUseSlotsForPathChange()
 	}

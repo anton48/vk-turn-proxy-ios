@@ -195,6 +195,15 @@ func isTransientNetworkError(err error) bool {
 		strings.Contains(s, "connection refused") ||
 		strings.Contains(s, "network is unreachable") ||
 		strings.Contains(s, "no route to host") ||
+		// EADDRNOTAVAIL on an ESTABLISHED socket: its source address is gone
+		// (an interface the phone lost after a path change; the kernel reports
+		// it on the next read/write, ~50 s after the switch on 2026-09-07).
+		// 🚫 NOT the "dial tcp …: connect: can't assign requested address" of
+		// an IPv6-only Wi-Fi without an IPv4 source — that one fails every
+		// dial in 30–200 ms and retrying it for 12 waves × 4 s would only
+		// delay the same answer (reference_ios_ipv4_only_eaddrnotavail).
+		strings.Contains(s, "read: can't assign requested address") ||
+		strings.Contains(s, "write: can't assign requested address") ||
 		strings.Contains(s, "i/o timeout") ||
 		strings.Contains(s, "deadline exceeded") ||
 		strings.Contains(s, "connection reset")

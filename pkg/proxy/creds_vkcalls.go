@@ -53,6 +53,7 @@ import (
 	"unicode/utf8"
 
 	fhttp "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/google/uuid"
 )
 
@@ -106,36 +107,10 @@ func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
 	log.Printf("vkcalls: identity — name: %s, device_id: %s, UA: %s", name, deviceID, ua)
 
 	// doRequest issues a POST to the given URL with no body (all params in URL
-	// per VK API convention). Returns parsed JSON response or error.
+	// per VK API convention) through the session client — vkCallsPost, with
+	// its one retry on a fresh connection.
 	doRequest := func(url string) (map[string]interface{}, error) {
-		client := GetSessionClient()
-		req, err := fhttp.NewRequest("POST", url, bytes.NewReader(nil))
-		if err != nil {
-			return nil, err
-		}
-		// Headers — minimal set matching what frida-trace captured from real
-		// VK Calls. Notably absent: Origin, Referer (legacy flow sends these
-		// because it imitates WebView; VK Calls is a native app).
-		req.Header.Set("User-Agent", ua)
-		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-		req.Header.Set("Accept-Language", "en-GB,en;q=0.9")
-
-		httpResp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = httpResp.Body.Close() }()
-
-		body, err := io.ReadAll(httpResp.Body)
-		if err != nil {
-			return nil, err
-		}
-		var resp map[string]interface{}
-		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, fmt.Errorf("unmarshal: %w, body: %s", err, truncate(string(body), 200))
-		}
-		return resp, nil
+		return vkCallsPost(url, ua)
 	}
 
 	// Step 1: get anonymous_token from VK Connect.
@@ -286,6 +261,132 @@ func getVKCredsViaVKCallsPath(linkID string) (*TURNCreds, error) {
 }
 
 // --- Helpers (duplicated from getVKCredsWithClientID closures for isolation) ---
+
+// vkCallsPost issues one bodiless POST of the VK Calls flow through the
+// current session client and parses the JSON answer. 🚨 A NETWORK-CLASS
+// failure — a timeout, a dead socket, a reset — is retried ONCE on a fresh
+// client: the client pools HTTP/2 connections across mints, and a connection
+// dialled on an interface the phone has since lost fails every request on it
+// (20 s each; 2026-09-07: four mints in a row, 65 s to recover) although the
+// host is one fresh dial away. A rotation, not a close of idle connections:
+// the neighbouring mint's stream keeps the dead connection "in use" for a
+// close, while a fresh client has no pool to be poisoned. The retry is also
+// what tells a stale connection from an unreachable host — a second failure is
+// real, and the caller's fallback to the legacy path is then the right answer,
+// which is why a network error does NOT skip that fallback.
+func vkCallsPost(url, ua string) (map[string]interface{}, error) {
+	if GetSessionClient() == nil {
+		return nil, fmt.Errorf("vkcalls: no session client")
+	}
+	h := sessionClient.Load()
+	resp, err := vkCallsAttempt(h.c, url, ua)
+	if err == nil {
+		h.used.Store(true)
+		return resp, nil
+	}
+	if !isNetworkClassError(err) || !h.used.Load() {
+		// VK's own answer — or a client that never completed a request, whose
+		// pool cannot hold a dead connection: it dialled fresh and got the
+		// network's verdict, and a second dial would only double the wait
+		// before the caller's fallback.
+		return resp, err
+	}
+	log.Printf("vkcalls: request failed at the network level (%s) — rotating the session client, retrying once on a fresh connection", networkErrorKind(err))
+	fresh := rotateVKSessionClient(h, "network error on a pooled connection")
+	if fresh == nil {
+		return resp, err // no client at all (a test's reset; never after construction in production)
+	}
+	// The holder the failed attempt used: whatever is idle on it by the time
+	// the retry is done — the dead connection, once the neighbouring mint's
+	// stream is gone too — goes now, not at the pool's 90 s idle timer.
+	defer func() { go h.c.CloseIdleConnections() }()
+	resp, err = vkCallsAttempt(fresh.c, url, ua)
+	if err == nil {
+		fresh.used.Store(true)
+	}
+	return resp, err
+}
+
+// vkCallsAttempt is one request on one client.
+func vkCallsAttempt(client tls_client.HttpClient, url, ua string) (map[string]interface{}, error) {
+	req, err := fhttp.NewRequest("POST", url, bytes.NewReader(nil))
+	if err != nil {
+		return nil, err
+	}
+	// Headers — minimal set matching what frida-trace captured from real
+	// VK Calls. Notably absent: Origin, Referer (legacy flow sends these
+	// because it imitates WebView; VK Calls is a native app).
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	req.Header.Set("Accept-Language", "en-GB,en;q=0.9")
+
+	httpResp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = httpResp.Body.Close() }()
+
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("unmarshal: %w, body: %s", err, truncate(string(body), 200))
+	}
+	return resp, nil
+}
+
+// networkErrorKinds are the substrings of the errors a dead or dying socket
+// yields, beyond isTransientNetworkError's DNS/refused/unreachable family.
+var networkErrorKinds = []string{
+	"can't assign requested address", // EADDRNOTAVAIL: the socket's source address is gone
+	"use of closed network connection",
+	"context deadline exceeded",
+	"Client.Timeout exceeded",
+	"connection reset by peer",
+	"broken pipe",
+	"unexpected EOF",
+	"http2: client connection",  // fhttp: "force closed via ClientConn.Close" / "lost" — a neighbour stream's write hit the dead socket
+	"http2: server sent GOAWAY", // VK closed a pooled connection under a request in flight
+}
+
+// isNetworkClassError reports whether err is the socket's or the timer's, not
+// VK's — what a fresh connection may fix. VK's own answers (a captcha, an
+// error object, a body that does not parse) are not.
+func isNetworkClassError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isTransientNetworkError(err) {
+		return true
+	}
+	s := err.Error()
+	for _, k := range networkErrorKinds {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
+
+// networkErrorKind names a network-class error for the log without its text
+// (the error carries the request URL and the call link).
+func networkErrorKind(err error) string {
+	s := err.Error()
+	for _, k := range networkErrorKinds {
+		if strings.Contains(s, k) {
+			return k
+		}
+	}
+	for _, k := range []string{"no such host", "connection refused", "network is unreachable", "no route to host", "i/o timeout"} {
+		if strings.Contains(s, k) {
+			return k
+		}
+	}
+	return "network error"
+}
 
 // extractStrFromResp walks resp[keys[0]][keys[1]]... and returns the leaf
 // value as a string. Same logic as the closure-form extractStr in creds.go;

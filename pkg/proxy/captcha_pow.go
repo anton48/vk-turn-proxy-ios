@@ -494,9 +494,38 @@ func customSafariIOS26Profile() profiles.ClientProfile {
 // like a real browser session. ALL VK API requests (login.vk.ru, api.vk.ru,
 // calls.okcdn.ru, id.vk.ru) flow through THIS one client.
 var (
-	sessionClientOnce sync.Once
-	sessionClient     tls_client.HttpClient
+	sessionClientOnce = new(sync.Once)
+	// sessionClient holds the CURRENT client — nil until the first
+	// GetSessionClient, nil for the life of the process if that construction
+	// failed. Atomic because it is replaced: rotateVKSessionClient swaps in a
+	// fresh client (same cookie jar) when the pooled connections are suspect,
+	// and readers on other goroutines keep the holder they took.
+	sessionClient atomic.Pointer[sessionClientHolder]
+	// vkProfileLogOnce: the TLS-profile diagnostic line is printed once per
+	// process, not once per rotation.
+	vkProfileLogOnce sync.Once
+
+	// vkSessionClientExtraOptions is the TEST seam: options appended to the
+	// singleton's construction — a dialer factory that leads every dial to a
+	// local fake VK, insecure TLS, a short timeout. nil in production, where
+	// the singleton talks to VK and nothing else.
+	vkSessionClientExtraOptions func() []tls_client.HttpClientOption
+	// vkRotateBeforeSwap is a TEST hook run between building the replacement
+	// client and the compare-and-swap — the window a second rotation can win.
+	// nil in production.
+	vkRotateBeforeSwap func()
 )
+
+// sessionClientHolder is one client's lifetime. `used` is set once a request
+// completed on it: only a client that has answered can hold a dead pooled
+// connection, so vkCallsPost retries on a fresh client only after a failure
+// on a USED one — a never-used client that fails dialled fresh and got the
+// network's verdict, and a second dial would merely double the wait before
+// the caller's fallback.
+type sessionClientHolder struct {
+	c    tls_client.HttpClient
+	used atomic.Bool
+}
 
 // vkDiagDialer returns a net.Dialer whose Control hook logs the exact remote
 // address the bogdanfinn session client is about to connect to, with the
@@ -521,16 +550,32 @@ func vkDiagDialer() net.Dialer {
 // persist. Exported (capitalized) so creds.go and proxy.go can call it.
 func GetSessionClient() tls_client.HttpClient {
 	sessionClientOnce.Do(func() {
-		var clientProfile profiles.ClientProfile
-		if desktopChromeProfile() != nil {
-			// VK_DESKTOP_CHROME diagnostic: real Chrome 146 JA3 to match the
-			// desktop UA + sec-ch-ua (same profile amurcanov uses).
-			clientProfile = profiles.Chrome_146
+		client, cerr := newVKSessionClient(nil)
+		if cerr != nil {
+			log.Printf("pow: ERROR creating bogdanfinn session client: %v", cerr)
+			return
+		}
+		sessionClient.Store(&sessionClientHolder{c: client})
+	})
+	return sessionClientIfCreated()
+}
+
+// newVKSessionClient builds a session client around jar (nil: a new jar) —
+// the singleton's construction, and every rotation's.
+func newVKSessionClient(jar fhttp.CookieJar) (tls_client.HttpClient, error) {
+	var clientProfile profiles.ClientProfile
+	if desktopChromeProfile() != nil {
+		// VK_DESKTOP_CHROME diagnostic: real Chrome 146 JA3 to match the
+		// desktop UA + sec-ch-ua (same profile amurcanov uses).
+		clientProfile = profiles.Chrome_146
+		vkProfileLogOnce.Do(func() {
 			log.Printf("pow: TLS profile=Chrome_146 (bogdanfinn built-in) — VK_DESKTOP_CHROME diagnostic mode")
-		} else {
-			// Phase 9 spec diagnostic — confirms what TLS bytes we send.
-			// Phase 10 expected: ciphers=14 extensions=15 random_ext_order=false.
-			clientProfile = customSafariIOS26Profile()
+		})
+	} else {
+		// Phase 9 spec diagnostic — confirms what TLS bytes we send.
+		// Phase 10 expected: ciphers=14 extensions=15 random_ext_order=false.
+		clientProfile = customSafariIOS26Profile()
+		vkProfileLogOnce.Do(func() {
 			spec, err := buildCustomSafariIOS26Spec()
 			if err != nil {
 				log.Printf("pow: TLS profile spec build ERROR: %v", err)
@@ -538,23 +583,88 @@ func GetSessionClient() tls_client.HttpClient {
 				log.Printf("pow: TLS profile=Safari_iOS_26_custom ciphers=%d extensions=%d random_ext_order=false (Phase 9 spec, Phase 10 session-unified across bootstrap+captcha)",
 					len(spec.CipherSuites), len(spec.Extensions))
 			}
-		}
+		})
+	}
 
-		jar := tls_client.NewCookieJar()
-		options := []tls_client.HttpClientOption{
-			tls_client.WithTimeoutSeconds(20),
-			tls_client.WithClientProfile(clientProfile),
-			tls_client.WithCookieJar(jar),
-			tls_client.WithDialer(vkDiagDialer()), // DIAGNOSTIC (build 167): log requested dial addr+family
-		}
-		client, cerr := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
-		if cerr != nil {
-			log.Printf("pow: ERROR creating bogdanfinn session client: %v", cerr)
-			return
-		}
-		sessionClient = client
-	})
-	return sessionClient
+	if jar == nil {
+		jar = tls_client.NewCookieJar()
+	}
+	options := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(20),
+		tls_client.WithClientProfile(clientProfile),
+		tls_client.WithCookieJar(jar),
+		tls_client.WithDialer(vkDiagDialer()), // DIAGNOSTIC (build 167): log requested dial addr+family
+	}
+	if vkSessionClientExtraOptions != nil {
+		options = append(options, vkSessionClientExtraOptions()...)
+	}
+	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+}
+
+// sessionClientIfCreated returns the current client if one has been built —
+// and never builds it. A path event must not conjure a VK client (a tunnel
+// that never minted has no connections to drop) just to replace what it does
+// not have.
+func sessionClientIfCreated() tls_client.HttpClient {
+	if h := sessionClient.Load(); h != nil {
+		return h.c
+	}
+	return nil
+}
+
+// rotateVKSessionClient replaces `old` — if it is still the current client —
+// with a fresh one around the SAME cookie jar, and returns the current holder.
+// A compare-and-swap, so two goroutines that lost the same dead connection at
+// once rotate once between them, and a request that failed on a client already
+// replaced simply moves to the replacement. In-flight requests finish on the
+// old client (its pooled connections are then released in the background).
+//
+// 🚨 WHY A ROTATION AND NOT CloseIdleConnections: tls-client's close walks the
+// pool but shuts only connections with NO stream in flight — and after a path
+// change two mints run at once by design (the pool's cold-start cap), so each
+// one's retry would have found the other's stream on the dead connection and
+// landed on it again (40 s per mint instead of 20); the path hook, too, could
+// only skip a connection carrying a mint. A fresh client has an empty pool:
+// its first request dials on the current path, whatever the old client still
+// holds. Its close also takes the round-tripper's lock, which a host's first
+// dial holds for up to the 20 s dial timeout — a hook on the serial
+// path-monitor queue must not wait behind that. The cost of a rotation is one
+// TLS handshake on the next request; cookies survive (the jar is shared).
+func rotateVKSessionClient(old *sessionClientHolder, why string) *sessionClientHolder {
+	cur := sessionClient.Load()
+	if cur == nil || cur != old {
+		return cur // never built, or already rotated by someone else
+	}
+	client, err := newVKSessionClient(old.c.GetCookieJar())
+	if err != nil {
+		log.Printf("vk: session client rotation (%s) failed, keeping the current client: %v", why, err)
+		return cur
+	}
+	fresh := &sessionClientHolder{c: client}
+	if hook := vkRotateBeforeSwap; hook != nil {
+		hook()
+	}
+	if !sessionClient.CompareAndSwap(old, fresh) {
+		return sessionClient.Load()
+	}
+	go old.c.CloseIdleConnections() // what was idle on the old client goes now; in-flight requests finish there
+	log.Printf("vk: session client rotated (%s) — the next request dials on the current path", why)
+	return fresh
+}
+
+// RotateVKSessionClient is the path-event hook: Proxy.OnPathChange and the
+// exported pool's OnPathChange (so csqtt's adapter reaches it too) replace the
+// VK client whose pooled connections may be bound to the interface the event
+// took away. The pool keeps HTTP/2 connections through 90 s of idle time,
+// re-armed by every stream, with no health check and no retry on a dead
+// stream: on 2026-09-07 four consecutive credential mints after a Wi-Fi→LTE
+// switch went out on one such connection (two 20 s timeouts, then
+// EADDRNOTAVAIL at +50 s — the first fresh dial succeeded in 1 s) and twenty
+// connections waited 65 s. Nothing happens when no client was ever built.
+func RotateVKSessionClient() {
+	if h := sessionClient.Load(); h != nil {
+		rotateVKSessionClient(h, "path change")
+	}
 }
 
 // GetSessionUserAgent returns the User-Agent string ALL VK API requests in
@@ -679,7 +789,9 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	// captcha session shares cookies with the getAnonymousToken request that
 	// issued this captcha. The legacy cred fetch passes a FRESH per-fetch client
 	// (newFreshSessionClient) so each fetch is a distinct VK session.
-	// (bogdanfinn HttpClient has no CloseIdleConnections; profile pool is reused via package-level state)
+	// (The client is never closed here; on a path event the singleton is
+	// rotated by RotateVKSessionClient — this run keeps its client, the jar
+	// is shared.)
 
 	// Random initial delay (1.5-2.5s) — HAR timing from real browser
 	delay := time.Duration(1500+mathrand.Intn(1000)) * time.Millisecond

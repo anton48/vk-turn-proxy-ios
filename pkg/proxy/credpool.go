@@ -249,10 +249,15 @@ func IsAuthError(err error) bool { return isAuthError(err) }
 // Invalidate drops every cached credential (a wholesale re-fetch follows).
 func (p *CredPool) Invalidate() { p.cp.invalidate() }
 
-// OnPathChange is what Proxy.OnPathChange does to its pool: marks the slots
-// in use so the next acquires spread, and pauses acquires briefly so a
-// dual PathMonitor event does not grab fresh slots in the gap.
-func (p *CredPool) OnPathChange() { p.cp.MarkInUseSlotsForPathChange() }
+// OnPathChange is what Proxy.OnPathChange does on a path event: replaces the
+// VK session client (its pooled connections may be bound to the interface the
+// event took away), marks the slots in use so the next acquires spread, and
+// pauses acquires briefly so a dual PathMonitor event does not grab fresh
+// slots in the gap.
+func (p *CredPool) OnPathChange() {
+	RotateVKSessionClient()
+	p.cp.MarkInUseSlotsForPathChange()
+}
 
 // ExtendPause lengthens the post-path-change acquire pause (a transition
 // the caller knows is still in progress).
