@@ -17,7 +17,7 @@
 
 import Foundation
 
-enum TunnelBackend {
+enum TunnelBackend: Equatable {
     case wireguard(Int32)
     case csqtt(Int32)
 

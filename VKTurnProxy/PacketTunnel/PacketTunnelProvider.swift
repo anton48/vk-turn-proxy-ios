@@ -7,7 +7,38 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// The running tunnel, if any. The kind travels with the handle (stage 5,
     /// variant B): every per-handle bridge call goes through TunnelBackend, so
     /// a csqtt handle can never be handed to a wg* export or the reverse.
-    private var backend: TunnelBackend?
+    ///
+    /// 🚨 Read and written from several queues — the start work on the
+    /// userInitiated queue, stopTunnel, wake, the path-monitor queue, the
+    /// app-message handler — so the storage sits behind a lock and every
+    /// access goes through this property (the same data-race class one layer
+    /// above the bridge's, found by the review of 2026-09-06). A reader may
+    /// still hold a backend stopTunnel has just turned off: the Go side
+    /// answers a deleted handle with a no-op, by design.
+    private let backendLock = NSLock()
+    private var _backend: TunnelBackend?
+    private var backend: TunnelBackend? {
+        get {
+            backendLock.lock()
+            defer { backendLock.unlock() }
+            return _backend
+        }
+        set {
+            backendLock.lock()
+            _backend = newValue
+            backendLock.unlock()
+        }
+    }
+
+    /// Clears the backend only if it is still the one the caller owns: a
+    /// failure branch of a start that runs after stopTunnel already cleared
+    /// it (the bridge's -7, a bootstrap wait woken by the stop) must not clear
+    /// a backend a LATER start installed. One comparison under the lock.
+    private func clearBackend(_ owned: TunnelBackend) {
+        backendLock.lock()
+        if _backend == owned { _backend = nil }
+        backendLock.unlock()
+    }
     private let log = OSLog(subsystem: "com.vkturnproxy.tunnel", category: "PacketTunnel")
 
     // The inputs the tunnel settings were built from, kept so DIRECT mode
@@ -368,7 +399,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             case 0:
                 self.logMsg("waitReady: timeout after 120s — aborting")
                 backend.turnOff()
-                self.backend = nil
+                self.clearBackend(backend)
                 completionHandler(VPNError.bootstrapTimeout)
                 return
             default:
@@ -378,7 +409,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 let reason = backend.terminalError()
                 self.logMsg("waitReady: failed with code \(ready)\(reason.isEmpty ? "" : " (\(reason))") — aborting")
                 backend.turnOff()
-                self.backend = nil
+                self.clearBackend(backend)
                 completionHandler(reason.isEmpty ? VPNError.backendFailed(code: ready) : Self.csqttStopError(reason))
                 return
             }
@@ -396,7 +427,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 guard let provJSON = backend.waitWrapAProvision(timeoutMs: 30_000) else {
                     self.logMsg("ERROR: wgWaitWrapAProvision returned null — aborting")
                     backend.turnOff()
-                    self.backend = nil
+                    self.clearBackend(backend)
                     completionHandler(VPNError.backendFailed(code: -100))
                     return
                 }
@@ -407,14 +438,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                       let addr = prov["address"] as? String, !addr.isEmpty else {
                     self.logMsg("ERROR: WRAP-A provision empty/invalid — aborting")
                     backend.turnOff()
-                    self.backend = nil
+                    self.clearBackend(backend)
                     completionHandler(VPNError.invalidConfiguration)
                     return
                 }
                 guard self.isValidTunnelAddress(addr) else {
                     self.logMsg("ERROR: WRAP-A provision address is not a valid ip/prefix — aborting")
                     backend.turnOff()
-                    self.backend = nil
+                    self.clearBackend(backend)
                     completionHandler(VPNError.invalidConfiguration)
                     return
                 }
@@ -441,7 +472,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                       self.isValidTunnelAddress(addr) else {
                     self.logMsg("ERROR: csqtt provision empty/invalid — aborting")
                     backend.turnOff()
-                    self.backend = nil
+                    self.clearBackend(backend)
                     completionHandler(VPNError.invalidConfiguration)
                     return
                 }
@@ -514,7 +545,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     if let error = error {
                         self.logMsg("setTunnelNetworkSettings ERROR: \(error)")
                         backend.turnOff()
-                        self.backend = nil
+                        self.clearBackend(backend)
                         completionHandler(error)
                         return
                     }
@@ -526,7 +557,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     guard let tunFd = self.findTunFileDescriptor() else {
                         self.logMsg("ERROR: could not find TUN fd after setTunnelNetworkSettings")
                         backend.turnOff()
-                        self.backend = nil
+                        self.clearBackend(backend)
                         completionHandler(VPNError.noTunDevice)
                         return
                     }
@@ -537,8 +568,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     let rc = backend.attach(wgConfig: effWGConfig, tunFd: tunFd)
                     if rc < 0 {
                         self.logMsg("ERROR: attach returned \(rc)")
+                        if rc == -7 {
+                            self.logMsg("attach: the tunnel was stopped during the attach — the bridge closed the device it built; nothing to tear down here")
+                        }
                         backend.turnOff()
-                        self.backend = nil
+                        self.clearBackend(backend)
                         completionHandler(VPNError.backendFailed(code: rc))
                         return
                     }
@@ -749,7 +783,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         if let backend = backend {
             logMsg("stopTunnel: calling turnOff(\(backend.isCSQTT ? "csqtt" : "wg") \(backend.handle))")
             backend.turnOff()
-            self.backend = nil
+            self.clearBackend(backend)
             logMsg("stopTunnel: turnOff returned (\(elapsedMs())ms total)")
         } else {
             logMsg("stopTunnel: no active tunnel, skipping turnOff")

@@ -78,6 +78,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -87,15 +88,30 @@ import (
 	speedtestpkg "github.com/cacggghp/vk-turn-proxy/pkg/speedtest"
 	"github.com/cacggghp/vk-turn-proxy/pkg/turnbind"
 
+	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
 // tunnelEntry holds a running tunnel's state.
 type tunnelEntry struct {
-	device *device.Device
-	proxy  *proxy.Proxy
-	bind   *turnbind.TURNBind
+	device *device.Device // guarded by tunnelsMu; written once by the attach (the device owns its bind)
+	proxy  *proxy.Proxy   // set before the entry is registered; immutable after
+}
+
+// deviceNow is the ONLY way to read an entry's device. The attach installs
+// it under tunnelsMu and wgTurnOff removes the entry under the same lock
+// before reading it, so a stop that lands between the attach's pre-check
+// and its install is seen by whichever runs second — the same window
+// csqtt_bridge.go closed in build 364 (a device installed on a stopped
+// tunnel is nobody's to close: the dup'd descriptor and wireguard-go's
+// goroutines until the extension dies). Before this, TurnOff, wgSetConfig
+// and wgGetConfig read the field bare, ordered only by Swift's call
+// sequence (the review of 2026-09-06).
+func (e *tunnelEntry) deviceNow() *device.Device {
+	tunnelsMu.Lock()
+	defer tunnelsMu.Unlock()
+	return e.device
 }
 
 var (
@@ -349,6 +365,11 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 		log.Printf("wgTurnOnWithTURN: dup fd failed: %s", err)
 		return -2
 	}
+	if err := unix.SetNonblock(dupFd, true); err != nil { // see wgAttachWireGuardImpl
+		log.Printf("wgTurnOnWithTURN: SetNonblock: %s", err)
+		unix.Close(dupFd)
+		return -2
+	}
 	tunFile := os.NewFile(uintptr(dupFd), "/dev/tun")
 	tunDev, err := tun.CreateTUNFromFile(tunFile, 0)
 	if err != nil {
@@ -385,7 +406,6 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 	tunnels[id] = &tunnelEntry{
 		device: dev,
 		proxy:  p,
-		bind:   bind,
 	}
 	tunnelsMu.Unlock()
 
@@ -470,8 +490,8 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	// wasn't configured (logFilePath == ""), persistence is silently
 	// disabled — credPool will treat empty path as "no persist".
 	var credCachePath string
-	if logFilePath != "" {
-		credCachePath = filepath.Join(filepath.Dir(logFilePath), "creds-pool.json")
+	if dir := logDir(); dir != "" {
+		credCachePath = filepath.Join(dir, "creds-pool.json")
 	}
 
 	if pcfg.UseWrapS {
@@ -588,11 +608,39 @@ func wgWaitBootstrapReady(tunnelHandle C.int32_t, timeoutMs C.int32_t) C.int32_t
 // TURNBind over the proxy, applies the UAPI config, and brings the device up.
 //
 // Returns 1 on success, -1 if tunnel handle not found, -2 if a device is
-// already attached, or a negative code in -3..-6 for each setup step.
+// already attached, a negative code in -3..-6 for each setup step, or -7 when
+// the tunnel was stopped during the attach (the device built here is closed here).
 //
 //export wgAttachWireGuard
 func wgAttachWireGuard(tunnelHandle C.int32_t, wgConfigSettings *C.char, tunFd C.int32_t) C.int32_t {
-	id := int32(tunnelHandle)
+	return C.int32_t(wgAttachWireGuardImpl(int32(tunnelHandle), C.GoString(wgConfigSettings), int(tunFd)))
+}
+
+// wgOpenTun and wgNewBind are the attach's two seams: production opens
+// wireguard-go's tun over the dup'd descriptor and binds through the proxy;
+// a test swaps in a socketpair device and a plain UDP bind so the whole
+// attach — the device, Up, the install against the stop — runs on the host.
+var wgOpenTun = func(dupFd int) (tun.Device, error) {
+	tunFile := os.NewFile(uintptr(dupFd), "/dev/tun")
+	dev, err := tun.CreateTUNFromFile(tunFile, 0)
+	if err != nil {
+		tunFile.Close()
+		return nil, err
+	}
+	return dev, nil
+}
+
+var wgNewBind = func(p *proxy.Proxy) conn.Bind { return turnbind.NewTURNBind(p) }
+
+// wgAfterAttachUp is a test hook that runs after the device is up and before
+// it is installed on the entry — the instant a stop must not slip into; nil
+// in production.
+var wgAfterAttachUp func()
+
+// -1 unknown handle, -2 already attached, -3/-4 the descriptor, -5/-6 the
+// WireGuard config / Up, -7 the tunnel was stopped during the attach (the
+// device built here is closed here), 1 attached.
+func wgAttachWireGuardImpl(id int32, goSettings string, tunFd int) int32 {
 	tunnelsMu.Lock()
 	entry, ok := tunnels[id]
 	tunnelsMu.Unlock()
@@ -601,27 +649,37 @@ func wgAttachWireGuard(tunnelHandle C.int32_t, wgConfigSettings *C.char, tunFd C
 		log.Printf("wgAttachWireGuard: tunnel %d not found", id)
 		return -1
 	}
-	if entry.device != nil {
+	if entry.deviceNow() != nil {
 		log.Printf("wgAttachWireGuard: tunnel %d already has a WG device attached", id)
 		return -2
 	}
 
-	goSettings := C.GoString(wgConfigSettings)
-
 	// TURNBind pumps WG packets into/out of the already-started proxy.
 	// Proxy.Start() is idempotent, so when WireGuard calls TURNBind.Open()
 	// inside dev.Up() below, the second Start() is a no-op.
-	bind := turnbind.NewTURNBind(entry.proxy)
+	bind := wgNewBind(entry.proxy)
 
-	dupFd, err := dupFD(int(tunFd))
+	dupFd, err := dupFD(tunFd)
 	if err != nil {
 		log.Printf("wgAttachWireGuard: dup fd failed: %s", err)
 		return -3
 	}
-	tunFile := os.NewFile(uintptr(dupFd), "/dev/tun")
-	tunDev, err := tun.CreateTUNFromFile(tunFile, 0)
+	// Non-blocking BEFORE os.NewFile, as wireguard-apple's bridge does:
+	// wireguard-go's CreateTUNFromFile sets nothing, and Go decides at
+	// NewFile whether reads go through its poller. On a blocking descriptor
+	// the device's TUN reader sits in read(2) and device.Close waits for it
+	// until the utun delivers a packet — the stopped-during-attach path
+	// below, and every wgTurnOff before this (device.Close took ~330 ms on
+	// the phone where csqtt's, non-blocking since build 355, takes 12 ms).
+	// The flag lives on the open file description, shared with Swift's fd —
+	// exactly as on csqtt's path and in wireguard-apple.
+	if err := unix.SetNonblock(dupFd, true); err != nil {
+		log.Printf("wgAttachWireGuard: SetNonblock: %s", err)
+		unix.Close(dupFd)
+		return -3
+	}
+	tunDev, err := wgOpenTun(dupFd)
 	if err != nil {
-		tunFile.Close()
 		log.Printf("wgAttachWireGuard: CreateTUNFromFile failed: %s", err)
 		return -4
 	}
@@ -644,29 +702,53 @@ func wgAttachWireGuard(tunnelHandle C.int32_t, wgConfigSettings *C.char, tunFd C
 		dev.Close()
 		return -6
 	}
+	if wgAfterAttachUp != nil {
+		wgAfterAttachUp()
+	}
 
+	// The install is a check-and-set against the stop: wgTurnOff removes the
+	// entry from the registry under this lock BEFORE it reads the device, so
+	// an entry no longer registered belongs to a stopped tunnel and the
+	// device we just brought up is ours to close. Two attaches racing are
+	// caught in the same section.
 	tunnelsMu.Lock()
-	// Re-check under lock in case two attaches raced.
-	if entry.device != nil {
-		tunnelsMu.Unlock()
+	registered := tunnels[id] == entry
+	occupied := entry.device != nil
+	if registered && !occupied {
+		entry.device = dev
+	}
+	tunnelsMu.Unlock()
+	if !registered {
+		log.Printf("wgAttachWireGuard: tunnel %d was stopped during the attach — tearing down our device", id)
+		dev.Close()
+		return -7
+	}
+	if occupied {
 		log.Printf("wgAttachWireGuard: tunnel %d raced — tearing down our device", id)
 		dev.Close()
 		return -2
 	}
-	entry.device = dev
-	entry.bind = bind
-	tunnelsMu.Unlock()
 
 	log.Printf("wgAttachWireGuard: tunnel %d WireGuard attached", id)
 	return 1
 }
 
 //export wgTurnOff
-func wgTurnOff(tunnelHandle C.int32_t) {
-	id := int32(tunnelHandle)
+func wgTurnOff(tunnelHandle C.int32_t) { wgTurnOffImpl(int32(tunnelHandle)) }
+
+func wgTurnOffImpl(id int32) {
+	// One critical section: unregister, then read what the tunnel owns. The
+	// attach installs its device under the same lock and checks the
+	// registration first, so whichever of the two runs second sees the
+	// other — an attach still in flight closes its own device.
 	tunnelsMu.Lock()
 	entry, ok := tunnels[id]
 	delete(tunnels, id)
+	var dev *device.Device
+	var prx *proxy.Proxy
+	if ok {
+		dev, prx = entry.device, entry.proxy
+	}
 	tunnelsMu.Unlock()
 
 	if !ok {
@@ -674,8 +756,8 @@ func wgTurnOff(tunnelHandle C.int32_t) {
 	}
 
 	started := time.Now()
-	hasDevice := entry.device != nil
-	hasProxy := entry.proxy != nil
+	hasDevice := dev != nil
+	hasProxy := prx != nil
 	log.Printf("wgTurnOff: tunnel %d stopping (device=%v proxy=%v)", id, hasDevice, hasProxy)
 
 	// Order matters: stop proxy FIRST, device SECOND.
@@ -699,12 +781,12 @@ func wgTurnOff(tunnelHandle C.int32_t) {
 	// returns its completionHandler.
 	if hasProxy {
 		ps := time.Now()
-		entry.proxy.StopWithTimeout(2 * time.Second)
+		prx.StopWithTimeout(2 * time.Second)
 		log.Printf("wgTurnOff: tunnel %d proxy.Stop took %s", id, time.Since(ps).Round(time.Millisecond))
 	}
 	if hasDevice {
 		ds := time.Now()
-		entry.device.Close()
+		dev.Close()
 		log.Printf("wgTurnOff: tunnel %d device.Close took %s", id, time.Since(ds).Round(time.Millisecond))
 	}
 	log.Printf("wgTurnOff: tunnel %d stopped (total %s)", id, time.Since(started).Round(time.Millisecond))
@@ -712,7 +794,10 @@ func wgTurnOff(tunnelHandle C.int32_t) {
 
 //export wgSetConfig
 func wgSetConfig(tunnelHandle C.int32_t, settings *C.char) C.int64_t {
-	id := int32(tunnelHandle)
+	return C.int64_t(wgSetConfigImpl(int32(tunnelHandle), C.GoString(settings)))
+}
+
+func wgSetConfigImpl(id int32, goSettings string) int64 {
 	tunnelsMu.Lock()
 	entry, ok := tunnels[id]
 	tunnelsMu.Unlock()
@@ -720,13 +805,12 @@ func wgSetConfig(tunnelHandle C.int32_t, settings *C.char) C.int64_t {
 	if !ok {
 		return -1
 	}
-	if entry.device == nil {
+	dev := entry.deviceNow()
+	if dev == nil {
 		log.Printf("wgSetConfig: tunnel %d has no WG device yet (call wgAttachWireGuard first)", id)
 		return -3
 	}
-
-	goSettings := C.GoString(settings)
-	if err := entry.device.IpcSet(goSettings); err != nil {
+	if err := dev.IpcSet(goSettings); err != nil {
 		log.Printf("wgSetConfig: %s", err)
 		return -2
 	}
@@ -735,23 +819,26 @@ func wgSetConfig(tunnelHandle C.int32_t, settings *C.char) C.int64_t {
 
 //export wgGetConfig
 func wgGetConfig(tunnelHandle C.int32_t) *C.char {
-	id := int32(tunnelHandle)
+	return C.CString(wgGetConfigImpl(int32(tunnelHandle)))
+}
+
+func wgGetConfigImpl(id int32) string {
 	tunnelsMu.Lock()
 	entry, ok := tunnels[id]
 	tunnelsMu.Unlock()
 
 	if !ok {
-		return C.CString("")
+		return ""
 	}
-	if entry.device == nil {
-		return C.CString("")
+	dev := entry.deviceNow()
+	if dev == nil {
+		return ""
 	}
-
-	settings, err := entry.device.IpcGet()
+	settings, err := dev.IpcGet()
 	if err != nil {
-		return C.CString("")
+		return ""
 	}
-	return C.CString(settings)
+	return settings
 }
 
 //export wgGetTURNServerIP
@@ -951,7 +1038,7 @@ func wgPathUp(tunnelHandle C.int32_t) {
 	tunnelsMu.Lock()
 	entry, ok := tunnels[id]
 	tunnelsMu.Unlock()
-	if !ok {
+	if !ok || entry.proxy == nil {
 		return
 	}
 	entry.proxy.OnPathUp()
@@ -1236,6 +1323,18 @@ var (
 	logChan     chan string
 )
 
+// logDir is the directory of the log file Swift set (the App Group), or ""
+// before it did — read under logFileMu, which wgSetLogFilePath writes under.
+func logDir() string {
+	logFileMu.Lock()
+	p := logFilePath
+	logFileMu.Unlock()
+	if p == "" {
+		return ""
+	}
+	return filepath.Dir(p)
+}
+
 func startLogWriter() {
 	logChan = make(chan string, 512)
 	go func() {
@@ -1367,8 +1466,8 @@ func (osLogWriter) Write(p []byte) (int, error) {
 	C.go_os_log(msg)
 	// Build timestamped line using local timezone (set via wgSetTimezoneOffset)
 	now := time.Now()
-	if goTZ != nil {
-		now = now.In(goTZ)
+	if tz := goTZ.Load(); tz != nil {
+		now = now.In(tz)
 	}
 	ts := now.Format("15:04:05.000000")
 	line := fmt.Sprintf("[Go] %s %s\n", ts, s)
@@ -1380,14 +1479,18 @@ func (osLogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// goTZ holds the local timezone offset set from Swift (iOS Go runtime lacks tzdata).
-var goTZ *time.Location
+// goTZ holds the local timezone offset set from Swift (iOS Go runtime lacks
+// tzdata). Written by wgSetTimezoneOffset on Swift's thread at every start and
+// read by every logging goroutine — atomic, like its neighbour logFilePath is
+// locked (the review of 2026-09-07).
+var goTZ atomic.Pointer[time.Location]
 
 //export wgSetTimezoneOffset
 func wgSetTimezoneOffset(offsetSeconds C.int) {
 	off := int(offsetSeconds)
-	goTZ = time.FixedZone(fmt.Sprintf("UTC%+d", off/3600), off)
-	log.Printf("timezone set to %s (offset %ds)", goTZ, off)
+	tz := time.FixedZone(fmt.Sprintf("UTC%+d", off/3600), off)
+	goTZ.Store(tz)
+	log.Printf("timezone set to %s (offset %ds)", tz, off)
 }
 
 func init() {
@@ -1526,8 +1629,6 @@ func wgSpeedtestServers() *C.char {
 	return C.CString(string(out))
 }
 
-//export wgSpeedtestFindServers
-//
 // Asks OOKLA for servers matching a query, instead of filtering the nearby list.
 // A query of digits is looked up by id; anything else is a keyword search.
 //
@@ -1535,6 +1636,8 @@ func wgSpeedtestServers() *C.char {
 // whom Ookla places on the wrong side of a sea never sees their own city's
 // server in it, however they spell the search. Same JSON shape as
 // wgSpeedtestServers, same {"error": ...} on failure.
+//
+//export wgSpeedtestFindServers
 func wgSpeedtestFindServers(query *C.char) *C.char {
 	list, err := speedtestpkg.FindServers(context.Background(), C.GoString(query))
 	if err != nil {

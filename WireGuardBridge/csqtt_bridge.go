@@ -411,15 +411,7 @@ func csqttNextIdentity(dir string) (uint64, string) {
 // csqttCacheDir is where the pool's cache and the generation live: the App
 // Group directory the log file is in, or nothing (no persistence) when
 // Swift has not set a log path.
-func csqttCacheDir() string {
-	logFileMu.Lock()
-	p := logFilePath
-	logFileMu.Unlock()
-	if p == "" {
-		return ""
-	}
-	return filepath.Dir(p)
-}
+func csqttCacheDir() string { return logDir() }
 
 // Starts a csqtt tunnel: the credential pool now, the client in a goroutine
 // (credentials, N allocations, GETCONF → TUNCONF). No TUN yet. Returns a

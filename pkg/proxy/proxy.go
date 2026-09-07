@@ -536,6 +536,7 @@ func NewProxy(cfg Config) *Proxy {
 	ctx, cancel := context.WithCancel(context.Background())
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	p := &Proxy{
+		linkID:            parseVKLinkID(cfg.VKLink), // fixed here, never in Start
 		config:            cfg,
 		ctx:               ctx,
 		cancel:            cancel,
@@ -665,16 +666,9 @@ func (p *Proxy) Start() error {
 	// causes ~1500 wakes/sec. Limiting to 2 threads keeps us well under.
 	runtime.GOMAXPROCS(2)
 
-	// Parse VK link ID
-	linkID := p.config.VKLink
-	if strings.Contains(linkID, "join/") {
-		parts := strings.Split(linkID, "join/")
-		linkID = parts[len(parts)-1]
-	}
-	if idx := strings.IndexAny(linkID, "/?#"); idx != -1 {
-		linkID = linkID[:idx]
-	}
-	p.linkID = linkID
+	// p.linkID is fixed in NewProxy (parseVKLinkID) and never written here:
+	// RefreshCaptchaURL reads it on Swift's thread with no ordering against
+	// this goroutine, so it must be immutable once the Proxy exists.
 
 	// Resolve peer address
 	peer, err := net.ResolveUDPAddr("udp", p.config.PeerAddr)

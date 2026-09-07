@@ -2989,6 +2989,20 @@ do {
           "the provider holds a TunnelBackend and starts/attaches/stops through it — else the scan above proves nothing")
     check(!provider.contains("tunnelHandle"),
           "🚨 a bare `tunnelHandle` is back in the provider — the number without its kind")
+    // 🚨 THE BACKEND IS READ FROM SEVERAL QUEUES (start, stop, wake, the path
+    //    monitor, app messages): its storage sits behind a lock, reached only
+    //    through the computed property — a plain stored property is the same
+    //    data race one layer above the Go one build 364 fixed.
+    check(provider.contains("private let backendLock = NSLock()") && provider.contains("private var _backend: TunnelBackend?"),
+          "🚨 the provider's backend must be a locked computed property over _backend")
+    let backendStores = provider.components(separatedBy: "_backend").count - 1
+    check(backendStores == 5,
+          "🚨 _backend is touched outside the property and clearBackend (\(backendStores) mentions, want the declaration + get + set + clearBackend's compare and clear)")
+    // 🚨 A failure branch clears ONLY the backend it owns (check-and-set under
+    //    the lock): a blind `self.backend = nil` after a stop would clear a
+    //    backend a later start installed.
+    check(!provider.contains("self.backend = nil") && provider.contains("private func clearBackend(_ owned: TunnelBackend)"),
+          "🚨 a blind `self.backend = nil` is back — every clear goes through clearBackend(owned)")
     // 🚨 THE PATH-UP HOOK FIRES ONLY ON A SATISFIED REAL INTERFACE, right after
     //    pathChanged. On an unsatisfied event there is no path to rebuild the
     //    sessions on; on iface=other the transition branch runs instead. Without

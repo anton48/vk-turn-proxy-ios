@@ -48,6 +48,7 @@ int32_t wgWaitBootstrapReady(int32_t tunnelHandle, int32_t timeoutMs);
 ///   -4: failed to create TUN device
 ///   -5: failed to apply WireGuard config
 ///   -6: failed to bring up device
+///   -7: the tunnel was stopped during the attach (the device built here is closed here)
 int32_t wgAttachWireGuard(int32_t tunnelHandle, const char *wgConfigSettings, int32_t tunFd);
 
 /// Stop a tunnel. Accepts handles from either wgTurnOnWithTURN or
