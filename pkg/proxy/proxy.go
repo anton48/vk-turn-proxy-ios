@@ -898,32 +898,59 @@ func (p *Proxy) growCredPool(ctx context.Context) {
 	}
 }
 
-// The connection ramp, at package scope so anything that has to WAIT for the
+// The connection start, at package scope so anything that has to WAIT for the
 // pool computes the wait from the same numbers that create it.
 //
 // 🚨 These were local constants inside startConnections until 2026-08-10, and
 // the synthetic uplink duly picked its 90-second timeout by eyeballing the
-// code — while a 30-conn ramp takes 106.8 s BY CONSTRUCTION. It gave up 17
-// seconds short of a full pool and cost a device run. Anything with a deadline
-// against this ramp must call expectedRampTime; never guess it.
-const (
-	rampBurstSize    = 10
-	rampBurstStagger = 200 * time.Millisecond
-	rampSlowStagger  = 5 * time.Second
-)
+// code — while the 30-conn ramp of that day took 106.8 s BY CONSTRUCTION. It
+// gave up 17 seconds short of a full pool and cost a device run. Anything
+// with a deadline against the start must call expectedRampTime; never guess
+// it.
+//
+// connStartStagger is the whole ramp: conn 0 is the bootstrap, every other
+// connection launches at a random point within this window after it — the
+// shape the path-change restart has used since build 360 (thirty re-dials
+// within a second; 30/30 in 1.3–2.6 s, no 486 across four switches, §57).
+//
+// 🚫 Until 2026-09-07 the start was bi-modal — ten at 200 ms, then one every
+// 5 s, 1m46.8s to thirty — from commit d2a1a6a (2026-04-28), which read an
+// April log (conns 10–15 hitting 486 on ONE credential) as a token bucket
+// refilling one allocation per 20–30 s and paced the rest to that refill.
+// The measurement of 2026-06-28 (tools/turn_quota_test) replaced the model:
+// VK caps SIMULTANEOUS allocations at ~10 per (identity, relay), nothing
+// refills, and the pool hands every ten connections their own identity
+// (connIdx/10 → slot). The 5 s then paced nothing: the grower and Phase 2 mint slots
+// 1 and 2 within seconds of the bootstrap regardless, so the ramp only delayed
+// the USE of credentials that already existed (build 368 on a warm cache:
+// conn 29 on cred 5, on disk from the start, established at +102 s). Mint
+// pacing — the cold-start cap, the grower's cadence, the captcha — stays
+// where it lives, in the pool; a connection that finds no slot parks there.
+const connStartStagger = time.Second
+
+// connStartDelay is when connection i launches, measured from the bootstrap:
+// conn 0 at once, every other one at a random point within connStartStagger.
+func connStartDelay(connIdx int) time.Duration {
+	if connIdx <= 0 {
+		return 0
+	}
+	return restartStagger()
+}
+
+// restartStagger is the sub-second spread that keeps thirty dials from
+// landing in one instant — the start and the path-change re-dial share it.
+func restartStagger() time.Duration {
+	return time.Duration(mathrand.Int63n(int64(connStartStagger)))
+}
 
 // expectedRampTime is when the LAST connection of an n-connection pool is
-// launched, measured from startConnections. Establishment takes longer still,
-// so callers add their own slack. n=30 → 1m46.8s; n=60 → 4m16.8s.
+// launched at the latest, measured from startConnections. Establishment takes
+// longer still, so callers add their own slack. n ≥ 2 → connStartStagger.
 func expectedRampTime(n int) time.Duration {
-	if n <= rampBurstSize {
-		if n <= 1 {
-			return 0
-		}
-		return time.Duration(n-1) * rampBurstStagger
+	if n <= 1 {
+		return 0
 	}
-	return time.Duration(rampBurstSize-1)*rampBurstStagger +
-		time.Duration(n-rampBurstSize)*rampSlowStagger
+	return connStartStagger
 }
 
 // startConnections launches all connection goroutines using the current session context.
@@ -1123,37 +1150,18 @@ func (p *Proxy) startConnections() error {
 		return fmt.Errorf("first connection failed: %w", err)
 	}
 
-	// Bi-modal stagger: first burstSize conns launch 200ms apart to use
-	// VK's initial allocation token bucket (~10 tokens immediately
-	// available); the rest wait slowStagger between each to fit the
-	// observed refill rate (~1 token / 20-30s).
-	//
-	// Empirically (vpn.wifi.18.log starting 20:16:55, NumConns=16): the
-	// first 10 allocations succeeded in 2 seconds (200ms*9 stagger);
-	// then conns 10-15 spent ~38s burning 15s DTLS handshake timeouts
-	// against an empty bucket before any of them succeeded — pure waste
-	// because they were retrying immediately on 486 instead of waiting
-	// for a refill. With slowStagger=5s, conn 10 starts at ~7s (after
-	// the burst window), which is close to when the next bucket token
-	// becomes available; subsequent conns continue at 5s intervals.
-	//
-	// For NumConns ≤ burstSize, the slow branch is never taken and
-	// behaviour matches the previous linear stagger (200ms × i).
+	// Every other connection launches within connStartStagger of the
+	// bootstrap — the path-change restart's shape (see the constant for the
+	// bi-modal ramp this replaced and why it paced nothing). Credentials come
+	// from the pool at each conn's own pace: ten per identity, the cold-start
+	// cap and the grower for the mints, a park on the slot-available signal
+	// when none is ready yet.
 	for i := 1; i < p.config.NumConns; i++ {
 		p.wg.Add(1)
 		connIdx := i
 		go func() {
 			defer p.wg.Done()
-			var delay time.Duration
-			if connIdx < rampBurstSize {
-				delay = time.Duration(connIdx) * rampBurstStagger
-			} else {
-				// Burst phase ends at (burstSize-1)*burstStagger after t=0.
-				// Then each subsequent conn launches slowStagger after
-				// the previous one.
-				delay = time.Duration(rampBurstSize-1)*rampBurstStagger +
-					time.Duration(connIdx-rampBurstSize+1)*rampSlowStagger
-			}
+			delay := connStartDelay(connIdx)
 			select {
 			case <-time.After(delay):
 			case <-sessCtx.Done():
@@ -2096,7 +2104,7 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				connIdx, time.Since(start).Round(time.Second))
 			shortFailures = 0
 			select {
-			case <-time.After(time.Duration(mathrand.Intn(1000)) * time.Millisecond):
+			case <-time.After(restartStagger()):
 			case <-sessCtx.Done():
 				return sessCtx.Err()
 			case <-p.ctx.Done():
@@ -2229,9 +2237,12 @@ func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *T
 }
 
 // fetchFreshCreds is the pool's underlying VK fetcher. It wraps GetVKCreds
-// with captcha-token bookkeeping and TURN host:port parsing. Serialized
-// under credPool.mu, so only one fetch runs at a time — VK rate limiting
-// makes real parallelism pointless anyway.
+// with captcha-token bookkeeping and TURN host:port parsing. NOT serialized:
+// get() and tryFill release the pool's lock before they fetch, so mints run
+// concurrently up to the cold-start cap (ready + in-flight < ceil(size/4):
+// three at N=30, six at N=60) — and since the sub-second start of
+// 2026-09-07 two conn-driven mints beside the grower's are the normal
+// cold-cache shape, not a race.
 func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURNCreds, error) {
 	var creds *TURNCreds
 
@@ -4040,8 +4051,8 @@ var memstatsFastTicks atomic.Bool
 // SetMemstatsFastTicks turns the forced 1 s cadence on or off. Safe at any time:
 // the loop re-reads it every tick, so switching it on mid-session costs at worst
 // one 10 s tick of latency and never a reconnect — which matters, because a
-// reconnect re-ramps 30 connections over ~107 s and would destroy the very
-// session being measured.
+// reconnect tears down the thirty sessions and with them the very session
+// being measured.
 func SetMemstatsFastTicks(on bool) { memstatsFastTicks.Store(on) }
 
 // memstatsCadence picks the tick interval, and is the ONLY thing that does.

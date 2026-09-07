@@ -70,11 +70,13 @@ const (
 	// 🚨 HOW LONG TO WAIT FOR THE POOL, AND WHY IT IS NOT A NUMBER.
 	//
 	// The first version of this file used a flat 90 s, picked by eyeballing the
-	// code. A 30-connection ramp takes **106.8 s by construction** — 200 ms
-	// apart for the first ten, then 5 s apart for the rest — so the generator
+	// code. The 30-connection ramp of that day took **106.8 s by construction** —
+	// 200 ms apart for the first ten, then 5 s apart for the rest — so the generator
 	// gave up 17 seconds before the pool completed, logged a refusal, and cost
-	// a device run. The device's own HEARTBEAT shows the ramp exactly: one more
-	// conn every 5 s, 30 up at t+1m47s.
+	// a device run. The device's own HEARTBEAT showed that ramp exactly: one
+	// more conn every 5 s, 30 up at t+1m47s. (Since 2026-09-07 the start is
+	// one connStartStagger wide and this slack is most of the budget; the
+	// rule stands.)
 	//
 	// So the wait is DERIVED from the same constants that build the ramp, via
 	// expectedRampTime, plus slack for establishment. Never hardcode it again.

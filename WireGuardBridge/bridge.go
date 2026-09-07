@@ -227,7 +227,7 @@ type ProxyConfig struct {
 	// logs collected on 2026-08-11, one had 1 s ticks over the burst being
 	// measured, one had them over the dead gap between runs, and one had none.
 	// Carried here so it survives a reconnect; wgSetMemstatsFastTicks below is
-	// the live path, because turning it on must not cost a 107 s connection ramp.
+	// the live path, because turning it on must not cost a re-dial of the thirty sessions.
 	MemstatsFastTicks bool `json:"memstats_fast_ticks,omitempty"`
 
 	// UplinkSynthMbit / UplinkSynthSec drive the paced synthetic uplink in
@@ -1158,8 +1158,8 @@ func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 // 🚨 THE LIVE PATH IS THE POINT. The same value also rides ProxyConfig, which
 // would be enough if the switch were only ever set before connecting — but the
 // case that matters is deciding mid-session that the next few minutes are worth
-// recording at 1 s, and applying it through a reconnect would re-ramp 30
-// connections over ~107 s and measure the ramp instead of the thing.
+// recording at 1 s, and applying it through a reconnect would tear down the
+// thirty sessions and measure the restart instead of the thing.
 //
 // The extension is the only process that runs logMemStatsLoop, so unlike
 // wgSetForceLegacyCaptcha this needs no companion call in the main app.
@@ -1175,8 +1175,8 @@ func wgSetMemstatsFastTicks(enabled C.int32_t) {
 // 🚨 SAME REASON AS wgSetMemstatsFastTicks ABOVE: the value already rides
 // ProxyConfig, which covers "set it, then connect". This covers the case the
 // switch is actually for — flipping it on a live tunnel — where a reconnect
-// would re-ramp 30 connections over ~107 s and hand the user a stall as the
-// price of a setting. Verified live on device across seven toggles.
+// would tear down and re-dial the thirty sessions and hand the user a stall
+// as the price of a setting. Verified live on device across seven toggles.
 //
 //export wgSetUplinkPace
 func wgSetUplinkPace(kib C.int32_t, burstKiB C.int32_t) {

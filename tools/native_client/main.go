@@ -64,7 +64,7 @@ func main() {
 	routes := flag.String("route", "", "comma-separated hosts to route through the tunnel (IPs or names, resolved once)")
 	defaultRoute := flag.Bool("default-route", false, "send the DEFAULT route through the tunnel once every connection is up; the relay host, -keep-hosts and $SSH_CLIENT are pinned to the old gateway and everything is restored on exit")
 	keepHosts := flag.String("keep-hosts", "", "-default-route: comma-separated IPs that must stay on the old gateway (your SSH source, a direct-control target)")
-	defaultRouteWait := flag.Duration("default-route-wait", 3*time.Minute, "-default-route: how long to wait for ALL connections before switching anyway (the app's credential pool grows 30 connections in ~2 min from a cold start)")
+	defaultRouteWait := flag.Duration("default-route-wait", 3*time.Minute, "-default-route: how long to wait for ALL connections before switching anyway (every connection launches within a second of the bootstrap since 2026-09-07; a cold cache adds its mints — 3 min is a generous upper bound)")
 	duration := flag.Duration("duration", 0, "stop after this long (0 = until Ctrl-C)")
 	statsEvery := flag.Duration("stats-every", 10*time.Second, "stats line interval")
 	bootstrapTimeout := flag.Duration("bootstrap-timeout", 90*time.Second, "how long to wait for the first connection")
