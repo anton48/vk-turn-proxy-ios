@@ -2530,19 +2530,30 @@ func (cp *credPool) ExtendPauseAcquireForTransition(d time.Duration) {
 // Respects cooldown (skip) and in-flight fetches (skip). Like get(), it
 // does NOT hold mu across the VK fetch.
 //
-// abortIfAvailableGTE (0 = disabled, >0 = enabled): if at any of the two
-// checkpoints — pre-fetch (saves PoW time) or post-fetch (catches races
-// during PoW) — cp.countAvailableLocked() returns >= this value, the fill
-// is aborted. Pre-fetch abort releases the slot's `fetching` flag and
-// returns false (no VK call made). Post-fetch abort discards already-
-// fetched creds AND releases the flag.
+// abortIfAvailableGTE (0 = disabled, >0 = enabled): checked ONCE, before the
+// fetch — if cp.countAvailableLocked() is already >= this value the fill is
+// skipped (no VK call made, `fetching` never set) and false is returned. Used
+// by the grower during cold start so it does not START a mint the conn-driven
+// fetches in get() have made redundant.
 //
-// Used by the grower to bail when conn-driven fetches in get() race ahead
-// and push the pool past the cold-start target during our 5-10s PoW wait.
-// Without this, the grower systematically over-shoots cold-start by 1
-// (observed vpn.wifi.5.log + wifi.6.log: pool 0 → 4 instead of 0 → 3 for
-// NumConns=30 because conn 10 fetched slot 2 while grower was mid-PoW
-// on slot 3).
+// 🚨 A FETCH THAT WAS STARTED IS ALWAYS KEPT (2026-09-07). Until then a second
+// checkpoint sat after the fetch and DISCARDED the credential when the
+// conn-driven mints had reached the target during the grower's PoW window
+// (0256116, 2026-05-14: "systematically over-shoots cold-start by 1",
+// vpn.wifi.5/6.log). What that bought was only the maintenance stagger of ONE
+// slot's expiry (2–5 min against a lifetime of hours): a credential sitting
+// in a slot with active=0 makes no allocations, and conns fill compactly, so
+// a fourth slot draws nobody while three have seats — the 486 cascade the
+// cold-start cap in get() guards against is not this. What it cost, measured
+// on 2026-09-07 with the sub-second start (the conn-driven mints are now the
+// fast ones and the grower's the slow one, so the race is the NORMAL cold
+// start, decided by a coin): a paid captcha solve and VK identity thrown
+// away, `maintenance fill skipped/failed` logged about a SUCCESS, and the
+// pool left at 3/12 for the 120–300 s maintenance interval (vpn.srtp.lte.2.log
+// 23:10:30 → slot 3 only at 23:13:56; the Wi-Fi phone kept its grower's cred
+// because it landed third). So after a cold start the pool may read 4/12
+// where it used to read 3/12 — in exactly that race, and maintenance goes on
+// from four.
 func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGTE int) bool {
 	cp.mu.Lock()
 	if slot < 0 || slot >= cp.size {
@@ -2583,14 +2594,9 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 	cp.mu.Lock()
 	cp.pool[slot].fetching = false
 	if err == nil {
-		// Post-fetch abort check (catches races during our 5-10s PoW
-		// window). Discards fetched creds — they go to waste this round
-		// but that's far cheaper than continuing to systematically
-		// over-shoot the cold-start target by 1.
-		if abortIfAvailableGTE > 0 && cp.countAvailableLocked() >= abortIfAvailableGTE {
-			cp.mu.Unlock()
-			return false
-		}
+		// No second checkpoint here: the fetch happened, the credential is
+		// paid for, it goes into the slot whatever the count is now (see the
+		// doc comment — the discard this replaced cost more than it saved).
 		cp.pool[slot] = credPoolEntry{addr: addr, creds: creds, ts: time.Now()}
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()

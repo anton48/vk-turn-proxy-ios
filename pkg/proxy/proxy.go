@@ -862,11 +862,11 @@ func (p *Proxy) growCredPool(ctx context.Context) {
 			}
 		}
 
-		// abortIfAvailableGTE: only enabled during cold-start. Catches
-		// the race where a conn-driven fetch in get() completes during
-		// THIS tryFill's 5-10s PoW window. If by post-fetch check available
-		// >= coldStartSlots, tryFill discards the fetched creds rather
-		// than committing them (which would over-shoot the target by 1).
+		// abortIfAvailableGTE: only enabled during cold-start, and checked by
+		// tryFill BEFORE the fetch alone — a mint that conn-driven fetches in
+		// get() have already made redundant is not started. A mint that WAS
+		// started is kept even when the target is met while it runs (the
+		// post-fetch discard was removed 2026-09-07; tryFill's doc says why).
 		// Disabled (0) in maintenance mode because there's no target to
 		// guard against — every maintenance fill is intended to add one.
 		abortGuard := 0
