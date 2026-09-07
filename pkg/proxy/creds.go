@@ -2087,19 +2087,20 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		cp.pool[target].fetching = false
 	}
 	if fetchErr == nil {
-		got := target
+		got, why := target, ""
 		if owns {
 			// Replacing an empty/stale slot — active was 0, now 1 (us).
 			cp.pool[target] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: 1, gen: gen}
 		} else {
-			got = cp.placeIntoEmptySlotLocked(addr, creds, 1)
+			got, why = cp.placeIntoEmptySlotLocked(addr, creds, 1)
 		}
 		if got < 0 {
-			// Nowhere to keep it: fall through to the failure path with an
-			// error of our own — it puts no cooldown on a slot that is not ours
-			// and looks for a seat in the pool as after any failed fetch.
-			log.Printf("credpool: conn %d: slot %d changed hands during the fetch and no slot is empty — fetched cred dropped", connIdx, target)
-			fetchErr = fmt.Errorf("credpool: slot %d changed hands during the fetch, no empty slot for the fetched cred", target)
+			// Not kept: fall through to the failure path with an error of our
+			// own — it puts no cooldown on a slot that is not ours and looks
+			// for a seat in the pool as after any failed fetch (in cookie mode
+			// that seat is the refilled slot itself, when it has one free).
+			log.Printf("credpool: conn %d: slot %d changed hands during the fetch — fetched cred dropped (%s)", connIdx, target, why)
+			fetchErr = fmt.Errorf("credpool: slot %d changed hands during the fetch, fetched cred dropped (%s)", target, why)
 		} else {
 			filled := cp.countFreshLocked()
 			cp.mu.Unlock()
@@ -2647,11 +2648,11 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 			log.Printf("credpool: background fill slot %d failed (%v) after the slot changed hands — nothing recorded", slot, err)
 			return false
 		}
-		placed := cp.placeIntoEmptySlotLocked(addr, creds, 0)
+		placed, why := cp.placeIntoEmptySlotLocked(addr, creds, 0)
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()
 		if placed < 0 {
-			log.Printf("credpool: slot %d changed hands during the background fetch and no slot is empty — fetched cred dropped", slot)
+			log.Printf("credpool: slot %d changed hands during the background fetch — fetched cred dropped (%s)", slot, why)
 			return false
 		}
 		log.Printf("credpool: slot %d changed hands during the background fetch — fetched cred placed into slot %d (%d/%d slots filled)", slot, placed, filled, cp.size)
@@ -2709,21 +2710,49 @@ func (cp *credPool) ownsLocked(slot int, gen uint64) bool {
 
 // placeIntoEmptySlotLocked stores a credential whose original slot changed
 // hands during its fetch into the first slot nobody holds (no credential, no
-// fetch in flight) and returns that index, or -1 when the pool has none — the
-// credential is then dropped, which costs one VK solve and nothing else. The
-// entry gets its own fresh stamp. Caller holds cp.mu.
-func (cp *credPool) placeIntoEmptySlotLocked(addr string, creds *TURNCreds, active int) int {
+// fetch in flight) and returns that index — or -1 and the reason when it must
+// not be kept, in which case the credential is dropped (one VK solve, nothing
+// else). The entry gets its own fresh stamp. Caller holds cp.mu.
+//
+// 🚨 TWO REFUSALS (user's review, 2026-09-08 — reproduced 3/3: after ten
+// leases on relay A the pool allowed an eleventh):
+//
+//  1. Cookie (VKAuth) mode: a slot IS a (call, relay) bucket — fetchFreshCreds
+//     → cookieCredForSlot(slot) returns the SAME credential for the same slot
+//     every time. After a reset the new fetch refills slot 0 with relay A's
+//     credential; the late fetch returns that very credential and, moved into
+//     the free slot 1 meant for relay B, would let the pool hand out ten more
+//     allocations on A (VK's quota is per (identity, relay)) while counting
+//     slot 1 as filled with B unused — 486s and an incomplete recovery. In
+//     cookie mode a credential lives in its own slot or nowhere.
+//  2. Any mode: a credential whose Username is already in the pool is a
+//     duplicate of that slot (Username identifies the cred set — seedSlot's
+//     dedup rule) and must not become a second copy of one quota.
+//
+// Anonymous credentials are unique per fetch, so relocation stays the normal
+// outcome for them.
+func (cp *credPool) placeIntoEmptySlotLocked(addr string, creds *TURNCreds, active int) (int, string) {
+	if cookieAuthEnabled.Load() {
+		return -1, "cookie mode: the credential is bound to its own slot's relay"
+	}
 	for len(cp.pool) < cp.size {
 		cp.pool = append(cp.pool, credPoolEntry{})
+	}
+	if creds != nil {
+		for i := range cp.pool {
+			if cp.pool[i].creds != nil && cp.pool[i].creds.Username == creds.Username {
+				return -1, fmt.Sprintf("duplicate of the credential already in slot %d", i)
+			}
+		}
 	}
 	for i := range cp.pool {
 		if cp.pool[i].creds == nil && !cp.pool[i].fetching {
 			cp.nextGen++
 			cp.pool[i] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: active, gen: cp.nextGen}
-			return i
+			return i, ""
 		}
 	}
-	return -1
+	return -1, "no slot is empty"
 }
 
 // pickSlotToFill returns the index of a slot that is eligible for the

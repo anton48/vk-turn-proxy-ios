@@ -242,3 +242,129 @@ func TestUninterruptedFetchPublishesIntoItsOwnSlot(t *testing.T) {
 		t.Fatalf("get: slot %d err %v", slot, err)
 	}
 }
+
+// Cookie (VKAuth) mode: a slot is one (call, relay) bucket and the fetcher
+// returns the SAME credential for the same slot. A late fetch for slot 0
+// returns relay A's credential, which the new fetch has already put back into
+// slot 0 with ten seats — it must NOT be moved into the free slot 1 (relay
+// B's): that would be an eleventh allocation on A and a filled-looking slot 1
+// with B unused (user's review, reproduced 3/3 on 376). Sabotage seen red:
+// the cookie-mode refusal removed — the copy lands in slot 1.
+func TestLateFetchInCookieModeIsNotRelocated(t *testing.T) {
+	cookieAuthEnabled.Store(true)
+	t.Cleanup(func() { cookieAuthEnabled.Store(false) })
+	credA := lateCreds("cookie-A")
+	l := newLateFetchPool(t)
+	// The cookie fetcher: slot 0 always answers relay A's credential.
+	l.cp.mu.Lock()
+	l.cp.fetch = func(_ bool, slot int) (string, *TURNCreds, error) {
+		l.seen.Add(1)
+		<-l.gate
+		if slot == 0 {
+			return lateRelay, credA, nil
+		}
+		return lateRelay, lateCreds(fmt.Sprintf("cookie-%d", slot)), nil
+	}
+	l.cp.mu.Unlock()
+
+	// The grower's late fetch for slot 0.
+	done := make(chan bool, 1)
+	go func() { done <- l.cp.tryFill(0, false, 0) }()
+	l.waitFetching(t, 0)
+	l.cp.invalidate()
+	l.cp.mu.Lock()
+	l.cp.pool[0] = credPoolEntry{addr: lateRelay, creds: credA, ts: time.Now(), active: 10}
+	l.cp.mu.Unlock()
+	close(l.gate)
+	if ok := <-done; ok {
+		t.Fatal("tryFill answered true although relay A's credential was already in slot 0")
+	}
+	if got := l.slotsNamed("cookie-A"); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("relay A's credential sits in slots %v, want slot 0 alone", got)
+	}
+	if e := l.entry(0); e.active != 10 {
+		t.Fatalf("slot 0 active = %d, want 10", e.active)
+	}
+
+	// A connection's own late fetch for slot 0 while A is full: no eleventh
+	// seat on A anywhere — the conn is told to retry.
+	l2 := newLateFetchPool(t)
+	l2.cp.mu.Lock()
+	l2.cp.fetch = func(_ bool, slot int) (string, *TURNCreds, error) { <-l2.gate; return lateRelay, credA, nil }
+	l2.cp.mu.Unlock()
+	type result struct {
+		slot int
+		err  error
+	}
+	res := make(chan result, 1)
+	go func() { _, _, slot, err := l2.cp.get(5, false); res <- result{slot, err} }()
+	l2.waitFetching(t, 0)
+	l2.cp.invalidate()
+	l2.cp.mu.Lock()
+	l2.cp.pool[0] = credPoolEntry{addr: lateRelay, creds: credA, ts: time.Now(), active: 10}
+	l2.cp.mu.Unlock()
+	close(l2.gate)
+	r := <-res
+	if r.err == nil || r.slot != -1 {
+		t.Fatalf("get: slot %d err %v — want a retry error, not an eleventh seat on relay A", r.slot, r.err)
+	}
+	if got := l2.slotsNamed("cookie-A"); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("relay A's credential sits in slots %v, want slot 0 alone", got)
+	}
+	if e := l2.entry(0); e.active != 10 || !e.cooldownUntil.IsZero() {
+		t.Fatalf("slot 0: active=%d cooldown=%v — want the ten seats untouched and no cooldown", e.active, e.cooldownUntil)
+	}
+
+	// The window the Username check cannot see: after the reset a NEW fetch
+	// for slot 0 is in flight (fetching, no credential yet) when the late one
+	// returns relay A's credential. Nothing in the pool matches it, yet it
+	// must not move into slot 1 — the new fetch is about to put the same
+	// credential into slot 0. This is the case the cookie-mode refusal exists
+	// for (the sabotage that removes only that refusal is red here alone).
+	l3 := newLateFetchPool(t)
+	l3.cp.mu.Lock()
+	l3.cp.fetch = func(_ bool, slot int) (string, *TURNCreds, error) { <-l3.gate; return lateRelay, credA, nil }
+	l3.cp.mu.Unlock()
+	done3 := make(chan bool, 1)
+	go func() { done3 <- l3.cp.tryFill(0, false, 0) }()
+	l3.waitFetching(t, 0)
+	l3.cp.invalidate()
+	l3.cp.mu.Lock()
+	l3.cp.claimForFetchLocked(0) // the new fetch for relay A has started
+	l3.cp.mu.Unlock()
+	close(l3.gate)
+	if ok := <-done3; ok {
+		t.Fatal("tryFill answered true with relay A's credential moved out of its slot")
+	}
+	if got := l3.slotsNamed("cookie-A"); len(got) != 0 {
+		t.Fatalf("relay A's credential was placed into slots %v while its own slot's fetch was in flight", got)
+	}
+	if e := l3.entry(0); !e.fetching || e.creds != nil {
+		t.Fatalf("slot 0 (the new fetch's claim) was touched: fetching=%v creds=%v", e.fetching, e.creds)
+	}
+}
+
+// Anonymous mode: a late credential whose Username is already in the pool is
+// the same cred set and must not become a second copy of one quota, even with
+// empty slots around. Sabotage seen red: the duplicate check removed.
+func TestLateDuplicateCredentialIsNotRelocated(t *testing.T) {
+	same := lateCreds("same-set")
+	l := newLateFetchPool(t)
+	l.cp.mu.Lock()
+	l.cp.fetch = func(_ bool, slot int) (string, *TURNCreds, error) { <-l.gate; return lateRelay, same, nil }
+	l.cp.mu.Unlock()
+	done := make(chan bool, 1)
+	go func() { done <- l.cp.tryFill(3, false, 0) }()
+	l.waitFetching(t, 3)
+	l.cp.invalidate()
+	l.cp.mu.Lock()
+	l.cp.pool[3] = credPoolEntry{addr: lateRelay, creds: same, ts: time.Now(), active: 10}
+	l.cp.mu.Unlock()
+	close(l.gate)
+	if ok := <-done; ok {
+		t.Fatal("tryFill answered true for a duplicate credential")
+	}
+	if got := l.slotsNamed("same-set"); len(got) != 1 || got[0] != 3 {
+		t.Fatalf("the credential sits in slots %v, want slot 3 alone", got)
+	}
+}
