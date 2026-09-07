@@ -1075,6 +1075,27 @@ const pauseAcquireAfterPathEvent = 500 * time.Millisecond
 //   500ms ≤ gap < 90s           → CASCADE detected, set pause to 30s
 //   gap ≥ 90s                  → isolated event, normal pause (500ms)
 //
+// 🚨 ARMING (2026-09-07): lastPathEventAt is recorded only by an event that
+// found LIVE sessions (a slot with active > 0) or that itself detected a
+// cascade, or that is the sub-500 ms follow-up of an armed event (an iOS
+// burst's stamp keeps moving with its last event, as it always did — csqtt
+// releases every lease within ms of the kick, so its follow-ups find
+// nothing live) — never by a FIRST event on an idle pool. The tunnel's own
+// start is such an event: NWPathMonitor's initial "satisfied" report is
+// forwarded to Go only if Swift's backend already exists, a race the user
+// cannot see (measured on builds 355–369: the report is processed +1–4 ms
+// after startTunnel on a cellular start and +15–27 ms on Wi-Fi, the
+// backend exists at +8–95 ms — it reached Go in 1 of 22 starts, 1 of 4 on
+// Wi-Fi, 0 of 18 on cellular), 1.5 s before conn 0 takes its seat, with
+// nothing to protect. Recorded, it made the FIRST real switch 0.5–90 s
+// after Connect read as a cascade: 07.09 run B paid the full 30 s (89
+// parks, 39 dormancies, 30/30 only 31.5 s after the event) where run A,
+// whose report lost the race, paid 500 ms. A chain of real flaps still
+// re-arms through the cascade branch even when every conn is parked and no
+// slot is live. Accepted trade: a chain whose FIRST event lands on a pool
+// that an outage of ≥ 90 s emptied is caught one event later (one extra
+// 3-slot set) — unobserved in the archive.
+//
 // 90s window comfortably covers observed real cascades with margin (typical
 // gap 25-60s). 30s pause covers the time conns would otherwise redistribute
 // onto fresh slots between events. After 30s of "no path event" we assume
@@ -1184,11 +1205,14 @@ type credPool struct {
 	pauseAcquireTimer *time.Timer
 
 	// lastPathEventAt is the timestamp of the most recent
-	// MarkInUseSlotsForPathChange invocation. Used for adaptive cascade
-	// detection: if a new path event fires within cascadeDetectionWindow
-	// of this timestamp (and not within iOS dual-event range), we extend
-	// pauseAcquireUntil by cascadePauseDuration instead of the default
-	// 500ms — see cascadeDetectionWindow comment.
+	// MarkInUseSlotsForPathChange invocation that had live sessions to
+	// protect or detected a cascade — NOT of every invocation (the
+	// tunnel's own start reports a path with nothing live). Used for
+	// adaptive cascade detection: if a new path event fires within
+	// cascadeDetectionWindow of this timestamp (and not within iOS
+	// dual-event range), we extend pauseAcquireUntil by
+	// cascadePauseDuration instead of the default 500ms — see the
+	// cascadeDetectionWindow comment.
 	lastPathEventAt time.Time
 
 	// fetch is the underlying credential fetcher. It must do all the work
@@ -2300,8 +2324,16 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 	// (subsequent "skipping slot 4 (VK-saturated)" lines confirm) — only
 	// the marking log itself was lost.
 	markedSlots := make([]int, 0, cp.size)
+	// live: some slot has sessions on it right now — this event has something
+	// to protect and counts for cascade detection. Read BEFORE the skips
+	// below: a slot already saturated by the previous event of an iOS triple
+	// still carries its sessions until the restart cancels them.
+	live := false
 	for slot := 0; slot < cp.size && slot < len(cp.pool); slot++ {
 		e := cp.pool[slot]
+		if e.active > 0 {
+			live = true
+		}
 		// Skip already-saturated (re-marking is no-op but spams logs)
 		if !e.saturatedUntil.IsZero() && e.saturatedUntil.After(now) {
 			continue
@@ -2370,14 +2402,26 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 	// Adaptive pause-acquire selection. See cascadeDetectionWindow comment
 	// for the full rationale.
 	pauseDur := pauseAcquireAfterPathEvent // default 500ms
+	cascade, dual := false, false
 	if !cp.lastPathEventAt.IsZero() {
 		gap := now.Sub(cp.lastPathEventAt)
-		if gap >= pauseAcquireAfterPathEvent && gap < cascadeDetectionWindow {
+		switch {
+		case gap < pauseAcquireAfterPathEvent:
+			// iOS dual-event: a follow-up of the armed event. The burst's
+			// stamp moves with it, so the burst is measured from its LAST
+			// event — as before the arming gate. The native transport holds
+			// every seat through a burst (the restart fires 1 s after the
+			// last path-up), csqtt releases every lease within ms of the
+			// kick and its follow-ups find nothing live: without this the
+			// third event of a ≥ 500 ms burst would read as a cascade there.
+			dual = true
+		case gap < cascadeDetectionWindow:
 			// Cascade detected — previous event was 500ms-90s ago,
 			// not iOS dual-event (< 500ms) and not isolated (≥ 90s).
 			// Extend pause to block conn redistribution until network
 			// stabilises.
 			pauseDur = cascadePauseDuration
+			cascade = true
 			log.Printf("credpool: path-change cascade detected (gap %v from prev event) — extending pause to %v",
 				gap.Round(time.Millisecond), cascadePauseDuration)
 		}
@@ -2387,7 +2431,19 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 		cp.pauseAcquireUntil = deadline
 		cp.armPauseAcquireBroadcastLocked()
 	}
-	cp.lastPathEventAt = now
+	// Arm the detector only from an event that had something to protect,
+	// that continued a chain, or that followed an armed event within the
+	// dual-event range — see the ARMING note on cascadeDetectionWindow. A
+	// first event on an idle pool (the tunnel's own start report; the first
+	// event after a long outage killed every session) records nothing, so the
+	// next real switch is judged on its own. 🚫 Not `len(markedSlots) > 0`: a
+	// start on a warm cache marks disk-loaded "active-recent" slots with
+	// active 0 and would arm exactly as before.
+	if live || cascade || dual {
+		cp.lastPathEventAt = now
+	} else {
+		log.Printf("credpool: path event with nothing live — not counted for cascade detection")
+	}
 }
 
 // armPauseAcquireBroadcastLocked (re)schedules a one-shot broadcast on
