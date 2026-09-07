@@ -7,6 +7,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -124,5 +125,55 @@ func TestRestartSessionsOlderThanSparesTheNewOnes(t *testing.T) {
 	p.restartSessionsOlderThan(1, "test again")
 	if oldCancelled != 1 {
 		t.Fatal("a session that already ended was cancelled again")
+	}
+}
+
+// The tunnel's own start report can reach OnPathUp before any session exists
+// (the seeded path: 1.5 s before conn 0; the unseeded path: while conn 0's
+// bootstrap handshake is in flight). Before the first established session a
+// path-up rotates the hello and arms NO restart — an unseeded bootstrap must
+// not lose its attempt to its own start's report. After the first session,
+// path-ups restart as before.
+//
+// Sabotage seen red: the gate dropped from OnPathUp (a restart timer armed and
+// the epoch bumped on a proxy that never had a session).
+func TestPathUpBeforeTheFirstSessionArmsNoRestart(t *testing.T) {
+	p := &Proxy{bootstrapDoneCh: make(chan error, 1)}
+	p.initGroupHello(Config{})
+	fa := &fakeAfter{}
+	p.pathRestart.after = fa.after
+	p.pathRestart.fire = func(int64) {}
+	armed := func() int {
+		fa.mu.Lock()
+		defer fa.mu.Unlock()
+		return len(fa.armed)
+	}
+
+	before := append([]byte(nil), p.groupHelloBytes()...)
+	p.OnPathUp()
+	if bytes.Equal(before, p.groupHelloBytes()) {
+		t.Fatal("the start's path-up did not rotate the hello — the bootstrap must announce a fresh id")
+	}
+	if n := armed(); n != 0 {
+		t.Fatalf("%d restart timer(s) armed before any session existed — the unseeded bootstrap would be cancelled by its own start", n)
+	}
+	if e := p.pathRestart.current(); e != 0 {
+		t.Fatalf("epoch %d before the first session, want 0", e)
+	}
+
+	// A FATAL bootstrap signal is not a session: the gate stays shut.
+	p.signalBootstrapDone(errors.New("first connection failed"))
+	p.OnPathUp()
+	if n := armed(); n != 0 {
+		t.Fatalf("%d restart timer(s) armed after a fatal bootstrap signal — only a session that carried traffic opens the gate", n)
+	}
+
+	p.signalBootstrapDone(nil) // conn 0 carries traffic
+	p.OnPathUp()
+	if n := armed(); n != 1 {
+		t.Fatalf("%d restart timer(s) armed after the first session, want 1", n)
+	}
+	if e := p.pathRestart.current(); e != 1 {
+		t.Fatalf("epoch %d after the first real path-up, want 1", e)
 	}
 }

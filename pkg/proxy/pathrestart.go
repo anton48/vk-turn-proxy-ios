@@ -98,6 +98,29 @@ func (r *pathRestart) pathUp() int64 {
 // announces the new group; the restart of the old sessions is debounced.
 func (p *Proxy) OnPathUp() {
 	p.rotateGroupHello()
+	// 🚨 Before the first session ever came up there is nothing to move to a
+	// new group — and the tunnel's OWN start report can land here: NWPath-
+	// Monitor's initial "satisfied" reaches Go in a minority of starts (a
+	// race with Swift's backend assignment), 1.5 s before conn 0 on the seeded
+	// path (harmless: "restarting 0 session(s)") but DURING conn 0's bootstrap
+	// handshake on the unseeded one, where the settle timer would cancel that
+	// attempt and cost a re-dial (≤ ~1 s and one allocate/deallocate pair —
+	// never observed: every archived start is seeded). The hello still rotates
+	// (the bootstrap announces the fresh id); the restart waits for a session
+	// to exist. The trade, accepted and stated: a REAL switch inside an
+	// unseeded bootstrap's relay handshake is left to that handshake's own
+	// bounded failure — the 5 s relay dial and pion's ~8 s Allocate ladder are
+	// not ctx-bound anyway, only the 10 s SRTP handshake was ever cut by the
+	// settle timer — and that failure then leaves runConnection through the
+	// bootstrap rule (`!signaled && readyCh != nil` → return err), so attempt 2
+	// waits the bootstrap ladder's 10 s backoff: the new interface is dialled
+	// at ~+8–20 s where the settle restart would have re-dialled at ~+1–2 s.
+	// Pre-build-360 behaviour, on a sub-second window of a rare path; a switch
+	// during a captcha-pending or WebView bootstrap has no session either way.
+	if !p.firstSessionUp.Load() {
+		log.Printf("proxy: path up before the first session — group rotated, nothing to restart")
+		return
+	}
 	e := p.pathRestart.pathUp()
 	log.Printf("proxy: path up — group rotated; every session older than epoch %d restarts in %s", e, pathRestartSettle)
 }

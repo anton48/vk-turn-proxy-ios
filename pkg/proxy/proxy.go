@@ -488,6 +488,10 @@ type Proxy struct {
 	// can defer setTunnelNetworkSettings until VK bootstrap is actually done.
 	bootstrapDoneCh   chan error
 	bootstrapDoneOnce sync.Once
+	// firstSessionUp is set when the first session ever carried traffic
+	// (signalBootstrapDone(nil)). Until then a path-up has nothing to
+	// restart — see OnPathUp.
+	firstSessionUp atomic.Bool
 }
 
 // NewProxy creates a new proxy instance.
@@ -625,6 +629,9 @@ func NewProxy(cfg Config) *Proxy {
 // failure before any conn came up. Captcha-pending should NOT signal (the
 // user may still solve it and a conn will come up via Resume()).
 func (p *Proxy) signalBootstrapDone(err error) {
+	if err == nil {
+		p.firstSessionUp.Store(true)
+	}
 	p.bootstrapDoneOnce.Do(func() {
 		p.bootstrapDoneCh <- err
 	})
