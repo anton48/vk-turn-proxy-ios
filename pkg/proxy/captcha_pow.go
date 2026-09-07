@@ -144,6 +144,10 @@ func randomHex(n int) string {
 // Rationale: empirically (2026-05-30, captcha-probe.{mac,msk,www,meg}.log)
 // our iPhone-Safari presentation gets checkbox->BOT + getContent->ERROR on
 // all 4 IPs and even with amurcanov's exact creds, while amurcanov's Android
+// (🚨 2026-09-07: the SAME pair — BOT with show_captcha_type="" plus
+// getContent ERROR — is ALSO what a session that was never opened with
+// captchaNotRobot.initSession gets, whatever the identity; see the 0/4 step
+// in callCaptchaNotRobotAPI before reading it as an identity verdict.)
 // fork — which presents this exact desktop-Chrome identity (profiles.Chrome_146
 // + desktop UA + sec-ch-ua, see go_client/{profiles,captcha_v2}.go) — gets VK
 // to serve a SOLVABLE Go-slider. This mode lets tools/captcha_test reproduce
@@ -820,6 +824,25 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	// constant via a JS bump auto-invalidates.
 	debugInfo := fetchAndCacheDebugInfo(ctx, client, scriptURL)
 
+	// debug_info is the page's own UUID when the page carries one — what the
+	// live widget sends (`window.vk.<key>`, 2026-09-07) — and the build-93
+	// constant otherwise (a monolith page, or VK_DEBUG_INFO_PAGE=0). 🚨 The UUID
+	// is a per-PAGE-LOAD value, not a per-build constant: two loads of the same
+	// session on 2026-09-07 printed two different ones (A0's ec045fe9… and
+	// e2208979…), so the constant can only ever be wrong; it passed on
+	// 2026-08-21 and in arm A1, so VK does not verify it today.
+	debugInfoSource := "constant"
+	if debugInfoFromPage() {
+		if powParams.DebugInfo != "" {
+			debugInfo, debugInfoSource = powParams.DebugInfo, "page"
+		} else {
+			debugInfoSource = "constant (no window.vk UUID on the page)"
+		}
+	}
+	log.Printf("pow: arms initSession=%v debugInfo=%s connFields=%v (page uuid=%q lang=%q)",
+		initSessionEnabled(), debugInfoSource, checkConnFieldsEnabled(),
+		powParams.DebugInfo, powParams.Lang)
+
 	// Log cookies received from page load (for debugging) — bogdanfinn API
 	if parsedURL, e := url.Parse("https://id.vk.ru"); e == nil {
 		cookies := client.GetCookies(parsedURL)
@@ -892,7 +915,7 @@ func solveCaptchaPoW(ctx context.Context, client tls_client.HttpClient, redirect
 	time.Sleep(time.Duration(200+mathrand.Intn(300)) * time.Millisecond)
 
 	// Step 3: Call captchaNotRobot API sequence (using same client = same cookies)
-	successToken, showType, reached, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, captchaDomain, hash, adFp, debugInfo, htmlSettings)
+	successToken, showType, reached, err := callCaptchaNotRobotAPI(ctx, client, sessionToken, captchaDomain, hash, adFp, debugInfo, powParams.Lang, htmlSettings)
 	if err != nil {
 		return "", showType, reached, fmt.Errorf("captchaNotRobot API: %w", err)
 	}
@@ -1202,6 +1225,106 @@ const safariAcceptEncoding = "gzip, deflate, br, zstd"
 // position-by-position comparison with Safari capture 2026-05-15.
 const accessTokenSuffix = "&access_token="
 
+// The three switches of the 2026-09-07 experiment (tools/captcha_test on
+// ya1.48.org, one attempt per arm, three minutes apart, generated fingerprint):
+//
+//	A0 (none)                       → check BOT, show_captcha_type="" — no slider offered, getContent ERROR
+//	A1 initSession                  → check BOT, show_captcha_type="slider" — slider offered, solved, SUCCESS
+//	A2 A1 + page debug_info         → same as A1, SUCCESS
+//	A3 A2 + no connection fields    → same as A1, SUCCESS
+//
+// initSession is the load-bearing one (its refusal arm is A0); the other two
+// changed no verdict (no refusal arm exists for them — they are kept because
+// they are what the live widget sends, not because they were shown to matter).
+// Each switch reads the environment once per solve so an arm can be re-run
+// from tools/captcha_test without a build.
+
+// initSessionEnabled: open the session with captchaNotRobot.initSession before
+// settings (default). VK_INIT_SESSION=0 restores the pre-2026-09-07 sequence —
+// the negative control, which answers BOT with no slider offered.
+func initSessionEnabled() bool { return os.Getenv("VK_INIT_SESSION") != "0" }
+
+// debugInfoFromPage: send the page's own window.vk UUID as debug_info when the
+// page carries one (default), else the build-93 constant. VK_DEBUG_INFO_PAGE=0
+// forces the constant.
+func debugInfoFromPage() bool { return os.Getenv("VK_DEBUG_INFO_PAGE") != "0" }
+
+// checkConnFieldsEnabled: keep `connectionRtt`/`connectionDownlink` in the
+// check body. Default OFF since 2026-09-07 — bundle entry.817e5905.js has
+// neither field; VK_CHECK_CONN_FIELDS=1 restores the 2026-08-21 shape.
+func checkConnFieldsEnabled() bool { return os.Getenv("VK_CHECK_CONN_FIELDS") == "1" }
+
+// initSessionBody is captchaNotRobot.initSession's form body exactly as the
+// BFF widget's transport serialises it: the method params in insertion order —
+// `apiRequest("captchaNotRobot.initSession", {session_token:e, domain:t, lang:n})`
+// in entry.817e5905.js — then the empty access_token the transport appends
+// last. `lang` is `window.vk.lang || 0`, so an unreadable one is sent as "0".
+func initSessionBody(sessionToken, domain, lang string) string {
+	if lang == "" {
+		lang = "0"
+	}
+	return fmt.Sprintf("session_token=%s&domain=%s&lang=%s",
+		url.QueryEscape(sessionToken), url.QueryEscape(domain), url.QueryEscape(lang)) + accessTokenSuffix
+}
+
+// initSessionSettings turns an initSession response into the settings map the
+// slider path already consumes (extractSliderSettings reads
+// response.captcha_settings[].{type,settings}) and returns VK's announced
+// show_captcha_type. On the BFF branch the widget sends
+// content_settings[type].settings_key as getContent's captcha_settings
+// (storeService.getCaptchaTypeSettings), so settings_key is preferred and the
+// monolith-era `settings` value is the fallback. nil when the response carries
+// no `response` object (an error answer).
+func initSessionSettings(resp map[string]interface{}) (map[string]interface{}, string) {
+	respObj, ok := resp["response"].(map[string]interface{})
+	if !ok {
+		return nil, ""
+	}
+	showType, _ := respObj["show_captcha_type"].(string)
+	var settings []interface{}
+	if raw, ok := respObj["content_settings"].([]interface{}); ok {
+		for _, item := range raw {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			entry := map[string]interface{}{"type": m["type"]}
+			if key, _ := m["settings_key"].(string); key != "" {
+				entry["settings"] = key
+			} else {
+				entry["settings"] = m["settings"]
+			}
+			settings = append(settings, entry)
+		}
+	}
+	data := map[string]interface{}{"show_captcha_type": showType}
+	if settings != nil {
+		data["captcha_settings"] = settings
+	}
+	return map[string]interface{}{"response": data}, showType
+}
+
+// buildCheckBody is captchaNotRobot.check's form body in the widget's field
+// order: the session triple (baseParams), the five sensor arrays — empty, as
+// real iOS Safari sends them for the checkbox (WKWebView capture 2026-05-15) —
+// then browser_fp, hash, answer, debug_info and the trailing access_token.
+// withConnFields keeps `connectionRtt`/`connectionDownlink` after `taps`, the
+// 15-field shape of the 2026-08-21 widget; bundle entry.817e5905.js
+// (2026-09-07) has neither field anywhere.
+func buildCheckBody(baseParams, browserFp, hash, answer, debugInfo string, withConnFields bool) string {
+	empty := url.QueryEscape("[]")
+	var b strings.Builder
+	b.WriteString(baseParams)
+	fmt.Fprintf(&b, "&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s", empty, empty, empty, empty, empty)
+	if withConnFields {
+		fmt.Fprintf(&b, "&connectionRtt=%s&connectionDownlink=%s", empty, empty)
+	}
+	fmt.Fprintf(&b, "&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
+		browserFp, url.QueryEscape(hash), url.QueryEscape(answer), debugInfo)
+	b.WriteString(accessTokenSuffix)
+	return b.String()
+}
+
 // logCookiesForURL logs the names of cookies that the bogdanfinn captcha
 // session client would send to the given URL. Used for diagnostic
 // visibility into whether the captcha session jar correctly accumulates
@@ -1476,7 +1599,7 @@ func randomUUIDish() string {
 // succeeded. It is a named return defaulting to FALSE so that any early exit
 // added later is "we never got VK's opinion" by construction; the single place
 // it becomes true is right after the check response parses.
-func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, sessionToken, domain, hash, adFp, debugInfo string, htmlSettings map[string]interface{}) (token string, showType string, reached bool, err error) {
+func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, sessionToken, domain, hash, adFp, debugInfo, lang string, htmlSettings map[string]interface{}) (token string, showType string, reached bool, err error) {
 	vkReq := func(method, postData string) (map[string]interface{}, error) {
 		reqURL := "https://" + vkAPIHost() + "/method/" + method + "?v=5.131"
 		req, err := fhttp.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
@@ -1604,6 +1727,46 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 	// show_captcha_type signal. Seeded from the HTML hint; overwritten by the
 	// API check response if we make one.
 	lastShowType := htmlShowType
+
+	// 0/4: initSession (default since 2026-09-07; VK_INIT_SESSION=0 skips it).
+	//
+	// The BFF widget (st.vk.ru/vkid/vkid-bff/…/entry.<hash>.js) opens every
+	// session with `captchaNotRobot.initSession {session_token, domain, lang}`
+	// BEFORE settings and reads the challenge from ITS response — the payload
+	// `window.init` used to carry on the page (show_captcha_type,
+	// content_settings, captcha_id, app_id). Absent from every WebView flow
+	// archived through 2026-08-18, present in every one of 2026-09-07.
+	//
+	// 🎯 MEASURED 2026-09-07 (ya1, tools/captcha_test): without it VK answers
+	// the checkbox check BOT with show_captcha_type="" — no slider offered —
+	// and getContent ERROR (the 0/22 of 2026-09-06/07 on the phone, from three
+	// networks); WITH it the checkbox check still says BOT for our identity
+	// but announces show_captcha_type="slider", getContent with the
+	// settings_key from this response answers the puzzle, and the slider
+	// solver passed 3/3 at its first guess. Our 2026-08-21 solve had passed
+	// WITHOUT the call, so the requirement is VK's change of 2026-08-21…09-06.
+	// content_settings[type=slider].settings_key is exactly what the widget
+	// sends as getContent's captcha_settings on the BFF branch
+	// (storeService.getCaptchaTypeSettings) — the missing piece behind every
+	// "getContent without settings also returned ERROR" since the rewrite.
+	if initSessionEnabled() {
+		log.Printf("pow: 0/4 captchaNotRobot.initSession (lang=%q)", lang)
+		initResp, err := vkReq("captchaNotRobot.initSession", initSessionBody(sessionToken, domain, lang))
+		if err != nil {
+			return "", lastShowType, reached, fmt.Errorf("initSession: %w", err)
+		}
+		if s, initShowType := initSessionSettings(initResp); s != nil {
+			log.Printf("pow: initSession show_captcha_type=%q, slider settings_key=%d chars",
+				initShowType, len(extractSliderSettings(s)))
+			if htmlSettings == nil {
+				htmlSettings = s
+			}
+			if initShowType != "" {
+				lastShowType = initShowType
+			}
+		}
+		time.Sleep(time.Duration(100+mathrand.Intn(100)) * time.Millisecond)
+	}
 
 	// 1/4: settings
 	//
@@ -1736,42 +1899,22 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 		// for checkbox-style captcha (sensor data is only relevant
 		// for slider variant). Sending fake values gave VK an extra
 		// signal to detect us; reverting matches Safari exactly.
-		cursorBytes := []byte("[]")
-		downlinkBytes := []byte("[]")
-
 		answer := base64.StdEncoding.EncodeToString([]byte("{}"))
 
-		// debug_info — passed in from solveCaptchaPoW.
-		// fetchAndCacheDebugInfo extracts the version-specific constant
-		// from not_robot_captcha.js dynamically (Phase 6 of 2026-05-15
-		// PoW regression investigation, ported from Moroka8 v2 solver).
-		// Falls back to the canonical "a0ac4896..." constant on any
-		// extraction failure. See callCaptchaNotRobotAPI sig + Phase 2
-		// commentary in build 93 for the original hardcoded reasoning.
-
-		// Phase 11.1 (build 107): URL-encode `answer` value. Captured
-		// WebView sends `answer=e30%3D` (encoded `=`); pre-build-107 we
-		// sent `answer=e30=` (raw `=`). Functionally same param value,
-		// but byte-different on wire — possibly a fingerprint signal.
-		checkData := baseParams + fmt.Sprintf(
-			"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s"+
-				"&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
-			url.QueryEscape("[]"),
-			url.QueryEscape("[]"),
-			url.QueryEscape("[]"),
-			url.QueryEscape(string(cursorBytes)),
-			url.QueryEscape("[]"),
-			url.QueryEscape("[]"),
-			url.QueryEscape(string(downlinkBytes)),
-			browserFp,
-			// The v2 PoW envelope is standard base64, so it can contain
-			// `+`, `/` and `=` — all of which change meaning in a form body
-			// (`+` would arrive as a space). The old bare hex digest needed
-			// no escaping, which is why this was interpolated raw.
-			url.QueryEscape(hash),
-			url.QueryEscape(answer),
-			debugInfo,
-		) + accessTokenSuffix
+		// debug_info — passed in from solveCaptchaPoW: the build-93 constant, or
+		// the page's own UUID under VK_DEBUG_INFO_PAGE=1 (see there).
+		//
+		// Phase 11.1 (build 107): `answer` is URL-encoded — the captured WebView
+		// sends `answer=e30%3D`, not `answer=e30=`; same value, different bytes.
+		// The v2 PoW envelope is standard base64 (`+`, `/`, `=`), so `hash` is
+		// escaped too; the old bare hex never needed it.
+		//
+		// `connectionRtt`/`connectionDownlink` are gone since 2026-09-07: bundle
+		// entry.817e5905.js has neither field anywhere — the widget's check
+		// carries the five sensor arrays only, where the 2026-08-21 widget still
+		// sent both after `taps`. Dropping them changed no verdict (arm A3);
+		// VK_CHECK_CONN_FIELDS=1 restores them.
+		checkData := buildCheckBody(baseParams, browserFp, hash, answer, debugInfo, checkConnFieldsEnabled())
 
 		if os.Getenv("VK_DUMP_CHECK_SHAPE") == "1" {
 			shape := make([]string, 0, 16)
@@ -1935,6 +2078,16 @@ type powPageParams struct {
 	// anyway so that a value we have never seen can be REFUSED rather than
 	// guessed at.
 	Prefix string
+	// DebugInfo is the UUID the BFF page prints inside `window.vk` under an
+	// obfuscated, per-build key (`brlefapmjnpg` in bundle entry.817e5905.js,
+	// 2026-09-07); the widget sends it as check's `debug_info`
+	// (`debug_info: window.vk?.<key> || PACKAGE_VERSION_HASHED`). Empty on a
+	// page without a `window.vk` block. Found by SHAPE, never by key name.
+	DebugInfo string
+	// Lang is `window.vk.lang` as printed on the page; the widget sends it as
+	// `lang` on captchaNotRobot.initSession (`lang_id: window.vk.lang || 0`).
+	// Empty when the page carries no window.vk block (the caller sends "0").
+	Lang string
 }
 
 var (
@@ -2001,6 +2154,8 @@ func parsePowPage(html string) (powPageParams, error) {
 				"capture it with VK_DUMP_POW_HTML rather than assuming " + powPrefixFallback)
 	}
 
+	p.DebugInfo, p.Lang = parseVKGlobal(html)
+
 	if m := rePowIIFEArgs.FindStringSubmatch(html); len(m) >= 3 {
 		d, err := strconv.Atoi(m[2])
 		if err != nil || d <= 0 || d > 8 {
@@ -2027,6 +2182,76 @@ func parsePowPage(html string) (powPageParams, error) {
 	}
 
 	return powPageParams{}, errors.New("captcha pow parameters not found in HTML")
+}
+
+var (
+	// reVKGlobalStart finds the page's `window.vk = {` — printed on every BFF
+	// captcha page (2026-08-21 onwards); a monolith page has none.
+	reVKGlobalStart = regexp.MustCompile(`window\.vk\s*=\s*\{`)
+	// reVKGlobalUUID matches `<key>: "<uuid>"` inside that block. The KEY is
+	// obfuscated and fixed per bundle build (`brlefapmjnpg` in entry.817e5905.js
+	// and on the 2026-08-21 page alike), so the value is found by its shape.
+	reVKGlobalUUID = regexp.MustCompile(`[A-Za-z_$][\w$]*\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"`)
+	// reVKGlobalLang is the block's own `lang: 3` (an object key, not the
+	// `window.lang = {…}` translation table that follows the block).
+	reVKGlobalLang = regexp.MustCompile(`\blang\s*:\s*(\d+)\b`)
+)
+
+// vkGlobalBlock returns the balanced `{…}` of `window.vk = {…}`, or "" when the
+// page has none. Braces inside string literals are skipped, so the JSON the
+// block embeds (apiConfigDomains, statsMeta) cannot end it early — and nothing
+// AFTER the block (window.lang, the PoW script, a stray UUID) is ever searched.
+func vkGlobalBlock(html string) string {
+	m := reVKGlobalStart.FindStringIndex(html)
+	if m == nil {
+		return ""
+	}
+	start := m[1] - 1
+	depth := 0
+	var inStr byte
+	for i := start; i < len(html); i++ {
+		c := html[i]
+		if inStr != 0 {
+			if c == '\\' {
+				i++
+			} else if c == inStr {
+				inStr = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			inStr = c
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return html[start : i+1]
+			}
+		}
+	}
+	return ""
+}
+
+// parseVKGlobal reads the two values the BFF widget takes from `window.vk`:
+// the UUID it sends as check's debug_info, and `lang`, which initSession
+// carries. Both empty on a page without the block.
+func parseVKGlobal(html string) (debugInfo, lang string) {
+	block := vkGlobalBlock(html)
+	if block == "" {
+		return "", ""
+	}
+	if all := reVKGlobalUUID.FindAllStringSubmatch(block, -1); len(all) > 0 {
+		debugInfo = all[0][1]
+		if len(all) > 1 {
+			log.Printf("pow: window.vk carries %d UUID values — taking the first as debug_info", len(all))
+		}
+	}
+	if m := reVKGlobalLang.FindStringSubmatch(block); len(m) >= 2 {
+		lang = m[1]
+	}
+	return debugInfo, lang
 }
 
 // buildPowResult wraps a solved PoW in the envelope the page builds today.
