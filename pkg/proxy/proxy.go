@@ -5493,25 +5493,38 @@ type turnSessionClient interface {
 	SendBindingRequest() (net.Addr, error)
 }
 
-// relayCloseWriteBudget bounds the ONE write pion makes when an allocation
-// is closed — the deallocate (Refresh with lifetime 0, sent without waiting
-// for the answer; the write itself is synchronous) — on the CONTROL socket.
-// pion's relay conn has no write deadline of its own (a stub), and on the
-// TCP transport a relay that stopped taking bytes leaves that write blocked
-// for ever: the goroutine closing the session hangs past StopWithTimeout,
-// with the socket it holds (seen with a real pion allocation and a blocked
-// WriteTo, 2026-09-06). The deadline goes on the socket we own — STUNConn
-// forwards it to the TCP conn, a UDP socket honours it directly — so a
-// healthy relay still hears the deallocate and a dead one costs the budget.
+// relayCloseWriteBudget bounds EVERY write a session's teardown makes on the
+// control socket we own — DTLS's close_notify (pion/dtls writes it
+// synchronously, with no timeout of its own), pion's deallocate when the
+// allocation is closed, and any keepalive or refresh already in flight —
+// with ONE absolute deadline set before the first of them. The relay conn's
+// own SetWriteDeadline is a stub, so the socket beneath it is the only place
+// a bound can go; on a relay that stopped taking bytes (a dead TCP relay,
+// the interface a path change just took away) each of those writes would
+// otherwise block for ever, and with it the session's Close and its restart.
+// A healthy relay finishes them in microseconds. 🚨 The deadline is absolute
+// from Close's first statement: a Close during a saturated upload can cut
+// the close_notify and the deallocate behind a full send buffer, and the
+// allocation then lives out its lifetime at VK — the known price of a
+// bounded stop.
 const relayCloseWriteBudget = 500 * time.Millisecond
 
 func (s *srtpSessionConn) Close() error {
 	var firstErr error
 	s.closeOnce.Do(func() {
+		// ONE absolute deadline for EVERY write this teardown makes on the
+		// control socket, set FIRST: DTLS's close_notify (pion writes it
+		// synchronously, with a background context and no timeout of its
+		// own) goes through the SRTP wrapper and the relay into this very
+		// socket, then pion's deallocate. On a relay that stopped taking
+		// bytes — the interface a path change just took away — both block
+		// for ever, and with them the session's restart. A deadline placed
+		// after s.Conn.Close bounded only the deallocate (user's review,
+		// 2026-09-07).
+		_ = s.ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
 		if err := s.Conn.Close(); err != nil {
 			firstErr = err
 		}
-		_ = s.ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
 		if err := s.relayConn.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}

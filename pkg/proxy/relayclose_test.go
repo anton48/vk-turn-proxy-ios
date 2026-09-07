@@ -1,12 +1,14 @@
 package proxy
 
-// The one write pion makes when an allocation is closed — the deallocate —
-// goes on the control socket without a deadline of its own; on a TCP relay
-// that stopped taking bytes it blocks for ever, and so does whoever closes
-// the session. Verified with a real pion allocation and a blocked WriteTo on
-// 2026-09-06 (hung after three seconds, ended only by forcing the control
-// socket shut). The session's Close puts a write deadline on the socket we
-// own before closing the allocation.
+// The writes a session's teardown makes on the control socket have no
+// deadline of their own: pion's deallocate when the allocation is closed,
+// and before it DTLS's close_notify (pion/dtls writes it synchronously with a
+// background context) through the SRTP wrapper and the relay. On a TCP relay
+// that stopped taking bytes each blocks for ever, and so does whoever closes
+// the session — after a path change, the restart. Verified with a real pion
+// allocation and a blocked WriteTo on 2026-09-06 (hung after three seconds,
+// ended only by forcing the control socket shut). The session's Close puts
+// ONE absolute write deadline on the socket we own before ANY of them.
 
 import (
 	"net"
@@ -112,5 +114,48 @@ func TestSRTPSessionCloseIsBoundedWhenTheDeallocateBlocks(t *testing.T) {
 	}
 	if took := time.Since(t0); took < relayCloseWriteBudget/2 {
 		t.Fatalf("Close returned in %s — it did not even try the deallocate under its deadline", took)
+	}
+}
+
+// closeNotifyConn is the DTLS/SRTP conn as Close sees it: pion's Close
+// WRITES a close_notify through the relay — here, like the deallocate,
+// through the control socket.
+type closeNotifyConn struct {
+	net.Conn
+	ctl net.PacketConn
+}
+
+func (c closeNotifyConn) Close() error {
+	_, err := c.ctl.WriteTo([]byte("close_notify"), nil)
+	return err
+}
+
+// The SRTP session's Close returns within ONE budget when the control
+// socket's writes hang: the close_notify and the deallocate share the
+// absolute deadline set before either of them. Sabotage seen red: the
+// deadline moved back after s.Conn.Close (the close_notify hangs for ever —
+// the shape the user's review found on 2026-09-07).
+func TestSRTPSessionCloseIsBoundedWhenTheCloseNotifyBlocks(t *testing.T) {
+	ctl := newBlockedCtl(t)
+	s := &srtpSessionConn{
+		Conn:      closeNotifyConn{ctl: ctl},
+		relayConn: deallocatingRelay{PacketConn: ctl, ctl: ctl},
+		tc:        noopCloser{},
+		ctlConn:   ctl,
+	}
+	done := make(chan struct{})
+	t0 := time.Now()
+	go func() { _ = s.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(relayCloseWriteBudget + 2*time.Second):
+		t.Fatal("srtpSessionConn.Close did not return: the close_notify write hung it")
+	}
+	took := time.Since(t0)
+	if took < relayCloseWriteBudget/2 {
+		t.Fatalf("Close returned in %s — it did not even try the close_notify under its deadline", took)
+	}
+	if took > relayCloseWriteBudget+300*time.Millisecond {
+		t.Fatalf("Close took %s — the close_notify and the deallocate must share ONE deadline, not pay two", took)
 	}
 }
