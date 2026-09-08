@@ -1247,6 +1247,19 @@ type credPool struct {
 	// surfacing the error.
 	fetch func(allowCaptchaBlock bool, slot int) (string, *TURNCreds, error)
 
+	// coldStartTarget is how many credential slots a cold pool needs before
+	// get()'s Phase 2 stops minting and parks the rest of the herd to share —
+	// ceil(NumConns/connsPerSlot), bounded by the pool size, set by
+	// setColdStartTarget where NumConns is known (NewProxy, NewCredPool); the
+	// grower's cold-start/maintenance switch reads the SAME number. 🚨 Until
+	// 2026-09-08 get() derived it as ceil(size/4) — the inverse of the
+	// ANONYMOUS pool sizing, which the cookie pool (2 × links slots) breaks:
+	// 3 links ⇒ 6 slots ⇒ target 2, while 30 conns need 3 (call, relay)
+	// buckets. After a path change that parked ten connections for 1m24s
+	// until the grower's maintenance fill (vpn.vkauth.srtp.wifi.lte.0.log
+	// 13:01:08 → 13:02:32, the log line `(2 ready+inflight >= 2 target)`).
+	coldStartTarget int
+
 	// cachePath is the on-disk JSON file that persists the pool across
 	// extension launches. Empty disables persistence. The file lives in
 	// the App Group container alongside vpn.log and is sandbox-protected
@@ -1514,6 +1527,35 @@ func (cp *credPool) authErrorCount(slot int) int64 {
 	return cp.authErrors[slot].Load()
 }
 
+// coldStartTargetFor is the cold-start target for numConns connections on a
+// pool of size slots: ceil(numConns/connsPerSlot), never below 1 and never
+// above the pool (a cookie pool of one link has two slots whatever N is).
+func coldStartTargetFor(numConns, size int) int {
+	target := (numConns + connsPerSlot - 1) / connsPerSlot
+	if target < 1 {
+		target = 1
+	}
+	if size >= 1 && target > size {
+		target = size
+	}
+	return target
+}
+
+// setColdStartTarget fixes the pool's cold-start target from the connection
+// count. Called once, before any goroutine uses the pool.
+func (cp *credPool) setColdStartTarget(numConns int) {
+	cp.mu.Lock()
+	cp.coldStartTarget = coldStartTargetFor(numConns, cp.size)
+	cp.mu.Unlock()
+}
+
+// coldStartTargetValue is the target the grower and get() share.
+func (cp *credPool) coldStartTargetValue() int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.coldStartTarget
+}
+
 func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePath string, fetch func(bool, int) (string, *TURNCreds, error)) *credPool {
 	if size < 1 {
 		size = 1
@@ -1542,6 +1584,11 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 		// (and the old one closed) every time the pool changes in a
 		// way that may unblock a parked conn — see broadcastSlotAvailable.
 		slotAvailableCh: make(chan struct{}),
+		// The pre-2026-09-08 inverse, right for the anonymous sizing
+		// (size = ceil(N·2/5) ⇒ ceil(size/4) = ceil(N/10)) and for pools
+		// built without a connection count (tests); production callers
+		// overwrite it through setColdStartTarget.
+		coldStartTarget: (size + 3) / 4,
 	}
 	if cachePath != "" {
 		cp.loadFromDisk()
@@ -2007,7 +2054,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				inFlight++
 			}
 		}
-		coldStartTarget := (cp.size + 3) / 4 // ceil(size/4) ≈ ceil(NumConns/connsPerSlot)
+		coldStartTarget := cp.coldStartTarget // ceil(NumConns/connsPerSlot), see the field
 		if coldStartTarget < 1 {
 			coldStartTarget = 1
 		}

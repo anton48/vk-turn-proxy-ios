@@ -596,6 +596,7 @@ func NewProxy(cfg Config) *Proxy {
 		}
 	}
 	p.credPool = newCredPool(ctx, poolSize, cfg.CredPoolCooldown, cfg.CredCachePath, p.fetchFreshCreds)
+	p.credPool.setColdStartTarget(cfg.NumConns)
 
 	p.initGroupHello(cfg)
 
@@ -807,10 +808,10 @@ func (p *Proxy) growCredPool(ctx context.Context) {
 	// the same idea but didn't scale with NumConns: at NumConns=30 with
 	// pool=12, it was 6 fast slots → 6 maintenance. Now it's 3 fast → 9
 	// maintenance, doubling the staggered portion.
-	coldStartSlots := (p.config.NumConns + 9) / 10 // ceil(NumConns/10)
-	if coldStartSlots < 1 {
-		coldStartSlots = 1
-	}
+	// ONE number with get()'s cold-start cap — ceil(NumConns/10) bounded by the
+	// pool (setColdStartTarget in NewProxy); the two used to be computed apart
+	// and disagreed on the cookie pool (see credPool.coldStartTarget).
+	coldStartSlots := p.credPool.coldStartTargetValue()
 	// Two-mode state machine:
 	//   coldStartMet=false  → fill aggressively (fastInterval), pass
 	//                          coldStartSlots as tryFill abort guard so

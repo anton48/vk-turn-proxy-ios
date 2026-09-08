@@ -105,6 +105,7 @@ func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 		}
 	}
 	p.cp = newCredPool(ctx, size, cfg.Cooldown, cfg.CachePath, fetch)
+	p.cp.setColdStartTarget(cfg.NumConns)
 	if cfg.SeededTURN != nil {
 		if host, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
 			p.cp.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
@@ -350,10 +351,7 @@ func (p *CredPool) Grow(ready <-chan struct{}) {
 			return
 		}
 	}
-	coldStartSlots := (p.numConns + connsPerSlot - 1) / connsPerSlot
-	if coldStartSlots < 1 {
-		coldStartSlots = 1
-	}
+	coldStartSlots := p.cp.coldStartTargetValue() // the same number get()'s cap uses
 	coldStartMet := false
 	interval := p.pace.fast
 	for {
