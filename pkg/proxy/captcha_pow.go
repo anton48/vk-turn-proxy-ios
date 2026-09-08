@@ -1225,8 +1225,9 @@ const safariAcceptEncoding = "gzip, deflate, br, zstd"
 // position-by-position comparison with Safari capture 2026-05-15.
 const accessTokenSuffix = "&access_token="
 
-// The three switches of the 2026-09-07 experiment (tools/captcha_test on
-// ya1.48.org, one attempt per arm, three minutes apart, generated fingerprint):
+// The three switches of the 2026-09-07 experiment (tools/captcha_test on a
+// FreeBSD stand host, one attempt per arm, three minutes apart, generated
+// fingerprint):
 //
 //	A0 (none)                       → check BOT, show_captcha_type="" — no slider offered, getContent ERROR
 //	A1 initSession                  → check BOT, show_captcha_type="slider" — slider offered, solved, SUCCESS
@@ -1737,7 +1738,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 	// content_settings, captcha_id, app_id). Absent from every WebView flow
 	// archived through 2026-08-18, present in every one of 2026-09-07.
 	//
-	// 🎯 MEASURED 2026-09-07 (ya1, tools/captcha_test): without it VK answers
+	// 🎯 MEASURED 2026-09-07 (the stand host, tools/captcha_test): without it VK answers
 	// the checkbox check BOT with show_captcha_type="" — no slider offered —
 	// and getContent ERROR (the 0/22 of 2026-09-06/07 on the phone, from three
 	// networks); WITH it the checkbox check still says BOT for our identity

@@ -11,7 +11,7 @@
 // device id).
 //
 //	go build -o /tmp/csqtt_client ./tools/csqtt_client
-//	/tmp/csqtt_client -server elizabeth.48.org:46000 -password <pw> \
+//	/tmp/csqtt_client -server <csqtt-host>:46000 -password <pw> \
 //	    -vk-link https://vk.ru/call/join/<id>
 package main
 

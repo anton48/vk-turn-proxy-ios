@@ -239,7 +239,7 @@ func TestExperimentSwitchesDefaultToTheLiveWidgetsShape(t *testing.T) {
 	}
 }
 
-// bffPowFixture is the page VK served ya1 on 2026-09-07 (arm A0's second
+// bffPowFixture is the page VK served the stand host on 2026-09-07 (arm A0's second
 // attempt), reduced to its window.vk and PoW script blocks — the first live
 // BFF page in the repository. The UUID is that page load's; the next load of
 // the same session printed a different one.
