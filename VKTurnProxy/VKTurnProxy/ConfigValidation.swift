@@ -148,9 +148,18 @@ enum ConfigValidation {
     /// (2026-09-06: a cleared field connected with an invisible UUID and was
     /// DENIED:device_mismatch with nothing to correct on screen). Empty blocks
     /// Connect; the edit screen fills an empty field with a visible one.
-    static func csqttDeviceID(_ s: String) -> Issue? {
+    ///
+    /// `onEditScreen` picks the wording: the edit screen can say "open this
+    /// screen again" because that is where an empty field gets filled; the
+    /// main screen cannot (it generates nothing) and points to Settings
+    /// instead — the same text on both read wrong on the main screen
+    /// (§60 audit item 11, 2026-09-08).
+    static func csqttDeviceID(_ s: String, onEditScreen: Bool = false) -> Issue? {
         if s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return Issue(.error, "Device ID is required — the server binds the password to it. Use the one registered on the server, or open this screen again to generate one.")
+            if onEditScreen {
+                return Issue(.error, "Device ID is required — the server binds the password to it. Use the one registered on the server, or open this screen again to generate one.")
+            }
+            return Issue(.error, "Device ID is required — the server binds the password to it. Open the server in Settings and use the id registered on the server; the edit screen fills an empty field with a new one.")
         }
         return nil
     }

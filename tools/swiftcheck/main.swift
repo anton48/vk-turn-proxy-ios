@@ -3090,8 +3090,26 @@ do {
         check(false, "could not find configValidationError")
     }
     let editView = codeWithoutComments("VKTurnProxy/VKTurnProxy/ServerEditView.swift")
-    check(editView.contains("hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID))"),
-          "the edit screen shows the Device ID requirement under the field")
+    check(editView.contains("hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID, onEditScreen: true))"),
+          "the edit screen shows the Device ID requirement under the field, in the edit screen's wording")
+    // 🚨 THE MAIN SCREEN GENERATES NOTHING, so its wording must not say "open
+    //    this screen again" (§60 audit item 11, 2026-09-08): it points to
+    //    Settings. Pinned at both ends — the main screen's call does not ask
+    //    for the edit screen's wording, and the default wording has no "this
+    //    screen" in it.
+    check(!contentView.contains("csqttDeviceID(s.csqttDeviceID, onEditScreen: true)"),
+          "the main screen must not use the edit screen's Device ID wording")
+    let configValidation = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
+    if let fn = configValidation.range(of: "static func csqttDeviceID(_ s: String, onEditScreen: Bool = false)") {
+        let body = String(configValidation[fn.upperBound...].prefix(900))
+        let editWording = body.range(of: "if onEditScreen {")
+        let editEnd = editWording.flatMap { body.range(of: "}", range: $0.upperBound..<body.endIndex) }
+        let mainWording = editEnd.map { String(body[$0.upperBound...].prefix(400)) } ?? ""
+        check(editWording != nil && mainWording.contains("Settings") && !mainWording.contains("this screen"),
+              "the main screen's Device ID wording points to Settings and never says \"this screen\"")
+    } else {
+        check(false, "could not find csqttDeviceID(_:onEditScreen:)")
+    }
     check(editView.contains("if draft.useCsqtt && draft.csqttDeviceID.isEmpty {"),
           "the edit screen fills an empty csqtt Device ID with a visible one")
 }

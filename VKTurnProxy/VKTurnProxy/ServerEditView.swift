@@ -145,7 +145,7 @@ struct ServerEditView: View {
                         // fallback; onAppear below fills an empty one.
                         TextField("Device ID", text: $draft.csqttDeviceID)
                             .autocapitalization(.none).disableAutocorrection(true)
-                        hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID))
+                        hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID, onEditScreen: true))
                         Text("csqtt has no key exchange: the password is the tunnel's only key, so traffic recorded today can be decrypted by anyone who learns it later (no forward secrecy). The other modes do not have this property.")
                             .font(.caption)
                             .foregroundColor(.orange)
