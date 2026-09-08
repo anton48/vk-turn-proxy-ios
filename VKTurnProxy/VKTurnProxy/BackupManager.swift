@@ -603,7 +603,12 @@ enum BackupManager {
             throw BackupError.decodeFailed("URL scheme is not csqtt://")
         }
         var host = "", port = "", password = "", firstHash = "", device = ""
-        if trimmed.lowercased().hasPrefix("csqtt://connect") {
+        // The connect form is `csqtt://connect?…` — the `?` is part of the
+        // test: a LEGACY link whose password starts with "connect"
+        // (`csqtt://connected1@host:46000`) also starts with "csqtt://connect"
+        // and was parsed as the query form, which then failed on the missing
+        // host (§60 audit item 10, 2026-09-08).
+        if trimmed.lowercased().hasPrefix("csqtt://connect?") {
             guard let comps = URLComponents(string: trimmed) else {
                 throw BackupError.decodeFailed("csqtt:// link is not a valid URL")
             }

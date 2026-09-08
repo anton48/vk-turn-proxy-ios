@@ -1,6 +1,6 @@
 module github.com/cacggghp/vk-turn-proxy/ios/WireGuardBridge
 
-go 1.25.5
+go 1.26.0
 
 require (
 	github.com/cacggghp/vk-turn-proxy v0.0.0

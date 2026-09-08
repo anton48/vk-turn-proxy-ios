@@ -3089,6 +3089,16 @@ do {
     } else {
         check(false, "could not find configValidationError")
     }
+    // 🚨 THE csqtt CONNECT FORM IS RECOGNISED BY `csqtt://connect?`, WITH THE
+    //    `?`: a legacy `csqtt://<password>@<host>:<port>` link whose password
+    //    starts with "connect" also starts with "csqtt://connect" and was
+    //    parsed as the query form (§60 audit item 10). Scan-only: the parser
+    //    lives in BackupManager, which the harness cannot compile. On the RAW
+    //    source: codeWithoutComments cuts a line at its first `//`, which the
+    //    `csqtt://` literal itself contains.
+    let backup = source("VKTurnProxy/VKTurnProxy/BackupManager.swift")
+    check(backup.contains("hasPrefix(\"csqtt://connect?\")") && !backup.contains("hasPrefix(\"csqtt://connect\")"),
+          "the csqtt connect form is told from the legacy form by `csqtt://connect?`, never by the bare `csqtt://connect`")
     let editView = codeWithoutComments("VKTurnProxy/VKTurnProxy/ServerEditView.swift")
     check(editView.contains("hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID, onEditScreen: true))"),
           "the edit screen shows the Device ID requirement under the field, in the edit screen's wording")
