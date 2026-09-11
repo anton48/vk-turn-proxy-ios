@@ -817,7 +817,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     // any desc-change (including flag-only flips, which are
                     // diagnostically interesting even though we skip the
                     // bridge call below).
-                    if let backend = self.backend {
+                    let essential = self.pathEssentialIdentity(path)
+                    let backendNow = self.backend
+                    if backendNow == nil {
+                        // The tunnel's own start report (and anything iOS
+                        // fires before the backend exists): nothing to
+                        // forward, but the gate below must judge the FIRST
+                        // event after the backend appears against THIS
+                        // network, not against nothing. Without the seed a
+                        // flag-only flip after a wake (dns dropped, same
+                        // wifi, same ssid — vpn 2026-09-11 17:29:00, 8.5 min
+                        // after the start) counted as a network change:
+                        // 50 csqtt workers restarted, 5 slots marked for
+                        // 10m30s; on native the same ghost runs the
+                        // variant-A restart of every session.
+                        self.lastPathEssentialIdentity = essential
+                        self.logMsg("[PathMonitor] no backend yet — path identity seeded (\(essential))")
+                    }
+                    if let backend = backendNow {
                         backend.logPathSnapshot(desc)
 
                         // Essential-identity gate: skip the bridge call
@@ -826,8 +843,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         // ssid + status. Such "events" are iOS internal
                         // state updates, not real network changes — see
                         // lastPathEssentialIdentity comment for the
-                        // 2026-05-15 16:36 motivating case.
-                        let essential = self.pathEssentialIdentity(path)
+                        // 2026-05-15 16:36 motivating case. The identity
+                        // is seeded above while the backend is nil.
                         if essential == self.lastPathEssentialIdentity {
                             self.logMsg("[PathMonitor] flag-only change (\(essential)) — bridge call skipped")
                             return

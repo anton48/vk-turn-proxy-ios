@@ -3016,6 +3016,31 @@ do {
         check(false, "could not find backend.pathChanged() in the provider")
     }
     check(backend.contains("wgPathUp("), "TunnelBackend reaches wgPathUp")
+    // 🚨 THE PATH-IDENTITY GATE IS SEEDED BEFORE THE BACKEND EXISTS. The start's
+    //    own path report arrives while `backend` is nil (the backend is built
+    //    later in startTunnel); until 2026-09-11 the essential identity was
+    //    recorded only on a forwarded event, so the FIRST event after the
+    //    backend appeared — a dns flag flip after a wake, same wifi, same ssid
+    //    (vpn 2026-09-11 17:29:00) — compared against nil and went to the bridge:
+    //    50 csqtt workers restarted, 5 slots marked for 10m30s. The identity is
+    //    computed once, before the backend lookup, and stored on the nil branch.
+    if let seed = provider.range(of: "[PathMonitor] no backend yet — path identity seeded (") {
+        let before = String(provider[..<seed.lowerBound])
+        let essentialDecl = before.range(of: "let essential = self.pathEssentialIdentity(path)", options: .backwards)
+        let backendRead = before.range(of: "let backendNow = self.backend", options: .backwards)
+        let seedStore = before.range(of: "self.lastPathEssentialIdentity = essential", options: .backwards)
+        check(essentialDecl != nil && backendRead != nil && seedStore != nil
+              && essentialDecl!.lowerBound < backendRead!.lowerBound
+              && backendRead!.lowerBound < seedStore!.lowerBound,
+              "🚨 the path identity is computed, then the backend read once, then the identity stored on the nil-backend branch")
+        let after = String(provider[seed.upperBound...].prefix(1200))
+        check(after.contains("if let backend = backendNow {") && after.contains("if essential == self.lastPathEssentialIdentity {"),
+              "🚨 the forwarded path uses the SAME backend read and the SAME essential value the seed used")
+        check(provider.components(separatedBy: "self.lastPathEssentialIdentity = essential").count - 1 == 2,
+              "🚨 exactly two stores of the path identity: the seed (backend nil) and the gate (event forwarded)")
+    } else {
+        check(false, "could not find the path-identity seed log line in the provider")
+    }
     for name in ["wgWaitBootstrapReady", "csqttWaitReady", "wgAttachWireGuard", "csqttAttach",
                  "wgTurnOff", "csqttTurnOff", "wgGetStats", "csqttGetStats",
                  "wgPathChanged", "csqttPathChanged", "wgWakeHealthCheck", "csqttWakeHealthCheck"] {
