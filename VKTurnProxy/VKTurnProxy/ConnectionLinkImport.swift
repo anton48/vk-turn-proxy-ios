@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// The root-level consumer for `vkturnproxy://` / `wdtt://` / `freeturn://`
-/// links, and the one place the confirmation wording and the apply step live.
+/// The root-level consumer for `vkturnproxy://` / `wdtt://` / `freeturn://` /
+/// `csqtt://` links, and the one place the confirmation wording and the apply
+/// step live.
 ///
 /// 🚨 IT IS A SEPARATE VIEW, NOT AN OBSERVER ON `ContentView`. `ContentView`
 /// hosts the `NavigationView`, so anything that re-renders its body tears down
@@ -170,15 +171,53 @@ enum ConnectionLinkPrompt {
             s.dnsServers.map { "DNS \($0)" }
         ].compactMap { $0 }.joined(separator: ", ")
         let extrasText = extras.isEmpty ? "" : " (\(extras))"
-        // A freeturn:// link (SRTP-WRAP-S) carries neither WG keys nor a VK call
-        // link, so the new server starts without them — say so, or the user will
-        // expect the import to have filled them in. A quick_link.py WRAP-S link
-        // DOES include WG keys (privateKey non-nil).
-        if s.useWrapS == true, s.privateKey == nil {
+        // SRTP-WRAP-S: a freeturn:// link never carries a VK call link and
+        // carries WireGuard keys only through its `wg` field (their commit
+        // 9da2c8e; GitHub #86). Say what the new server starts WITH and WITHOUT
+        // from the LINK itself — keys present or not, a call link present or
+        // not — never from the mode: a vkturnproxy:// WRAP-S link is the same
+        // mode with both, and applyConnectionLink writes a non-empty vkLink.
+        if s.useWrapS == true {
             let prof = s.obfProfile ?? "rtpopus"
-            return "Add \(name) as SRTP-WRAP-S for \(s.peerAddress)\(extrasText)? "
-                 + "Sets the server, WRAP key, obf profile (\(prof)) and Client-ID, and makes it "
-                 + "active. WireGuard keys and the VK call link are NOT included — enter them manually."
+            let keys = s.privateKey != nil
+            let vk = !s.vkLink.isEmpty
+            var text = "Add \(name) as SRTP-WRAP-S for \(s.peerAddress)\(extrasText)? "
+                     + "Sets the server, WRAP key, obf profile (\(prof)), Client-ID"
+            if keys {
+                // Only what the section actually carried: an IPv6-only or
+                // absent Address leaves the profile's default in place.
+                var from = ["the WireGuard keys"]
+                if s.tunnelAddress != nil { from.append("tunnel address") }
+                if s.dnsServers != nil { from.append("DNS") }
+                text += " and " + listing(from) + " from the link, and makes it active."
+                if !vk { text += " The VK call link is NOT included — enter it manually." }
+                if s.tunnelAddress == nil {
+                    text += " The link's WireGuard section has no IPv4 address — check the tunnel address in the server's settings."
+                }
+            } else if !vk {
+                text += ", and makes it active. WireGuard keys and the VK call link are NOT included — enter them manually."
+            } else {
+                text += ", and makes it active. WireGuard keys are NOT included — enter them manually."
+            }
+            if vk { text += " The VK call link is global and will be updated." }
+            if s.wgConfUnreadable == true {
+                text += " The link's WireGuard section could not be read (no usable key pair) — enter the keys manually."
+            }
+            // The link's WireGuard section may be an AmneziaWG conf (free-turn's
+            // default backend): the keys are the same protocol, the obfuscation
+            // parameters are not ours — name them before the first failed
+            // connect rather than after it. The names come through a
+            // letters-and-digits filter: the field is Codable, a crafted
+            // vkturnproxy:// payload could put anything in it.
+            let awgNames = (s.awgWireParametersIgnored ?? []).prefix(16)
+                .map { String($0.filter { $0.isLetter || $0.isNumber }.prefix(24)) }.filter { !$0.isEmpty }
+            let awg = awgNames.isEmpty ? "" :
+                " Note: the WireGuard section is an AmneziaWG config (\(awgNames.joined(separator: ", "))); "
+                + "this app speaks plain WireGuard and cannot use those settings — the tunnel will not connect "
+                + "to a server that enforces them. Use these keys with an AmneziaWG client, or ask the server's "
+                + "admin for a plain-WireGuard peer."
+            text += awg
+            return text
         }
         // csqtt: say what the user is signing up for — the password is the
         // tunnel's only key, so there is no forward secrecy on this transport.
@@ -196,9 +235,20 @@ enum ConnectionLinkPrompt {
              + "active? Your existing servers are kept; the VK call link is global and will be updated."
     }
 
-    /// Applies the link and returns the message to show afterwards.
+    /// Applies the link and returns the message to show afterwards — with the
+    /// name the server actually got (a collision with an existing name adds
+    /// " 2", which the confirmation could not know).
     static func apply(_ link: ConnectionLink) -> String {
-        BackupManager.applyConnectionLink(link)
-        return "Settings applied. Reconnect to use them."
+        let created = BackupManager.applyConnectionLink(link)
+        return "Added \"\(created.serverName)\" [\(created.modeLabel)] and made it active. Reconnect to use it."
+    }
+
+    /// "a", "a and b", "a, b and c".
+    private static func listing(_ items: [String]) -> String {
+        switch items.count {
+        case 0: return ""
+        case 1: return items[0]
+        default: return items.dropLast().joined(separator: ", ") + " and " + items[items.count - 1]
+        }
     }
 }

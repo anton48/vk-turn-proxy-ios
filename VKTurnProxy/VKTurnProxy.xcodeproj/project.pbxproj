@@ -37,6 +37,7 @@
 		6795B707AE033110D01EB135 /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 41F2E4485000AF848A0CFE03 /* AppIntents.framework */; };
 		69634039BA6025FF5BECEBF7 /* ProxyConfigRedaction.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C7C4C08873404E9AB6C562A /* ProxyConfigRedaction.swift */; };
 		6C715D35A7DE938BCED16E7A /* ServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC7905B75584E8ECB5B29CDF /* ServerStore.swift */; };
+		73952EE6108E076CA46AC66B /* WireGuardConfText.swift in Sources */ = {isa = PBXBuildFile; fileRef = D50AB4E14F60429CED233BAF /* WireGuardConfText.swift */; };
 		74676C96495AC72E7D7C7EB5 /* TunnelMTU.swift in Sources */ = {isa = PBXBuildFile; fileRef = C80CE8603F45C625FABAC090 /* TunnelMTU.swift */; };
 		7CA072A4E64691BE582D450C /* RoutingShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41B2D2BACDE5E78E1E2E72C2 /* RoutingShortcuts.swift */; };
 		7D5BE8912D686FBFB3143EA1 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 605ED1D89D0F1886A8414767 /* NetworkExtension.framework */; };
@@ -44,6 +45,7 @@
 		82CCE35CF361F2FC25A6388B /* SpeedTestLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F8FEAB45E642DBC5ACA8FF7 /* SpeedTestLog.swift */; };
 		8B3730E4522EA4838D0D2F77 /* VPNLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58612E89BCBF7234C05D3831 /* VPNLiveActivity.swift */; };
 		90CBABBC0C21BE682CF22ACF /* OSLogReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B579DDFDDB7800E681CAC9C4 /* OSLogReader.swift */; };
+		91082FA4C05ECE0FC876A499 /* ConnectionLinkFragment.swift in Sources */ = {isa = PBXBuildFile; fileRef = E04340A5B77EA3853EAB93D0 /* ConnectionLinkFragment.swift */; };
 		93DB8A55F33CCF80C672B562 /* VKOAuthWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8330245254538EE46DB7157 /* VKOAuthWebView.swift */; };
 		96F82C428BBBE30E65182344 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3F6AB47B5515172AD460053 /* ContentView.swift */; };
 		999F3FA557EC56BCA1B6E621 /* SpeedTestRunConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB135B4462CB26B12E38DA9E /* SpeedTestRunConfig.swift */; };
@@ -167,9 +169,11 @@
 		C3A5B4FA5218B9A32CDB5F78 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
 		C80CE8603F45C625FABAC090 /* TunnelMTU.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelMTU.swift; sourceTree = "<group>"; };
 		CFF216A96C8B2716DA861C50 /* LiveActivityIntents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityIntents.swift; sourceTree = "<group>"; };
+		D50AB4E14F60429CED233BAF /* WireGuardConfText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WireGuardConfText.swift; sourceTree = "<group>"; };
 		D5927A5725339CB3E0F08E4B /* VKCookieStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VKCookieStore.swift; sourceTree = "<group>"; };
 		DC7C5DA2979EF658A4117B58 /* SpeedTestServerList.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeedTestServerList.swift; sourceTree = "<group>"; };
 		DDB21244CBAB1A5B17A5CF06 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
+		E04340A5B77EA3853EAB93D0 /* ConnectionLinkFragment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionLinkFragment.swift; sourceTree = "<group>"; };
 		E28ACD6367F3CDE026C71A36 /* PacketTunnel.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = PacketTunnel.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		E74B178DC212A229BC8565F4 /* TunnelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelManager.swift; sourceTree = "<group>"; };
 		EB135B4462CB26B12E38DA9E /* SpeedTestRunConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeedTestRunConfig.swift; sourceTree = "<group>"; };
@@ -256,6 +260,7 @@
 				4D13B015BF30B930DDDB8BBF /* BackupManager.swift */,
 				00AF3235469FAE0005F97B29 /* BridgeHeader.h */,
 				0ACB6146869BD6DC55039EC2 /* ConfigValidation.swift */,
+				E04340A5B77EA3853EAB93D0 /* ConnectionLinkFragment.swift */,
 				975F526A4188951C5B37166D /* ConnectionLinkImport.swift */,
 				9BFB01AD2F5F70DE3F7A4A8C /* ConnectionLinkInbox.swift */,
 				54AD060976AEB359770E134A /* ConnectionReport.swift */,
@@ -298,6 +303,7 @@
 				FDE10D4B4A2BE32E0DD5E3D4 /* VKTurnProxyApp.swift */,
 				284043E2EA6CAC284FF241D3 /* VPNActivityAttributes.swift */,
 				54B78245B4410AB09F5B6E47 /* VPNConfigFailure.swift */,
+				D50AB4E14F60429CED233BAF /* WireGuardConfText.swift */,
 			);
 			path = VKTurnProxy;
 			sourceTree = "<group>";
@@ -477,6 +483,7 @@
 				121CB1E4F13DAA593FF6B4D9 /* AppEntitlements.swift in Sources */,
 				FD1864DD0B5915A3945CE086 /* BackupManager.swift in Sources */,
 				23FB3FA154A0B74AE5DFB39C /* ConfigValidation.swift in Sources */,
+				91082FA4C05ECE0FC876A499 /* ConnectionLinkFragment.swift in Sources */,
 				D51B685C21E726518A413AF3 /* ConnectionLinkImport.swift in Sources */,
 				A02BF48D27F1B0BCFADA8912 /* ConnectionLinkInbox.swift in Sources */,
 				C283D9BDC8B44E083F84A76B /* ConnectionReport.swift in Sources */,
@@ -517,6 +524,7 @@
 				5BFFE56605C7A3D0A4672924 /* VKTurnProxyApp.swift in Sources */,
 				AACB3A08FC4C5ACF9B5D9FE0 /* VPNActivityAttributes.swift in Sources */,
 				55808C77B750142FE667ECDE /* VPNConfigFailure.swift in Sources */,
+				73952EE6108E076CA46AC66B /* WireGuardConfText.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -539,7 +547,7 @@
 		1551285F9714F8A1EA2F3F46 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 381;
+				CURRENT_PROJECT_VERSION = 382;
 				INFOPLIST_FILE = VKTurnProxyWidget/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -559,7 +567,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 381;
+				CURRENT_PROJECT_VERSION = 382;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -589,7 +597,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 381;
+				CURRENT_PROJECT_VERSION = 382;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -615,7 +623,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 381;
+				CURRENT_PROJECT_VERSION = 382;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -710,7 +718,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 381;
+				CURRENT_PROJECT_VERSION = 382;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -735,7 +743,7 @@
 		C9EC52049256F969AB0E71C8 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CURRENT_PROJECT_VERSION = 381;
+				CURRENT_PROJECT_VERSION = 382;
 				INFOPLIST_FILE = VKTurnProxyWidget/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (

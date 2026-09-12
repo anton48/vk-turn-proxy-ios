@@ -314,6 +314,21 @@ struct ConnectionSettings: Codable {
     /// Name for the server this link creates (build 179+). Importing a link now
     /// ADDS a named server instead of overwriting the current configuration.
     /// Absent (older vkturnproxy:// links, and wdtt:// which has no name field)
-    /// → ServerStore assigns the next free "ServerN".
+    /// → ServerStore assigns the next free "ServerN". Since build 382 a wdtt://
+    /// or csqtt:// link's `#fragment` fills it (GitHub #81).
     var serverName: String? = nil
+    /// AmneziaWG parameters that a freeturn:// link's embedded WireGuard conf
+    /// carried and this app cannot honour (S1–S4, H1–H4, HeaderProtectionKey —
+    /// see WireGuardConfText.awgWireChanging). Only the confirmation text reads
+    /// it: a plain-WireGuard client may not reach a server that insists on
+    /// them, and the user should hear that BEFORE the first failed connect.
+    /// In-memory only in practice (links are decoded, never encoded here); a
+    /// crafted vkturnproxy:// payload can set it, so the confirmation text
+    /// shows the names through a letters-and-digits filter.
+    var awgWireParametersIgnored: [String]? = nil
+    /// A freeturn:// link carried a `wg` section that yielded no usable key
+    /// pair (malformed keys, no [Peer]) — the confirmation says the section
+    /// could not be read instead of "keys NOT included", so the user does not
+    /// type in by hand what the link was supposed to carry.
+    var wgConfUnreadable: Bool? = nil
 }

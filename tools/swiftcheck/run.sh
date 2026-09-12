@@ -38,6 +38,10 @@ SOURCES=(
     # The extension's proxy-config redaction (Foundation only): the harness
     # RUNS it on real encodings — a text scan cannot see a regex stop at \".
     VKTurnProxy/PacketTunnel/ProxyConfigRedaction.swift
+    # The link-fragment name and the freeturn `wg` conf parser (Foundation only):
+    # RUN against fixtures — a text scan cannot see a key that decodes to 31 bytes.
+    VKTurnProxy/VKTurnProxy/ConnectionLinkFragment.swift
+    VKTurnProxy/VKTurnProxy/WireGuardConfText.swift
     "$S/UplinkPace.swift"
     "$S/UplinkPaceSync.swift"
     "$S/UplinkSynth.swift"

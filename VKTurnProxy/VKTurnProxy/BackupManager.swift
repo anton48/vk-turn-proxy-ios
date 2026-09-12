@@ -488,6 +488,13 @@ enum BackupManager {
     /// grows a full conn pool from a single VK link. His own Android app doesn't
     /// register the wdtt:// scheme (paste-only), so when WE register it there's
     /// no handler collision.
+    ///
+    /// `…#<name>` after the hash list names the server the import creates
+    /// (GitHub #81, the vless-style remark; the format itself has no fragment —
+    /// people append it by hand). The colon split stops after the fifth `:`
+    /// (`maxSplits: 5`), so the sixth field carries the hash list AND the name
+    /// whole — a `:` inside the name ("DE: Berlin") is kept — and the `#` is
+    /// looked for in that field only, so a `#` inside the password is left alone.
     static func parseWdttLink(_ raw: String) throws -> ConnectionLink {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.lowercased().hasPrefix("wdtt://") else {
@@ -497,7 +504,7 @@ enum BackupManager {
         // omittingEmptySubsequences:false keeps positional integrity if a field
         // is empty — matches amurcanov's Kotlin split(":") semantics so our
         // field indices line up with his.
-        let parts = body.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        let parts = body.split(separator: ":", maxSplits: 5, omittingEmptySubsequences: false).map(String.init)
         guard parts.count >= 6 else {
             throw BackupError.decodeFailed("wdtt:// link needs 6 colon-separated fields, got \(parts.count)")
         }
@@ -505,8 +512,10 @@ enum BackupManager {
         let dtlsPort = parts[1].trimmingCharacters(in: .whitespaces)
         // parts[2] = wgPort, parts[3] = localPeerPort — intentionally ignored.
         let password = parts[4]
-        // parts[5] may be a comma-separated list of VK hashes — take the first.
-        let firstHashRaw = parts[5]
+        // parts[5] = the hash list, then an optional `#<name>` (GitHub #81).
+        let (hashesField, fragment) = ConnectionLinkFragment.split(parts[5])
+        // The list may be comma-separated — take the first.
+        let firstHashRaw = hashesField
             .split(separator: ",", omittingEmptySubsequences: false)
             .first.map(String.init) ?? ""
         let firstHash = stripVkUrl(firstHashRaw)
@@ -530,7 +539,8 @@ enum BackupManager {
             useSrtp: nil, useUDP: nil,
             useWrapA: true, wrapAPassword: password,
             turnServerOverride: nil,
-            dnsServers: nil, numConnections: nil
+            dnsServers: nil, numConnections: nil,
+            serverName: ConnectionLinkFragment.serverName(from: fragment)
         )
         return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }
@@ -597,19 +607,31 @@ enum BackupManager {
     /// DENIED:device_mismatch until it was typed in by hand) — absent, the id
     /// is minted on import. A link without hashes keeps the device's current
     /// VK call link (vkLink "" → applyConnectionLink does not clobber it).
+    ///
+    /// `…#<name>` names the server the import creates (GitHub #81). It is cut
+    /// off BEFORE URLComponents sees the connect form — a pasted name with a
+    /// space or an emoji is not a valid URL and would have failed the whole
+    /// import — and, in the legacy form, looked for after the LAST `@` only, so
+    /// a `#` inside the password survives as before. Known limit of that
+    /// order: a legacy-form name containing `@` moves the split (`…#me@home`
+    /// fails as "needs <host>:<port>") — the password's `#` was judged the
+    /// likelier case.
     static func parseCsqttLink(_ raw: String) throws -> ConnectionLink {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.lowercased().hasPrefix("csqtt://") else {
             throw BackupError.decodeFailed("URL scheme is not csqtt://")
         }
         var host = "", port = "", password = "", firstHash = "", device = ""
+        var fragment: String? = nil
         // The connect form is `csqtt://connect?…` — the `?` is part of the
         // test: a LEGACY link whose password starts with "connect"
         // (`csqtt://connected1@host:46000`) also starts with "csqtt://connect"
         // and was parsed as the query form, which then failed on the missing
         // host (§60 audit item 10, 2026-09-08).
         if trimmed.lowercased().hasPrefix("csqtt://connect?") {
-            guard let comps = URLComponents(string: trimmed) else {
+            let (link, frag) = ConnectionLinkFragment.split(trimmed)
+            fragment = frag
+            guard let comps = URLComponents(string: link) else {
                 throw BackupError.decodeFailed("csqtt:// link is not a valid URL")
             }
             let q = Dictionary((comps.queryItems ?? []).map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { a, _ in a })
@@ -631,7 +653,8 @@ enum BackupManager {
                 throw BackupError.decodeFailed("csqtt:// link needs <password>@<host>:<port>")
             }
             password = String(body[..<at]).removingPercentEncoding ?? String(body[..<at])
-            let hp = String(body[body.index(after: at)...])
+            let (hp, frag) = ConnectionLinkFragment.split(String(body[body.index(after: at)...]))
+            fragment = frag
             guard let colon = hp.lastIndex(of: ":") else {
                 throw BackupError.decodeFailed("csqtt:// link needs <host>:<port>")
             }
@@ -661,6 +684,7 @@ enum BackupManager {
         settings.useCsqtt = true
         settings.csqttPassword = password
         if !device.isEmpty { settings.csqttDeviceID = device }
+        settings.serverName = ConnectionLinkFragment.serverName(from: fragment)
         return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }
 
@@ -673,16 +697,23 @@ enum BackupManager {
     ///
     /// We map ONLY the fields that have an equivalent in our app:
     ///   peer→peerAddress, transport(tcp|udp)→useUDP, obf→obfProfile,
-    ///   key→wrapKeyHex, n→numConnections, cid→clientID, dnss→dnsServers.
-    /// Every other field (provider, mode, bond, spc, listen, dns, mcap, name)
-    /// is intentionally ignored. Importing always switches to SRTP-WRAP-S.
+    ///   key→wrapKeyHex, n→numConnections, cid→clientID, dnss→dnsServers,
+    ///   name→serverName, and since build 382 (GitHub #86, their commit 9da2c8e)
+    ///   wg→privateKey/peerPublicKey/presharedKey/tunnelAddress (+ DNS when
+    ///   `dnss` is absent) through WireGuardConfText.
+    /// Every other field (provider, mode, bond, spc, listen, dns, mcap) is
+    /// intentionally ignored. Importing always switches to SRTP-WRAP-S.
     ///
-    /// The link carries NEITHER a VK call link NOR WireGuard keys (free-turn
-    /// passes the VK -link + WG config as separate CLI flags, not in the URI),
-    /// so those stay untouched: WG keys via nil-preserve, and vkLink by passing
-    /// the device's current value straight back through (applyConnectionLink
-    /// writes vkLink unconditionally). The user still fills WG keys + the VK
-    /// call link in by hand after import.
+    /// The link carries NO VK call link (free-turn passes the VK -link as a
+    /// separate CLI flag, not in the URI): vkLink is "" and applyConnectionLink
+    /// skips an empty one (the csqtt parser relies on the same rule), so the
+    /// device's call link is untouched and the confirmation can say so. `wg`
+    /// is the client's relay .conf verbatim — an AmneziaWG conf on their
+    /// default install; the keys/address/DNS are taken, the obfuscation
+    /// parameters are reported to the confirmation text and ignored (this app
+    /// speaks plain WireGuard). A link without `wg` imports as before (WG keys
+    /// nil-preserve, the user fills them in by hand); a `wg` with no usable key
+    /// pair does the same and is flagged `wgConfUnreadable` for the text.
     static func parseFreeturnLink(_ raw: String) throws -> ConnectionLink {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.lowercased().hasPrefix("freeturn://") else {
@@ -756,19 +787,25 @@ enum BackupManager {
         // name → serverName. free-turn's own links carry a human label; absent
         // → ServerStore assigns the next free "ServerN".
         var serverName: String? = nil
-        if let n = (obj["name"] as? String)?.trimmingCharacters(in: .whitespaces), !n.isEmpty {
-            serverName = n
+        if let n = obj["name"] as? String {
+            serverName = ConnectionLinkFragment.clean(n)
         }
 
-        // vkLink is non-Optional and a freeturn:// link carries no call data, so
-        // pass the device's current value straight back through → the global
-        // vkLink is left untouched on import (preserve).
-        let currentVkLink = UserDefaults.standard.string(forKey: "vkLink") ?? ""
+        // wg → the WireGuard identity (GitHub #86). The conf's DNS applies only
+        // when the link's own `dnss` did not; AllowedIPs/Endpoint/MTU/keepalive
+        // are not read (see WireGuardConfText).
+        var wg: WireGuardConfText? = nil
+        var wgUnreadable = false
+        if let text = obj["wg"] as? String, !text.isEmpty {
+            wg = WireGuardConfText.parse(text)
+            wgUnreadable = wg == nil
+            if dnsServers == nil, let d = wg?.dnsServers { dnsServers = d }
+        }
 
         let settings = ConnectionSettings(
-            privateKey: nil, peerPublicKey: nil, presharedKey: nil,
-            tunnelAddress: nil, allowedIPs: nil,
-            vkLink: currentVkLink,
+            privateKey: wg?.privateKey, peerPublicKey: wg?.peerPublicKey, presharedKey: wg?.presharedKey,
+            tunnelAddress: wg?.tunnelAddress, allowedIPs: nil,
+            vkLink: "",
             peerAddress: peer,
             useDTLS: nil, useWrap: nil, wrapKeyHex: wrapKeyHex,
             useSrtp: nil, useUDP: useUDP,
@@ -776,7 +813,9 @@ enum BackupManager {
             turnServerOverride: nil,
             dnsServers: dnsServers, numConnections: numConnections,
             useWrapS: true, obfProfile: obfProfile, clientID: clientID,
-            serverName: serverName
+            serverName: serverName,
+            awgWireParametersIgnored: (wg?.awgWireChanging.isEmpty ?? true) ? nil : wg?.awgWireChanging,
+            wgConfUnreadable: wgUnreadable ? true : nil
         )
         return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }
@@ -787,7 +826,11 @@ enum BackupManager {
     /// the new settings take effect. Optional fields (dnsServers,
     /// numConnections) only overwrite when present in the link;
     /// absent values preserve whatever the device already had.
-    static func applyConnectionLink(_ link: ConnectionLink) {
+    /// Returns the server it created — its name may differ from the link's
+    /// (ServerStore uniquifies a collision with " 2"), and the receipt shows
+    /// the name that actually landed.
+    @discardableResult
+    static func applyConnectionLink(_ link: ConnectionLink) -> ServerProfile {
         let d = UserDefaults.standard
         let s = link.settings
 
@@ -802,7 +845,8 @@ enum BackupManager {
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
 
         let created = ServerStore.shared.addAndActivate(ServerProfile(link: s))
-        SharedLogger.shared.log("[AppDebug] Backup: connection link imported as new server \"\(created.serverName)\" [\(created.modeLabel)] (peer=\(stripControlChars(created.peerAddress)), numConnections=\(created.numConnections), dnsServers=\(created.dnsServers))")
+        SharedLogger.shared.log("[AppDebug] Backup: connection link imported as new server \"\(stripControlChars(created.serverName))\" [\(created.modeLabel)] (peer=\(stripControlChars(created.peerAddress)), numConnections=\(created.numConnections), dnsServers=\(stripControlChars(created.dnsServers)))")
+        return created
     }
 
     /// Strip ASCII control characters (CR/LF/etc.) from an imported free-form

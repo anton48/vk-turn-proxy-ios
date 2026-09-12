@@ -3124,6 +3124,180 @@ do {
     let backup = source("VKTurnProxy/VKTurnProxy/BackupManager.swift")
     check(backup.contains("hasPrefix(\"csqtt://connect?\")") && !backup.contains("hasPrefix(\"csqtt://connect\")"),
           "the csqtt connect form is told from the legacy form by `csqtt://connect?`, never by the bare `csqtt://connect`")
+
+    // ── wdtt:// and csqtt:// `#fragment` = the server's name (GitHub #81), and
+    //    the freeturn:// `wg` field (GitHub #86, their commit 9da2c8e) — build 382.
+    //    The two helpers are Foundation-only and RUN here; the parsers that call
+    //    them live in BackupManager (scan-only, see above). Reviewed by three
+    //    agents before landing; every fixture below is a case one of them raised.
+    do {
+        let (body, frag) = ConnectionLinkFragment.split("wdtt://1.2.3.4:443:51820:0:pw:AbC#🇩🇪 Germany-1")
+        check(body == "wdtt://1.2.3.4:443:51820:0:pw:AbC" && frag == "🇩🇪 Germany-1",
+              "the fragment is cut at the FIRST '#'; everything after it is the name")
+        check(ConnectionLinkFragment.split("no-fragment").1 == nil, "no '#' → no fragment")
+        check(ConnectionLinkFragment.split("a#b#c").1 == "b#c", "a '#' inside the name is kept")
+        check(ConnectionLinkFragment.serverName(from: "%F0%9F%87%A9%F0%9F%87%AA%20Germany-1") == "🇩🇪 Germany-1",
+              "a TAPPED link's fragment arrives percent-encoded and is decoded")
+        check(ConnectionLinkFragment.serverName(from: "🇩🇪 Германия-1") == "🇩🇪 Германия-1",
+              "a PASTED fragment is taken as typed")
+        check(ConnectionLinkFragment.serverName(from: "100% VPN") == "100% VPN",
+              "a '%' that is not an escape stays literal")
+        check(ConnectionLinkFragment.serverName(from: "  Home\r\nlab\u{7f} ") == "Homelab",
+              "control characters are removed and the ends trimmed — a name is persisted and logged")
+        check(ConnectionLinkFragment.serverName(from: "Home\u{2028}lab\u{202E}x\u{85}y") == "Homelabxy",
+              "🚨 line/paragraph separators, bidi overrides and C1 controls are removed — a name reads on one line, forwards")
+        check(ConnectionLinkFragment.serverName(from: "🏳️‍🌈 pride") == "🏳️‍🌈 pride",
+              "the zero-width joiner is kept — a composite emoji stays one glyph")
+        check(ConnectionLinkFragment.serverName(from: "") == nil && ConnectionLinkFragment.serverName(from: "   ") == nil
+              && ConnectionLinkFragment.serverName(from: nil) == nil,
+              "an empty fragment names nothing — ServerStore assigns ServerN as before")
+        check(ConnectionLinkFragment.serverName(from: String(repeating: "x", count: 100))?.count == ConnectionLinkFragment.maxLength,
+              "a name is cut at maxLength characters")
+        check(ConnectionLinkFragment.clean("50%25 off") == "50%25 off", "clean() never percent-decodes — the rule for a JSON name")
+
+        let priv = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+        let priv2 = "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ="
+        let pub = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+        let psk = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+        let hpk = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk="
+        // free-turn's relay.conf template at 9da2c8e (scripts/install.sh, the
+        // `relay_conf` heredoc) VERBATIM — spacing, key order, every key — with
+        // values as its default install generates them: Jc 4…6, Jmin 10, Jmax
+        // 50, S1–S3 random ≥ 15, S4 = 12, H1–H4 = 1…4, HPK = 32 random bytes,
+        // Endpoint = WG_ENDPOINT (127.0.0.1:9000). Compare against upstream
+        // here when their template moves.
+        let ftConf = """
+        [Interface]
+        Address = 10.13.13.2/32
+        DNS = 1.1.1.1, 1.0.0.1
+        PrivateKey = \(priv)
+        Jc = 5
+        Jmin = 10
+        Jmax = 50
+        S1 = 37
+        S2 = 71
+        S3 = 22
+        S4 = 12
+        H1 = 1
+        H2 = 2
+        H3 = 3
+        H4 = 4
+        HeaderProtectionKey = \(hpk)
+        ContentPaddingAddition = 10
+        RekeyAfterTime = 110
+        RekeyTimeout = 5
+        RejectAfterTime = 160
+        KeepaliveTimeout = 10
+        MaxHandshakeAttempts = 15
+        RandomTrailers = on
+        DisableCookies = on
+
+        [Peer]
+        PublicKey = \(pub)
+        AllowedIPs = 0.0.0.0/0, ::/0
+        Endpoint = 127.0.0.1:9000
+        PersistentKeepalive = 25
+        """
+        if let c = WireGuardConfText.parse(ftConf) {
+            check(c.privateKey == priv && c.peerPublicKey == pub && c.presharedKey == nil,
+                  "free-turn's relay.conf: the key pair is taken, there is no PSK")
+            check(c.tunnelAddress == "10.13.13.2/32", "the Address entry is the tunnel address")
+            check(c.dnsServers == "1.1.1.1,1.0.0.1", "DNS is comma-joined without spaces — dnsServers' own form")
+            check(c.awgKeys.count == 20 && c.awgKeys.first == "Jc" && c.awgKeys.contains("HeaderProtectionKey")
+                  && c.awgKeys.contains("DisableCookies"),
+                  "every AmneziaWG key of the template (20) is reported, in its own spelling")
+            check(c.awgWireChanging == ["S1", "S2", "S3", "S4", "HeaderProtectionKey", "RandomTrailers"],
+                  "🚨 the WIRE-changing subset is S1–S4 ≠ 0, HeaderProtectionKey and RandomTrailers on; H1–H4 at 1…4 and Jc/Jmin/Jmax are not")
+        } else {
+            check(false, "free-turn's relay.conf template parses")
+        }
+        let plain = "\u{FEFF}[Interface]\r\nprivatekey = \(priv2)\r\nPrivateKey = \(priv) # the one that counts\r\naddress = fd00::2/128, 192.168.102.3\r\nDNS = 1.1.1.1 # cloudflare\r\n; a comment\r\n[Peer] # main\r\nPublicKey=\(pub)\r\n[Peer]\r\nPublicKey = \(hpk)\r\nPresharedKey = \(psk)\r\n"
+        if let c = WireGuardConfText.parse(plain) {
+            check(c.awgKeys.isEmpty && c.awgWireChanging.isEmpty, "a plain WireGuard conf reports no AmneziaWG keys")
+            check(c.privateKey == priv, "🚨 a repeated PrivateKey: the LAST wins, as wg(8) does")
+            check(c.peerPublicKey == pub && c.presharedKey == nil,
+                  "🚨 only the FIRST [Peer] counts — the second peer's PresharedKey is not attached to the first peer's key")
+            check(c.tunnelAddress == "192.168.102.3/32", "an IPv6 entry FIRST is skipped; an IPv4 without a prefix gets /32")
+            check(c.dnsServers == "1.1.1.1", "🚨 a `#` starts a comment anywhere on the line (wg's rule) — the comment is not part of the DNS")
+        } else {
+            check(false, "a plain WireGuard conf with a BOM, CRLF, lower-case keys, inline comments and a commented section header parses")
+        }
+        let awgOff = "[Interface]\nPrivateKey = \(priv)\nJc = 4\nS1 = 0\nS2 = 0\nH1 = 5\nRandomTrailers = off\n[Peer]\nPublicKey = \(pub)\n"
+        check(WireGuardConfText.parse(awgOff)?.awgWireChanging == ["H1"],
+              "S = 0 and RandomTrailers = off are not wire-changing; H1 ≠ 1 is")
+        check(WireGuardConfText.parse("[Interface]\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = \(pub)\n") == nil,
+              "no PrivateKey → nil (the link imports without WireGuard settings, as before the field existed)")
+        check(WireGuardConfText.parse("[Interface]\nPrivateKey = \(priv)\n[Peer]\nPublicKey = notakey\n") == nil,
+              "🚨 a PublicKey that is not 32 base64 bytes → nil, never a broken profile")
+        check(WireGuardConfText.parse("[Interface]\nPrivateKey = \(priv)\n[Peer]\nPublicKey = \(pub)\nPresharedKey = short\n")?.presharedKey == nil,
+              "a malformed PresharedKey is dropped, the pair is kept")
+        check(WireGuardConfText.parse("[Interface]\nPrivateKey = \(priv)\nAddress = my.host.name, 300.1.1.1/32, 10.0.0.2/33\n[Peer]\nPublicKey = \(pub)\n")?.tunnelAddress == nil,
+              "🚨 a hostname, an octet > 255 or a prefix > 32 is not a tunnel address — the profile keeps its default and the text says so")
+        check(WireGuardConfText.parse("garbage") == nil && WireGuardConfText.parse("") == nil, "garbage → nil")
+
+        // The parsers (scan-only, RAW source: the literals contain `//`).
+        let backup = source("VKTurnProxy/VKTurnProxy/BackupManager.swift")
+        func parserBody(_ fn: String) -> String {
+            guard let r = backup.range(of: "static func " + fn + "(") else { return "" }
+            let rest = backup[r.upperBound...]
+            if let end = rest.range(of: "\n    static func ") { return String(rest[..<end.lowerBound]) }
+            return String(rest)
+        }
+        let wdtt = parserBody("parseWdttLink"), csqtt = parserBody("parseCsqttLink"), ft = parserBody("parseFreeturnLink")
+        check(wdtt.contains("body.split(separator: \":\", maxSplits: 5, omittingEmptySubsequences: false)"),
+              "🚨 wdtt://: the colon split stops after the fifth ':' — a ':' inside the name (\"DE: Berlin\") is kept")
+        check(wdtt.contains("ConnectionLinkFragment.split(parts[5])"),
+              "🚨 wdtt://: the '#' is looked for in the LAST field only — a '#' in the password field is not a name")
+        check(wdtt.contains("serverName: ConnectionLinkFragment.serverName(from: fragment)"),
+              "wdtt://: the fragment names the server")
+        if let s = csqtt.range(of: "ConnectionLinkFragment.split(trimmed)"), let u = csqtt.range(of: "URLComponents(string: link)") {
+            check(s.lowerBound < u.lowerBound,
+                  "🚨 csqtt://connect?: the fragment is cut BEFORE URLComponents — a pasted name with a space or an emoji is not a valid URL")
+        } else {
+            check(false, "csqtt://connect?: the fragment split precedes URLComponents(string: link)")
+        }
+        check(csqtt.contains("ConnectionLinkFragment.split(String(body[body.index(after: at)...]))"),
+              "🚨 csqtt:// legacy: the '#' is looked for after the LAST '@' — a '#' in the password survives")
+        check(csqtt.components(separatedBy: "fragment = frag").count == 3,
+              "🚨 csqtt://: BOTH forms keep the fragment they cut (`fragment = frag` twice) — cutting it and dropping it would parse fine and name nothing")
+        check(csqtt.contains("settings.serverName = ConnectionLinkFragment.serverName(from: fragment)"),
+              "csqtt://: the fragment names the server")
+        check(ft.contains("WireGuardConfText.parse(text)") && ft.contains("obj[\"wg\"] as? String"),
+              "freeturn://: the `wg` field goes through WireGuardConfText")
+        check(ft.contains("if dnsServers == nil, let d = wg?.dnsServers { dnsServers = d }"),
+              "freeturn://: the link's own `dnss` wins over the conf's DNS")
+        check(ft.contains("privateKey: wg?.privateKey, peerPublicKey: wg?.peerPublicKey, presharedKey: wg?.presharedKey")
+              && ft.contains("tunnelAddress: wg?.tunnelAddress"),
+              "freeturn://: the key pair, the PSK and the tunnel address come from the conf (nil-preserve when there is none)")
+        check(ft.contains("awgWireParametersIgnored: (wg?.awgWireChanging.isEmpty ?? true) ? nil : wg?.awgWireChanging")
+              && ft.contains("wgConfUnreadable: wgUnreadable ? true : nil"),
+              "🚨 freeturn://: the AmneziaWG note and the unreadable flag are PLUMBED into the settings — the text can only say what it is told")
+        check(ft.contains("vkLink: \"\"") && !ft.contains("UserDefaults.standard.string(forKey: \"vkLink\")"),
+              "🚨 freeturn://: vkLink is EMPTY (applyConnectionLink skips it) — not the device's current value passed back, so the text can tell 'not included' from 'included'")
+        check(ft.contains("serverName = ConnectionLinkFragment.clean(n)"),
+              "freeturn://: the JSON `name` goes through the same cleaning rule as a fragment")
+        check(backup.contains("static func applyConnectionLink(_ link: ConnectionLink) -> ServerProfile {"),
+              "applyConnectionLink returns the server it created — the receipt names what actually landed")
+        let prompt = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConnectionLinkImport.swift")
+        check(prompt.contains("let keys = s.privateKey != nil") && prompt.contains("let vk = !s.vkLink.isEmpty"),
+              "🚨 the WRAP-S confirmation is composed from the LINK (keys present? call link present?), not from the mode")
+        check(prompt.contains("WireGuard keys and the VK call link are NOT included — enter them manually.")
+              && prompt.contains("WireGuard keys are NOT included — enter them manually.")
+              && prompt.contains("The VK call link is NOT included — enter it manually.")
+              && prompt.contains("The VK call link is global and will be updated."),
+              "all four key/call-link combinations have their sentence")
+        check(prompt.contains("if s.tunnelAddress != nil { from.append(\"tunnel address\") }")
+              && prompt.contains("if s.dnsServers != nil { from.append(\"DNS\") }")
+              && prompt.contains("has no IPv4 address"),
+              "🚨 'tunnel address' and 'DNS' are claimed only when they were actually taken; a missing IPv4 address is said")
+        check(prompt.contains("s.wgConfUnreadable == true") && prompt.contains("could not be read"),
+              "a wg section with no usable key pair is reported as unreadable, not as 'not included'")
+        check(prompt.contains("s.awgWireParametersIgnored") && prompt.contains("AmneziaWG config") && prompt.contains("text += awg")
+              && prompt.contains("$0.isLetter || $0.isNumber"),
+              "🚨 an AmneziaWG conf's wire-changing parameters are named IN the confirmation text (appended, not just composed), through a letters-and-digits filter")
+        check(prompt.contains("let created = BackupManager.applyConnectionLink(link)") && prompt.contains("Added \\\"\\(created.serverName)\\\""),
+              "the receipt shows the name the server actually got")
+    }
     let editView = codeWithoutComments("VKTurnProxy/VKTurnProxy/ServerEditView.swift")
     check(editView.contains("hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID, onEditScreen: true))"),
           "the edit screen shows the Device ID requirement under the field, in the edit screen's wording")
