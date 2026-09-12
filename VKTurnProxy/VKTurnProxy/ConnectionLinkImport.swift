@@ -203,6 +203,12 @@ enum ConnectionLinkPrompt {
             if s.wgConfUnreadable == true {
                 text += " The link's WireGuard section could not be read (no usable key pair) — enter the keys manually."
             }
+            // wg-quick would set these as search domains; iOS gets addresses only.
+            let search = (s.dnsSearchDomainsIgnored ?? []).prefix(8)
+                .map { String($0.filter { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }.prefix(64)) }.filter { !$0.isEmpty }
+            if !search.isEmpty {
+                text += " DNS search domains in the link (\(search.joined(separator: ", "))) are not supported and were ignored."
+            }
             // The link's WireGuard section may be an AmneziaWG conf (free-turn's
             // default backend): the keys are the same protocol, the obfuscation
             // parameters are not ours — name them before the first failed

@@ -3234,6 +3234,24 @@ do {
         check(WireGuardConfText.parse("[Interface]\nPrivateKey = \(priv)\nAddress = my.host.name, 300.1.1.1/32, 10.0.0.2/33\n[Peer]\nPublicKey = \(pub)\n")?.tunnelAddress == nil,
               "🚨 a hostname, an octet > 255 or a prefix > 32 is not a tunnel address — the profile keeps its default and the text says so")
         check(WireGuardConfText.parse("garbage") == nil && WireGuardConfText.parse("") == nil, "garbage → nil")
+        // wg-quick's DNS rule (src/wg-quick/linux.bash): split on commas AND
+        // whitespace; an address is a server, anything else a search domain.
+        // A search domain or a space-joined pair handed to NEDNSSettings.servers
+        // breaks its contract (user's review, 2026-09-12).
+        let dnsMix = "[Interface]\nPrivateKey = \(priv)\nDNS = 10.13.13.1, corp.example\nDNS = 1.1.1.1 8.8.8.8 2606:4700:4700::1111 lab.local\n[Peer]\nPublicKey = \(pub)\n"
+        if let c = WireGuardConfText.parse(dnsMix) {
+            check(c.dnsServers == "10.13.13.1,1.1.1.1,8.8.8.8,2606:4700:4700::1111",
+                  "🚨 DNS: only ADDRESSES become servers — commas and spaces both separate, IPv6 literals count")
+            check(c.dnsSearchDomains == ["corp.example", "lab.local"],
+                  "🚨 DNS: the non-address entries are search domains, reported separately")
+        } else {
+            check(false, "a conf with a mixed DNS line parses")
+        }
+        check(WireGuardConfText.parse("[Interface]\nPrivateKey = \(priv)\nDNS = corp.example\n[Peer]\nPublicKey = \(pub)\n")?.dnsServers == nil,
+              "a DNS line with search domains only yields no servers (the device keeps its DNS)")
+        let dnss = WireGuardConfText.splitDNS("1.1.1.1, 10.0.0.1 example.org host:53")
+        check(dnss.servers == ["1.1.1.1", "10.0.0.1"] && dnss.search == ["example.org", "host:53"],
+              "splitDNS is the one rule for a link's own `dnss` too — host:port is not an IPv6 literal")
 
         // The parsers (scan-only, RAW source: the literals contain `//`).
         let backup = source("VKTurnProxy/VKTurnProxy/BackupManager.swift")
@@ -3276,6 +3294,10 @@ do {
               "🚨 freeturn://: vkLink is EMPTY (applyConnectionLink skips it) — not the device's current value passed back, so the text can tell 'not included' from 'included'")
         check(ft.contains("serverName = ConnectionLinkFragment.clean(n)"),
               "freeturn://: the JSON `name` goes through the same cleaning rule as a fragment")
+        check(ft.contains("let (servers, search) = WireGuardConfText.splitDNS(dns)")
+              && ft.contains("dnsSearch.append(contentsOf: wg?.dnsSearchDomains ?? [])")
+              && ft.contains("dnsSearchDomainsIgnored: dnsSearch.isEmpty ? nil : dnsSearch"),
+              "🚨 freeturn://: `dnss` goes through splitDNS (addresses only) and the search domains of both sources are plumbed to the text")
         check(backup.contains("static func applyConnectionLink(_ link: ConnectionLink) -> ServerProfile {"),
               "applyConnectionLink returns the server it created — the receipt names what actually landed")
         let prompt = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConnectionLinkImport.swift")
@@ -3292,6 +3314,8 @@ do {
               "🚨 'tunnel address' and 'DNS' are claimed only when they were actually taken; a missing IPv4 address is said")
         check(prompt.contains("s.wgConfUnreadable == true") && prompt.contains("could not be read"),
               "a wg section with no usable key pair is reported as unreadable, not as 'not included'")
+        check(prompt.contains("s.dnsSearchDomainsIgnored") && prompt.contains("search domains in the link"),
+              "ignored DNS search domains are named in the confirmation")
         check(prompt.contains("s.awgWireParametersIgnored") && prompt.contains("AmneziaWG config") && prompt.contains("text += awg")
               && prompt.contains("$0.isLetter || $0.isNumber"),
               "🚨 an AmneziaWG conf's wire-changing parameters are named IN the confirmation text (appended, not just composed), through a letters-and-digits filter")

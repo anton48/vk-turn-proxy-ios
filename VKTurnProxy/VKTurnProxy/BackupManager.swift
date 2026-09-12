@@ -779,9 +779,15 @@ enum BackupManager {
         }
 
         // dnss (comma-separated DNS servers) → dnsServers. Absent = nil-preserve.
+        // Addresses only (wg-quick's split, WireGuardConfText.splitDNS): a
+        // search domain or a space-joined pair would break NEDNSSettings'
+        // contract; domains are reported as ignored.
         var dnsServers: String? = nil
-        if let dns = (obj["dnss"] as? String)?.trimmingCharacters(in: .whitespaces), !dns.isEmpty {
-            dnsServers = dns
+        var dnsSearch: [String] = []
+        if let dns = obj["dnss"] as? String {
+            let (servers, search) = WireGuardConfText.splitDNS(dns)
+            if !servers.isEmpty { dnsServers = servers.joined(separator: ",") }
+            dnsSearch.append(contentsOf: search)
         }
 
         // name → serverName. free-turn's own links carry a human label; absent
@@ -800,6 +806,7 @@ enum BackupManager {
             wg = WireGuardConfText.parse(text)
             wgUnreadable = wg == nil
             if dnsServers == nil, let d = wg?.dnsServers { dnsServers = d }
+            dnsSearch.append(contentsOf: wg?.dnsSearchDomains ?? [])
         }
 
         let settings = ConnectionSettings(
@@ -815,7 +822,8 @@ enum BackupManager {
             useWrapS: true, obfProfile: obfProfile, clientID: clientID,
             serverName: serverName,
             awgWireParametersIgnored: (wg?.awgWireChanging.isEmpty ?? true) ? nil : wg?.awgWireChanging,
-            wgConfUnreadable: wgUnreadable ? true : nil
+            wgConfUnreadable: wgUnreadable ? true : nil,
+            dnsSearchDomainsIgnored: dnsSearch.isEmpty ? nil : dnsSearch
         )
         return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }

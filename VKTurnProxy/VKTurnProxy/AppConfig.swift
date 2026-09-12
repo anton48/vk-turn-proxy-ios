@@ -331,4 +331,9 @@ struct ConnectionSettings: Codable {
     /// could not be read instead of "keys NOT included", so the user does not
     /// type in by hand what the link was supposed to carry.
     var wgConfUnreadable: Bool? = nil
+    /// DNS entries of a freeturn:// link (its `dnss` or the `wg` conf's DNS
+    /// line) that are search domains, not addresses — wg-quick would set them
+    /// as search domains, this app has no field for them (NEDNSSettings gets
+    /// addresses only), so the confirmation names them as ignored.
+    var dnsSearchDomainsIgnored: [String]? = nil
 }

@@ -44,9 +44,17 @@ struct WireGuardConfText: Equatable {
     /// there is none (an IPv6-only conf, a hostname, no Address line) — the
     /// profile then keeps its default and the confirmation says so.
     var tunnelAddress: String?
-    /// [Interface] DNS — the entries comma-joined without spaces
+    /// [Interface] DNS — the ADDRESS entries comma-joined without spaces
     /// ("1.1.1.1,1.0.0.1"), the form `dnsServers` already carries. Optional.
+    /// wg-quick's rule (src/wg-quick/linux.bash): the value is split on
+    /// commas AND whitespace, an entry that looks like an address is a server
+    /// and anything else is a SEARCH DOMAIN — `DNS = 10.13.13.1, corp.example`
+    /// is one server and one domain. NEDNSSettings.servers takes addresses
+    /// only, so the domains go to `dnsSearchDomains` (unsupported, reported).
     var dnsServers: String?
+    /// The DNS entries that are not addresses — search domains. This app has
+    /// no field for them; the confirmation names them as ignored.
+    var dnsSearchDomains: [String]
     /// AmneziaWG keys present under [Interface] with a non-empty value, in
     /// file order and their own spelling. Empty for a plain WireGuard conf.
     var awgKeys: [String]
@@ -75,7 +83,7 @@ struct WireGuardConfText: Equatable {
         var section = ""
         var privateKey = "", publicKey = ""
         var psk: String? = nil, address: String? = nil
-        var dns: [String] = []
+        var dns: [String] = [], dnsSearch: [String] = []
         var awgKeys: [String] = [], wireChanging: [String] = []
         var peerSeen = false
 
@@ -107,7 +115,9 @@ struct WireGuardConfText: Equatable {
                 case "address":
                     if address == nil { address = firstIPv4(value) }
                 case "dns":
-                    dns.append(contentsOf: dnsEntries(value))
+                    let (servers, search) = splitDNS(value)
+                    dns.append(contentsOf: servers)
+                    dnsSearch.append(contentsOf: search)
                 default:
                     if awgKeyNames.contains(key), !value.isEmpty {
                         awgKeys.append(keyText)
@@ -130,6 +140,7 @@ struct WireGuardConfText: Equatable {
         guard isKey32(privateKey), isKey32(publicKey) else { return nil }
         return WireGuardConfText(privateKey: privateKey, peerPublicKey: publicKey, presharedKey: psk,
                                  tunnelAddress: address, dnsServers: dns.isEmpty ? nil : dns.joined(separator: ","),
+                                 dnsSearchDomains: dnsSearch,
                                  awgKeys: awgKeys, awgWireChanging: wireChanging)
     }
 
@@ -151,6 +162,26 @@ struct WireGuardConfText: Equatable {
             guard let p = Int(halves[1]), !halves[1].isEmpty, (0...32).contains(p) else { return false }
         }
         return true
+    }
+
+    /// wg-quick's DNS rule: split on commas and whitespace; an IPv4 or IPv6
+    /// literal is a server, anything else a search domain. Also applied to a
+    /// freeturn:// link's own `dnss` list — the same NEDNSSettings contract.
+    static func splitDNS(_ list: String) -> (servers: [String], search: [String]) {
+        var servers: [String] = [], search: [String] = []
+        for raw in list.split(whereSeparator: { $0 == "," || $0.isWhitespace }) {
+            let e = String(raw)
+            if e.isEmpty { continue }
+            if isIPv4CIDR(e) && !e.contains("/") || isIPv6Literal(e) { servers.append(e) } else { search.append(e) }
+        }
+        return (servers, search)
+    }
+
+    /// An IPv6 literal: hex digits, at least two ':' (so "host:port" is not
+    /// one), optionally a dotted IPv4 tail. No zone index, no brackets.
+    static func isIPv6Literal(_ s: String) -> Bool {
+        guard s.filter({ $0 == ":" }).count >= 2, s.count <= 45 else { return false }
+        return s.allSatisfy { $0.isHexDigit || $0 == ":" || $0 == "." }
     }
 
     private static func changesTheWire(key: String, value: String) -> Bool {
@@ -182,7 +213,4 @@ struct WireGuardConfText: Equatable {
         return nil
     }
 
-    private static func dnsEntries(_ list: String) -> [String] {
-        return list.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    }
 }
