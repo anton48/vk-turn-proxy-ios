@@ -71,6 +71,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // ("interface bounced").
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.vkturnproxy.tunnel.pathmonitor")
+    // 🚨 The three path-state fields below (lastPathDescription,
+    // lastPathEssentialIdentity, currentWiFiSSID) are read and written on
+    // pathMonitorQueue ONLY: the monitor delivers there, the SSID-fetch
+    // callback hops back there before it stores, and stopPathMonitoring
+    // clears them there. Not behind a lock — one owner queue is the simpler
+    // rule, and the handler already assumes it.
     private var lastPathDescription: String?
     // Essential identity = status + iface + ssid + unsatisfiedReason. Excludes
     // flag-only attributes (dns/expensive/constrained/v4/v6) that iOS toggles
@@ -97,10 +103,57 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // missing entitlement, or extension lifecycle quirks).
     private var currentWiFiSSID: String?
 
-    // VKAuth background watchdog: polls the Go cookie fatal-auth latch; on a
-    // non-empty value (cookie rejected/expired mid-session) it stops the tunnel
-    // with a user-readable reason, since a login WebView can't be shown here.
-    private var authErrorTimer: DispatchSourceTimer?
+    /// Raised by stopTunnel, under backendLock, BEFORE it clears anything or
+    /// turns the backend off. Two readers:
+    /// - failStart: a start's failure branch tells "the stop cut me off" from a
+    ///   failure of its own. The bridge cannot say it for us: a stop during the
+    ///   bootstrap wait (the common window — seconds to minutes with a captcha)
+    ///   answers -1, a csqtt attach -1 or -2, a native attach -7, depending on
+    ///   where the stop landed; the flag is one rule for all of them.
+    /// - swapWatchdog: a timer installed AFTER the stop is cancelled instead of
+    ///   kept — stopTunnel's own clears ran already, and a start that outlives
+    ///   the stop by milliseconds would otherwise leave a resumed timer polling
+    ///   a dead tunnel for the life of the process.
+    /// startTunnel lowers it first thing (a provider instance serves one session;
+    /// the reset costs nothing if that ever changes).
+    private var _stopRequested = false
+    private var stopRequested: Bool {
+        backendLock.lock()
+        defer { backendLock.unlock() }
+        return _stopRequested
+    }
+
+    // The two watchdog timers — VKAuth's cookie-rejection poll and csqtt's
+    // terminal-error poll. 🚨 EACH SLOT IS TOUCHED FROM THREE CONTEXTS: installed
+    // by the start (the bootstrap wait's userInitiated queue for VKAuth, the
+    // setTunnelNetworkSettings completion — NE's own queue, not main — for
+    // csqtt), cleared by the timer's own handler on the utility queue, and
+    // cleared by stopTunnel on the provider's thread. A plain stored property
+    // there is the data race the review of 2026-09-06 found one layer below
+    // (the bridge) and §65 of 2026-09-07 left here. The slots sit behind
+    // backendLock and are reached ONLY through swapWatchdog; a start INSTALLS
+    // its timer before it RESUMES it, so a stop that lands between the two
+    // cancels the new timer instead of missing it (a cancelled suspended
+    // source may still be resumed — that is how it is released; a suspended
+    // source may never be dropped), and an install after the stop is refused
+    // by the flag above.
+    private var _authErrorTimer: DispatchSourceTimer?
+    private var _csqttWatchdog: DispatchSourceTimer?
+
+    /// Installs `timer` in the slot (nil clears it) and cancels whatever the
+    /// slot held — unless the stop has run, in which case the incoming timer
+    /// is cancelled and the slot stays empty. One critical section around the
+    /// slot and the flag; the cancels happen after it — a cancel needs no lock.
+    private func swapWatchdog(_ slot: ReferenceWritableKeyPath<PacketTunnelProvider, DispatchSourceTimer?>,
+                              _ timer: DispatchSourceTimer?) {
+        backendLock.lock()
+        let displaced = self[keyPath: slot]
+        let stopped = _stopRequested
+        self[keyPath: slot] = stopped ? nil : timer
+        backendLock.unlock()
+        displaced?.cancel()
+        if stopped { timer?.cancel() }
+    }
 
     private func logMsg(_ msg: String) {
         os_log("%{public}s", log: log, type: .default, msg)
@@ -150,7 +203,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // the tunnel with a clear error (cancelTunnelWithError) — the app surfaces
     // the reason via the App Group key + stats auth_error.
     private func startAuthErrorWatchdog() {
-        stopAuthErrorWatchdog()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + 20, repeating: 20)
         timer.setEventHandler { [weak self] in
@@ -167,24 +219,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ])
             self.cancelTunnelWithError(err)
         }
+        // Install, THEN resume — see the slots' comment.
+        swapWatchdog(\._authErrorTimer, timer)
         timer.resume()
-        authErrorTimer = timer
         logMsg("VKAuth: started background cookie-rejection watchdog (20s)")
     }
 
     private func stopAuthErrorWatchdog() {
-        authErrorTimer?.cancel()
-        authErrorTimer = nil
+        swapWatchdog(\._authErrorTimer, nil)
     }
 
     // csqtt: a terminal failure after start (the server DENIED the session, a
     // captcha on a re-mint) stops the client inside Go; nobody in the app is
     // guaranteed to be polling stats at that moment, so the extension asks
     // every 5 s and stops the tunnel itself with the reason.
-    private var csqttWatchdog: DispatchSourceTimer?
-
     private func startCsqttWatchdog(_ backend: TunnelBackend) {
-        stopCsqttWatchdog()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + 5, repeating: 5)
         timer.setEventHandler { [weak self] in
@@ -195,13 +244,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.stopCsqttWatchdog()
             self.cancelTunnelWithError(Self.csqttStopError(msg))
         }
+        // Install, THEN resume — see the slots' comment.
+        swapWatchdog(\._csqttWatchdog, timer)
         timer.resume()
-        csqttWatchdog = timer
     }
 
     private func stopCsqttWatchdog() {
-        csqttWatchdog?.cancel()
-        csqttWatchdog = nil
+        swapWatchdog(\._csqttWatchdog, nil)
     }
 
     /// A csqtt stop reason as iOS carries it to the app: an NSError with the
@@ -211,6 +260,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// "(PacketTunnel.VPNError error N)" instead of the reason.
     static func csqttStopError(_ reason: String) -> NSError {
         NSError(domain: "VKTurnProxy", code: 2, userInfo: [NSLocalizedDescriptionKey: "csqtt: \(reason)"])
+    }
+
+    /// The start's outcome when stopTunnel ran before the start finished. Not
+    /// a backend failure: the completion iOS is still owed names the stop, in
+    /// the same NSError shape as the two watchdog reasons (the text in
+    /// userInfo crosses to the app; a Swift LocalizedError's does not).
+    static func stoppedDuringStartError() -> NSError {
+        NSError(domain: "VKTurnProxy", code: 3, userInfo: [
+            NSLocalizedDescriptionKey: "The tunnel was stopped while it was starting."
+        ])
+    }
+
+    /// Every failure branch of the start after the backend exists ends here.
+    /// When stopTunnel has already run, the failure is the stop's — whatever
+    /// code the bridge answered (see `_stopRequested`): a plain log line, no
+    /// ERROR, no turnOff (stopTunnel did it), the clear a check-and-set that
+    /// may run BEFORE stopTunnel's own (the native attach sees turnOff's
+    /// registry deletion while stopTunnel is still inside turnOff — either
+    /// order clears the slot once), and the completion names the stop. The
+    /// start's completion may then reach iOS before the stop's; both are
+    /// called exactly once. Otherwise the branch's own line and error, as
+    /// before — plus the VKAuth watchdog and the path monitor stopped, which
+    /// every post-ready failure had left running (the review of 2026-09-14).
+    private func failStart(_ backend: TunnelBackend, at stage: String, line: String, error: Error,
+                           _ completionHandler: (Error?) -> Void) {
+        if stopRequested {
+            logMsg("\(stage): the tunnel was stopped during the start — nothing to tear down here")
+            clearBackend(backend)
+            completionHandler(Self.stoppedDuringStartError())
+            return
+        }
+        logMsg(line)
+        stopAuthErrorWatchdog()
+        stopPathMonitoring()
+        backend.turnOff()
+        clearBackend(backend)
+        completionHandler(error)
     }
 
     // MARK: - Tunnel Lifecycle
@@ -227,6 +313,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // behavior.
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         logMsg("startTunnel called (build \(build))")
+        backendLock.lock()
+        _stopRequested = false
+        backendLock.unlock()
         startPathMonitoring()
 
         // Set Go timezone BEFORE wgSetLogFilePath so the first Go log line
@@ -397,20 +486,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.startAuthErrorWatchdog()
                 }
             case 0:
-                self.logMsg("waitReady: timeout after 120s — aborting")
-                backend.turnOff()
-                self.clearBackend(backend)
-                completionHandler(VPNError.bootstrapTimeout)
+                self.failStart(backend, at: "waitReady", line: "waitReady: timeout after 120s — aborting",
+                               error: VPNError.bootstrapTimeout, completionHandler)
                 return
             default:
                 // csqtt names its terminal reason (a captcha it cannot show, a
                 // DENIED, an unusable call link); the WireGuard path has only
-                // the code.
+                // the code. A stop during the wait answers -1 on both — the
+                // common window of a Disconnect while connecting; failStart
+                // reports it as the stop's.
                 let reason = backend.terminalError()
-                self.logMsg("waitReady: failed with code \(ready)\(reason.isEmpty ? "" : " (\(reason))") — aborting")
-                backend.turnOff()
-                self.clearBackend(backend)
-                completionHandler(reason.isEmpty ? VPNError.backendFailed(code: ready) : Self.csqttStopError(reason))
+                self.failStart(backend, at: "waitReady",
+                               line: "waitReady: failed with code \(ready)\(reason.isEmpty ? "" : " (\(reason))") — aborting",
+                               error: reason.isEmpty ? VPNError.backendFailed(code: ready) : Self.csqttStopError(reason),
+                               completionHandler)
                 return
             }
 
@@ -425,10 +514,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if isWrapA {
                 self.logMsg("WRAP-A: fetching GETCONF provision...")
                 guard let provJSON = backend.waitWrapAProvision(timeoutMs: 30_000) else {
-                    self.logMsg("ERROR: wgWaitWrapAProvision returned null — aborting")
-                    backend.turnOff()
-                    self.clearBackend(backend)
-                    completionHandler(VPNError.backendFailed(code: -100))
+                    self.failStart(backend, at: "WRAP-A provision", line: "ERROR: wgWaitWrapAProvision returned null — aborting",
+                                   error: VPNError.backendFailed(code: -100), completionHandler)
                     return
                 }
                 guard !provJSON.isEmpty,
@@ -436,17 +523,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                       let prov = (try? JSONSerialization.jsonObject(with: provData)) as? [String: Any],
                       let uapi = prov["uapi"] as? String, !uapi.isEmpty,
                       let addr = prov["address"] as? String, !addr.isEmpty else {
-                    self.logMsg("ERROR: WRAP-A provision empty/invalid — aborting")
-                    backend.turnOff()
-                    self.clearBackend(backend)
-                    completionHandler(VPNError.invalidConfiguration)
+                    self.failStart(backend, at: "WRAP-A provision", line: "ERROR: WRAP-A provision empty/invalid — aborting",
+                                   error: VPNError.invalidConfiguration, completionHandler)
                     return
                 }
                 guard self.isValidTunnelAddress(addr) else {
-                    self.logMsg("ERROR: WRAP-A provision address is not a valid ip/prefix — aborting")
-                    backend.turnOff()
-                    self.clearBackend(backend)
-                    completionHandler(VPNError.invalidConfiguration)
+                    self.failStart(backend, at: "WRAP-A provision", line: "ERROR: WRAP-A provision address is not a valid ip/prefix — aborting",
+                                   error: VPNError.invalidConfiguration, completionHandler)
                     return
                 }
                 effWGConfig = uapi
@@ -470,10 +553,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                       let prov = (try? JSONSerialization.jsonObject(with: provData)) as? [String: Any],
                       let addr = prov["address"] as? String, !addr.isEmpty,
                       self.isValidTunnelAddress(addr) else {
-                    self.logMsg("ERROR: csqtt provision empty/invalid — aborting")
-                    backend.turnOff()
-                    self.clearBackend(backend)
-                    completionHandler(VPNError.invalidConfiguration)
+                    self.failStart(backend, at: "csqtt provision", line: "ERROR: csqtt provision empty/invalid — aborting",
+                                   error: VPNError.invalidConfiguration, completionHandler)
                     return
                 }
                 effAddress = addr
@@ -543,10 +624,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     + " (single shot)")
                 self.setTunnelNetworkSettings(finalSettings) { error in
                     if let error = error {
-                        self.logMsg("setTunnelNetworkSettings ERROR: \(error)")
-                        backend.turnOff()
-                        self.clearBackend(backend)
-                        completionHandler(error)
+                        self.failStart(backend, at: "setTunnelNetworkSettings", line: "setTunnelNetworkSettings ERROR: \(error)",
+                                       error: error, completionHandler)
                         return
                     }
                     self.logMsg("setTunnelNetworkSettings OK — TUN interface live")
@@ -555,10 +634,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     // setTunnelNetworkSettings returns. Hand it to Go so
                     // WireGuard can attach to the already-running proxy.
                     guard let tunFd = self.findTunFileDescriptor() else {
-                        self.logMsg("ERROR: could not find TUN fd after setTunnelNetworkSettings")
-                        backend.turnOff()
-                        self.clearBackend(backend)
-                        completionHandler(VPNError.noTunDevice)
+                        self.failStart(backend, at: "TUN fd", line: "ERROR: could not find TUN fd after setTunnelNetworkSettings",
+                                       error: VPNError.noTunDevice, completionHandler)
                         return
                     }
                     self.attachedTunFd = tunFd
@@ -567,13 +644,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
                     let rc = backend.attach(wgConfig: effWGConfig, tunFd: tunFd)
                     if rc < 0 {
-                        self.logMsg("ERROR: attach returned \(rc)")
-                        if rc == -7 {
-                            self.logMsg("attach: the tunnel was stopped during the attach — the bridge closed the device it built; nothing to tear down here")
-                        }
-                        backend.turnOff()
-                        self.clearBackend(backend)
-                        completionHandler(VPNError.backendFailed(code: rc))
+                        // A stop racing the attach reads -7 from the native
+                        // bridge (the device it built is closed there) and
+                        // -1 / -2 from csqtt's; failStart tells a stop from a
+                        // failure by stopTunnel's own flag, not by the code.
+                        self.failStart(backend, at: "attach", line: "ERROR: attach returned \(rc)",
+                                       error: VPNError.backendFailed(code: rc), completionHandler)
                         return
                     }
                     self.logMsg("attach OK — tunnel fully up")
@@ -754,6 +830,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let started = Date()
         let elapsedMs: () -> Int = { Int(Date().timeIntervalSince(started) * 1000) }
         logMsg("stopTunnel: entered (reason=\(reason.rawValue))")
+        // First, before any clear and before turnOff: a start still in flight
+        // reads it to complete as "stopped", a watchdog install that arrives
+        // after this point is refused.
+        backendLock.lock()
+        _stopRequested = true
+        backendLock.unlock()
         stopPathMonitoring()
         stopAuthErrorWatchdog()
         stopCsqttWatchdog()
@@ -904,16 +986,27 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // path event logging never blocks on the SSID lookup.
             if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) {
                 NEHotspotNetwork.fetchCurrent { [weak self] network in
-                    // Sanitize the network-controlled SSID before it reaches any
-                    // log sink (describePath → vpn.log, and describePath →
-                    // wgLogPathSnapshot → Go pathstats): an AP named with
-                    // embedded CR/LF could otherwise forge log lines.
-                    if let rawSSID = network?.ssid {
-                        self?.currentWiFiSSID = SharedLogger.sanitizeField(rawSSID, maxLength: 64)
-                    } else {
-                        self?.currentWiFiSSID = nil
+                    guard let self = self else { return }
+                    // 🚨 BACK ONTO THE PATH QUEUE FIRST. fetchCurrent answers on
+                    // a queue of its own, so without this hop the SSID, the
+                    // dedup key and the identity gate were written from that
+                    // queue on wifi and from pathMonitorQueue on everything
+                    // else (§65 of 2026-09-07). Every store below, and every
+                    // read in describePath / pathEssentialIdentity, is on
+                    // pathMonitorQueue now; stopPathMonitoring clears there too.
+                    self.pathMonitorQueue.async {
+                        // Sanitize the network-controlled SSID before it
+                        // reaches any log sink (describePath → vpn.log, and
+                        // describePath → wgLogPathSnapshot → Go pathstats): an
+                        // AP named with embedded CR/LF could otherwise forge
+                        // log lines.
+                        if let rawSSID = network?.ssid {
+                            self.currentWiFiSSID = SharedLogger.sanitizeField(rawSSID, maxLength: 64)
+                        } else {
+                            self.currentWiFiSSID = nil
+                        }
+                        process()
                     }
-                    process()
                 }
             } else {
                 self.currentWiFiSSID = nil
@@ -928,8 +1021,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func stopPathMonitoring() {
         pathMonitor?.cancel()
         pathMonitor = nil
-        lastPathDescription = nil
-        lastPathEssentialIdentity = nil
+        // The path state is owned by pathMonitorQueue (see the fetchCurrent
+        // hop above): clearing it from stopTunnel's thread was the other half
+        // of the §65 race. Queued after the cancel, so it runs after every
+        // event the monitor had already delivered. An SSID fetch still in
+        // flight at the stop lands after this clear and runs its event on
+        // whatever backend is installed by then — nil, this instance having
+        // been stopped (a provider instance serves one session) — and re-seeds
+        // the identity with the network it is on: harmless either way.
+        pathMonitorQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.lastPathDescription = nil
+            self.lastPathEssentialIdentity = nil
+            self.currentWiFiSSID = nil
+        }
     }
 
     // pathEssentialIdentity returns a key that captures only the network-
@@ -941,8 +1046,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // PathMonitor handler to gate the wgPathChanged bridge call so that
     // iOS-internal flag flips don't trigger full smart-pause marking.
     //
-    // Safe to call only from the path-handler queue: reads currentWiFiSSID
-    // which is updated on the same queue inside the SSID-fetch callback.
+    // Safe to call only from pathMonitorQueue: reads currentWiFiSSID, which
+    // is written there alone — the SSID-fetch callback hops back onto the
+    // queue before it stores (see startPathMonitoring).
     private func pathEssentialIdentity(_ path: Network.NWPath) -> String {
         let status: String
         switch path.status {

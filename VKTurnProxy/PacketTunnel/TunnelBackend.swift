@@ -54,7 +54,11 @@ enum TunnelBackend: Equatable {
     }
 
     /// Attaches the TUN. WireGuard applies `wgConfig` (UAPI) to its device;
-    /// csqtt has no device and ignores it.
+    /// csqtt has no device and ignores it. A stop racing the attach answers
+    /// -7 on the WireGuard bridge (its code for "stopped during the attach")
+    /// but -1 (handle gone) or -2 (stopped between the lookup and the device
+    /// lock) on csqtt's — the provider does not read the stop off the code;
+    /// stopTunnel's own flag says whether the stop ran (failStart).
     func attach(wgConfig: String, tunFd: Int32) -> Int32 {
         switch self {
         case .wireguard(let h):

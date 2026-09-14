@@ -3,19 +3,11 @@
 
 #include <stdint.h>
 
-/// Start a WireGuard tunnel with TURN proxy (legacy single-call flow).
-/// Retained for backward compatibility; new callers should use the split
-/// flow (wgStartVKBootstrap + wgWaitBootstrapReady + wgAttachWireGuard) so
-/// Swift can defer setTunnelNetworkSettings until VK bootstrap is ready.
-/// @param settings UAPI configuration string (key=value\n format)
-/// @param tunFd File descriptor of the TUN device
-/// @param proxyConfigJSON JSON string with proxy configuration
-/// @return Tunnel handle (>0 on success), negative on error:
-///   -1: invalid proxy config JSON
-///   -2: failed to create TUN device
-///   -3: failed to apply WireGuard config
-///   -4: failed to bring up device
-int32_t wgTurnOnWithTURN(const char *settings, int32_t tunFd, const char *proxyConfigJSON);
+/// 🚨 Every function declared here is a `//export` in the Go sources and every
+/// export is declared here — WireGuardBridge/wg_bridge_test.go compares the
+/// two sets, so a removed export leaves no dangling declaration and a new one
+/// cannot be forgotten. (wgTurnOnWithTURN and wgSetLogger, dead since the split
+/// startup, went in build 384.)
 
 /// Start VK bootstrap (API call, TURN allocation, DTLS handshake) in a
 /// background goroutine. Does NOT create a TUN device yet. Returns a tunnel
@@ -48,13 +40,16 @@ int32_t wgWaitBootstrapReady(int32_t tunnelHandle, int32_t timeoutMs);
 ///   -4: failed to create TUN device
 ///   -5: failed to apply WireGuard config
 ///   -6: failed to bring up device
-///   -7: the tunnel was stopped during the attach (the device built here is closed here)
+///   -7: the tunnel was stopped during the attach (the device built here is
+///       closed here; nothing to tear down). An expected outcome of a stop
+///       racing the start, not a failure — the provider reports it as the
+///       stop's by its own stop flag, which also covers a stop that lands
+///       before the attach (this export then answers -1: unknown handle).
 int32_t wgAttachWireGuard(int32_t tunnelHandle, const char *wgConfigSettings, int32_t tunFd);
 
-/// Stop a tunnel. Accepts handles from either wgTurnOnWithTURN or
-/// wgStartVKBootstrap; it tears down a WG device if one was attached and
-/// stops the underlying proxy in either case.
-/// @param tunnelHandle Handle returned by wgTurnOnWithTURN or wgStartVKBootstrap
+/// Stop a tunnel: tears down the WG device if one was attached and stops the
+/// underlying proxy. A no-op on an unknown handle.
+/// @param tunnelHandle Handle returned by wgStartVKBootstrap
 void wgTurnOff(int32_t tunnelHandle);
 
 /// Update WireGuard configuration.
@@ -265,10 +260,6 @@ const char *wgSpeedtestPoll(void);
 /// Cancel a run in progress. Idempotent.
 void wgSpeedtestCancel(void);
 
-/// Set logging callback.
-typedef void (*logger_fn_t)(int level, const char *msg);
-void wgSetLogger(logger_fn_t fn);
-
 /// ─── csqtt — the sixth transport (stage 5, variant B) ──────────────────────
 ///
 /// A csqtt tunnel has its OWN handle space and its own exports: these handles
@@ -301,8 +292,9 @@ const char *csqttProvision(int32_t handle);
 
 /// Attach the TUN after setTunnelNetworkSettings returned: duplicates tunFd
 /// (the caller keeps its own descriptor) and starts the packet pumps.
-/// @return 1 ok; -1 unknown handle; -2 not ready or already attached;
-///         -3 dup failed; -4 the device could not be opened
+/// @return 1 ok; -1 unknown handle (a stop that already ran deletes it);
+///         -2 not ready, already attached, or stopped between the lookup and
+///         the device lock; -3 dup failed; -4 the device could not be opened
 int32_t csqttAttach(int32_t handle, int32_t tunFd);
 
 /// Stop a csqtt tunnel within a bounded time: the client (DISCONNECT

@@ -3347,6 +3347,187 @@ do {
           "the edit screen fills an empty csqtt Device ID with a visible one")
 }
 
+print("The provider's cross-queue state — the watchdog slots behind the lock, the path state on one queue, a stop during the start is no failure")
+
+// 🚨 §65's LEFTOVERS (2026-09-07, closed in build 384). After the native
+//    bridge's device went behind tunnelsMu and the provider's backend behind
+//    backendLock, three things stayed bare in the provider: (a) the two
+//    watchdog timer slots, written by the start, by the timer's own handler
+//    and by stopTunnel — three contexts on one stored property; (b) the
+//    path-monitor state, written on pathMonitorQueue on a non-wifi event but
+//    on NEHotspotNetwork.fetchCurrent's OWN queue on a wifi one, and cleared
+//    from stopTunnel's thread; (c) the bridge's -7 (stopped during the attach)
+//    logged as ERROR and completed as a backend failure although it is the
+//    stop's expected outcome. Each is pinned by SHAPE, because none of the
+//    three can be exercised by the harness: the provider compiles only with
+//    NetworkExtension.
+do {
+    let provider = codeWithoutComments("VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift")
+
+    // (a) The two slots exist, and are reached ONLY as swapWatchdog's key path —
+    //     one install from the start, one clear from the stop; no bare cancel
+    //     or store anywhere (that is the race).
+    for slot in ["_authErrorTimer", "_csqttWatchdog"] {
+        check(provider.contains("private var \(slot): DispatchSourceTimer?"),
+              "the \(slot) slot is declared as a stored optional timer")
+        let mentions = provider.components(separatedBy: slot).count - 1
+        check(mentions == 3,
+              "🚨 \(slot) is touched outside swapWatchdog (\(mentions) mentions, want the declaration + the start's install + the stop's clear)")
+        let keyPathUses = provider.components(separatedBy: "swapWatchdog(\\.\(slot), ").count - 1
+        check(keyPathUses == 2,
+              "🚨 \(slot) must be reached ONLY as swapWatchdog's key path — install and clear (\(keyPathUses) uses)")
+        check(!provider.contains("\(slot)?.cancel()") && !provider.contains("\(slot) = ") && !provider.contains("\(slot)?."),
+              "🚨 a bare cancel or store on \(slot) is back — three contexts on one stored property")
+    }
+    // swapWatchdog's shape: ONE critical section around the slot AND the stop
+    // flag (read the displaced timer, read the flag, store the new timer or
+    // nothing), the cancels after it — the displaced timer always, the
+    // incoming one when the stop has run.
+    if let swap = provider.range(of: "private func swapWatchdog(") {
+        let body = String(provider[swap.upperBound...].prefix(900))
+        check(inOrder(body, ["backendLock.lock()", "let displaced = self[keyPath: slot]", "let stopped = _stopRequested",
+                             "self[keyPath: slot] = stopped ? nil : timer", "backendLock.unlock()",
+                             "displaced?.cancel()", "if stopped { timer?.cancel() }"]),
+              "🚨 swapWatchdog: lock → read the slot → read the stop flag → store (nothing after the stop) → unlock → cancel the displaced timer → cancel the refused one, in that order")
+        check(body.components(separatedBy: "backendLock.lock()").count - 1 == 1
+              && body.components(separatedBy: "self[keyPath: slot] = ").count - 1 == 1,
+              "swapWatchdog takes the lock once and stores once — the order pin above is not satisfied by a duplicate")
+    } else {
+        check(false, "could not find swapWatchdog in the provider")
+    }
+    // A start INSTALLS its timer before it RESUMES it: a stop between the two
+    // then cancels the new timer instead of missing a timer that resumes after
+    // the stop. (A cancelled suspended source may still be resumed — that is
+    // how it is released.)
+    for (start, slot) in [("private func startAuthErrorWatchdog()", "_authErrorTimer"),
+                          ("private func startCsqttWatchdog(", "_csqttWatchdog")] {
+        if let s = provider.range(of: start) {
+            let body = String(provider[s.upperBound...].prefix(1400))
+            let install = "swapWatchdog(\\.\(slot), timer)"
+            check(inOrder(body, [install, "timer.resume()"]) && !inOrder(body, ["timer.resume()", install]),
+                  "🚨 \(start) must install the timer (swapWatchdog) BEFORE timer.resume() — resumed first, a stop between the two misses it")
+        } else {
+            check(false, "could not find \(start) in the provider")
+        }
+    }
+    check(provider.components(separatedBy: "timer.resume()").count - 1 == 2,
+          "exactly two timer.resume() calls in the provider (one per watchdog) — the order pins above are not satisfied by a duplicate")
+
+    // (b) The SSID-fetch callback hops back onto pathMonitorQueue BEFORE it
+    //     stores the SSID and runs the event; the path state is written on
+    //     that queue alone.
+    if let fetch = provider.range(of: "NEHotspotNetwork.fetchCurrent {") {
+        let body = String(provider[fetch.upperBound...].prefix(1600))
+        check(inOrder(body, ["pathMonitorQueue.async {", "currentWiFiSSID = ", "process()"]),
+              "🚨 the fetchCurrent callback must hop onto pathMonitorQueue BEFORE it writes currentWiFiSSID and runs process() — fetchCurrent answers on its own queue")
+        if let hop = body.range(of: "pathMonitorQueue.async {") {
+            check(!String(body[..<hop.lowerBound]).contains("currentWiFiSSID"),
+                  "🚨 currentWiFiSSID is written before the hop onto pathMonitorQueue")
+        }
+    } else {
+        check(false, "could not find NEHotspotNetwork.fetchCurrent in the provider")
+    }
+    //     …and stopPathMonitoring clears the three fields ON the queue, after
+    //     the cancel — never from stopTunnel's thread.
+    if let stop = provider.range(of: "private func stopPathMonitoring()") {
+        let body = String(provider[stop.upperBound...].prefix(1000))
+        check(inOrder(body, ["pathMonitor?.cancel()", "pathMonitorQueue.async", "self.lastPathDescription = nil",
+                             "self.lastPathEssentialIdentity = nil", "self.currentWiFiSSID = nil"]),
+              "🚨 stopPathMonitoring: cancel the monitor, then clear the three path-state fields INSIDE pathMonitorQueue.async")
+        if let q = body.range(of: "pathMonitorQueue.async") {
+            let beforeHop = String(body[..<q.lowerBound])
+            check(!beforeHop.contains("lastPathDescription") && !beforeHop.contains("lastPathEssentialIdentity")
+                  && !beforeHop.contains("currentWiFiSSID"),
+                  "🚨 stopPathMonitoring clears path state from stopTunnel's thread — the §65 race")
+        }
+    } else {
+        check(false, "could not find stopPathMonitoring in the provider")
+    }
+    check(provider.components(separatedBy: "lastPathDescription = nil").count - 1 == 1
+          && provider.components(separatedBy: "lastPathEssentialIdentity = nil").count - 1 == 1,
+          "the path state is cleared in exactly one place — the order pin above is not satisfied by a duplicate")
+
+    // (c) A STOP DURING THE START IS THE STOP'S OUTCOME, NOT A FAILURE — for
+    //     the whole start and both backends, not for the native attach's -7
+    //     window alone (the review of 2026-09-14: the common window is the
+    //     bootstrap wait, where a stop reads -1 on both backends, and csqtt's
+    //     attach answers -1 / -2 for it). stopTunnel raises `_stopRequested`
+    //     under backendLock before it clears or turns anything off; every
+    //     failure branch after the backend exists ends in failStart, which
+    //     reads the flag: stopped → a plain log line, clearBackend, the
+    //     stoppedDuringStartError NSError; otherwise the branch's own line and
+    //     error exactly as before, plus the VKAuth watchdog and the path
+    //     monitor stopped (a failed start had left both running).
+    check(provider.contains("private var _stopRequested = false"), "the stop flag is declared")
+    let flagMentions = provider.components(separatedBy: "_stopRequested").count - 1
+    check(flagMentions == 5,
+          "🚨 _stopRequested is touched outside its sites (\(flagMentions) mentions, want the declaration, the locked getter, startTunnel's reset, stopTunnel's set and swapWatchdog's read)")
+    if let getter = provider.range(of: "private var stopRequested: Bool {") {
+        let body = String(provider[getter.upperBound...].prefix(200))
+        check(inOrder(body, ["backendLock.lock()", "defer { backendLock.unlock() }", "return _stopRequested"]),
+              "the stop flag is read under backendLock")
+    } else {
+        check(false, "could not find the stopRequested getter in the provider")
+    }
+    if let start = provider.range(of: "override func startTunnel(") {
+        let body = String(provider[start.upperBound...].prefix(1500))
+        check(inOrder(body, ["backendLock.lock()", "_stopRequested = false", "backendLock.unlock()", "startPathMonitoring()"]),
+              "startTunnel lowers the stop flag under the lock before it starts anything")
+    } else {
+        check(false, "could not find startTunnel in the provider")
+    }
+    if let stop = provider.range(of: "override func stopTunnel(") {
+        let body = String(provider[stop.upperBound...].prefix(3000))
+        check(inOrder(body, ["backendLock.lock()", "_stopRequested = true", "backendLock.unlock()", "stopPathMonitoring()",
+                             "stopAuthErrorWatchdog()", "stopCsqttWatchdog()", "backend.turnOff()"]),
+              "🚨 stopTunnel raises the stop flag under the lock BEFORE the clears and turnOff — a start's failure branch and a late watchdog install decide by it")
+    } else {
+        check(false, "could not find stopTunnel in the provider")
+    }
+    if let f = provider.range(of: "private func failStart(") {
+        let body = String(provider[f.upperBound...].prefix(1500))
+        check(inOrder(body, ["if stopRequested {", "the tunnel was stopped during the start", "clearBackend(backend)",
+                             "completionHandler(Self.stoppedDuringStartError())", "return", "logMsg(line)",
+                             "stopAuthErrorWatchdog()", "stopPathMonitoring()", "backend.turnOff()", "clearBackend(backend)",
+                             "completionHandler(error)"]),
+              "🚨 failStart: stopped → the plain line, clear, stoppedDuringStartError(); otherwise the branch's line, the VKAuth watchdog and the path monitor stopped, turnOff, clear, the branch's error — in that order")
+        if let arm = body.range(of: "if stopRequested {"), let rest = body.range(of: "logMsg(line)"),
+           arm.upperBound < rest.lowerBound {
+            let stoppedArm = String(body[arm.upperBound..<rest.lowerBound])
+            check(!stoppedArm.contains("ERROR") && !stoppedArm.contains("turnOff") && !stoppedArm.contains("backendFailed"),
+                  "🚨 failStart's stopped arm logs ERROR, turns off or reports a backend failure — a stop during the start is not a failure")
+        }
+    } else {
+        check(false, "🚨 could not find failStart in the provider — every failure branch after the backend exists must end there")
+    }
+    // …and every such branch DOES end there: the only turnOff calls in the
+    // provider are failStart's and stopTunnel's, the nine branches call it,
+    // and nothing between the backend's install and the end of startTunnel
+    // completes with an error on its own.
+    let turnOffs = provider.components(separatedBy: "backend.turnOff()").count - 1
+    check(turnOffs == 2,
+          "🚨 a failure branch tears down on its own (\(turnOffs) backend.turnOff() calls, want failStart's and stopTunnel's)")
+    let failStarts = provider.components(separatedBy: "self.failStart(backend, at: ").count - 1
+    check(failStarts == 9,
+          "every failure branch after the backend exists goes through failStart (\(failStarts) call sites, want 9: the waitReady timeout and failure, WRAP-A ×3, the csqtt provision, setTunnelNetworkSettings, the TUN fd, the attach)")
+    if let install = provider.range(of: "self.backend = backend"),
+       let end = provider.range(of: "override func handleAppMessage(") , install.upperBound < end.lowerBound {
+        let rest = String(provider[install.upperBound..<end.lowerBound])
+        check(!rest.contains("completionHandler(VPNError.") && !rest.contains("completionHandler(Self.csqttStopError")
+              && !rest.contains("completionHandler(error)") && rest.contains("completionHandler(nil)"),
+              "🚨 a failure branch after the backend's install completes on its own — it must go through failStart, which knows whether the stop ran")
+    } else {
+        check(false, "could not find the backend install and the end of startTunnel in the provider")
+    }
+    if let err = provider.range(of: "static func stoppedDuringStartError() -> NSError") {
+        let body = String(provider[err.upperBound...].prefix(300))
+        check(body.contains("NSLocalizedDescriptionKey") && body.contains("domain: \"VKTurnProxy\""),
+              "stoppedDuringStartError carries its text in NSLocalizedDescriptionKey under the VKTurnProxy domain — a Swift LocalizedError's text does not cross to the app")
+    } else {
+        check(false, "🚨 the stop-during-start outcome must be an NSError (stoppedDuringStartError) — the text crosses to the app in userInfo, like the watchdog reasons")
+    }
+}
+
 print("The proxy-config log line — secrets leave it STRUCTURALLY, never by a pattern over the text")
 
 // 🚨 THE csqtt PASSWORD IS THE TUNNEL'S ONLY KEY, AND THE LOG LINE IS WHAT

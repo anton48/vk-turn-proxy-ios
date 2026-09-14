@@ -12,7 +12,9 @@ package main
 // the ownership is exercised, not modelled.
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -231,6 +233,122 @@ func TestWGDeviceFieldAccessesSitUnderTheLock(t *testing.T) {
 	for _, fn := range []string{"deviceNow", "wgAttachWireGuardImpl", "wgTurnOffImpl"} {
 		if seen[fn] == 0 {
 			t.Errorf("no locked device/bind access found in %s — the scan is looking at the wrong tree", fn)
+		}
+	}
+}
+
+// failingBind is a conn.Bind whose Open fails, so device.Up fails through
+// BindUpdate — the -6 path of the attach.
+type failingBind struct{}
+
+func (failingBind) Open(uint16) ([]conn.ReceiveFunc, uint16, error) {
+	return nil, 0, errors.New("failingBind: open refused")
+}
+func (failingBind) Close() error                       { return nil }
+func (failingBind) SetMark(uint32) error               { return nil }
+func (failingBind) Send([][]byte, conn.Endpoint) error { return errors.New("failingBind") }
+func (failingBind) ParseEndpoint(string) (conn.Endpoint, error) {
+	return nil, errors.New("failingBind")
+}
+func (failingBind) BatchSize() int { return 1 }
+
+// A stop that lands BEFORE the device comes up, with Up then failing: the
+// answer is -7 (stopped during the attach — the outcome the provider treats
+// as expected), not -6 (failed to bring up the device — a backend failure
+// in the provider's log and completion). Same fact as the post-Up
+// check-and-set, one step earlier; §65's "a stop before dev.Up surfaces as
+// -6" (2026-09-07). The stop comes from inside the bind seam, which the
+// attach calls before it touches the descriptor. Sabotage seen red: the
+// registration check dropped from the Up-failure branch (attach answers -6).
+func TestWGAttachStoppedBeforeUpAnswersStopped(t *testing.T) {
+	installWGFakes(t)
+	id := registerWGEntry(t)
+	prevBind := wgNewBind
+	wgNewBind = func(*proxy.Proxy) conn.Bind {
+		wgTurnOffImpl(id) // the stop lands before dev.Up
+		return failingBind{}
+	}
+	t.Cleanup(func() { wgNewBind = prevBind })
+	mine, theirs := socketPair(t)
+	defer unix.Close(theirs)
+	defer unix.Close(mine)
+
+	if rc := wgAttachWireGuardImpl(id, testWGConfig, mine); rc != -7 {
+		t.Fatalf("attach with the tunnel stopped before Up answered %d, want -7 — a stop before the device came up is reported as a backend failure", rc)
+	}
+	if !fdIsOpen(mine) {
+		t.Fatal("the caller's descriptor was closed — the attach must only close its dup")
+	}
+	// The control: the same failing bind with the tunnel still registered is
+	// the -6 it always was — the new branch answers -7 only for a stop.
+	id2 := registerWGEntry(t)
+	wgNewBind = func(*proxy.Proxy) conn.Bind { return failingBind{} }
+	if rc := wgAttachWireGuardImpl(id2, testWGConfig, mine); rc != -6 {
+		t.Fatalf("attach on a live tunnel whose device cannot come up answered %d, want -6", rc)
+	}
+}
+
+// Every `//export` in the bridge's Go sources is declared in
+// include/wireguard_turn.h, and every function declared there is an export:
+// a removed export leaves no declaration Swift could still compile a call
+// against (an unresolved symbol at link time, or at run time through a
+// stale xcframework), and a new export cannot be forgotten in the header.
+// The header is what the xcframework ships (Makefile: -headers include).
+// Seen red with wgSetLogger's declaration left in the header after its
+// export went, and with an export the header does not declare.
+func TestHeaderDeclaresExactlyTheExports(t *testing.T) {
+	exports := map[string]bool{}
+	exportLine := regexp.MustCompile(`^//export ([A-Za-z0-9_]+)\s*$`)
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(string(src), "\n") {
+			if m := exportLine.FindStringSubmatch(line); m != nil {
+				exports[m[1]] = true
+			}
+		}
+	}
+	header, err := os.ReadFile("include/wireguard_turn.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Comments out (both kinds), then a declaration is a line of the form
+	// `<type> [*]name(` — the star may sit on either side of the space. A
+	// typedef line is not a declaration (a function-pointer typedef would
+	// read as one named after its return type).
+	text := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(string(header), "")
+	decl := regexp.MustCompile(`^\s*(?:const\s+)?[A-Za-z0-9_]+\s*\*?\s*([A-Za-z0-9_]+)\s*\(`)
+	declared := map[string]bool{}
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "typedef") {
+			continue
+		}
+		if m := decl.FindStringSubmatch(line); m != nil {
+			declared[m[1]] = true
+		}
+	}
+	// Not vacuous: both scans found the bridge (44 exports on 2026-09-14).
+	if len(exports) < 40 || len(declared) < 40 {
+		t.Fatalf("the scans found %d exports and %d declarations — one of them is looking at the wrong tree", len(exports), len(declared))
+	}
+	for name := range exports {
+		if !declared[name] {
+			t.Errorf("//export %s has no declaration in include/wireguard_turn.h (or its declaration is not one line of the form `<type> [*]name(`, which is all this scan reads)", name)
+		}
+	}
+	for name := range declared {
+		if !exports[name] {
+			t.Errorf("include/wireguard_turn.h declares %s, which no Go file exports — a dead declaration", name)
 		}
 	}
 }

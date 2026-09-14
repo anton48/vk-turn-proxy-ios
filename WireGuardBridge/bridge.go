@@ -15,12 +15,6 @@ static void disable_async_preempt(void) {
 	setenv("GODEBUG", "asyncpreemptoff=1", 1);
 }
 
-// Logging callback type matching wireguard-apple convention
-typedef void(*logger_fn_t)(int level, const char *msg);
-static void callLogger(void *fn, int level, const char *msg) {
-	((logger_fn_t)fn)(level, msg);
-}
-
 // Write Go log messages to os_log (visible in Console.app)
 static void go_os_log(const char *msg) {
 	os_log_t log = os_log_create("com.vkturnproxy.tunnel", "go");
@@ -289,135 +283,13 @@ type ProxyConfig struct {
 	DeviceID string `json:"device_id,omitempty"`
 }
 
-// Legacy single-call entry point: starts VK bootstrap AND attaches WireGuard
-// in one synchronous step. Retained so existing callers keep working while
-// PacketTunnelProvider is migrated to the split flow (wgStartVKBootstrap +
-// wgWaitBootstrapReady + wgAttachWireGuard), after which this export can be
-// deleted.
+// --- Phased startup (the APNs-through-tunnel refactor) ---
 //
-//export wgTurnOnWithTURN
-func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char) C.int32_t {
-	goSettings := C.GoString(settings)
-	goProxyJSON := C.GoString(proxyConfigJSON)
-
-	var pcfg ProxyConfig
-	if err := json.Unmarshal([]byte(goProxyJSON), &pcfg); err != nil {
-		log.Printf("wgTurnOnWithTURN: invalid proxy config: %s", err)
-		return -1
-	}
-	if pcfg.NumConns <= 0 {
-		pcfg.NumConns = 1
-	}
-
-	// Apply pre-resolved VK host IPs (set by main app before startVPNTunnel).
-	if len(pcfg.VKHostIPs) > 0 {
-		log.Printf("wgTurnOnWithTURN: using %d pre-resolved VK host IPs from main app", len(pcfg.VKHostIPs))
-		proxy.SetVKHostIPs(pcfg.VKHostIPs)
-	}
-	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
-	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
-	// The pacer is applied at BOTH connect sites, because a tunnel that comes up
-	// through the bootstrap path is the same tunnel: applying it at one site only
-	// would make the setting depend on how the session happened to start.
-	proxy.SetUplinkPace(pcfg.UplinkPaceKiB, pcfg.UplinkPaceBurstKiB)
-	if !pcfg.UseCookieAuth {
-		proxy.SetVKCookieAuth(false, "", nil)
-	}
-
-	// Create proxy
-	if pcfg.UseWrapS {
-		pcfg.UseWrap = false // SRTP-WRAP-S and SRTP-WRAP are mutually exclusive
-	}
-	wrapKey, wrapErr := decodeWrapKey(pcfg.UseWrap || pcfg.UseWrapS, pcfg.WrapKeyHex)
-	if wrapErr != nil {
-		log.Printf("wgTurnOnWithTURN: WRAP key invalid: %s — disabling WRAP", wrapErr)
-		pcfg.UseWrap = false
-		pcfg.UseWrapS = false
-	}
-	p := proxy.NewProxy(proxy.Config{
-		UplinkSynthMbit:  pcfg.UplinkSynthMbit,
-		UplinkSynthSec:   pcfg.UplinkSynthSec,
-		PeerAddr:         pcfg.PeerAddr,
-		TurnServer:       pcfg.TurnServer,
-		TurnPort:         pcfg.TurnPort,
-		VKLink:           pcfg.VKLink,
-		UseDTLS:          pcfg.UseDTLS,
-		UseUDP:           pcfg.UseUDP,
-		UseWrap:          pcfg.UseWrap,
-		WrapKey:          wrapKey,
-		UseWrapS:         pcfg.UseWrapS,
-		ObfProfile:       pcfg.ObfProfile,
-		ClientID:         pcfg.ClientID,
-		UseSrtp:          pcfg.UseSrtp,
-		UseWrapA:         pcfg.UseWrapA,
-		WrapAPassword:    pcfg.WrapAPassword,
-		DeviceID:         pcfg.DeviceID,
-		NumConns:         pcfg.NumConns,
-		CredPoolCooldown: time.Duration(pcfg.CredPoolCooldownSeconds) * time.Second,
-	})
-
-	// Create TURN bind
-	bind := turnbind.NewTURNBind(p)
-
-	// Create TUN device from file descriptor
-	dupFd, err := dupFD(int(tunFd))
-	if err != nil {
-		log.Printf("wgTurnOnWithTURN: dup fd failed: %s", err)
-		return -2
-	}
-	if err := unix.SetNonblock(dupFd, true); err != nil { // see wgAttachWireGuardImpl
-		log.Printf("wgTurnOnWithTURN: SetNonblock: %s", err)
-		unix.Close(dupFd)
-		return -2
-	}
-	tunFile := os.NewFile(uintptr(dupFd), "/dev/tun")
-	tunDev, err := tun.CreateTUNFromFile(tunFile, 0)
-	if err != nil {
-		tunFile.Close()
-		log.Printf("wgTurnOnWithTURN: CreateTUNFromFile failed: %s", err)
-		return -5
-	}
-	// Time the uplink read loop — see pkg/proxy/tunstats.go. Transparent
-	// wrapper: only Read is intercepted, and only to measure where the loop's
-	// time goes. It answers "is wireguard-go starved or slow?", which is the
-	// one question left about the ~22 Mbit/s upload ceiling.
-	tunDev = proxy.WrapTUNForStats(tunDev)
-
-	// Create WireGuard device with our custom bind
-	logger := device.NewLogger(device.LogLevelVerbose, "(wireguard-turn) ")
-	dev := device.NewDevice(tunDev, bind, logger)
-
-	// Apply UAPI configuration
-	if err := dev.IpcSet(goSettings); err != nil {
-		log.Printf("wgTurnOnWithTURN: IpcSet: %s", err)
-		dev.Close()
-		return -3
-	}
-
-	if err := dev.Up(); err != nil {
-		log.Printf("wgTurnOnWithTURN: Up: %s", err)
-		dev.Close()
-		return -4
-	}
-
-	tunnelsMu.Lock()
-	id := nextID
-	nextID++
-	tunnels[id] = &tunnelEntry{
-		device: dev,
-		proxy:  p,
-	}
-	tunnelsMu.Unlock()
-
-	log.Printf("wgTurnOnWithTURN: tunnel %d started", id)
-	return C.int32_t(id)
-}
-
-// --- APNs-through-tunnel refactor: split entry points ---
-//
-// The three exports below replace the single synchronous wgTurnOnWithTURN
-// with a phased startup so Swift can defer setTunnelNetworkSettings until
-// after VK bootstrap is done:
+// The tunnel starts in three steps so Swift can defer setTunnelNetworkSettings
+// until after VK bootstrap is done. (They replaced a single synchronous
+// entry point, wgTurnOnWithTURN, which had no Swift caller since the split
+// and was removed in build 384 — a second copy of the start sequence that
+// every later fix had to be applied to twice.)
 //
 //   1. wgStartVKBootstrap   — kicks off VK API + TURN alloc + DTLS in a
 //                             goroutine; returns a handle immediately, no
@@ -429,8 +301,8 @@ func wgTurnOnWithTURN(settings *C.char, tunFd C.int32_t, proxyConfigJSON *C.char
 //
 // wgGetTURNServerIP remains unchanged; call it between steps 2 and 3 to get
 // the TURN server IP before updating NEVPNProtocol.serverAddress.
-// wgTurnOff / wgPause / wgResume / wgSetConfig / wgGetStats work on handles
-// from either the legacy or split flow — they just look up tunnelEntry.
+// wgTurnOff / wgPause / wgResume / wgSetConfig / wgGetStats take the handle
+// wgStartVKBootstrap returned — they just look up tunnelEntry.
 
 // Starts VK bootstrap (API call, TURN allocation, DTLS handshake) in a
 // background goroutine. Does NOT create a TUN device. Returns a tunnel
@@ -462,9 +334,9 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
-	// The pacer is applied at BOTH connect sites, because a tunnel that comes up
-	// through the bootstrap path is the same tunnel: applying it at one site only
-	// would make the setting depend on how the session happened to start.
+	// The pacer is applied at the one connect site there is (the legacy second
+	// site went with wgTurnOnWithTURN in build 384) and again by
+	// wgSetUplinkPace on a running tunnel.
 	proxy.SetUplinkPace(pcfg.UplinkPaceKiB, pcfg.UplinkPaceBurstKiB)
 	// Defensive: when cookie auth isn't requested, force it OFF (the extension
 	// process can be reused across connects — clear any stale cookie state).
@@ -701,8 +573,21 @@ func wgAttachWireGuardImpl(id int32, goSettings string, tunFd int) int32 {
 		return -5
 	}
 	if err := dev.Up(); err != nil {
-		log.Printf("wgAttachWireGuard: Up: %s", err)
 		dev.Close()
+		// A stop that landed before the device came up: the failure is the
+		// stop's (the answer is -7, "stopped during the attach", the same
+		// outcome as below the install), not a -6 the caller would report as
+		// a backend failure. The error is still logged for the record.
+		// ⚖️ Not reachable with today's bind: after wgStartVKBootstrap the
+		// TURNBind's Open is a no-op Start plus a flag, no fwmark is ever
+		// set, so Up cannot fail — the branch answers for a bind that can
+		// (the test drives it with one); the race the device sees takes the
+		// post-Up check-and-set below.
+		if !wgRegistered(id, entry) {
+			log.Printf("wgAttachWireGuard: tunnel %d was stopped before the device came up (Up: %s)", id, err)
+			return -7
+		}
+		log.Printf("wgAttachWireGuard: Up: %s", err)
 		return -6
 	}
 	if wgAfterAttachUp != nil {
@@ -734,6 +619,16 @@ func wgAttachWireGuardImpl(id int32, goSettings string, tunFd int) int32 {
 
 	log.Printf("wgAttachWireGuard: tunnel %d WireGuard attached", id)
 	return 1
+}
+
+// wgRegistered reports whether entry is still the tunnel registered under id
+// — false once wgTurnOff has unregistered it. Touches no device field: the
+// install's own check-and-set (registration AND an empty device slot, in one
+// section) stays where it is.
+func wgRegistered(id int32, entry *tunnelEntry) bool {
+	tunnelsMu.Lock()
+	defer tunnelsMu.Unlock()
+	return tunnels[id] == entry
 }
 
 //export wgTurnOff
@@ -1293,25 +1188,6 @@ func wgProbeVKCreds(linkID, vkHostIPsJSON, savedSID, savedKey, savedToken1, save
 //export wgVersion
 func wgVersion() *C.char {
 	return C.CString("0.1.0-turn")
-}
-
-//export wgSetLogger
-func wgSetLogger(loggerFn unsafe.Pointer) {
-	if loggerFn == nil {
-		return
-	}
-	log.SetOutput(&clogWriter{fn: loggerFn})
-}
-
-type clogWriter struct {
-	fn unsafe.Pointer
-}
-
-func (w *clogWriter) Write(p []byte) (int, error) {
-	msg := C.CString(string(p))
-	defer C.free(unsafe.Pointer(msg))
-	C.callLogger(w.fn, 0, msg)
-	return len(p), nil
 }
 
 func dupFD(fd int) (int, error) {

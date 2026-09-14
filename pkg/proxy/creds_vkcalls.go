@@ -78,7 +78,7 @@ const (
 // the free path is captcha-free, so the solver (header-order fix + slider)
 // never runs in normal use. On iOS it's driven by an undocumented
 // `forceLegacyCaptcha` field in the backup JSON, plumbed through ProxyConfig ->
-// wgStartVKBootstrap / wgTurnOnWithTURN -> SetForceLegacyCaptcha. Default false.
+// wgStartVKBootstrap -> SetForceLegacyCaptcha. Default false.
 var forceLegacyCaptcha atomic.Bool
 
 // SetForceLegacyCaptcha sets the force-legacy-captcha on-device test flag.
