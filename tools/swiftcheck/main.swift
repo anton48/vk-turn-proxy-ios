@@ -3431,9 +3431,9 @@ do {
     //     the cancel — never from stopTunnel's thread.
     if let stop = provider.range(of: "private func stopPathMonitoring()") {
         let body = String(provider[stop.upperBound...].prefix(1000))
-        check(inOrder(body, ["pathMonitor?.cancel()", "pathMonitorQueue.async", "self.lastPathDescription = nil",
+        check(inOrder(body, ["swapPathMonitor(nil)", "pathMonitorQueue.async", "self.lastPathDescription = nil",
                              "self.lastPathEssentialIdentity = nil", "self.currentWiFiSSID = nil"]),
-              "🚨 stopPathMonitoring: cancel the monitor, then clear the three path-state fields INSIDE pathMonitorQueue.async")
+              "🚨 stopPathMonitoring: take the monitor out under the lock (swapPathMonitor), then clear the three path-state fields INSIDE pathMonitorQueue.async")
         if let q = body.range(of: "pathMonitorQueue.async") {
             let beforeHop = String(body[..<q.lowerBound])
             check(!beforeHop.contains("lastPathDescription") && !beforeHop.contains("lastPathEssentialIdentity")
@@ -3460,8 +3460,8 @@ do {
     //     monitor stopped (a failed start had left both running).
     check(provider.contains("private var _stopRequested = false"), "the stop flag is declared")
     let flagMentions = provider.components(separatedBy: "_stopRequested").count - 1
-    check(flagMentions == 5,
-          "🚨 _stopRequested is touched outside its sites (\(flagMentions) mentions, want the declaration, the locked getter, startTunnel's reset, stopTunnel's set and swapWatchdog's read)")
+    check(flagMentions == 6,
+          "🚨 _stopRequested is touched outside its sites (\(flagMentions) mentions, want the declaration, the locked getter, startTunnel's reset, stopTunnel's set, swapWatchdog's and swapPathMonitor's reads)")
     if let getter = provider.range(of: "private var stopRequested: Bool {") {
         let body = String(provider[getter.upperBound...].prefix(200))
         check(inOrder(body, ["backendLock.lock()", "defer { backendLock.unlock() }", "return _stopRequested"]),
@@ -3484,21 +3484,54 @@ do {
     } else {
         check(false, "could not find stopTunnel in the provider")
     }
+    // 🚨 THE FLAG DECIDES WHAT IS SAID, NEVER WHAT IS DONE. Build 384's first
+    //    cut skipped turnOff on the flag; stopTunnel then read a backend that
+    //    clear had emptied and nobody turned the Go tunnel off (the user's
+    //    review, both completions called, turnOff zero times). The teardown
+    //    runs in full on both arms, turnOff BEFORE clearBackend, so whoever
+    //    finds the slot empty may rely on the tunnel being off.
     if let f = provider.range(of: "private func failStart(") {
         let body = String(provider[f.upperBound...].prefix(1500))
-        check(inOrder(body, ["if stopRequested {", "the tunnel was stopped during the start", "clearBackend(backend)",
-                             "completionHandler(Self.stoppedDuringStartError())", "return", "logMsg(line)",
+        check(inOrder(body, ["let stopped = stopRequested", "logMsg(stopped ? ", "the tunnel was stopped during the start", ": line)",
                              "stopAuthErrorWatchdog()", "stopPathMonitoring()", "backend.turnOff()", "clearBackend(backend)",
-                             "completionHandler(error)"]),
-              "🚨 failStart: stopped → the plain line, clear, stoppedDuringStartError(); otherwise the branch's line, the VKAuth watchdog and the path monitor stopped, turnOff, clear, the branch's error — in that order")
-        if let arm = body.range(of: "if stopRequested {"), let rest = body.range(of: "logMsg(line)"),
-           arm.upperBound < rest.lowerBound {
-            let stoppedArm = String(body[arm.upperBound..<rest.lowerBound])
-            check(!stoppedArm.contains("ERROR") && !stoppedArm.contains("turnOff") && !stoppedArm.contains("backendFailed"),
-                  "🚨 failStart's stopped arm logs ERROR, turns off or reports a backend failure — a stop during the start is not a failure")
+                             "completionHandler(stopped ? Self.stoppedDuringStartError() : error)"]),
+              "🚨 failStart: read the flag once, log the stop's line or the branch's, then ONE teardown — the VKAuth watchdog, the path monitor, turnOff, clear — and the completion carries the stop's error or the branch's, in that order")
+        if let end = body.range(of: "\n    }\n") {
+            check(!String(body[..<end.lowerBound]).contains("return"),
+                  "🚨 failStart returns early — a branch that skips part of the teardown on the flag is the hole of 2026-09-14")
+        } else {
+            check(false, "could not find the end of failStart")
         }
+        check(body.components(separatedBy: "backend.turnOff()").count - 1 == 1
+              && body.components(separatedBy: "clearBackend(backend)").count - 1 == 1,
+              "failStart turns off once and clears once — the order pin above is not satisfied by a duplicate")
     } else {
         check(false, "🚨 could not find failStart in the provider — every failure branch after the backend exists must end there")
+    }
+    // The monitor's slot: swapped under the lock like the watchdog slots
+    // (stopTunnel and failStart may both stop it from different threads — an
+    // ARC race on a plain stored reference, seen as an abort on a stand).
+    check(provider.contains("private var _pathMonitor: NWPathMonitor?"), "the path monitor's slot is declared")
+    let monitorMentions = provider.components(separatedBy: "_pathMonitor").count - 1
+    check(monitorMentions == 3,
+          "🚨 _pathMonitor is touched outside swapPathMonitor (\(monitorMentions) mentions, want the declaration + the helper's read and store)")
+    check(!provider.contains("pathMonitor?.cancel()") && !provider.contains("pathMonitor = monitor") && !provider.contains("pathMonitor = nil"),
+          "🚨 a bare cancel or store on the path monitor is back — two threads on one stored reference")
+    if let swap = provider.range(of: "private func swapPathMonitor(") {
+        let body = String(provider[swap.upperBound...].prefix(900))
+        check(inOrder(body, ["backendLock.lock()", "let displaced = _pathMonitor", "let stopped = _stopRequested",
+                             "_pathMonitor = stopped ? nil : monitor", "backendLock.unlock()",
+                             "displaced?.cancel()", "if stopped { monitor?.cancel() }"]),
+              "🚨 swapPathMonitor: lock → read the slot → read the stop flag → store (nothing after the stop) → unlock → cancel the displaced monitor → cancel the refused one, in that order")
+    } else {
+        check(false, "could not find swapPathMonitor in the provider")
+    }
+    if let start = provider.range(of: "private func startPathMonitoring()") {
+        let body = String(provider[start.upperBound...].prefix(9000))
+        check(inOrder(body, ["monitor.start(queue: pathMonitorQueue)", "swapPathMonitor(monitor)"]),
+              "startPathMonitoring starts the monitor, then installs it through swapPathMonitor")
+    } else {
+        check(false, "could not find startPathMonitoring in the provider")
     }
     // …and every such branch DOES end there: the only turnOff calls in the
     // provider are failStart's and stopTunnel's, the nine branches call it,

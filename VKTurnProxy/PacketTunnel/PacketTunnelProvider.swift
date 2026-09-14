@@ -69,8 +69,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // handoff, cellular handover, interface flap, etc.). Without this, the
     // Go log only shows the consequence ("socket dead") but not the cause
     // ("interface bounced").
-    private var pathMonitor: NWPathMonitor?
+    // 🚨 The monitor's slot sits behind backendLock like the watchdog slots:
+    // stopTunnel (the provider's thread) and failStart (the failing start's
+    // thread) may both stop it, and a plain stored reference written from two
+    // threads is an ARC race — ThreadSanitizer flagged it and the user's stand
+    // died with an ARC abort on build 384's first cut. Reached ONLY through
+    // swapPathMonitor: the reference is taken out under the lock, cancelled
+    // outside it.
+    private var _pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.vkturnproxy.tunnel.pathmonitor")
+
+    /// Installs `monitor` in the slot (nil clears it) and cancels whatever the
+    /// slot held — unless the stop has run, in which case the incoming monitor
+    /// is cancelled and the slot stays empty. swapWatchdog's shape.
+    private func swapPathMonitor(_ monitor: NWPathMonitor?) {
+        backendLock.lock()
+        let displaced = _pathMonitor
+        let stopped = _stopRequested
+        _pathMonitor = stopped ? nil : monitor
+        backendLock.unlock()
+        displaced?.cancel()
+        if stopped { monitor?.cancel() }
+    }
     // 🚨 The three path-state fields below (lastPathDescription,
     // lastPathEssentialIdentity, currentWiFiSSID) are read and written on
     // pathMonitorQueue ONLY: the monitor delivers there, the SSID-fetch
@@ -104,16 +124,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var currentWiFiSSID: String?
 
     /// Raised by stopTunnel, under backendLock, BEFORE it clears anything or
-    /// turns the backend off. Two readers:
+    /// turns the backend off. It means the stop has BEGUN — nothing about what
+    /// its teardown has done yet. Three readers:
     /// - failStart: a start's failure branch tells "the stop cut me off" from a
-    ///   failure of its own. The bridge cannot say it for us: a stop during the
-    ///   bootstrap wait (the common window — seconds to minutes with a captcha)
-    ///   answers -1, a csqtt attach -1 or -2, a native attach -7, depending on
-    ///   where the stop landed; the flag is one rule for all of them.
-    /// - swapWatchdog: a timer installed AFTER the stop is cancelled instead of
-    ///   kept — stopTunnel's own clears ran already, and a start that outlives
-    ///   the stop by milliseconds would otherwise leave a resumed timer polling
-    ///   a dead tunnel for the life of the process.
+    ///   failure of its own — for the log line and the completion's error only;
+    ///   the teardown runs regardless. The bridge cannot say it for us: a stop
+    ///   during the bootstrap wait (the common window — seconds to minutes with
+    ///   a captcha) answers -1, a csqtt attach -1 or -2, a native attach -7,
+    ///   depending on where the stop landed; the flag is one rule for all.
+    /// - swapWatchdog / swapPathMonitor: an install AFTER the stop is cancelled
+    ///   instead of kept — a start that outlives the stop by milliseconds would
+    ///   otherwise leave a resumed timer or a live monitor on a dead tunnel for
+    ///   the life of the process.
     /// startTunnel lowers it first thing (a provider instance serves one session;
     /// the reset costs nothing if that ever changes).
     private var _stopRequested = false
@@ -273,30 +295,30 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// Every failure branch of the start after the backend exists ends here.
-    /// When stopTunnel has already run, the failure is the stop's — whatever
-    /// code the bridge answered (see `_stopRequested`): a plain log line, no
-    /// ERROR, no turnOff (stopTunnel did it), the clear a check-and-set that
-    /// may run BEFORE stopTunnel's own (the native attach sees turnOff's
-    /// registry deletion while stopTunnel is still inside turnOff — either
-    /// order clears the slot once), and the completion names the stop. The
-    /// start's completion may then reach iOS before the stop's; both are
-    /// called exactly once. Otherwise the branch's own line and error, as
-    /// before — plus the VKAuth watchdog and the path monitor stopped, which
-    /// every post-ready failure had left running (the review of 2026-09-14).
+    /// The stop flag decides only what is SAID — the log line and the error the
+    /// completion carries (the stop's, whatever code the bridge answered; see
+    /// `_stopRequested`) — never what is DONE: the teardown below runs in full
+    /// either way, every step idempotent and shared with stopTunnel's (the
+    /// watchdog and the monitor swap under the lock, turnOff is a no-op on a
+    /// handle the other side already took, clearBackend a check-and-set).
+    /// 🚨 The flag means the stop has BEGUN, not that its teardown ran: the
+    /// first cut of build 384 skipped turnOff here on the flag, stopTunnel
+    /// then read a backend this clear had already emptied, and NOBODY turned
+    /// the Go tunnel off (the user's review, 2026-09-14). Hence turnOff BEFORE
+    /// clearBackend: whoever finds the slot empty may rely on the tunnel being
+    /// off. The start's completion may reach iOS before the stop's; each is
+    /// called exactly once. On a real failure this also stops the VKAuth
+    /// watchdog and the path monitor, which every post-ready failure had left
+    /// running (the review of 2026-09-14).
     private func failStart(_ backend: TunnelBackend, at stage: String, line: String, error: Error,
                            _ completionHandler: (Error?) -> Void) {
-        if stopRequested {
-            logMsg("\(stage): the tunnel was stopped during the start — nothing to tear down here")
-            clearBackend(backend)
-            completionHandler(Self.stoppedDuringStartError())
-            return
-        }
-        logMsg(line)
+        let stopped = stopRequested
+        logMsg(stopped ? "\(stage): the tunnel was stopped during the start — tearing down whatever stopTunnel has not yet" : line)
         stopAuthErrorWatchdog()
         stopPathMonitoring()
         backend.turnOff()
         clearBackend(backend)
-        completionHandler(error)
+        completionHandler(stopped ? Self.stoppedDuringStartError() : error)
     }
 
     // MARK: - Tunnel Lifecycle
@@ -1014,13 +1036,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
         }
         monitor.start(queue: pathMonitorQueue)
-        pathMonitor = monitor
+        // Started, THEN installed: a stop that landed in between refuses the
+        // install and cancels this monitor (swapPathMonitor); the handler does
+        // not read the slot, so an event in the gap is processed as usual.
+        swapPathMonitor(monitor)
         logMsg("[PathMonitor] started")
     }
 
     private func stopPathMonitoring() {
-        pathMonitor?.cancel()
-        pathMonitor = nil
+        // Idempotent and thread-safe: stopTunnel and failStart may both get
+        // here, from different threads — the slot is swapped under the lock.
+        swapPathMonitor(nil)
         // The path state is owned by pathMonitorQueue (see the fetchCurrent
         // hop above): clearing it from stopTunnel's thread was the other half
         // of the §65 race. Queued after the cancel, so it runs after every
