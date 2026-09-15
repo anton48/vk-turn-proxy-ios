@@ -2953,6 +2953,34 @@ do {
     }
 }
 
+print("The relay-refusal breaker's stats — two optional keys, one box that appears only on a 486")
+
+// 🚨 THE 486 COUNTER AND THE MINT PAUSE REACH THE APP (build 389, the relay-
+//    refusal breaker in pkg/proxy/quotabreaker.go). The two keys are OPTIONAL
+//    in TunnelStats — the synthesized decoder throws on a missing required
+//    key, and the simulator mock / an older extension emit stats without
+//    them — and the main screen shows a box only once a 486 has been seen:
+//    a healthy session never has one, so the Conns/Reconnects row keeps its
+//    two boxes.
+do {
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(tm.contains("var credPoolQuotaRefusals: Int64?") && tm.contains("var credPoolMintPausedSec: Int32?"),
+          "🚨 TunnelStats declares credPoolQuotaRefusals / credPoolMintPausedSec as OPTIONALS — a required key breaks decoding of a stats JSON without it")
+    check(tm.contains("case credPoolQuotaRefusals = \"cred_pool_quota_refusals\"") && tm.contains("case credPoolMintPausedSec = \"cred_pool_mint_paused_sec\""),
+          "TunnelStats maps the two keys the Go Stats emit (cred_pool_quota_refusals, cred_pool_mint_paused_sec)")
+    let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+    if let box = cv.range(of: "StatBox(title: \"486\"") {
+        let before = String(cv[..<box.lowerBound].suffix(200))
+        check(before.contains("if let refusals = live.stats.credPoolQuotaRefusals, refusals > 0 {"),
+              "🚨 the 486 box must be conditional on a non-zero count — shown always, it is a third box on every healthy session")
+        let after = String(cv[box.lowerBound...].prefix(400))
+        check(after.contains("credPoolMintPausedSec") && after.contains("mint paused"),
+              "the 486 box's sub line names the mint pause while it is in force")
+    } else {
+        check(false, "could not find the 486 StatBox in ContentView")
+    }
+}
+
 print("The tunnel backend — every handle-bound bridge call goes through one enum")
 
 // 🚨 TWO HANDLE SPACES, ONE NUMBER. Since stage 5 (csqtt, variant B) the Go

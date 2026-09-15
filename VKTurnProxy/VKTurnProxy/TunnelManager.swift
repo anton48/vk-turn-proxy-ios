@@ -39,6 +39,12 @@ struct TunnelStats: Codable {
     // "Pool" number. Each relay is an independent ~10-allocation quota bucket, so
     // this is the real spread (esp. in cookie/VKAuth mode).
     var credPoolDistinctRelays: Int32 = 0
+    /// The relay-refusal breaker (build 389): 486s the pool was told of this
+    /// session, and the seconds left of its mint pause. Optional — decoding
+    /// must survive a stats JSON without the keys (the simulator mock, an
+    /// older extension).
+    var credPoolQuotaRefusals: Int64?
+    var credPoolMintPausedSec: Int32?
     // Seconds since the extension's Proxy was created. Source of truth
     // for the StatsView Uptime box — see fetchStats where it gets
     // converted to a Date origin for the live ticker. Authoritative
@@ -63,6 +69,8 @@ struct TunnelStats: Codable {
         case credPoolWithCreds = "cred_pool_with_creds"
         case credPoolSize = "cred_pool_size"
         case credPoolDistinctRelays = "cred_pool_distinct_relays"
+        case credPoolQuotaRefusals = "cred_pool_quota_refusals"
+        case credPoolMintPausedSec = "cred_pool_mint_paused_sec"
         case tunnelUptimeSec = "tunnel_uptime_sec"
         case captchaImageURL = "captcha_image_url"
         case captchaSID = "captcha_sid"

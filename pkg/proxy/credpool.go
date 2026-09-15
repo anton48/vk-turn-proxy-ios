@@ -81,6 +81,8 @@ type CredPoolStats struct {
 	DistinctRelays   int
 	Saturated        int
 	SaturatedLongest time.Duration
+	QuotaRefusals    int64         // 486s the pool was told of this session (quotabreaker.go)
+	MintPaused       time.Duration // the relay-refusal breaker's pause left; 0 = minting allowed
 }
 
 // NewCredPool builds a standalone pool sized as NewProxy sizes its own —
@@ -311,10 +313,12 @@ func (p *CredPool) RelayHosts() []string {
 func (p *CredPool) Stats() CredPoolStats {
 	available, withCreds, size := p.cp.snapshotSize()
 	saturated, _, longest := p.cp.saturationSnapshot()
+	refusals, paused := p.cp.quotaSnapshot()
 	return CredPoolStats{
 		Available: available, WithCreds: withCreds, Size: size,
 		DistinctRelays: p.cp.distinctRelays(),
 		Saturated:      saturated, SaturatedLongest: longest,
+		QuotaRefusals: refusals, MintPaused: paused,
 	}
 }
 

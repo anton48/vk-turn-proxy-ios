@@ -1078,6 +1078,15 @@ struct StatsView: View {
             HStack {
                 StatBox(title: "Conns", value: dashed("\(live.stats.activeConns)/\(live.stats.totalConns)"), sub: nil)
                 StatBox(title: "Reconnects", value: dashed("\(live.stats.reconnects)"), sub: nil)
+                // The relay-refusal breaker (build 389): shown only once the
+                // relay has answered a 486 this session — a healthy session
+                // never has one, so the row keeps its two boxes. The sub line
+                // names the mint pause while it is in force.
+                if let refusals = live.stats.credPoolQuotaRefusals, refusals > 0 {
+                    StatBox(title: "486",
+                            value: dashed("\(refusals)"),
+                            sub: (live.stats.credPoolMintPausedSec ?? 0) > 0 ? "mint paused \(live.stats.credPoolMintPausedSec ?? 0)s" : nil)
+                }
             }
 
             HStack {

@@ -1300,6 +1300,9 @@ type credPool struct {
 	// Reads/writes of the chan field are guarded by cp.mu; close itself
 	// runs after unlock so close-while-locked stalls are impossible.
 	slotAvailableCh chan struct{}
+
+	// quota is the relay-refusal breaker — see quotabreaker.go.
+	quota quotaBreaker
 }
 
 // poolSizeForNumConns derives the cred pool size from the configured
@@ -2005,6 +2008,15 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		return e.addr, e.creds, slot, nil
 	}
 
+	// The relay-refusal breaker (quotabreaker.go): while the relay refuses
+	// fresh identities, a mint is waste — park; the breaker's timer
+	// broadcasts at the pause's end. Before the cap, so the park says why.
+	if remaining, paused := cp.mintPausedLocked(time.Now()); paused {
+		wake := cp.slotAvailableCh
+		cp.mu.Unlock()
+		return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: minting paused — the relay refuses fresh credentials (486), %s remaining", remaining.Round(time.Second)), wake: wake}
+	}
+
 	// Phase 2 cold-start cap: don't let a COLD pool get over-fetched. When the
 	// pool starts empty (fresh install, or after a Settings "reset creds") and
 	// all NumConns race into get() at once with zero creds, only the first
@@ -2350,6 +2362,9 @@ func (cp *credPool) markSaturated(slot int) time.Duration {
 	}
 
 	entry := cp.pool[slot]
+	// The relay-refusal breaker hears of every 486 here, native and csqtt
+	// alike, before the slot's own cooldown is chosen — quotabreaker.go.
+	cp.noteQuotaRefusalLocked(slot, time.Now())
 	age := time.Since(entry.lastUsedAt)
 	hasRecentLastUsed := !entry.lastUsedAt.IsZero() && age < activeAllocationsWindow
 
@@ -2697,6 +2712,12 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 	// have already pushed available past the cold-start target, this
 	// fill is redundant.
 	if abortIfAvailableGTE > 0 && cp.countAvailableLocked() >= abortIfAvailableGTE {
+		cp.mu.Unlock()
+		return false
+	}
+	// The relay-refusal breaker: the grower mints nothing during the pause
+	// either (quotabreaker.go); get()'s park line says why, this stays quiet.
+	if _, paused := cp.mintPausedLocked(time.Now()); paused {
 		cp.mu.Unlock()
 		return false
 	}

@@ -889,6 +889,8 @@ func csqttAppStats(e *csqttEntry) proxy.Stats {
 		CredPoolWithCreds:      int32(ps.WithCreds),
 		CredPoolSize:           int32(ps.Size),
 		CredPoolDistinctRelays: int32(ps.DistinctRelays),
+		CredPoolQuotaRefusals:  ps.QuotaRefusals,
+		CredPoolMintPausedSec:  int32((ps.MintPaused + time.Second - 1) / time.Second),
 		TunnelUptimeSec:        int64(time.Since(e.started).Seconds()),
 		// The cookie latch only, as on the native path: the app answers a
 		// non-empty auth_error with its VK-session text and a disconnect.

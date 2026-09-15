@@ -186,3 +186,60 @@ func TestCsqttQuotaRefusalMovesTheWorkerToAnotherCredential(t *testing.T) {
 		t.Fatalf("VK mints %d — the second credential did not come from a fresh mint", mints.Load())
 	}
 }
+
+// THE STAND FOR THE STORM: a relay that refuses EVERY credential, the real
+// csqtt client over the real adapter and pool. Before build 389 each of the
+// worker's retries minted a fresh VK identity — with worker 1 alone (no
+// TUNCONF, the others wait) the attempts come at 0 s, 2 s and 6 s, so three
+// identities in six seconds and, on the phone, one per second once thirty
+// workers reach their 30-s backoff, until VK's captcha ended it. The
+// breaker trips at the second fresh refusal: two mints, two refusals, the
+// third attempt parks on "minting paused", and the relay never sees a third
+// credential. Sabotage seen red: the breaker's hook dropped from
+// markSaturated — the third mint lands at ~6 s.
+func TestCsqttRefusingRelayTripsTheMintBreaker(t *testing.T) {
+	relay := newQuotaTURN(t)
+	var mints atomic.Int32
+	fp := installFakePool(t, func(_ bool, slot int) (string, *proxy.TURNCreds, error) {
+		n := mints.Add(1)
+		return relay.addr, &proxy.TURNCreds{Username: freshUsername(fmt.Sprintf("storm-%d-slot-%d", n, slot)), Password: "p", Address: relay.addr, Addresses: []string{relay.addr}}, nil
+	})
+	csqttSeededSettle = 0
+	h := csqttStartImpl(`{"peer_addr":"127.0.0.1:46000","csqtt_password":"pw","csqtt_device_id":"dev","vk_link":"https://vk.ru/call/join/abc","num_conns":30,"use_udp":true}`)
+	if h < 0 {
+		t.Fatalf("csqttStart: %d", h)
+	}
+	t.Cleanup(func() { csqttTurnOffImpl(h) })
+
+	// The storm's signature is a THIRD mint; wait for it, or for nine
+	// seconds — past the third attempt's ~6 s, with margin.
+	deadline := time.Now().Add(9 * time.Second)
+	for mints.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	fp.mu.Lock()
+	pool := fp.pool
+	fp.mu.Unlock()
+	stats := pool.Stats()
+	t.Logf("486 refusals at the relay=%d distinct credentials=%d VK mints=%d saturated=%d quota refusals=%d mint paused=%s",
+		relay.refusals.Load(), relay.distinctUsers(), mints.Load(), stats.Saturated, stats.QuotaRefusals, stats.MintPaused.Round(time.Second))
+	if mints.Load() != 2 {
+		t.Fatalf("VK mints %d, want 2 — the relay refuses every credential and the breaker did not stop the minting (refusals %d, distinct credentials %d)",
+			mints.Load(), relay.refusals.Load(), relay.distinctUsers())
+	}
+	if relay.distinctUsers() != 2 || relay.refusals.Load() != 2 {
+		t.Fatalf("the relay saw %d credentials and refused %d times, want 2 and 2", relay.distinctUsers(), relay.refusals.Load())
+	}
+	if stats.QuotaRefusals != 2 || stats.MintPaused <= 0 {
+		t.Fatalf("pool stats: quota refusals %d, mint paused %s — want 2 and a pause in force", stats.QuotaRefusals, stats.MintPaused)
+	}
+	// And the app-facing stats carry it: the csqtt stats JSON names both.
+	e := csqttLookup(h)
+	if e == nil {
+		t.Fatal("tunnel gone")
+	}
+	s := csqttAppStats(e)
+	if s.CredPoolQuotaRefusals != 2 || s.CredPoolMintPausedSec <= 0 {
+		t.Fatalf("csqtt app stats: cred_pool_quota_refusals %d, cred_pool_mint_paused_sec %d — want 2 and > 0", s.CredPoolQuotaRefusals, s.CredPoolMintPausedSec)
+	}
+}
