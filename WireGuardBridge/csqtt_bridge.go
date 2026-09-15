@@ -329,6 +329,7 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 				TURNCredentials: csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: addr},
 				Release:         func() { once.Do(func() { a.pool.Release(slot) }) },
 				Failed:          func(err error) { a.refused(workerID, slot, err) },
+				Allocated:       func() { a.pool.NoteAllocated(slot) },
 			}, nil
 		}
 		if terminal := csqttTerminalCredError(err); terminal != nil {

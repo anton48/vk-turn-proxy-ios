@@ -14,11 +14,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cacggghp/vk-turn-proxy/pkg/csqtt"
 	"github.com/cacggghp/vk-turn-proxy/pkg/proxy"
 	"github.com/pion/stun/v3"
 )
@@ -242,4 +244,81 @@ func TestCsqttRefusingRelayTripsTheMintBreaker(t *testing.T) {
 	if s.CredPoolQuotaRefusals != 2 || s.CredPoolMintPausedSec <= 0 {
 		t.Fatalf("csqtt app stats: cred_pool_quota_refusals %d, cred_pool_mint_paused_sec %d — want 2 and > 0", s.CredPoolQuotaRefusals, s.CredPoolMintPausedSec)
 	}
+}
+
+// THE HERD ON THE STAND, through the real adapter: ten workers acquire the
+// same fresh credential and their allocations are refused while every lease
+// is still held — the overlapping failures the user reproduced against
+// build 390 (active never 1, twenty 486s, no pause). With success as the
+// key the second refusal trips the breaker; and the control — on two
+// identities in a row nine workers report Allocated and the tenth is
+// refused — trips nothing, because the relay has accepted those
+// identities. Sabotage seen red: the `allocated > 0` test dropped from the
+// breaker (the control's two tenth-allocation refusals trip it); the
+// adapter's Allocated wiring dropped (no callback to report a success).
+func TestCsqttOverlappingHerdRefusalsTripTheBreakerUnlessTheIdentityWasAccepted(t *testing.T) {
+	var mints atomic.Int32
+	installFakePool(t, mintingFetch(&mints))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := csqttNewPool(ctx, proxy.CredPoolConfig{VKLink: "https://vk.ru/call/join/abc", NumConns: 30, Cooldown: 150 * time.Second})
+	defer pool.Close()
+	a := &csqttPoolAdapter{pool: pool, fatal: func(err error) { t.Errorf("fatal: %v", err) }}
+	refused := errors.New("turn allocate: Allocate error response (error 486: Allocation Quota Reached)")
+	seat := func(first int) []csqtt.Credential { // ten workers on one credential, all leases held
+		t.Helper()
+		var leases []csqtt.Credential
+		for w := first; w < first+10; w++ {
+			cred, err := a.creds(ctx, w)
+			if err != nil {
+				t.Fatalf("creds(%d): %v", w, err)
+			}
+			if cred.Allocated == nil {
+				t.Fatal("the adapter's credential has no Allocated callback — the pool never learns the relay accepted the identity")
+			}
+			leases = append(leases, cred)
+		}
+		return leases
+	}
+	release := func(leases []csqtt.Credential) {
+		for _, cred := range leases {
+			cred.Release()
+		}
+	}
+
+	// The control, twice over: nine accepted, the tenth refused — the
+	// identity's quota, on a credential seconds old. Two of them would trip
+	// a breaker that keys on age alone.
+	for round := 0; round < 2; round++ {
+		leases := seat(1 + 10*round)
+		for _, cred := range leases[:9] {
+			cred.Allocated()
+		}
+		leases[9].Failed(refused)
+		release(leases)
+	}
+	if s := pool.Stats(); s.QuotaRefusals != 2 || s.MintPaused != 0 || mints.Load() != 2 {
+		t.Fatalf("after two tenth-allocation 486s on accepted identities: refusals %d, paused %s, mints %d — want 2, no pause, 2", s.QuotaRefusals, s.MintPaused, mints.Load())
+	}
+
+	// The storm: ten workers on the next fresh credential, every allocation
+	// refused while the others are still in flight — no Allocated, no
+	// Release between the failures.
+	leases := seat(21)
+	for _, cred := range leases {
+		cred.Failed(refused)
+	}
+	s := pool.Stats()
+	if s.MintPaused <= 0 {
+		t.Fatalf("ten overlapping refusals on a fresh, never-accepted identity did not trip the breaker (refusals %d)", s.QuotaRefusals)
+	}
+	release(leases)
+	before := mints.Load()
+	if _, _, _, err := a.pool.Acquire(35); err == nil || !strings.Contains(err.Error(), "minting paused") {
+		t.Fatalf("Acquire during the pause = %v, want the breaker's park", err)
+	}
+	if mints.Load() != before {
+		t.Fatalf("a mint went through during the pause")
+	}
+	t.Logf("control: 2 tenth-allocation refusals, no pause; storm: refusals %d in all, paused %s, mints %d", s.QuotaRefusals, s.MintPaused.Round(time.Second), before)
 }

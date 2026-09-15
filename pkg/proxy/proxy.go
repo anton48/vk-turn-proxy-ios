@@ -2566,6 +2566,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// every successful reconnect — sync.Once drops all calls after the first.
 	p.signalBootstrapDone(nil)
 
+	p.credPool.noteAllocated(credSlot) // the relay accepted this identity — quotabreaker.go
 	log.Printf("proxy: [conn %d, cred %d] DTLS+TURN session established", connIdx, credSlot)
 
 	// Reset this conn's last-pong time to "now" so the zombie watchdog
@@ -3101,6 +3102,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	// Signal proxy-lifetime bootstrap ready (sync.Once, idempotent).
 	p.signalBootstrapDone(nil)
 
+	p.credPool.noteAllocated(credSlot) // the relay accepted this identity — quotabreaker.go
 	log.Printf("proxy: [conn %d, cred %d] direct TURN session established", connIdx, credSlot)
 
 	// TURN reconnection loop (same as DTLS version but without DTLS)
@@ -3323,6 +3325,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	*signaled = true
 	p.signalBootstrapDone(nil)
 
+	p.credPool.noteAllocated(credSlot) // the relay accepted this identity — quotabreaker.go
 	log.Printf("proxy: [conn %d, cred %d] WRAP-A+TURN session established (getconf ok)", connIdx, credSlot)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
@@ -5088,6 +5091,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	*signaled = true
 	p.signalBootstrapDone(nil)
 
+	p.credPool.noteAllocated(credSlot) // the relay accepted this identity — quotabreaker.go
 	log.Printf("proxy: [conn %d, cred %d] SRTP+TURN session established", connIdx, credSlot)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {

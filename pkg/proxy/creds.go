@@ -881,6 +881,12 @@ type credPoolEntry struct {
 	// the TURN session ends or the conn switches to a different slot).
 	active int
 
+	// allocated counts the allocations that SUCCEEDED on this credential
+	// (both transports report one — quotabreaker.go); a fresh entry starts
+	// at 0, a refill replaces the entry. A 486 on a credential with none is
+	// the relay's refusal, with some its quota.
+	allocated int
+
 	// availableAt is the earliest moment this slot's cred is safe to
 	// hand out. Set by loadFromDisk when the on-disk lastUsedAt falls
 	// within credSaturationCooldown of now: instead of dropping the

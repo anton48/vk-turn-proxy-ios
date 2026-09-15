@@ -132,12 +132,12 @@ func TestARefusalOnAnOldCredentialIsNotFresh(t *testing.T) {
 // THE OTHER CONTROL, from the first device run of the breaker (csqtt,
 // 2026-09-15 21:34): ten workers on a slot minted 5 s earlier, nine
 // allocations up, the tenth refused with 486 — the identity's real quota on
-// a FRESH credential, and the relay accepted the next identity at once. A
-// refusal on a slot other leases still hold counts nothing; two of them
-// trip nothing; get() mints. The same slot with the refused holder alone
-// (the storm's shape) counts. Sabotage seen red: the `active != 1` test
-// dropped from noteQuotaRefusalLocked.
-func TestARefusalWithOtherHoldersOnTheSlotIsTheirQuotaNotARefusal(t *testing.T) {
+// a FRESH credential, and the relay accepted the next identity at once. The
+// pool knows of the nine through noteAllocated; a refusal on a credential
+// with a success counts nothing, two of them trip nothing, get() mints.
+// Sabotage seen red: the `allocated > 0` test dropped from
+// noteQuotaRefusalLocked.
+func TestARefusalOnACredentialWithASuccessIsItsQuotaNotARefusal(t *testing.T) {
 	var mints atomic.Int32
 	cp := breakerPool(t, &mints)
 	const relay = "95.163.34.180:19302"
@@ -147,34 +147,64 @@ func TestARefusalWithOtherHoldersOnTheSlotIsTheirQuotaNotARefusal(t *testing.T) 
 			creds: &TURNCreds{Username: fmt.Sprintf("%d:full-%d", time.Now().Add(8*time.Hour).Unix(), i), Password: "p", Address: relay, Addresses: []string{relay}}}
 	}
 	cp.mu.Unlock()
-	cp.markSaturated(0) // the tenth allocation refused, nine holders on the slot
+	for i := 0; i < 2; i++ {
+		for k := 0; k < 9; k++ {
+			cp.noteAllocated(i) // nine allocations accepted on each identity
+		}
+	}
+	cp.markSaturated(0) // the tenth refused
 	cp.markSaturated(1)
 	refusals, paused := cp.quotaSnapshot()
 	if refusals != 2 || paused != 0 {
-		t.Fatalf("quotaSnapshot after two tenth-allocation 486s = (%d, paused %s), want (2, 0) — a refusal with other holders is their quota, not the relay's refusal", refusals, paused)
+		t.Fatalf("quotaSnapshot after two tenth-allocation 486s = (%d, paused %s), want (2, 0) — a refusal on a credential the relay has accepted is its quota, not the relay's refusal", refusals, paused)
 	}
 	mintFor(t, cp, 5)
 	if mints.Load() != 1 {
 		t.Fatalf("mints = %d, want 1 — the pool must still mint for the refused worker", mints.Load())
 	}
-	// The storm's shape on the same fresh slots: the refused holder alone.
+}
+
+// THE HERD, overlapping (the user's reproduction on build 390): ten holders
+// on a fresh credential the relay refuses, their failures IN FLIGHT AT THE
+// SAME TIME — every mark sees active > 1, none sees the holder alone —
+// and no success on the identity. Build 390 keyed the count on `active ==
+// 1` and counted NOTHING here: twenty 486s, no pause, the next mint went
+// through. With success as the key every one of them counts and the second
+// trips. Sabotage seen red: the `allocated > 0` test replaced by
+// `active != 1`.
+func TestOverlappingHerdFailuresWithoutASuccessTripTheBreaker(t *testing.T) {
+	var mints atomic.Int32
+	cp := breakerPool(t, &mints)
+	const relay = "95.163.34.180:19302"
 	cp.mu.Lock()
-	cp.pool[0].active, cp.pool[1].active = 1, 1
-	cp.pool[0].saturatedUntil, cp.pool[1].saturatedUntil = time.Time{}, time.Time{}
+	cp.pool[0] = credPoolEntry{addr: relay, ts: time.Now(), active: 10, // ten leases, all still held
+		creds: &TURNCreds{Username: fmt.Sprintf("%d:herd", time.Now().Add(8*time.Hour).Unix()), Password: "p", Address: relay, Addresses: []string{relay}}}
 	cp.mu.Unlock()
-	cp.markSaturated(0)
-	cp.markSaturated(1)
-	if _, paused := cp.quotaSnapshot(); paused <= 0 {
-		t.Fatal("two refusals with the holder alone on fresh slots did not trip the breaker")
+	cp.markSaturated(0) // the first failure, nine others still in flight (active 10)
+	cp.markSaturated(0) // the second, overlapping (active still 10 — nobody released yet)
+	refusals, paused := cp.quotaSnapshot()
+	if refusals != 2 || paused <= 0 {
+		t.Fatalf("quotaSnapshot after two overlapping herd failures = (%d, paused %s), want (2, > 0) — the breaker missed a herd whose failures overlap", refusals, paused)
+	}
+	if _, _, _, err := cp.get(11, false); err == nil || !strings.Contains(err.Error(), "minting paused") {
+		t.Fatalf("get during the herd's pause = %v, want the breaker's park", err)
+	}
+	if mints.Load() != 0 {
+		t.Fatalf("mints = %d, want 0", mints.Load())
 	}
 }
 
-// The ladder: a trip within quotaLadderWindow of the previous one doubles
-// the pause, up to quotaPauseMax; the next trip needs two NEW fresh
-// refusals (the count is cleared at the trip). Driven with the pool's own
-// clock so the arithmetic is exact. Sabotage seen red: the doubling loop
-// dropped (every pause is the base).
-func TestTheMintPauseDoublesPerTripAndCaps(t *testing.T) {
+// The ladder: a trip within quotaLadderWindow of the PREVIOUS trip doubles
+// the previous pause, up to quotaPauseMax — and stays at the cap for as long
+// as the relay keeps refusing (a first cut kept a window of trips and lost
+// rungs once the refusal outlasted it: 30 → 60 → 120 → 240 → 300 → 120, the
+// user's model-time check). Only a quiet quotaLadderWindow starts it over at
+// the base; the next trip needs two NEW fresh refusals (the count is cleared
+// at the trip); refusals during a pause add no trip. Driven with the pool's
+// own clock so the arithmetic is exact. Sabotage seen red: the doubling
+// dropped (every pause is the base); the ladder keyed on the FIRST trip of
+// a window instead of the previous one (the cap decays).
+func TestTheMintPauseDoublesPerTripAndHoldsTheCap(t *testing.T) {
 	var mints atomic.Int32
 	cp := breakerPool(t, &mints)
 	quotaPauseBase, quotaPauseMax = 100*time.Millisecond, 350*time.Millisecond
@@ -183,6 +213,7 @@ func TestTheMintPauseDoublesPerTripAndCaps(t *testing.T) {
 	defer cp.mu.Unlock()
 	cp.pool[0] = credPoolEntry{ts: now, active: 1, creds: &TURNCreds{Username: "x"}}
 	trip := func(at time.Time) time.Duration {
+		cp.pool[0].ts = at // a fresh credential each time, never accepted
 		cp.noteQuotaRefusalLocked(0, at)
 		if _, paused := cp.mintPausedLocked(at); paused {
 			t.Fatalf("one fresh refusal at %s tripped the breaker — the trip needs %d", at.Sub(now), quotaRefusalTrip)
@@ -194,27 +225,76 @@ func TestTheMintPauseDoublesPerTripAndCaps(t *testing.T) {
 		}
 		return remaining
 	}
-	if p := trip(now); p != 100*time.Millisecond {
-		t.Fatalf("first pause = %s, want the base 100ms", p)
+	// Trips spaced 6 min apart: each after the previous pause ended and
+	// inside the ladder window of the PREVIOUS trip, while the first trip
+	// leaves the window by the third — the shape of a relay that keeps
+	// refusing through 5-min pauses, exactly where a window of trips loses
+	// rungs (only two of them fit in ten minutes).
+	step := 6 * time.Minute
+	want := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 350 * time.Millisecond, 350 * time.Millisecond, 350 * time.Millisecond, 350 * time.Millisecond}
+	var last time.Time // when the latest trip happened
+	for i, w := range want {
+		last = now.Add(time.Duration(i) * step)
+		if p := trip(last); p != w {
+			t.Fatalf("trip %d pause = %s, want %s (the ladder: base, 2×, cap, then the cap HELD while the refusal lasts)", i+1, p, w)
+		}
 	}
-	if p := trip(now.Add(time.Second)); p != 200*time.Millisecond {
-		t.Fatalf("second pause = %s, want 2× the base", p)
+	// Refusals DURING a pause (the herd's other failures landing while the
+	// pause runs) do not stack another trip on top of it.
+	cp.pool[0].ts = last
+	cp.noteQuotaRefusalLocked(0, last.Add(10*time.Millisecond))
+	cp.noteQuotaRefusalLocked(0, last.Add(20*time.Millisecond))
+	if _, paused := cp.mintPausedLocked(last.Add(20 * time.Millisecond)); !paused {
+		t.Fatal("the test's clock left the pause — the in-pause refusals were not in the pause")
 	}
-	if p := trip(now.Add(2 * time.Second)); p != 350*time.Millisecond {
-		t.Fatalf("third pause = %s, want the cap 350ms", p)
-	}
-	// Refusals DURING a pause do not stack another trip on top.
-	cp.pool[0].ts = now.Add(2 * time.Second)
-	cp.noteQuotaRefusalLocked(0, now.Add(2*time.Second+10*time.Millisecond))
-	cp.noteQuotaRefusalLocked(0, now.Add(2*time.Second+20*time.Millisecond))
-	if len(cp.quota.trips) != 3 {
-		t.Fatalf("refusals inside the pause added a trip: %d trips, want 3", len(cp.quota.trips))
+	if cp.quota.trips != len(want) {
+		t.Fatalf("refusals inside the pause added a trip: %d trips, want %d", cp.quota.trips, len(want))
 	}
 	// After a quiet quotaLadderWindow the ladder starts over at the base.
-	later := now.Add(2*time.Second + quotaLadderWindow + time.Second)
-	cp.pool[0].ts = later
+	later := last.Add(quotaLadderWindow + time.Second)
 	if p := trip(later); p != 100*time.Millisecond {
 		t.Fatalf("pause after a quiet ladder window = %s, want the base 100ms", p)
+	}
+}
+
+// The success hooks sit where each transport learns the relay accepted an
+// allocation — pinned by spelling: native at every "session established"
+// (the four transports), csqtt right after the relay dial returns, the
+// adapter wiring Credential.Allocated to the pool. Without them every 486
+// reads as a refusal again. Sabotage seen red: one native site's call
+// dropped; the csqtt call dropped; the adapter's wiring dropped.
+func TestTheSuccessHooksSitWhereAllocationsSucceed(t *testing.T) {
+	src, err := os.ReadFile("proxy.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(src)
+	sites := 0
+	for _, lit := range []string{"DTLS+TURN session established", "direct TURN session established", "WRAP-A+TURN session established", "SRTP+TURN session established"} {
+		i := strings.Index(code, lit)
+		if i < 0 {
+			t.Fatalf("proxy.go no longer logs %q", lit)
+		}
+		before := code[max(0, i-300):i]
+		if !strings.Contains(before, "p.credPool.noteAllocated(credSlot)") {
+			t.Errorf("proxy.go: %q is not preceded by p.credPool.noteAllocated(credSlot) — a 486 on that transport's credential would read as a refusal", lit)
+		}
+		sites++
+	}
+	if sites != 4 {
+		t.Fatalf("%d native session sites, want 4", sites)
+	}
+	csq, err := os.ReadFile("../csqtt/client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := string(csq)
+	if !strings.Contains(c, "Allocated func()") {
+		t.Error("pkg/csqtt: Credential has no Allocated callback")
+	}
+	dial := strings.Index(c, "w.c.allocRTT.Store(int64(time.Since(t0)))")
+	if dial < 0 || !strings.Contains(c[dial:dial+200], "cred.Allocated()") {
+		t.Error("pkg/csqtt: the worker does not call cred.Allocated() right after the relay dial succeeded")
 	}
 }
 

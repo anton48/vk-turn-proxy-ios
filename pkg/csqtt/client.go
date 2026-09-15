@@ -169,6 +169,11 @@ type Credential struct {
 	TURNCredentials
 	Release func()
 	Failed  func(err error)
+	// Allocated, when set, is called once the relay ACCEPTED the allocation
+	// — the pool's evidence that this identity works, so a later 486 on it
+	// is its quota rather than the relay refusing everything (the pool's
+	// relay-refusal breaker keys on that). Called before READY.
+	Allocated func()
 }
 
 // dialRelay is DialRelay, replaceable by tests with a loopback relay.
@@ -838,6 +843,9 @@ func (w *worker) session() error {
 		return err
 	}
 	w.c.allocRTT.Store(int64(time.Since(t0)))
+	if cred.Allocated != nil {
+		cred.Allocated()
+	}
 	creds := cred.TURNCredentials
 	wrapper, err := NewWrapper(w.cipher, w.c.cfg.Mode)
 	if err != nil {

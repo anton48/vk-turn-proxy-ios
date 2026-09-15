@@ -32,22 +32,35 @@ import (
 // counted: a fresh identity is exactly its cure (the four-switch run of
 // 2026-09-06 lived on those mints).
 //
-// 🚨 FRESH IS NOT ENOUGH: THE REFUSED HOLDER MUST BE ALONE ON THE SLOT. The
+// 🚨 FRESH IS NOT ENOUGH: NOTHING MAY HAVE SUCCEEDED ON THE CREDENTIAL. The
 // first device run of this breaker (csqtt, 2026-09-15 21:34) showed the
 // other 486 a fresh credential gets: ten workers seated on a slot minted
 // 5 s earlier, nine allocations succeeded, the TENTH was refused — the
-// identity's real quota, on a credential 5 s old. The relay accepted the
+// identity's real quota, on a credential 5 s old; the relay accepted the
 // next identity at once. Counted by age alone that is a fresh refusal, and
 // two such in one post-switch herd would have paused minting for 30 s
-// while the tunnel was recovering on exactly those mints. So a refusal
-// counts only when the refused holder is the slot's only lease (active ==
-// 1 at the mark, before its release): nobody else made it on that
-// identity. That is the storm's shape on every path — csqtt's worker 1
-// alone before TUNCONF, the native bootstrap's conn 0, and a herd whose
-// ten dials all fail (the last failure marks with active == 1) — and not
-// the tenth-allocation quota, whose nine successes still hold the slot.
-// The archive agrees: 296 logs, 8 real 486s, one of them on a credential
-// under a minute old — that tenth allocation, with nine holders.
+// while the tunnel was recovering on exactly those mints. Build 390 keyed
+// the distinction on the refused holder being ALONE on the slot (active ==
+// 1) — wrong twice over (the user's review): a herd whose failures OVERLAP
+// never shows active == 1 (two failures in flight see active == 2, the
+// count ends at zero, twenty 486s and no pause), and "alone" is a proxy
+// for what is actually meant. What is meant is SUCCESS: both transports
+// tell the pool when an allocation went through (noteAllocated — native
+// at every "session established", csqtt through Credential.Allocated), and
+// a refusal counts only on a credential with NO success yet. The storm's
+// shape has none on every path — csqtt's worker 1 before TUNCONF, the
+// native bootstrap's conn 0, a herd whose ten dials all fail, overlapping
+// or not — while the tenth-allocation quota has nine. The archive agrees:
+// 296 logs, 8 real 486s, one of them on a credential under a minute old —
+// that tenth allocation, after nine successes.
+//
+// 🚨 THE LADDER MUST NOT DECAY WHILE THE RELAY STILL REFUSES. A first cut
+// kept a window of trips and doubled per trip inside it, so a refusal that
+// outlasted the window LOST rungs: 30 → 60 → 120 → 240 → 300 → 120 (the
+// user's model-time check) — the bound loosened exactly for the long
+// outage it exists for. Each trip now doubles the PREVIOUS pause when it
+// comes within quotaLadderWindow of the previous trip, and starts over at
+// the base only after that long a quiet: 30 → 60 → 120 → 240 → 300 → 300 …
 const (
 	// quotaFreshCredWindow: a 486 this soon after the slot was filled is a
 	// refusal of a fresh identity, not a quota. Ten connections seat on a
@@ -73,11 +86,28 @@ var (
 )
 
 type quotaBreaker struct {
-	refusals    int64       // every 486 the pool was told of, this session — both transports
-	fresh       []time.Time // refusals on fresh credentials, trimmed to quotaRefusalWindow
-	trips       []time.Time // when the breaker tripped, trimmed to quotaLadderWindow
-	pausedUntil time.Time   // minting refused while now is before it
-	timer       *time.Timer // broadcasts slot-available at the pause's end
+	refusals    int64         // every 486 the pool was told of, this session — both transports
+	fresh       []time.Time   // refusals on fresh credentials with no success, trimmed to quotaRefusalWindow
+	trips       int           // how many times the breaker tripped, this session (the log)
+	lastTrip    time.Time     // when it last tripped — the ladder's clock
+	lastPause   time.Duration // the pause that trip set — doubled by the next trip within the window
+	pausedUntil time.Time     // minting refused while now is before it
+	timer       *time.Timer   // broadcasts slot-available at the pause's end
+}
+
+// noteAllocated records a successful allocation on slot's credential — the
+// evidence that the relay accepts this identity, so a later 486 on it is
+// its quota, not a refusal. Native calls it at every "session established";
+// csqtt through Credential.Allocated right after the relay dial.
+func (cp *credPool) noteAllocated(slot int) {
+	if slot < 0 {
+		return
+	}
+	cp.mu.Lock()
+	if slot < cp.size && slot < len(cp.pool) {
+		cp.pool[slot].allocated++
+	}
+	cp.mu.Unlock()
 }
 
 // noteQuotaRefusalLocked records a 486 on slot. Called by markSaturated —
@@ -90,29 +120,30 @@ func (cp *credPool) noteQuotaRefusalLocked(slot int, now time.Time) {
 	if e.ts.IsZero() || now.Sub(e.ts) >= quotaFreshCredWindow {
 		return // an older credential: a real quota, cured by a fresh identity
 	}
-	if e.active != 1 {
-		return // others hold this identity — its allocations went through; the tenth-allocation quota, not a refusal
+	if e.allocated > 0 {
+		return // this identity has been accepted before: its quota, not the relay's refusal
 	}
 	q.fresh = keepSince(append(q.fresh, now), now.Add(-quotaRefusalWindow))
 	if len(q.fresh) < quotaRefusalTrip || now.Before(q.pausedUntil) {
 		return
 	}
-	q.trips = keepSince(append(q.trips, now), now.Add(-quotaLadderWindow))
 	pause := quotaPauseBase
-	for i := 1; i < len(q.trips) && pause < quotaPauseMax; i++ {
-		pause *= 2
+	if !q.lastTrip.IsZero() && now.Sub(q.lastTrip) < quotaLadderWindow {
+		pause = q.lastPause * 2
+		if pause > quotaPauseMax {
+			pause = quotaPauseMax
+		}
 	}
-	if pause > quotaPauseMax {
-		pause = quotaPauseMax
-	}
+	q.trips++
+	q.lastTrip, q.lastPause = now, pause
 	q.pausedUntil = now.Add(pause)
 	q.fresh = nil
 	if q.timer != nil {
 		q.timer.Stop()
 	}
 	q.timer = time.AfterFunc(pause, cp.broadcastSlotAvailable)
-	log.Printf("credpool: the relay refused %d fresh credentials within %s (486 on a credential's first allocation, slot %d last) — minting paused for %s (trip %d within %s); existing slots are still handed out",
-		quotaRefusalTrip, quotaRefusalWindow, slot, pause.Round(time.Second), len(q.trips), quotaLadderWindow)
+	log.Printf("credpool: the relay refused %d fresh credentials within %s (486 with no allocation ever accepted on them, slot %d last) — minting paused for %s (trip %d); existing slots are still handed out",
+		quotaRefusalTrip, quotaRefusalWindow, slot, pause.Round(time.Second), q.trips)
 }
 
 // mintPausedLocked reports whether minting is paused at `now` and for how
