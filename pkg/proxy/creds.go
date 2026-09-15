@@ -1914,6 +1914,25 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 	return bestSlot, "fresh"
 }
 
+// poolParkError is get()'s "not now" answer — a path-change pause, the
+// cold-start cap, or no slot at all. It carries the slot-available channel
+// that was CURRENT under the pool's lock at the moment of the decision, so
+// the caller parks on the broadcast it would otherwise have missed: get()
+// used to return a plain error after Unlock, runConnection logged the
+// session's end and only THEN asked slotAvailableChannel() for a channel —
+// a broadcast landing in that gap (a mint finishing, a release, a cooldown
+// ending) closed a channel nobody held, and the conn waited out its 2–7 s
+// timer or the 30–60 s dormancy for the NEXT one (Sep 7 §71's lost-wakeup
+// gap; exposed by the cold-start herd, where the mints land exactly while
+// eighteen conns are parking). Its text is unchanged from the old errors —
+// the log lines and the tests that read them are as before.
+type poolParkError struct {
+	msg  string
+	wake <-chan struct{}
+}
+
+func (e *poolParkError) Error() string { return e.msg }
+
 func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
 	cp.mu.Lock()
 
@@ -1924,8 +1943,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// loop, back off briefly, and try again after the pause expires.
 	if !cp.pauseAcquireUntil.IsZero() && time.Now().Before(cp.pauseAcquireUntil) {
 		remaining := time.Until(cp.pauseAcquireUntil).Round(time.Millisecond)
+		wake := cp.slotAvailableCh
 		cp.mu.Unlock()
-		return "", nil, -1, fmt.Errorf("credpool: paused for path-change settle, %s remaining", remaining)
+		return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: paused for path-change settle, %s remaining", remaining), wake: wake}
 	}
 
 	// ownSlot is the slot this conn would prefer to live on, by
@@ -2059,8 +2079,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			coldStartTarget = 1
 		}
 		if ready+inFlight >= coldStartTarget {
+			wake := cp.slotAvailableCh
 			cp.mu.Unlock()
-			return "", nil, -1, fmt.Errorf("credpool: cold-start cap (%d ready+inflight >= %d target) — parking to share instead of over-fetching", ready+inFlight, coldStartTarget)
+			return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: cold-start cap (%d ready+inflight >= %d target) — parking to share instead of over-fetching", ready+inFlight, coldStartTarget), wake: wake}
 		}
 	}
 
@@ -2113,8 +2134,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		// cooldown, or being fetched by someone else. Return a descriptive
 		// error so the caller's reconnect loop knows to back off and try
 		// again later.
+		wake := cp.slotAvailableCh
 		cp.mu.Unlock()
-		return "", nil, -1, fmt.Errorf("credpool: no slot available (all saturated, cooling down, or fetching)")
+		return "", nil, -1, &poolParkError{msg: "credpool: no slot available (all saturated, cooling down, or fetching)", wake: wake}
 	}
 	gen := cp.claimForFetchLocked(target)
 	cp.mu.Unlock()
@@ -2913,7 +2935,9 @@ func (cp *credPool) broadcastSlotAvailable() {
 
 // slotAvailableChannel returns the channel a conn should select on to
 // receive the next slot-available broadcast. Must be re-read after each
-// wake-up since broadcastSlotAvailable replaces the field.
+// wake-up since broadcastSlotAvailable replaces the field. A conn that was
+// just PARKED by get() does not read it: the park error carries the channel
+// that was current under the lock (poolParkError) — see Proxy.wakeChannelFor.
 func (cp *credPool) slotAvailableChannel() <-chan struct{} {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()

@@ -1091,7 +1091,7 @@ func (p *Proxy) startConnections() error {
 			waitFor := longest + allSaturatedWaitSafety
 			log.Printf("proxy: bootstrap attempt %d/%d failed (%v), %d/%d slots saturated, 0 available — waiting up to %s for slot-available signal",
 				attempt, maxBootstrapAttempts, err, saturated, total, waitFor.Round(time.Second))
-			slotCh := p.credPool.slotAvailableChannel()
+			slotCh := p.wakeChannelFor(err)
 			select {
 			case <-slotCh:
 				log.Printf("proxy: bootstrap attempt %d/%d woken by slot-available signal, retrying immediately",
@@ -2202,7 +2202,7 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				// capacity. Without this, "no slot available" failures
 				// — common during cascade reconnects — wait out the
 				// full random dormancy regardless of when slots reopen.
-				slotCh := p.credPool.slotAvailableChannel()
+				slotCh := p.wakeChannelFor(err)
 				select {
 				case <-time.After(dormantDuration):
 					shortFailures = 0 // reset after dormancy
@@ -2237,7 +2237,7 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 			// pool-state change makes immediate retry sensible — see
 			// dormancy comment above.
 			delay := time.Duration(2000+mathrand.Intn(5000)) * time.Millisecond
-			slotCh := p.credPool.slotAvailableChannel()
+			slotCh := p.wakeChannelFor(err)
 			select {
 			case <-time.After(delay):
 			case <-slotCh:
@@ -2282,6 +2282,22 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 // evaluated_alternatives_turn_endpoint_rotation.md.
 func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
 	return p.credPool.get(connIdx, allowCaptchaBlock)
+}
+
+// wakeChannelFor is the channel a retry parks on after err. A park error
+// carries the slot-available channel that was current under the pool's lock
+// when the pool said "not now"; a broadcast since then closed exactly that
+// channel, so the select returns at once instead of waiting for the NEXT
+// broadcast — the lost-wakeup gap between get()'s Unlock and a later
+// slotAvailableChannel() call (Sep 7 §71). Any other error parks on the
+// pool's current channel, as before. The session functions return the
+// pool's error unwrapped (`return err`), so errors.As finds it.
+func (p *Proxy) wakeChannelFor(err error) <-chan struct{} {
+	var park *poolParkError
+	if errors.As(err, &park) && park.wake != nil {
+		return park.wake
+	}
+	return p.credPool.slotAvailableChannel()
 }
 
 // fetchFreshCreds is the pool's underlying VK fetcher. It wraps GetVKCreds
