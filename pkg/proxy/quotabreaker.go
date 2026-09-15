@@ -31,6 +31,23 @@ import (
 // holding allocations from before a switch — is a real quota and is NOT
 // counted: a fresh identity is exactly its cure (the four-switch run of
 // 2026-09-06 lived on those mints).
+//
+// 🚨 FRESH IS NOT ENOUGH: THE REFUSED HOLDER MUST BE ALONE ON THE SLOT. The
+// first device run of this breaker (csqtt, 2026-09-15 21:34) showed the
+// other 486 a fresh credential gets: ten workers seated on a slot minted
+// 5 s earlier, nine allocations succeeded, the TENTH was refused — the
+// identity's real quota, on a credential 5 s old. The relay accepted the
+// next identity at once. Counted by age alone that is a fresh refusal, and
+// two such in one post-switch herd would have paused minting for 30 s
+// while the tunnel was recovering on exactly those mints. So a refusal
+// counts only when the refused holder is the slot's only lease (active ==
+// 1 at the mark, before its release): nobody else made it on that
+// identity. That is the storm's shape on every path — csqtt's worker 1
+// alone before TUNCONF, the native bootstrap's conn 0, and a herd whose
+// ten dials all fail (the last failure marks with active == 1) — and not
+// the tenth-allocation quota, whose nine successes still hold the slot.
+// The archive agrees: 296 logs, 8 real 486s, one of them on a credential
+// under a minute old — that tenth allocation, with nine holders.
 const (
 	// quotaFreshCredWindow: a 486 this soon after the slot was filled is a
 	// refusal of a fresh identity, not a quota. Ten connections seat on a
@@ -72,6 +89,9 @@ func (cp *credPool) noteQuotaRefusalLocked(slot int, now time.Time) {
 	e := cp.pool[slot]
 	if e.ts.IsZero() || now.Sub(e.ts) >= quotaFreshCredWindow {
 		return // an older credential: a real quota, cured by a fresh identity
+	}
+	if e.active != 1 {
+		return // others hold this identity — its allocations went through; the tenth-allocation quota, not a refusal
 	}
 	q.fresh = keepSince(append(q.fresh, now), now.Add(-quotaRefusalWindow))
 	if len(q.fresh) < quotaRefusalTrip || now.Before(q.pausedUntil) {

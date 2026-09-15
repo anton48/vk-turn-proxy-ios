@@ -129,6 +129,46 @@ func TestARefusalOnAnOldCredentialIsNotFresh(t *testing.T) {
 	}
 }
 
+// THE OTHER CONTROL, from the first device run of the breaker (csqtt,
+// 2026-09-15 21:34): ten workers on a slot minted 5 s earlier, nine
+// allocations up, the tenth refused with 486 — the identity's real quota on
+// a FRESH credential, and the relay accepted the next identity at once. A
+// refusal on a slot other leases still hold counts nothing; two of them
+// trip nothing; get() mints. The same slot with the refused holder alone
+// (the storm's shape) counts. Sabotage seen red: the `active != 1` test
+// dropped from noteQuotaRefusalLocked.
+func TestARefusalWithOtherHoldersOnTheSlotIsTheirQuotaNotARefusal(t *testing.T) {
+	var mints atomic.Int32
+	cp := breakerPool(t, &mints)
+	const relay = "95.163.34.180:19302"
+	cp.mu.Lock()
+	for i := 0; i < 2; i++ {
+		cp.pool[i] = credPoolEntry{addr: relay, ts: time.Now(), active: 10,
+			creds: &TURNCreds{Username: fmt.Sprintf("%d:full-%d", time.Now().Add(8*time.Hour).Unix(), i), Password: "p", Address: relay, Addresses: []string{relay}}}
+	}
+	cp.mu.Unlock()
+	cp.markSaturated(0) // the tenth allocation refused, nine holders on the slot
+	cp.markSaturated(1)
+	refusals, paused := cp.quotaSnapshot()
+	if refusals != 2 || paused != 0 {
+		t.Fatalf("quotaSnapshot after two tenth-allocation 486s = (%d, paused %s), want (2, 0) — a refusal with other holders is their quota, not the relay's refusal", refusals, paused)
+	}
+	mintFor(t, cp, 5)
+	if mints.Load() != 1 {
+		t.Fatalf("mints = %d, want 1 — the pool must still mint for the refused worker", mints.Load())
+	}
+	// The storm's shape on the same fresh slots: the refused holder alone.
+	cp.mu.Lock()
+	cp.pool[0].active, cp.pool[1].active = 1, 1
+	cp.pool[0].saturatedUntil, cp.pool[1].saturatedUntil = time.Time{}, time.Time{}
+	cp.mu.Unlock()
+	cp.markSaturated(0)
+	cp.markSaturated(1)
+	if _, paused := cp.quotaSnapshot(); paused <= 0 {
+		t.Fatal("two refusals with the holder alone on fresh slots did not trip the breaker")
+	}
+}
+
 // The ladder: a trip within quotaLadderWindow of the previous one doubles
 // the pause, up to quotaPauseMax; the next trip needs two NEW fresh
 // refusals (the count is cleared at the trip). Driven with the pool's own
