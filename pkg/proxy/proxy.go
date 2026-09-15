@@ -1773,6 +1773,18 @@ func (p *Proxy) enqueueRecv(ctx context.Context, pkt []byte) bool {
 // ReceivePacket receives a packet from the tunnel.
 // Blocks until a packet arrives or context is cancelled.
 func (p *Proxy) ReceivePacket(buf []byte) (int, error) {
+	return p.ReceivePacketUntil(nil, buf)
+}
+
+// ReceivePacketUntil is ReceivePacket that also returns when `done` is
+// closed — with net.ErrClosed, the conn.Bind word for "this bind is done".
+// turnbind's Close closes its bind's channel, so a receiver parked here wakes
+// WITHOUT a proxy stop: the device's Down (darwin's EventDown), a UAPI
+// listen_port through BindUpdate, or a bind closed beside a live proxy (the
+// bridge's two-attaches race) no longer park wireguard-go's net.stopping.Wait
+// until the proxy stops. The proxy's own stop still returns ctx.Err(), which
+// turnbind maps to the same net.ErrClosed. A nil `done` never fires.
+func (p *Proxy) ReceivePacketUntil(done <-chan struct{}, buf []byte) (int, error) {
 	select {
 	case pkt := <-p.recvCh:
 		// Downlink disorder is measured HERE and not at the producer side of
@@ -1796,6 +1808,8 @@ func (p *Proxy) ReceivePacket(buf []byte) (int, error) {
 		return n, nil
 	case <-p.ctx.Done():
 		return 0, p.ctx.Err()
+	case <-done:
+		return 0, net.ErrClosed
 	}
 }
 
@@ -2026,6 +2040,14 @@ func (p *Proxy) TURNServerIP() string {
 func (p *Proxy) Stop() {
 	p.cancel()
 	p.wg.Wait()
+}
+
+// Stopped reports whether Stop or StopWithTimeout has run: the root context
+// is cancelled and nothing will be received through this proxy again. Read by
+// turnbind's tests to prove that a receiver woke on the bind's Close and not
+// on a stop.
+func (p *Proxy) Stopped() bool {
+	return p.ctx.Err() != nil
 }
 
 // StopWithTimeout cancels and waits for goroutines, but gives up after
