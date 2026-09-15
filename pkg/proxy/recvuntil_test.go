@@ -62,3 +62,67 @@ func TestReceivePacketUntilReturnsErrClosedWhenDoneCloses(t *testing.T) {
 		t.Fatal("the proxy context was cancelled — the wake must not come from a stop")
 	}
 }
+
+// A closed `done` takes precedence over a queued packet. The select in
+// ReceivePacketUntil picks at random among ready cases, so without the
+// non-blocking check of `done` first, a call made after Close could still
+// return data — the user's reproduction on build 386: 40 of 100 calls after
+// Close returned a packet. Every one of 100 calls must be net.ErrClosed and
+// the queue must be left exactly as it was: the packets belong to whoever
+// receives next with a live bind. Sabotage seen red: the preliminary select
+// on `done` dropped — a fraction of the 100 calls returns data.
+func TestReceivePacketUntilPrefersAClosedDoneOverAQueuedPacket(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &Proxy{ctx: ctx, recvCh: make(chan []byte, 8)}
+	for i := 0; i < 8; i++ {
+		if !p.enqueueRecv(ctx, []byte{byte(i), 1, 2, 3}) {
+			t.Fatal("enqueueRecv failed with room available")
+		}
+	}
+	done := make(chan struct{})
+	close(done)
+	buf := make([]byte, 64)
+	for i := 0; i < 100; i++ {
+		n, err := p.ReceivePacketUntil(done, buf)
+		if n != 0 || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("call %d on a closed done with 8 packets queued = (%d, %v), want (0, net.ErrClosed) — a closed bind returned data", i, n, err)
+		}
+	}
+	if got := len(p.recvCh); got != 8 {
+		t.Fatalf("the queue holds %d packets after 100 closed calls, want 8 untouched", got)
+	}
+}
+
+// The re-open pair: after BindUpdate's close+open the OLD ReceiveFunc (its
+// done closed) and the NEW one (its done open) share the proxy's queue.
+// The user's reproduction on build 386: the old callback returned data in 54
+// of 100 calls — packets the new routine never saw. The old must answer
+// net.ErrClosed every time without touching the queue; the new must then
+// receive every queued packet. Sabotage seen red: the preliminary select
+// on `done` dropped.
+func TestReceivePacketUntilOldDoneNeverStealsFromTheNewReceiver(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &Proxy{ctx: ctx, recvCh: make(chan []byte, 8)}
+	for i := 0; i < 8; i++ {
+		if !p.enqueueRecv(ctx, []byte{byte(i), 9, 9}) {
+			t.Fatal("enqueueRecv failed with room available")
+		}
+	}
+	oldDone := make(chan struct{})
+	close(oldDone)
+	newDone := make(chan struct{})
+	buf := make([]byte, 64)
+	for i := 0; i < 100; i++ {
+		if n, err := p.ReceivePacketUntil(oldDone, buf); n != 0 || !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("old receiver call %d = (%d, %v), want (0, net.ErrClosed) — the old bind stole a packet from the new one", i, n, err)
+		}
+	}
+	for i := 0; i < 8; i++ {
+		n, err := p.ReceivePacketUntil(newDone, buf)
+		if err != nil || n != 3 || buf[0] != byte(i) {
+			t.Fatalf("new receiver packet %d = (%d, %v, first byte %d), want (3, nil, %d) — the queue was not left intact and in order", i, n, err, buf[0], i)
+		}
+	}
+}

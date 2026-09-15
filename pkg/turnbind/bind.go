@@ -85,8 +85,12 @@ func (b *TURNBind) open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 // BindUpdate, or a bind closed beside a live proxy (the bridge's
 // two-attaches race) would have parked wireguard-go's net.stopping.Wait
 // under device.state.Lock until the proxy stopped. Close now closes this
-// open's done channel and ReceivePacketUntil returns on it; the order in
-// wgTurnOff stays proxy-first for the TUN-side reason, not for this one.
+// open's done channel and ReceivePacketUntil returns on it — checked BEFORE
+// the queue, so a call that starts after Close never returns a packet (a
+// closed bind's stray call, or the OLD receiver after BindUpdate's re-open,
+// used to take queued packets at random from the new one; the user's
+// reproduction on 386). The order in wgTurnOff stays proxy-first for the
+// TUN-side reason, not for this one.
 //
 // ⚠️ The context mapping keys on context.Canceled because that is the ONE
 // error the root context yields: a plain WithCancel, never a deadline, and

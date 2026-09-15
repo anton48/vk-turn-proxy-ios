@@ -1784,7 +1784,25 @@ func (p *Proxy) ReceivePacket(buf []byte) (int, error) {
 // bridge's two-attaches race) no longer park wireguard-go's net.stopping.Wait
 // until the proxy stops. The proxy's own stop still returns ctx.Err(), which
 // turnbind maps to the same net.ErrClosed. A nil `done` never fires.
+//
+// 🚨 A CLOSED BIND TAKES PRECEDENCE OVER A QUEUED PACKET. The select below
+// picks at random among its ready cases, so with `done` closed AND a packet
+// queued a call could still return data: in the user's reproduction on
+// build 386, 40 of 100 calls made AFTER Close returned a packet, and after a
+// re-Open the OLD ReceiveFunc took 54 of 100 — stealing from the new
+// receiver, whose routine then never sees those packets. The contract says
+// net.ErrClosed after Close, so `done` is checked first, without blocking.
+// (A call already inside the select when Close lands may still complete with
+// a packet — the same window every socket read has; calls that START after
+// Close never do.) The proxy's own stop keeps its old behaviour: a few
+// packets buffered before the stop may still be delivered before ctx.Err()
+// — harmless, the device is closing.
 func (p *Proxy) ReceivePacketUntil(done <-chan struct{}, buf []byte) (int, error) {
+	select {
+	case <-done:
+		return 0, net.ErrClosed
+	default:
+	}
 	select {
 	case pkt := <-p.recvCh:
 		// Downlink disorder is measured HERE and not at the producer side of

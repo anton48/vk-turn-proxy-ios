@@ -127,6 +127,12 @@ func TestStoppedProxyReadsAsClosedBind(t *testing.T) {
 // receiver stays parked after Close); the closure passing nil for done
 // (same); Close not closing the channel (same); Close closing without the
 // `closed` guard (the second Close panics on a closed channel).
+//
+// ⚠️ This test parks on an EMPTY queue. A closed bind with packets queued
+// is the other half of the contract — a call after Close must not return
+// one of them — and it is pinned where the select lives, in
+// pkg/proxy/recvuntil_test.go (the user's 386 reproduction: 40 of 100
+// calls returned data; 54 of 100 for the old receiver after a re-open).
 func TestCloseAloneReleasesTheReceiver(t *testing.T) {
 	p := testProxy(t)
 	b := NewTURNBind(p)
