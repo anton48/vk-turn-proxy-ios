@@ -45,14 +45,28 @@ import (
 // never shows active == 1 (two failures in flight see active == 2, the
 // count ends at zero, twenty 486s and no pause), and "alone" is a proxy
 // for what is actually meant. What is meant is SUCCESS: both transports
-// tell the pool when an allocation went through (noteAllocated — native
-// at every "session established", csqtt through Credential.Allocated), and
-// a refusal counts only on a credential with NO success yet. The storm's
+// tell the pool when an allocation went through (noteAllocated — native the
+// moment Allocate() returns in runTURN and setupSRTPSession, csqtt through
+// Credential.Allocated right after the relay dial), and a refusal counts
+// only on a credential with NO success yet. The storm's
 // shape has none on every path — csqtt's worker 1 before TUNCONF, the
 // native bootstrap's conn 0, a herd whose ten dials all fail, overlapping
 // or not — while the tenth-allocation quota has nine. The archive agrees:
 // 296 logs, 8 real 486s, one of them on a credential under a minute old —
 // that tenth allocation, after nine successes.
+//
+// 🚨 THE MARK IS THE ALLOCATION, NOT THE SESSION. Build 391 marked the slot
+// at the four "session established" lines, and the user's control stand
+// (build 391, a real local TURN accepting nine allocations per credential and
+// refusing the tenth, the SRTP handshake delayed, production runSRTPSession)
+// showed what that measures: session READINESS — the relay held 18
+// allocations, the pool saw allocated 0,0, and the breaker paused minting
+// for a plain quota; direct's line even precedes its allocation (a mark with
+// nothing behind it), DTLS's and WRAP-A's follow their handshakes. The
+// relay's answer to Allocate() IS the fact the breaker keys on; the
+// permission, the handshake and the session above are not the relay's
+// verdict on the identity. So the two native allocation sites mark the slot
+// the moment Allocate() succeeds, and the source scan pins the mark there.
 //
 // 🚨 THE LADDER MUST NOT DECAY WHILE THE RELAY STILL REFUSES. A first cut
 // kept a window of trips and doubled per trip inside it, so a refusal that
@@ -97,10 +111,12 @@ type quotaBreaker struct {
 
 // noteAllocated records a successful allocation on slot's credential — the
 // evidence that the relay accepts this identity, so a later 486 on it is
-// its quota, not a refusal. Native calls it at every "session established";
-// csqtt through Credential.Allocated right after the relay dial.
+// its quota, not a refusal. Native calls it the moment Allocate() succeeds
+// (runTURN, setupSRTPSession — before CreatePermission and any handshake);
+// csqtt through Credential.Allocated right after the relay dial. Nil-safe:
+// the transport helpers run in tests on a Proxy without a pool.
 func (cp *credPool) noteAllocated(slot int) {
-	if slot < 0 {
+	if cp == nil || slot < 0 {
 		return
 	}
 	cp.mu.Lock()

@@ -257,32 +257,63 @@ func TestTheMintPauseDoublesPerTripAndHoldsTheCap(t *testing.T) {
 	}
 }
 
-// The success hooks sit where each transport learns the relay accepted an
-// allocation — pinned by spelling: native at every "session established"
-// (the four transports), csqtt right after the relay dial returns, the
-// adapter wiring Credential.Allocated to the pool. Without them every 486
-// reads as a refusal again. Sabotage seen red: one native site's call
-// dropped; the csqtt call dropped; the adapter's wiring dropped.
-func TestTheSuccessHooksSitWhereAllocationsSucceed(t *testing.T) {
+// The success marks sit at the two native ALLOCATION sites — pinned by
+// spelling. Build 391 put them at the four "session established" lines, and
+// the user's control stand showed what that measures: session readiness, not
+// the relay's acceptance — a real TURN accepting nine allocations per
+// credential and refusing the tenth, the SRTP handshake delayed: allocated
+// 0,0 and a 30-second pause for a plain quota (and direct's line comes
+// BEFORE its allocation: a mark with nothing behind it). proxy.go allocates
+// in exactly two places, runTURN (DTLS, direct, WRAP-A) and setupSRTPSession
+// (SRTP); each Allocate() is followed by the mark before its "TURN relay
+// allocated" line and before CreatePermission; no "session established" line
+// carries one. csqtt: Credential.Allocated right after the relay dial; the
+// adapter wires it (the bridge test). Sabotage seen red: either mark
+// dropped; the marks moved back to "session established"; a mark placed
+// after CreatePermission.
+func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	src, err := os.ReadFile("proxy.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	code := string(src)
-	sites := 0
+	var allocs []int
+	for i := 0; ; {
+		j := strings.Index(code[i:], ".Allocate()")
+		if j < 0 {
+			break
+		}
+		allocs = append(allocs, i+j)
+		i += j + 1
+	}
+	if len(allocs) != 2 {
+		t.Fatalf("proxy.go has %d .Allocate() sites, want 2 (runTURN, setupSRTPSession) — a new one needs the mark too", len(allocs))
+	}
+	for _, a := range allocs {
+		after := code[a:]
+		logAt := strings.Index(after, "TURN relay allocated")
+		if logAt < 0 {
+			t.Fatalf("no \"TURN relay allocated\" line after the Allocate at byte %d", a)
+		}
+		span := after[:logAt]
+		if n := strings.Count(span, "noteAllocated("); n != 1 {
+			t.Errorf("Allocate at byte %d: %d noteAllocated calls between it and its \"TURN relay allocated\" line, want exactly 1 — the mark is the allocation", a, n)
+		}
+		if perm := strings.Index(span, "CreatePermission("); perm >= 0 && strings.Index(span, "noteAllocated(") > perm {
+			t.Errorf("Allocate at byte %d: the mark sits after CreatePermission — a permission failure is not the relay refusing the identity", a)
+		}
+	}
+	if n := strings.Count(code, "noteAllocated("); n != 2 {
+		t.Errorf("proxy.go: %d noteAllocated calls, want 2 — one per allocation site, none at a session line", n)
+	}
 	for _, lit := range []string{"DTLS+TURN session established", "direct TURN session established", "WRAP-A+TURN session established", "SRTP+TURN session established"} {
 		i := strings.Index(code, lit)
 		if i < 0 {
 			t.Fatalf("proxy.go no longer logs %q", lit)
 		}
-		before := code[max(0, i-300):i]
-		if !strings.Contains(before, "p.credPool.noteAllocated(credSlot)") {
-			t.Errorf("proxy.go: %q is not preceded by p.credPool.noteAllocated(credSlot) — a 486 on that transport's credential would read as a refusal", lit)
+		if strings.Contains(code[max(0, i-300):i], "noteAllocated(") {
+			t.Errorf("%q is preceded by a noteAllocated call — that is session readiness, not the allocation (391's mistake)", lit)
 		}
-		sites++
-	}
-	if sites != 4 {
-		t.Fatalf("%d native session sites, want 4", sites)
 	}
 	csq, err := os.ReadFile("../csqtt/client.go")
 	if err != nil {

@@ -2566,7 +2566,6 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// every successful reconnect — sync.Once drops all calls after the first.
 	p.signalBootstrapDone(nil)
 
-	p.credPool.noteAllocated(credSlot) // the relay accepted this identity — quotabreaker.go
 	log.Printf("proxy: [conn %d, cred %d] DTLS+TURN session established", connIdx, credSlot)
 
 	// Reset this conn's last-pong time to "now" so the zombie watchdog
@@ -3102,7 +3101,6 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	// Signal proxy-lifetime bootstrap ready (sync.Once, idempotent).
 	p.signalBootstrapDone(nil)
 
-	p.credPool.noteAllocated(credSlot) // the relay accepted this identity — quotabreaker.go
 	log.Printf("proxy: [conn %d, cred %d] direct TURN session established", connIdx, credSlot)
 
 	// TURN reconnection loop (same as DTLS version but without DTLS)
@@ -3325,7 +3323,6 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	*signaled = true
 	p.signalBootstrapDone(nil)
 
-	p.credPool.noteAllocated(credSlot) // the relay accepted this identity — quotabreaker.go
 	log.Printf("proxy: [conn %d, cred %d] WRAP-A+TURN session established (getconf ok)", connIdx, credSlot)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
@@ -3597,6 +3594,12 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	if err != nil {
 		return fmt.Errorf("TURN allocate: %w", err)
 	}
+	// The relay accepted this identity: mark the slot NOW, before anything
+	// downstream — the permission, a handshake, the session above — can be
+	// delayed or fail. The mark means the allocation, not the session
+	// (quotabreaker.go; build 391 marked at "session established" and the
+	// user's control stand paused minting on a plain tenth-allocation quota).
+	p.credPool.noteAllocated(slotIdx)
 	defer relayConn.Close()
 	// Registered AFTER relayConn.Close's defer, so LIFO runs it FIRST: the
 	// deallocate that Close writes goes out under relayCloseWriteBudget on
@@ -5091,7 +5094,6 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	*signaled = true
 	p.signalBootstrapDone(nil)
 
-	p.credPool.noteAllocated(credSlot) // the relay accepted this identity — quotabreaker.go
 	log.Printf("proxy: [conn %d, cred %d] SRTP+TURN session established", connIdx, credSlot)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
@@ -5535,6 +5537,10 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		_ = ctlConn.Close()
 		return nil, fmt.Errorf("turn allocate: %w", err)
 	}
+	// The relay accepted this identity: mark the slot NOW, before the
+	// permission and the SRTP handshake — the mark means the allocation, not
+	// the session (quotabreaker.go; see runTURN).
+	p.credPool.noteAllocated(credSlot)
 	allocDur := time.Since(allocStart)
 	// Surface the TURN-allocate roundtrip to the UI / Stats endpoint
 	// — same field runDTLSSession populates at proxy.go:2706, so the
