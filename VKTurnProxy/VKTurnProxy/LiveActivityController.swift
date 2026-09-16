@@ -230,6 +230,16 @@ final class LiveActivityController {
         switchDeadline = Date().addingTimeInterval(Self.switchWindow)
     }
 
+    /// The switch was refused before any start (UnseededStartPolicy): the
+    /// tunnel is stopped and stays so, so the excuse ends now and the card
+    /// follows the real state — it ends, as on any disconnect. Left to the
+    /// window, "Connecting…" would sit on screen for up to 150 s over a tunnel
+    /// that is down.
+    func releaseHold() {
+        switchDeadline = nil
+        pushNow()
+    }
+
     private func pushNow() {
         let tunnel = TunnelManager.shared
         // The SESSION's server, through the one shared rule — not the selected

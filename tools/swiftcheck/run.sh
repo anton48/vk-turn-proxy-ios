@@ -58,6 +58,7 @@ SOURCES=(
     "$S/DisconnectReason.swift"
     "$S/ConnectButtonAction.swift"
     "$S/VKCallCreationGate.swift"
+    "$S/UnseededStartPolicy.swift"
     "$S/SessionServer.swift"
     "$S/ConnectionLinkInbox.swift"
     "$S/DirectOutcome.swift"

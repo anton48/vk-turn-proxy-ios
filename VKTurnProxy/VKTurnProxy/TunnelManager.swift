@@ -792,18 +792,24 @@ class TunnelManager: ObservableObject {
     /// this makes the switch behave the same way.
     ///
     /// NON-INTERACTIVE by construction: one attempt, and anything that would
-    /// need a human (captcha) returns nil rather than trying to show a WebView
-    /// that a background intent cannot present anyway. Nil simply means we start
-    /// unseeded, exactly as before — no worse, and usually the free path answers
-    /// in ~3s (vpn.11: 16:44:34.9 → 16:44:37.4).
-    private func probeFreshCredWithoutUI(config: TunnelConfig)
-        async -> (address: String, username: String, password: String)? {
+    /// need a human (captcha) says so — `.captcha` — rather than trying to show
+    /// a WebView that a background intent cannot present anyway; whether that
+    /// start goes ahead unseeded is UnseededStartPolicy's call (csqtt: no, the
+    /// captcha is terminal there; native: yes, as before). Usually the free
+    /// path answers in ~3s (vpn.11: 16:44:34.9 → 16:44:37.4).
+    enum UIlessProbe {
+        case seed(address: String, username: String, password: String)
+        case captcha
+        case failed
+    }
+
+    private func probeFreshCredWithoutUI(config: TunnelConfig) async -> UIlessProbe {
         let linkID = URL(string: config.vkLink)?.lastPathComponent ?? ""
 
         if config.useCookieAuth {
             guard let cookieHeader = VKCookieStore.validCookieHeader() else {
                 SharedLogger.shared.log("[AppDebug] live-activity: no valid VK cookie — starting unseeded")
-                return nil
+                return .failed
             }
             let linksJSON = (try? String(data: JSONSerialization.data(withJSONObject: config.cookieLinks),
                                          encoding: .utf8)) ?? "[]"
@@ -821,16 +827,16 @@ class TunnelManager: ObservableObject {
             if let h = config.turnServerOverride, !h.isEmpty,
                let pt = config.turnPortOverride, !pt.isEmpty {
                 SharedLogger.shared.log("[AppDebug] live-activity: fresh cred, TURN override \(h):\(pt) (VK gave \(addr))")
-                return ("\(h):\(pt)", user, pass)
+                return .seed(address: "\(h):\(pt)", username: user, password: pass)
             }
             SharedLogger.shared.log("[AppDebug] live-activity: fresh TURN cred acquired (addr=\(addr))")
-            return (addr, user, pass)
+            return .seed(address: addr, username: user, password: pass)
         case .captcha:
-            SharedLogger.shared.log("[AppDebug] live-activity: captcha required — cannot solve from a background intent, starting unseeded")
-            return nil
+            SharedLogger.shared.log("[AppDebug] live-activity: captcha required — cannot solve from a background intent")
+            return .captcha
         default:
             SharedLogger.shared.log("[AppDebug] live-activity: cred probe failed — starting unseeded")
-            return nil
+            return .failed
         }
     }
 
@@ -877,13 +883,25 @@ class TunnelManager: ObservableObject {
         case directRepair = "repairing an unconfirmed routing change"
     }
 
-    func switchAndReconnect(to serverId: UUID, because reason: ReconnectReason) async {
-        guard let server = ServerStore.shared.servers.first(where: { $0.id == serverId }) else { return }
+    /// What the switch did — the DIRECT repair reads it to say the truth about
+    /// the tunnel (a refused start is not a rebuilt tunnel).
+    enum SwitchOutcome: Equatable {
+        case started
+        case refusedUnseeded(reason: String)
+        case failed
+    }
+
+    @discardableResult
+    func switchAndReconnect(to serverId: UUID, because reason: ReconnectReason) async -> SwitchOutcome {
+        guard let server = ServerStore.shared.servers.first(where: { $0.id == serverId }) else { return .failed }
         // Same reason as connect(): this is where the attempt begins, and it runs
         // for a while before any status transition.
         noticeMessage = nil
         disconnectGate.attemptBegan()
         attemptStartedTunnel = false
+        // An attempt that never reaches iOS — a refused unseeded start, a failed
+        // apply — leaves no mark on the gate (400), whichever way it returns.
+        defer { if !attemptStartedTunnel { disconnectGate.attemptAbandoned() } }
         SharedLogger.shared.log("[AppDebug] reconnect → \"\(server.serverName)\" "
             + "[\(server.modeLabel)] — \(reason.rawValue)")
         // 🚨 HOLD THE CARD FIRST. This passes through `.disconnected`, on which
@@ -905,15 +923,44 @@ class TunnelManager: ObservableObject {
         clearCredCacheIfAuthModeChanged(config: config)
         // A cached cred is free; otherwise go and get one, exactly as the
         // Connect button does — see probeFreshCredWithoutUI for why the
-        // extension cannot be left to do it.
+        // extension cannot be left to do it. The probe runs AFTER the stop on
+        // purpose: the app's own sockets are captured by the tunnel, and a
+        // probe through it would show VK the server's address, not ours.
         var seed = CredCache.loadValidCred()
+        var probe: UnseededStartPolicy.Probe = seed == nil ? .failed : .seeded
         if seed == nil {
-            seed = await probeFreshCredWithoutUI(config: config)
+            switch await probeFreshCredWithoutUI(config: config) {
+            case .seed(let address, let username, let password):
+                seed = (address, username, password)
+                probe = .seeded
+            case .captcha:
+                probe = .captcha
+            case .failed:
+                probe = .failed
+            }
+        }
+        // 🚨 A csqtt start the probe already knows will meet a captcha is not
+        // started: the captcha is terminal inside csqtt's extension, so the
+        // start would only die a few seconds later with "csqtt cannot show it
+        // here". The tunnel is stopped by now and stays so; the app says why
+        // and waits for Connect, whose probe shows the captcha. Native goes on
+        // unseeded as before (§168's decisions).
+        let entry: UnseededStartPolicy.Entry = reason == .directRepair
+            ? .directRepair : .pickerSwitch(serverName: server.serverName)
+        if case .stopAndWait(let why) = UnseededStartPolicy.decide(
+            transport: config.useCsqtt ? .csqtt : .native, entry: entry, probe: probe) {
+            SharedLogger.shared.log("[AppDebug] live-activity: csqtt start without a seed refused — the probe met a captcha; the tunnel stays stopped, the user presses Connect")
+            errorMessage = why
+            if #available(iOS 16.2, *) {
+                LiveActivityController.shared.releaseHold()
+            }
+            return .refusedUnseeded(reason: why)
         }
         do {
             try await applyConfigurationAndStart(config: config, seededTURN: seed)
             // Stay alive long enough to SEE it come up, so the card can be told.
             await awaitConnected()
+            return .started
         } catch {
             // Reaches saveToPreferences() through applyConfigurationAndStart just
             // as connect() does, so on an unentitled build it produced the same
@@ -921,8 +968,8 @@ class TunnelManager: ObservableObject {
             // diagnosis has no un-wired call site left.
             errorMessage = Self.connectFailure(error)
             SharedLogger.shared.log("[AppDebug] live-activity: switch failed — \(error.localizedDescription)")
+            return .failed
         }
-        if !attemptStartedTunnel { disconnectGate.attemptAbandoned() }
     }
 
     /// Everything from "we already know what to connect with" onward: build the
@@ -1491,9 +1538,13 @@ class TunnelManager: ObservableObject {
             + "— reconnecting, which rebuilds the full-tunnel routes from scratch "
             + "[asked from \(source.rawValue)]")
         directModeError = message + " Reconnecting to restore it."
-        await switchAndReconnect(to: ServerStore.shared.activeServerId, because: .directRepair)
+        let outcome = await switchAndReconnect(to: ServerStore.shared.activeServerId, because: .directRepair)
         refreshDirectMode()
-        if directMode {
+        if case .refusedUnseeded(let why) = outcome {
+            // Not rebuilt: a csqtt start the probe knew would meet a captcha was
+            // refused, and the tunnel stays stopped until Connect.
+            directModeError = "Routing could not be confirmed, and the tunnel could not be rebuilt from here. " + why
+        } else if directMode {
             // The rebuilt profile should be full-tunnel; if it is not, say so
             // rather than leaving the switch to imply everything is fine.
             directModeError = "Reconnected, but routing is still bypassing the tunnel."

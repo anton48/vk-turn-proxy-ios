@@ -2623,6 +2623,72 @@ do {
               && !cvg.contains("Uses the saved VK login if there is one."),
               "🚨 the flow's needs-login answer defers to the rule's reason, and the description no longer calls the login optional")
     }
+    // 🚨 AN UNSEEDED csqtt START THAT WILL MEET A CAPTCHA IS NOT STARTED (§168,
+    // the user's decisions, 2026-09-16): from the Live Activity's picker and the
+    // DIRECT repair the app cannot show the captcha WebView, and a captcha on
+    // csqtt's first credential is terminal in the extension — the start would
+    // only die with "csqtt cannot show it here". The policy takes the transport
+    // (native joins later by one line); the tunnel stays stopped with the reason
+    // in the app, and Connect's probe shows the captcha.
+    do {
+        typealias P = UnseededStartPolicy
+        let picker = P.Entry.pickerSwitch(serverName: "Sel1-csqtt")
+        for entry in [picker, P.Entry.directRepair] {
+            for probe in [P.Probe.seeded, .captcha, .failed] {
+                check(P.decide(transport: .native, entry: entry, probe: probe) == .start,
+                      "native starts as before whatever the probe found (\(probe)) — its extension has its own captcha path")
+            }
+            check(P.decide(transport: .csqtt, entry: entry, probe: .seeded) == .start
+                  && P.decide(transport: .csqtt, entry: entry, probe: .failed) == .start,
+                  "csqtt starts with a seed, and after a transient probe failure (the extension retries those itself)")
+        }
+        var whyPicker = ""
+        var whyRepair = ""
+        if case .stopAndWait(let r) = P.decide(transport: .csqtt, entry: picker, probe: .captcha) { whyPicker = r }
+        if case .stopAndWait(let r) = P.decide(transport: .csqtt, entry: .directRepair, probe: .captcha) { whyRepair = r }
+        check(!whyPicker.isEmpty && !whyRepair.isEmpty,
+              "🚨 csqtt + a captcha on the probe → stop and wait for Connect, from the picker and from the repair alike")
+        check(whyPicker.contains("Switching to “Sel1-csqtt”") && whyPicker.contains("csqtt cannot show") && whyPicker.contains("press Connect"),
+              "🚨 the picker's reason names the server, the transport's limit and the way out")
+        check(whyRepair.contains("Restoring the tunnel") && whyRepair.contains("press Connect"),
+              "…and the repair's names the repair")
+        // The wiring.
+        var probeTyped = false
+        if let pf = tm.range(of: "private func probeFreshCredWithoutUI(config: TunnelConfig) async -> UIlessProbe {") {
+            let body = String(tm[pf.upperBound...]).prefix(2200)
+            probeTyped = body.contains("return .captcha\n") && body.contains("return .failed") && body.contains("return .seed(address:")
+        }
+        check(probeTyped, "🚨 the UI-less probe tells a captcha from a transient failure — the policy cannot decide on nil")
+        var refusal = false
+        if let sw = tm.range(of: "func switchAndReconnect(") {
+            let body = String(tm[sw.upperBound...]).prefix(7000)
+            if let d = body.range(of: "UnseededStartPolicy.decide("),
+               let e = body.range(of: "errorMessage = why"),
+               let r = body.range(of: "LiveActivityController.shared.releaseHold()"),
+               let ret = body.range(of: "return .refusedUnseeded(reason: why)"),
+               let start = body.range(of: "try await applyConfigurationAndStart(config: config, seededTURN: seed)") {
+                refusal = d.lowerBound < e.lowerBound && e.lowerBound < r.lowerBound && r.lowerBound < ret.lowerBound
+                    && ret.lowerBound < start.lowerBound
+                    && body.contains("transport: config.useCsqtt ? .csqtt : .native")
+            }
+        }
+        check(refusal, "🚨 the switch asks the policy after the probe and, on stop-and-wait, sets the reason, releases the card's hold and returns BEFORE any start — the transport from the profile")
+        check(tm.contains("if case .refusedUnseeded(let why) = outcome {") && tm.contains("could not be rebuilt from here"),
+              "🚨 the DIRECT repair reads the outcome and does not claim a rebuilt tunnel after a refused start")
+        check(tm.contains("csqtt start without a seed refused"),
+              "…and the refusal is logged (the phone's signature)")
+        let lac = codeWithoutComments("VKTurnProxy/VKTurnProxy/LiveActivityController.swift")
+        var releases = false
+        if let rh = lac.range(of: "func releaseHold() {") {
+            // The window ends at the function's closing brace: a fixed 120 chars
+            // reached into the NEXT declaration — `private func pushNow()` — and
+            // stayed green with the push removed (the sabotage caught it).
+            let after = String(lac[rh.upperBound...])
+            let body = after.range(of: "\n    }").map { String(after[..<$0.lowerBound]) } ?? String(after.prefix(120))
+            releases = body.contains("switchDeadline = nil") && body.contains("pushNow()")
+        }
+        check(releases, "🚨 releasing the hold clears the switch window AND pushes the real state — the card ends instead of showing Connecting… for 150 s over a stopped tunnel")
+    }
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT
     // no-op — and that is the SAME population that hits the missing VPN
