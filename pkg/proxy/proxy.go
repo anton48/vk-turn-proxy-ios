@@ -3667,7 +3667,9 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	wg.Add(2)
 	turnCtx, turnCancel := context.WithCancel(ctx)
 	defer turnCancel()
-	context.AfterFunc(turnCtx, func() {
+	hookDone := make(chan struct{}) // closed when the cancel hook has run to its end
+	stopHook := context.AfterFunc(turnCtx, func() {
+		defer close(hookDone)
 		relayConn.SetDeadline(time.Now())
 		conn2.SetDeadline(time.Now())
 		// The forwarder toward the relay may be INSIDE a write the relay
@@ -3880,6 +3882,17 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	}()
 
 	wg.Wait()
+	// The deferred teardown re-arms a live budget for the deallocate — and
+	// the cancel hook may still be RUNNING here: a forwarder exits on the
+	// hook's first deadline and wg.Wait returns before its later steps, so
+	// the hook's past write deadline could land AFTER the budget and fail
+	// the deallocate on a healthy relay, leaving the allocation on the quota
+	// for its lifetime (the user's review of 395). The hook is stopped, or
+	// waited for, before anything below touches a deadline.
+	turnCancel()
+	if !stopHook() {
+		<-hookDone
+	}
 	// Reset conn2 deadline so it can be reused by the next TURN session.
 	relayConn.SetDeadline(time.Time{})
 	conn2.SetDeadline(time.Time{})
@@ -5583,15 +5596,33 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	// transaction fails at once — and only then closes the client:
 	// whichever of the two a transaction meets, it ends now. Scoped to this
 	// setup: the live session's own teardown closes tc in its order
-	// (srtpSessionConn.Close), so the hook is disarmed on return; the
-	// teardown below re-arms a live budget for the deallocate the hook's
-	// deadline would otherwise fail.
+	// (srtpSessionConn.Close), so the hook is quiesced on return; the
+	// teardown below quiesces it too and only then re-arms a live budget
+	// for the deallocate its deadline would otherwise fail.
+	hookDone := make(chan struct{}) // closed when the hook has run to its end
 	disarm := context.AfterFunc(ctx, func() {
+		defer close(hookDone)
 		_ = ctlConn.SetWriteDeadline(time.Now())
 		tc.Close()
 	})
-	defer disarm()
+	// quiesce: the hook is stopped before it ran, or has finished — never
+	// still running when a teardown re-arms its budget. The user's review
+	// of 395: the cleanup set now+500 ms, the hook still running replaced
+	// it with now, the deallocate failed its write and the allocation
+	// stayed on the quota for its lifetime; a stop alone does not wait for
+	// a hook that has started. Once: a second stop returns false for a hook
+	// that never ran and would wait for ever.
+	var quiesceOnce sync.Once
+	quiesce := func() {
+		quiesceOnce.Do(func() {
+			if !disarm() {
+				<-hookDone
+			}
+		})
+	}
+	defer quiesce()
 	abortSetup := func() {
+		quiesce()
 		_ = ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget)) // the deallocate goes out under a budget, hook or no hook
 		_ = relayConn.Close()
 		tc.Close()
