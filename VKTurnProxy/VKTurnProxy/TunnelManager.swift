@@ -2219,6 +2219,16 @@ class TunnelManager: ObservableObject {
                     // VKAuth's own message, the two compared equal, and the
                     // guard permitted the very overwrite it existed to prevent.
                     //
+                    // The death is asked about under the generation ITS session
+                    // went live under (the gate's `liveGeneration`). A server
+                    // switch announces the new attempt while the old session
+                    // still runs, so the old session's stop arrives here with an
+                    // earlier generation than the attempt's — its answer is the
+                    // previous session's, and mayPublish drops it (the user's
+                    // review of 400).
+                    if let g = deathGeneration, g != self.disconnectGate.generation {
+                        SharedLogger.shared.log("[AppDebug] the previous session's stop (generation \(g)) is asked about under its own generation — the attempt begun since (generation \(self.disconnectGate.generation)) will not be captioned by it")
+                    }
                     // ⚖️ nil on a user-initiated Disconnect, so an ordinary stop
                     // reports nothing. Per Apple's note the error is OURS when
                     // the extension cancelled the tunnel itself, so the

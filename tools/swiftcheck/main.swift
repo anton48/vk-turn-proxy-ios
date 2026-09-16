@@ -2401,6 +2401,56 @@ do {
         check(tm.contains("self.stopTunnelInternally()") && !tm.contains("self.disconnect()"),
               "…and the VKAuth self-stop is the app's own too")
     }
+    // 🚨 THE PREVIOUS SESSION'S STOP IS NOT THE NEW ATTEMPT'S (the user's review
+    // of 400): a server switch announces the new attempt — attemptBegan(),
+    // generation 2 — while the OLD session still runs; its stop was then asked
+    // about under 2, the new session's first .connecting consumed the pending
+    // mark instead of advancing (400's fix), and the late answer passed
+    // mayPublish on top of the new connection. A death is asked about under the
+    // generation its session went LIVE under — its own — never the current one.
+    do {
+        var o = DisconnectReasonGate()
+        _ = o.observe(.connecting)
+        _ = o.observe(.connected)                      // the old session, live under 1
+        o.attemptBegan()                               // the switch: the new attempt announced while it still runs
+        let oldDeath = o.observe(.disconnected)!       // the old session's stop
+        check(!o.mayPublish(fetchedUnder: oldDeath, messageNow: nil),
+              "🚨 the old session's stop is asked about under ITS generation, so its answer is dropped as soon as the new attempt is announced")
+        _ = o.observe(.connecting)                     // the new attempt reaching iOS: the same generation, the pending mark consumed
+        check(!o.mayPublish(fetchedUnder: oldDeath, messageNow: nil),
+              "🚨 …and stays dropped after the new session's first .connecting — 400's pending mark keeps the attempt's identity, it does not merge the previous session's stop into it")
+        o.stopRequestedByUser()                        // the user's Disconnect during the NEW start
+        let newDeath = o.observe(.disconnected)!
+        check(o.mayPublish(fetchedUnder: newDeath, messageNow: nil) && o.userCancelledTheStart(newDeath),
+              "…while the new attempt's own death is still its own, and an early Disconnect within it still names it")
+        // An intent recorded against the OLD session cannot become the new
+        // start's cancel: `connected` is per generation and was reset for the
+        // new one, so the death's generation must equal the current one.
+        var v = DisconnectReasonGate()
+        _ = v.observe(.connecting)
+        _ = v.observe(.connected)
+        v.stopRequestedByUser()                        // a Disconnect of the CONNECTED old session…
+        v.attemptBegan()                               // …and a new attempt announced before its death is observed
+        let oldStop = v.observe(.disconnected)!
+        check(!v.userCancelledTheStart(oldStop),
+              "🚨 a death from a generation the app has moved past is nobody's cancel of a START — `connected` describes the CURRENT generation only")
+        // The stamp is taken once, as the session goes live; a live status of
+        // the same session after the announcement does not re-stamp it.
+        var t = DisconnectReasonGate()
+        _ = t.observe(.connecting)
+        t.attemptBegan()
+        _ = t.observe(.reasserting)                    // the OLD session re-establishing, not the new one
+        let reassertedDeath = t.observe(.disconnected)!
+        check(!t.mayPublish(fetchedUnder: reassertedDeath, messageNow: nil),
+              "🚨 a live status of the SAME session after the announcement does not hand its death to the new attempt")
+        // The wiring: both answer paths of the observer are keyed on the
+        // generation observe() returned for the death, never on the current one.
+        check(tm.contains("if #available(iOS 16.0, *), let generation = deathGeneration {")
+              && tm.contains("} else if let generation = deathGeneration,"),
+              "🚨 the observer fetches and decides under the DEATH's generation — the one observe() returned for the session that died")
+        check(tm.contains("is asked about under its own generation"),
+              "…and says so in the log when the death's generation is behind the attempt's (the phone's signature of a switch)")
+    }
     // 🚨 A LATE ANSWER AFTER A DISCONNECT MUST NOT ACT (the user's review of 398):
     // the checks sat after the DNS wait and before the start only, so a probe
     // answering after the tap could still raise a captcha or a red error.

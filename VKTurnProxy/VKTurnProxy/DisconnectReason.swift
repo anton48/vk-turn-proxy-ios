@@ -40,10 +40,25 @@ struct DisconnectReasonGate {
     /// non-event rather than a death.
     private(set) var sawLiveSession = false
 
-    /// Bumped when a NEW session starts. A fetch captures the value current when
-    /// it was issued; if a reconnect has begun by the time the answer lands, the
-    /// two disagree and the answer belongs to a cycle nobody is looking at.
+    /// Bumped when a NEW attempt is announced (`attemptBegan`) or a session
+    /// nobody announced starts. A death is asked about under the generation its
+    /// session went LIVE under (`liveGeneration`); if a reconnect has begun by
+    /// the time the answer lands, the two disagree and the answer belongs to a
+    /// cycle nobody is looking at.
     private(set) var generation = 0
+
+    /// The generation the live session went live under — stamped ONCE, as
+    /// `sawLiveSession` flips, and what its death is asked about under.
+    ///
+    /// 🚨 NOT the current generation (the user's review of 400): a server switch
+    /// announces the NEW attempt — `attemptBegan()`, generation +1 — while the
+    /// OLD session still runs. Asked about under the current value, the old
+    /// session's stop was keyed to the new attempt; and since that attempt's
+    /// first `.connecting` no longer advances the generation (the pending mark
+    /// that keeps an early Disconnect within the attempt), the late answer
+    /// passed `mayPublish` on top of the new connection. The early Disconnect
+    /// keeps naming the attempt; the previous session's stop is its own.
+    private(set) var liveGeneration = 0
 
     /// The generation whose stop the USER asked for — `disconnect()` records it
     /// before `stopVPNTunnel()`. A stop asked for during the start still
@@ -95,7 +110,12 @@ struct DisconnectReasonGate {
     /// because the completions landed the other way round). So the fetch's
     /// nil answer, and a build without the fetch, consult this instead.
     func userCancelledTheStart(_ generationOfDeath: Int) -> Bool {
-        userStopGeneration == generationOfDeath && !connectedThisGeneration
+        // A death of the CURRENT generation only: `connectedThisGeneration`
+        // describes that one alone (reset when it advanced), so an earlier
+        // session's death — asked about under its own generation — cannot
+        // borrow it. That death is history, nobody's cancel of a start.
+        generationOfDeath == generation
+            && userStopGeneration == generationOfDeath && !connectedThisGeneration
     }
 
     /// The provider's stop-during-start outcome as it crosses the process
@@ -163,6 +183,10 @@ struct DisconnectReasonGate {
                     generation += 1
                     connectedThisGeneration = false
                 }
+                // The session's own identity, stamped as it goes live: its
+                // death is asked about under THIS, whatever the generation has
+                // become by then.
+                liveGeneration = generation
             }
             sawLiveSession = true
             if status == .connected {
@@ -175,7 +199,10 @@ struct DisconnectReasonGate {
             // stopped and get the reason for something the user already forgot.
             guard sawLiveSession else { return nil }
             sawLiveSession = false
-            return generation
+            // 🚨 The generation the session went live under, not the current
+            // one: a switch may have announced the next attempt while this
+            // session was still running, and its stop is not that attempt's.
+            return liveGeneration
         default:
             // .disconnecting — not terminal yet.
             return nil
