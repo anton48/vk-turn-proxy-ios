@@ -15,10 +15,23 @@ package proxy
 // asked. Sabotage seen red: client.Close dropped from runTURN's cancel
 // AfterFunc (the return 1.1 s after the cancel); setupSRTPSession's
 // AfterFunc dropped (the 3-s guard).
+//
+// The user's review of 394: a cancel that lands BEFORE the permission is
+// asked. AfterFunc on a ctx already done runs the hook in its own goroutine
+// at once, racing CreatePermission's registration, and a Close alone
+// releases only what is already registered — the transaction registered
+// after it waited out pion's whole ladder (3/3 on their stand). So the hook
+// first puts a write deadline in the PAST on the control socket (the first
+// write of any later transaction fails at once) and only then closes the
+// client: whichever of the two a transaction meets, it ends. The race
+// itself is probabilistic, so the ORDER is pinned by a source scan; the
+// held-answer stand below shows the behaviour.
 
 import (
 	"context"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,27 +45,38 @@ import (
 // head of a client → server chunk); from then on everything the server
 // answers is dropped — a relay that stays silent from the permission on.
 type permissionMutingTap struct {
-	ln       net.Listener
-	to       string
-	muted    atomic.Bool
-	requests atomic.Int32 // CreatePermission requests seen
-	mu       sync.Mutex
-	conns    []net.Conn
+	ln        net.Listener
+	to        string
+	muted     atomic.Bool
+	requests  atomic.Int32  // CreatePermission requests seen
+	requested chan struct{} // closed on the first client → server bytes (the Allocate request)
+	gate      chan struct{} // with hold: the server's answers are forwarded only once it is closed
+	reqOnce   sync.Once
+	gateOnce  sync.Once
+	mu        sync.Mutex
+	conns     []net.Conn
 }
 
-func newPermissionMutingTap(t *testing.T, to string) *permissionMutingTap {
+// hold: the relay's answers are held back until release() — an Allocate
+// whose answer is late, so a cancel can land before anything is armed.
+func newPermissionMutingTap(t *testing.T, to string, hold bool) *permissionMutingTap {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tap := &permissionMutingTap{ln: ln, to: to}
+	tap := &permissionMutingTap{ln: ln, to: to, requested: make(chan struct{}), gate: make(chan struct{})}
+	if !hold {
+		tap.release()
+	}
 	go tap.serve()
 	t.Cleanup(tap.close)
 	return tap
 }
 
 func (tap *permissionMutingTap) addr() string { return tap.ln.Addr().String() }
+
+func (tap *permissionMutingTap) release() { tap.gateOnce.Do(func() { close(tap.gate) }) }
 
 func (tap *permissionMutingTap) serve() {
 	for {
@@ -80,13 +104,15 @@ func (tap *permissionMutingTap) serve() {
 					if _, werr := up.Write(buf[:n]); werr != nil {
 						return
 					}
+					tap.reqOnce.Do(func() { close(tap.requested) })
 				}
 				if err != nil {
 					return
 				}
 			}
 		}()
-		go func() { // server → client, until muted
+		go func() { // server → client: held until released, then forwarded until muted
+			<-tap.gate
 			buf := make([]byte, 64<<10)
 			for {
 				n, err := up.Read(buf)
@@ -104,6 +130,7 @@ func (tap *permissionMutingTap) serve() {
 }
 
 func (tap *permissionMutingTap) close() {
+	tap.release() // never leave a copier parked on the gate
 	_ = tap.ln.Close()
 	tap.mu.Lock()
 	defer tap.mu.Unlock()
@@ -115,7 +142,7 @@ func (tap *permissionMutingTap) close() {
 // runTURN: the first packet's permission is asked, the relay says nothing,
 // the cancel lands while pion's ladder runs — runTURN returns at once.
 func TestRunTURNReturnsWhenTheRelayGoesSilentAtCreatePermission(t *testing.T) {
-	tap := newPermissionMutingTap(t, loopbackTURN(t))
+	tap := newPermissionMutingTap(t, loopbackTURN(t), false)
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
 	p := &Proxy{peer: peer, connTxBytes: make([]atomic.Int64, 1), lastTxAt: make([]atomic.Int64, 1)}
 	conn1, conn2 := connutil.AsyncPacketPipe()
@@ -156,7 +183,7 @@ func TestRunTURNReturnsWhenTheRelayGoesSilentAtCreatePermission(t *testing.T) {
 // setupSRTPSession: its explicit CreatePermission right after the
 // allocation, the relay silent from there — the cancel ends it at once.
 func TestSetupSRTPSessionReturnsWhenTheRelayGoesSilentAtCreatePermission(t *testing.T) {
-	tap := newPermissionMutingTap(t, loopbackTURN(t))
+	tap := newPermissionMutingTap(t, loopbackTURN(t), false)
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
 	p := &Proxy{peer: peer, connTxBytes: make([]atomic.Int64, 1), lastTxAt: make([]atomic.Int64, 1)}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -189,5 +216,94 @@ func TestSetupSRTPSessionReturnsWhenTheRelayGoesSilentAtCreatePermission(t *test
 	}
 	if took := time.Since(t0); took > relayCloseWriteBudget {
 		t.Fatalf("setupSRTPSession took %s after the cancel, want under the %s budget", took, relayCloseWriteBudget)
+	}
+}
+
+// The user's review of 394 on the real stack: the Allocate answer held, the
+// cancel lands with nothing armed yet, the answer released — the allocation
+// completes, the hook fires the moment it is armed (AfterFunc on a done ctx)
+// and races CreatePermission's registration, and the relay is silent from
+// the permission on. setupSRTPSession must return within the budget
+// whichever of the two runs first. The race is real and probabilistic: with
+// a Close alone (394) the user's stand saw the ladder 3/3; the ORDER that
+// closes every interleaving is pinned by the scan below.
+func TestSetupSRTPSessionReturnsWhenTheCancelPrecedesThePermission(t *testing.T) {
+	tap := newPermissionMutingTap(t, loopbackTURN(t), true)
+	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	p := &Proxy{peer: peer, connTxBytes: make([]atomic.Int64, 1), lastTxAt: make([]atomic.Int64, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0)
+		if c != nil {
+			_ = c.Close()
+		}
+		done <- err
+	}()
+	<-tap.requested // the Allocate request is on the wire, its answer held
+	cancel()        // the early cancel: nothing is armed yet
+	t0 := time.Now()
+	tap.release() // the allocation completes; the hook and CreatePermission race; the relay is silent from the permission on
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("setupSRTPSession succeeded on a cancelled context")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("setupSRTPSession did not return: a transaction registered after the hook's Close waited out pion's ladder")
+	}
+	if took := time.Since(t0); took > relayCloseWriteBudget {
+		t.Fatalf("setupSRTPSession took %s after the answer was released, want under the %s budget", took, relayCloseWriteBudget)
+	}
+}
+
+// The order inside both cancel hooks, and the teardown's re-armed budget,
+// pinned by spelling: the race above cannot be made deterministic, and a
+// hook that closes first and sets the deadline second leaves a transaction
+// registered in between waiting for its next retransmit.
+func TestTheCancelHooksSetThePastDeadlineBeforeTheClose(t *testing.T) {
+	src, err := os.ReadFile("proxy.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(src)
+	hook := func(start string) string {
+		i := strings.Index(code, start)
+		if i < 0 {
+			t.Fatalf("proxy.go lacks %q", start)
+		}
+		end := strings.Index(code[i:], "\n\t})")
+		if end < 0 {
+			t.Fatalf("no end for the hook at %q", start)
+		}
+		return code[i : i+end]
+	}
+	for _, h := range []struct{ start, deadline, closeCall string }{
+		{"context.AfterFunc(turnCtx, func() {", "turnConn.SetWriteDeadline(time.Now())", "client.Close()"},
+		{"disarm := context.AfterFunc(ctx, func() {", "ctlConn.SetWriteDeadline(time.Now())", "tc.Close()"},
+	} {
+		body := hook(h.start)
+		d, c := strings.Index(body, h.deadline), strings.Index(body, h.closeCall)
+		if d < 0 {
+			t.Errorf("the hook at %q sets no PAST write deadline (%q) — a transaction registered after its Close waits out pion's ladder", h.start, h.deadline)
+		}
+		if c < 0 {
+			t.Errorf("the hook at %q does not close the client (%q)", h.start, h.closeCall)
+		}
+		if d >= 0 && c >= 0 && d > c {
+			t.Errorf("the hook at %q closes the client BEFORE the past deadline — a transaction registered between the two waits for its next retransmit", h.start)
+		}
+		if strings.Contains(body, h.deadline+".Add(") {
+			t.Errorf("the hook at %q sets a FUTURE write deadline — a transaction registered after its Close writes once and waits", h.start)
+		}
+	}
+	abort := hook("abortSetup := func() {")
+	b, r := strings.Index(abort, "SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))"), strings.Index(abort, "relayConn.Close()")
+	if b < 0 || r < 0 || b > r {
+		t.Error("setupSRTPSession's abortSetup does not re-arm a live write budget before the deallocate — after a cancel the hook's past deadline would fail it")
+	}
+	if n := strings.Count(code[strings.Index(code, "abortSetup := func() {"):], "abortSetup()"); n != 2 {
+		t.Errorf("abortSetup() is called %d times after its definition, want 2 (the permission's and the handshake's error paths)", n)
 	}
 }
