@@ -2200,11 +2200,25 @@ class TunnelManager: ObservableObject {
                     // provider's own reason surfaces here too.
                     if #available(iOS 16.0, *), let generation = deathGeneration {
                         manager.connection.fetchLastDisconnectError { stop in
-                            guard let stop else { return }
                             Task { @MainActor in
                                 guard self.disconnectGate.mayPublish(
                                         fetchedUnder: generation,
                                         messageNow: self.errorMessage) else { return }
+                                guard let stop else {
+                                    // No reason recorded: an ordinary stop —
+                                    // unless the user stopped a session that
+                                    // never connected. iOS files that as a
+                                    // clean user stop when the stop's
+                                    // completion beats the start's, so the
+                                    // app's own record decides (the phone,
+                                    // 2026-09-16 19:26: status 2 at the tap,
+                                    // nil here, nothing shown).
+                                    if self.disconnectGate.userCancelledTheStart(generation) {
+                                        SharedLogger.shared.log("[AppDebug] the start was cancelled by the user's Disconnect — shown as a notice, not an error (iOS recorded no reason)")
+                                        self.noticeMessage = DisconnectReasonGate.cancelledByUserText
+                                    }
+                                    return
+                                }
                                 if self.disconnectGate.wasCancelledByUser(stop, fetchedUnder: generation) {
                                     // The user's own Disconnect during the start:
                                     // a notice, not "The tunnel stopped" (Sep 14 §116).
@@ -2215,6 +2229,12 @@ class TunnelManager: ObservableObject {
                                 }
                             }
                         }
+                    } else if let generation = deathGeneration,
+                              self.disconnectGate.userCancelledTheStart(generation) {
+                        // No fetch API before iOS 16: the app's own record is all
+                        // there is for the user's cancel of a start.
+                        SharedLogger.shared.log("[AppDebug] the start was cancelled by the user's Disconnect — shown as a notice, not an error (no stop reason API)")
+                        self.noticeMessage = DisconnectReasonGate.cancelledByUserText
                     }
                 default:
                     // .disconnecting only — keep polling/state, the tunnel

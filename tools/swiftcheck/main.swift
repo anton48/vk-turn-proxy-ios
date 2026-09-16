@@ -2291,6 +2291,71 @@ do {
               && DisconnectReasonGate.stoppedDuringStartCode == 3,
               "the gate names the provider's stop-during-start error")
     }
+    // 🚨 iOS MAY RECORD NO REASON FOR THE USER'S OWN CANCEL (the phone, build
+    // 398, 2026-09-16 19:26): a Disconnect at status 2, the fetch answered nil,
+    // nothing was shown — when the stop's completion beats the start's, iOS
+    // files the stop as a clean user stop. The app's own record decides: the
+    // user stopped a session that never connected.
+    do {
+        var w = DisconnectReasonGate()
+        w.attemptBegan()
+        _ = w.observe(.connecting)
+        w.stopRequestedByUser()
+        let death = w.observe(.disconnected)!
+        check(w.userCancelledTheStart(death),
+              "🚨 the user's Disconnect of a session that never connected is the user's cancel — with or without a fetched reason")
+        var c = DisconnectReasonGate()
+        c.attemptBegan()
+        _ = c.observe(.connecting)
+        _ = c.observe(.connected)
+        c.stopRequestedByUser()
+        let ordinary = c.observe(.disconnected)!
+        check(!c.userCancelledTheStart(ordinary),
+              "🚨 …but a Disconnect after the session CONNECTED is an ordinary stop, and says nothing")
+        var q = DisconnectReasonGate()
+        q.attemptBegan()
+        _ = q.observe(.connecting)
+        let unasked = q.observe(.disconnected)!
+        check(!q.userCancelledTheStart(unasked),
+              "🚨 …and a death nobody asked for is not the user's cancel, reason or no reason")
+        var r = DisconnectReasonGate()
+        r.attemptBegan()
+        _ = r.observe(.connecting)
+        r.stopRequestedByUser()
+        _ = r.observe(.disconnected)
+        r.attemptBegan()                                  // the next Connect
+        _ = r.observe(.connecting)
+        let next = r.observe(.disconnected)!
+        check(!r.userCancelledTheStart(next),
+              "🚨 the intent does not carry into the next attempt")
+        var s = DisconnectReasonGate()
+        s.attemptBegan()
+        _ = s.observe(.connecting)
+        _ = s.observe(.connected)
+        _ = s.observe(.disconnected)
+        _ = s.observe(.connecting)                         // a reconnect: a fresh generation
+        s.stopRequestedByUser()
+        let second = s.observe(.disconnected)!
+        check(s.userCancelledTheStart(second),
+              "🚨 `connected` is per generation — a session that connected earlier does not make the NEXT start's cancel an ordinary stop")
+        let fetch = tm.range(of: "manager.connection.fetchLastDisconnectError { stop in")
+        var nilBranch = false
+        if let fetch {
+            // Stripped comment lines keep their indentation, so the windows are
+            // sized for the eight-line comment inside the branch, not the code.
+            let body = String(tm[fetch.upperBound...]).prefix(2000)
+            if let g = body.range(of: "guard let stop else {") {
+                let after = String(body[g.upperBound...]).prefix(1500)
+                nilBranch = after.contains("self.disconnectGate.userCancelledTheStart(generation)")
+                    && after.contains("self.noticeMessage = DisconnectReasonGate.cancelledByUserText")
+                    && body.range(of: "self.disconnectGate.mayPublish(")!.lowerBound < g.lowerBound
+            }
+        }
+        check(nilBranch,
+              "🚨 the fetch's NIL answer consults the app's own record and publishes the notice — after mayPublish, so a stale nil from an old cycle says nothing")
+        check(tm.contains("} else if let generation = deathGeneration,") && tm.contains("(no stop reason API)"),
+              "…and a build without the fetch API publishes it from the record alone")
+    }
     // The wiring, by spelling — TunnelManager cannot be driven here.
     do {
         let ptp = codeWithoutComments("VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift")

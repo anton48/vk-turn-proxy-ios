@@ -57,11 +57,28 @@ struct DisconnectReasonGate {
     /// a death in the next.
     private(set) var userStopGeneration: Int?
 
+    /// True once this generation's session reported `.connected`: a stop after
+    /// that is an ordinary stop, whoever asked for it. Reset whenever the
+    /// generation advances.
+    private(set) var connectedThisGeneration = false
+
     init() {}
 
     /// Call from `disconnect()`, BEFORE the stop is issued: the user's intent.
     mutating func stopRequestedByUser() {
         userStopGeneration = generation
+    }
+
+    /// The user's own Disconnect of a session that never connected — known
+    /// from the app's own record alone, no stop reason needed. iOS may record
+    /// NO error for it: when the stop's completion beats the start's, the stop
+    /// is filed as a clean user stop and `fetchLastDisconnectError` answers nil
+    /// (the phone, 2026-09-16 19:26 — status 2 at the tap, nothing fetched,
+    /// nothing shown; on build 385 the same tap had shown the start's error
+    /// because the completions landed the other way round). So the fetch's
+    /// nil answer, and a build without the fetch, consult this instead.
+    func userCancelledTheStart(_ generationOfDeath: Int) -> Bool {
+        userStopGeneration == generationOfDeath && !connectedThisGeneration
     }
 
     /// The provider's stop-during-start outcome as it crosses the process
@@ -107,6 +124,7 @@ struct DisconnectReasonGate {
     /// `saveToPreferences()` look like a death.
     mutating func attemptBegan() {
         generation += 1
+        connectedThisGeneration = false
     }
 
     /// Feed every status observation. Returns the generation to fetch the stop
@@ -118,8 +136,12 @@ struct DisconnectReasonGate {
                 // A new session is starting: anything still in flight from the
                 // previous one is now answering a question nobody is asking.
                 generation += 1
+                connectedThisGeneration = false
             }
             sawLiveSession = true
+            if status == .connected {
+                connectedThisGeneration = true
+            }
             return nil
         case .disconnected, .invalid:
             // 🚨 Only a session that was actually live or starting can have died.
