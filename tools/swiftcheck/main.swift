@@ -2451,6 +2451,33 @@ do {
         check(tm.contains("is asked about under its own generation"),
               "…and says so in the log when the death's generation is behind the attempt's (the phone's signature of a switch)")
     }
+    // 🚨 A LATE .connected OF THE OLD SESSION MUST NOT MARK THE NEW GENERATION
+    // (the user's review of 401): the old session reported .connected after the
+    // switch had announced the new attempt, `connectedThisGeneration` was set
+    // for the NEW generation, and the new session — which never connected —
+    // lost its cancel notice. A .connected marks the generation only when it
+    // comes from the current generation's own session.
+    do {
+        for lateOldConnected in [false, true] {
+            var g = DisconnectReasonGate()
+            _ = g.observe(.connecting)                 // the old session, still starting
+            g.attemptBegan()                           // the switch announces the new attempt
+            if lateOldConnected { _ = g.observe(.connected) }   // the old session reports success before its stop
+            let oldDeath = g.observe(.disconnected)!
+            _ = g.observe(.connecting)                 // the new session starts and never connects
+            g.stopRequestedByUser()
+            let newDeath = g.observe(.disconnected)!
+            check(!g.mayPublish(fetchedUnder: oldDeath, messageNow: nil) && g.userCancelledTheStart(newDeath),
+                  "🚨 the new session's cancel is the user's whether or not the OLD session's late .connected arrived after the announcement (late=\(lateOldConnected)) — a .connected marks the generation only from the current generation's own session")
+        }
+        var n = DisconnectReasonGate()
+        n.attemptBegan()
+        _ = n.observe(.connecting)
+        _ = n.observe(.connected)                      // the current generation's own session
+        n.stopRequestedByUser()
+        check(!n.userCancelledTheStart(n.observe(.disconnected)!),
+              "…while the current session's own .connected still makes a later Disconnect an ordinary stop")
+    }
     // 🚨 A LATE ANSWER AFTER A DISCONNECT MUST NOT ACT (the user's review of 398):
     // the checks sat after the DNS wait and before the start only, so a probe
     // answering after the tap could still raise a captcha or a red error.

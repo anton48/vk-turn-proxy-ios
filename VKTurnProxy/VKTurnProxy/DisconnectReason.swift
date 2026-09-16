@@ -72,9 +72,11 @@ struct DisconnectReasonGate {
     /// a death in the next.
     private(set) var userStopGeneration: Int?
 
-    /// True once this generation's session reported `.connected`: a stop after
-    /// that is an ordinary stop, whoever asked for it. Reset whenever the
-    /// generation advances.
+    /// True once this generation's OWN session reported `.connected`: a stop
+    /// after that is an ordinary stop, whoever asked for it. Reset whenever the
+    /// generation advances, and set only by a `.connected` that comes from the
+    /// current generation's session (`liveGeneration == generation`) — the
+    /// previous session's late `.connected` after a switch is not this one's.
     private(set) var connectedThisGeneration = false
 
     /// An attempt announced by `attemptBegan()` whose session iOS has not yet
@@ -189,7 +191,12 @@ struct DisconnectReasonGate {
                 liveGeneration = generation
             }
             sawLiveSession = true
-            if status == .connected {
+            // 🚨 Only the CURRENT generation's own session marks it connected.
+            // A switch announces the next attempt while the old session still
+            // runs; its late `.connected` used to set the flag for the NEW
+            // generation, and the new session — which never connected — lost
+            // its cancel notice (the user's review of 401).
+            if status == .connected && liveGeneration == generation {
                 connectedThisGeneration = true
             }
             return nil
