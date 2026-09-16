@@ -2356,6 +2356,82 @@ do {
         check(tm.contains("} else if let generation = deathGeneration,") && tm.contains("(no stop reason API)"),
               "…and a build without the fetch API publishes it from the record alone")
     }
+    // 🚨 THE ATTEMPT'S IDENTITY SURVIVES ITS FIRST .connecting (the user's review
+    // of 397): attemptBegan() advanced the generation, the tap landed between
+    // startVPNTunnel() and iOS's first status report, and that report advanced
+    // it AGAIN — the intent stayed keyed to the old value and the user's cancel
+    // read as the tunnel's own stop.
+    do {
+        var p = DisconnectReasonGate()
+        p.attemptBegan()
+        p.stopRequestedByUser()                        // the tap before the first .connecting
+        _ = p.observe(.connecting)                     // the same attempt reaching iOS — not a new generation
+        let death = p.observe(.disconnected)!
+        check(p.userCancelledTheStart(death)
+              && p.wasCancelledByUser(NSError(domain: "VKTurnProxy", code: 3), fetchedUnder: death),
+              "🚨 a Disconnect tapped before the attempt's first .connecting still names THAT attempt's death")
+        var x = DisconnectReasonGate()
+        x.attemptBegan()
+        x.stopRequestedByUser()
+        x.attemptAbandoned()                           // the attempt never reached iOS (cancelled in pre-bootstrap)
+        _ = x.observe(.connecting)                     // a session started elsewhere: a NEW generation
+        let other = x.observe(.disconnected)!
+        check(!x.userCancelledTheStart(other),
+              "🚨 …but an attempt that never reached iOS leaves no mark: a session started elsewhere is not captioned by its stale intent")
+        var y = DisconnectReasonGate()
+        _ = y.observe(.connecting)                     // nobody announced this one
+        let g1 = y.observe(.disconnected)!
+        _ = y.observe(.connecting)
+        let g2 = y.observe(.disconnected)!
+        check(g2 == g1 + 1, "a session nobody announced still advances the generation on its first .connecting")
+        // The wiring of the mark.
+        let start = tm.range(of: "try manager.connection.startVPNTunnel()")
+        check(start != nil && String(tm[start!.upperBound...]).prefix(120).contains("attemptStartedTunnel = true"),
+              "🚨 the start's success is recorded right after startVPNTunnel() — the one fact that tells an abandoned attempt from one that reached iOS")
+        check(tm.components(separatedBy: "if !attemptStartedTunnel { disconnectGate.attemptAbandoned() }").count - 1 == 2,
+              "🚨 both attempt entry points — connect() and switchAndReconnect() — abandon an attempt that did not reach iOS")
+        let sw = tm.range(of: "func switchAndReconnect(")
+        var switchStopsInternally = false
+        if let sw {
+            let body = String(tm[sw.upperBound...]).prefix(2500)
+            switchStopsInternally = body.contains("stopTunnelInternally()") && !body.contains("disconnect()")
+        }
+        check(switchStopsInternally,
+              "🚨 the switch stops the OLD session as the app's own stop, never through disconnect() — since 399 that death would have read \"cancelled by the user\"")
+        check(tm.contains("self.stopTunnelInternally()") && !tm.contains("self.disconnect()"),
+              "…and the VKAuth self-stop is the app's own too")
+    }
+    // 🚨 A LATE ANSWER AFTER A DISCONNECT MUST NOT ACT (the user's review of 398):
+    // the checks sat after the DNS wait and before the start only, so a probe
+    // answering after the tap could still raise a captcha or a red error.
+    do {
+        let waits: [(String, String)] = [
+            ("let login = await awaitVKLogin()", "switch login {"),
+            ("let cookieProbe = await probeVKCreds(", "switch cookieProbe {"),
+            ("let webViewResult = await awaitPreBootstrapCaptcha(url: url)", "switch webViewResult {"),
+            ("try? await Task.sleep(nanoseconds: 10_000_000_000)", "case .dismissed:"),
+        ]
+        for (wait, next) in waits {
+            var ok = false
+            if let w = tm.range(of: wait) {
+                let after = String(tm[w.upperBound...]).prefix(400)
+                if let c = after.range(of: "if attemptCancelled() { return }"), let n = after.range(of: next) {
+                    ok = c.lowerBound < n.lowerBound
+                }
+            }
+            check(ok, "🚨 the cancel is checked right after `\(wait)` and before what acts on its answer — a late captcha, error or retry after a Disconnect must not reach the user")
+        }
+        var loopOK = false
+        if let loop = tm.range(of: "savedAttempt: savedAttempt\n                )\n") {
+            let after = String(tm[loop.upperBound...]).prefix(200)
+            if let c = after.range(of: "if attemptCancelled() { return }"), let n = after.range(of: "switch result {") {
+                loopOK = c.lowerBound < n.lowerBound
+            }
+        }
+        check(loopOK, "🚨 …and the probe loop's answer, before its switch")
+        check(tm.components(separatedBy: "if attemptCancelled() { return }").count - 1 >= 8,
+              "the attempt checks for the cancel after every wait it has")
+    }
     // The wiring, by spelling — TunnelManager cannot be driven here.
     do {
         let ptp = codeWithoutComments("VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift")

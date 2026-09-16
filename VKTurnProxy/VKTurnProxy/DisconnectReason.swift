@@ -62,7 +62,24 @@ struct DisconnectReasonGate {
     /// generation advances.
     private(set) var connectedThisGeneration = false
 
+    /// An attempt announced by `attemptBegan()` whose session iOS has not yet
+    /// reported. Its FIRST `.connecting` belongs to it and must not advance
+    /// the generation again: a Disconnect tapped between `startVPNTunnel()`
+    /// and that first status report was keyed to the announced generation, and
+    /// the second advance read the user's own cancel as the tunnel's own stop
+    /// (the user's review of 397). Cleared by that first live status, or by
+    /// `attemptAbandoned()` when the attempt never reached iOS — so a stale
+    /// mark cannot claim a session started elsewhere.
+    private(set) var attemptPending = false
+
     init() {}
+
+    /// Call when an announced attempt ended WITHOUT reaching iOS (cancelled or
+    /// failed in pre-bootstrap): the next live status is somebody else's
+    /// session and advances the generation as it always did.
+    mutating func attemptAbandoned() {
+        attemptPending = false
+    }
 
     /// Call from `disconnect()`, BEFORE the stop is issued: the user's intent.
     mutating func stopRequestedByUser() {
@@ -125,6 +142,7 @@ struct DisconnectReasonGate {
     mutating func attemptBegan() {
         generation += 1
         connectedThisGeneration = false
+        attemptPending = true
     }
 
     /// Feed every status observation. Returns the generation to fetch the stop
@@ -133,10 +151,18 @@ struct DisconnectReasonGate {
         switch status {
         case .connecting, .connected, .reasserting:
             if !sawLiveSession {
-                // A new session is starting: anything still in flight from the
-                // previous one is now answering a question nobody is asking.
-                generation += 1
-                connectedThisGeneration = false
+                if attemptPending {
+                    // The attempt we announced has reached iOS: the SAME
+                    // generation — an intent recorded in the window before
+                    // this report keeps naming this attempt.
+                    attemptPending = false
+                } else {
+                    // A session nobody announced is starting: anything still
+                    // in flight from the previous one is now answering a
+                    // question nobody is asking.
+                    generation += 1
+                    connectedThisGeneration = false
+                }
             }
             sawLiveSession = true
             if status == .connected {

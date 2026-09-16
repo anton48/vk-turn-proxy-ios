@@ -323,6 +323,10 @@ class TunnelManager: ObservableObject {
     /// Disconnect can cancel it before anything reaches iOS (there is no
     /// tunnel to stop yet; only this task).
     private var connectAttempt: Task<Void, Never>?
+    /// Set the moment startVPNTunnel() went out: an attempt that ends without
+    /// it never reached iOS and is abandoned in the gate (DisconnectReason),
+    /// so its pending mark cannot claim a session started elsewhere.
+    private var attemptStartedTunnel = false
     // Set true when JS detector in the WebView reports the loaded page is
     // "Attempt limit reached" (no interactive element, error text visible).
     // UI renders an overlay with a progress indicator while this is true.
@@ -405,12 +409,14 @@ class TunnelManager: ObservableObject {
         // startVPNTunnel() — cancels it here, and the body says so through the
         // notice when it unwinds (the user's finding on 397: that tap used to
         // run the Connect branch and be swallowed as a duplicate).
+        attemptStartedTunnel = false
         let attempt = Task { @MainActor [self] in
             await self.runConnectAttempt(config: config)
         }
         connectAttempt = attempt
         defer { connectAttempt = nil }
         await attempt.value
+        if !attemptStartedTunnel { disconnectGate.attemptAbandoned() }
     }
 
     /// True when Disconnect cancelled this attempt before the tunnel started:
@@ -547,7 +553,9 @@ class TunnelManager: ObservableObject {
 
                 if !VKCookieStore.isValid() {
                     SharedLogger.shared.log("[AppDebug] VKAuth: no valid cookie — presenting login WebView")
-                    switch await awaitVKLogin() {
+                    let login = await awaitVKLogin()
+                    if attemptCancelled() { return } // a late login answer after a Disconnect must not act
+                    switch login {
                     case .harvested(let header, let expiry):
                         VKCookieStore.save(cookieHeader: header, expiry: expiry)
                         SharedLogger.shared.log("[AppDebug] VKAuth: cookie harvested (expires \(expiry))")
@@ -568,7 +576,9 @@ class TunnelManager: ObservableObject {
                     }
                 }
 
-                switch await probeVKCreds(linkID: linkID, vkHostIPsJSON: hostIPsJSONStr) {
+                let cookieProbe = await probeVKCreds(linkID: linkID, vkHostIPsJSON: hostIPsJSONStr)
+                if attemptCancelled() { return } // a late probe answer after a Disconnect: no error, no captcha
+                switch cookieProbe {
                 case .ok(let addr, let user, let pass):
                     if let h = config.turnServerOverride, !h.isEmpty,
                        let pt = config.turnPortOverride, !pt.isEmpty {
@@ -631,6 +641,7 @@ class TunnelManager: ObservableObject {
                     savedTs: savedTs,
                     savedAttempt: savedAttempt
                 )
+                if attemptCancelled() { return } // a late probe answer after a Disconnect: no captcha, no error, no retry
                 switch result {
                 case .ok(let addr, let user, let pass):
                     // A fresh probe is a VK "receive" → honor the TURN override
@@ -655,6 +666,7 @@ class TunnelManager: ObservableObject {
                     }
                     SharedLogger.shared.log("[AppDebug] pre-bootstrap: captcha required (sid=\(sid), client_id=\(clientID)), showing WebView")
                     let webViewResult = await awaitPreBootstrapCaptcha(url: url)
+                    if attemptCancelled() { return } // the captcha closed after a Disconnect: no retry
                     switch webViewResult {
                     case .solved(let solvedKey):
                         SharedLogger.shared.log("[AppDebug] pre-bootstrap: user solved captcha (\(solvedKey.count) chars), retrying probe")
@@ -684,6 +696,7 @@ class TunnelManager: ObservableObject {
                         savedTs = 0
                         savedAttempt = 0
                         try? await Task.sleep(nanoseconds: 10_000_000_000)
+                        if attemptCancelled() { return } // `try?` swallows the cancel — the loop must not go on
                     case .dismissed:
                         SharedLogger.shared.log("[AppDebug] pre-bootstrap: user dismissed captcha — aborting")
                         return
@@ -870,6 +883,7 @@ class TunnelManager: ObservableObject {
         // for a while before any status transition.
         noticeMessage = nil
         disconnectGate.attemptBegan()
+        attemptStartedTunnel = false
         SharedLogger.shared.log("[AppDebug] reconnect → \"\(server.serverName)\" "
             + "[\(server.modeLabel)] — \(reason.rawValue)")
         // 🚨 HOLD THE CARD FIRST. This passes through `.disconnected`, on which
@@ -882,7 +896,7 @@ class TunnelManager: ObservableObject {
         }
 
         if status != .disconnected && status != .invalid {
-            disconnect()
+            stopTunnelInternally() // the OLD session's stop is the app's own, not the user's cancel of the new start
             await awaitTerminal()
         }
 
@@ -908,6 +922,7 @@ class TunnelManager: ObservableObject {
             errorMessage = Self.connectFailure(error)
             SharedLogger.shared.log("[AppDebug] live-activity: switch failed — \(error.localizedDescription)")
         }
+        if !attemptStartedTunnel { disconnectGate.attemptAbandoned() }
     }
 
     /// Everything from "we already know what to connect with" onward: build the
@@ -1102,6 +1117,16 @@ class TunnelManager: ObservableObject {
             // start's completion names it (DisconnectReason).
             try Task.checkCancellation()
             try manager.connection.startVPNTunnel()
+            attemptStartedTunnel = true
+    }
+
+    /// The app's OWN stop — a server switch tearing down the old session, the
+    /// VKAuth self-stop: never the user's cancel of a start, so no intent is
+    /// recorded (the switch used to go through disconnect(), and since 399 the
+    /// old session's death would have read "cancelled by the user").
+    private func stopTunnelInternally() {
+        SharedLogger.shared.log("[AppDebug] TunnelManager: stopping the tunnel internally (not the user's cancel)")
+        manager?.connection.stopVPNTunnel()
     }
 
     func disconnect() {
@@ -2461,7 +2486,7 @@ class TunnelManager: ObservableObject {
                         if let ae = newStats.authError, !ae.isEmpty {
                             self.debugLog("VKAuth: stats.auth_error='\(ae)' — stopping tunnel")
                             self.errorMessage = "Сессия VK отклонена или истекла. Войдите заново в Настройках."
-                            self.disconnect()
+                            self.stopTunnelInternally()
                             return
                         }
 
