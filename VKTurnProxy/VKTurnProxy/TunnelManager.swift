@@ -319,6 +319,10 @@ class TunnelManager: ObservableObject {
     // the "Connecting" state — without it, the user sees no visual
     // change for the ~5-15 seconds the probe takes.
     @Published var preBootstrapInProgress = false
+    /// The running pre-bootstrap attempt — connect()'s body as its own task, so
+    /// Disconnect can cancel it before anything reaches iOS (there is no
+    /// tunnel to stop yet; only this task).
+    private var connectAttempt: Task<Void, Never>?
     // Set true when JS detector in the WebView reports the loaded page is
     // "Attempt limit reached" (no interactive element, error text visible).
     // UI renders an overlay with a progress indicator while this is true.
@@ -396,6 +400,36 @@ class TunnelManager: ObservableObject {
         disconnectGate.attemptBegan()
         preBootstrapInProgress = true
         defer { preBootstrapInProgress = false }
+        // The attempt runs as its OWN task: a Disconnect tapped during
+        // pre-bootstrap — seconds to minutes of the app's own work before
+        // startVPNTunnel() — cancels it here, and the body says so through the
+        // notice when it unwinds (the user's finding on 397: that tap used to
+        // run the Connect branch and be swallowed as a duplicate).
+        let attempt = Task { @MainActor [self] in
+            await self.runConnectAttempt(config: config)
+        }
+        connectAttempt = attempt
+        defer { connectAttempt = nil }
+        await attempt.value
+    }
+
+    /// True when Disconnect cancelled this attempt before the tunnel started:
+    /// nothing reached iOS, so there is no completion, no stop reason and no
+    /// error to show — the notice says what happened, once.
+    @discardableResult
+    private func attemptCancelled() -> Bool {
+        guard Task.isCancelled else { return false }
+        if noticeMessage != DisconnectReasonGate.cancelledByUserText {
+            SharedLogger.shared.log("[AppDebug] TunnelManager.connect: cancelled by the user before the tunnel started — nothing reached iOS")
+            noticeMessage = DisconnectReasonGate.cancelledByUserText
+        }
+        return true
+    }
+
+    /// connect()'s body, as the task Disconnect can cancel. Cancellation is
+    /// checked after each wait and, in applyConfigurationAndStart, right before
+    /// startVPNTunnel(); the settle sleep there throws on it.
+    private func runConnectAttempt(config: TunnelConfig) async {
 
         // Set Go timezone BEFORE wgSetLogFilePath so the logger's first
         // line ("wgSetLogFilePath: ...") gets a local-time timestamp.
@@ -419,6 +453,7 @@ class TunnelManager: ObservableObject {
 
         do {
             let manager = try await getOrCreateManager()
+            if attemptCancelled() { return }
 
             // Build UAPI config string for WireGuard. Throws KeyError with a
             // user-readable message if any of the Base64 keys can't be decoded
@@ -441,6 +476,7 @@ class TunnelManager: ObservableObject {
             let vkHostIPs = await Task.detached(priority: .userInitiated) { [self] in
                 self.resolveVKHosts()
             }.value
+            if attemptCancelled() { return }
             if !vkHostIPs.isEmpty {
                 SharedLogger.shared.log("[AppDebug] TunnelManager.connect: pre-resolved VK hosts: \(vkHostIPs)")
             } else {
@@ -675,10 +711,16 @@ class TunnelManager: ObservableObject {
                 return
             }
 
+            if attemptCancelled() { return }
             try await applyConfigurationAndStart(config: config,
                                                  vkHostIPs: vkHostIPs,
                                                  seededTURN: seeded)
+        } catch is CancellationError {
+            // Disconnect cancelled the attempt before the tunnel started (the
+            // settle sleep or checkCancellation threw): the notice, no error.
+            attemptCancelled()
         } catch {
+            if attemptCancelled() { return } // a cancelled attempt's other failure is not news
             errorMessage = Self.connectFailure(error)
         }
     }
@@ -1055,10 +1097,23 @@ class TunnelManager: ObservableObject {
             if let id = config.serverID {
                 sessionServer = NamedServer(id: id, name: config.serverName)
             }
+            // The last moment a Disconnect during pre-bootstrap can still
+            // prevent the start: past this line the stop goes to iOS and the
+            // start's completion names it (DisconnectReason).
+            try Task.checkCancellation()
             try manager.connection.startVPNTunnel()
     }
 
     func disconnect() {
+        // An attempt still in pre-bootstrap has not reached iOS: cancel the
+        // task (its body publishes the notice as it unwinds) — AND still record
+        // the intent and issue the stop below, for the window where
+        // startVPNTunnel() already went out and iOS has not reported
+        // .connecting yet; a stop on a connection that never started is a no-op.
+        if preBootstrapInProgress, let attempt = connectAttempt {
+            SharedLogger.shared.log("[AppDebug] TunnelManager.disconnect: cancelling the attempt in pre-bootstrap")
+            attempt.cancel()
+        }
         // The user's intent, recorded BEFORE the stop: a stop during the start
         // completes that start with the provider's stop error, which iOS then
         // reports as the last disconnect error — and only this record lets the

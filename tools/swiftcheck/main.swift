@@ -2320,6 +2320,52 @@ do {
         check(nb != nil && String(cvn[nb!.upperBound...]).prefix(300).contains(".foregroundColor(.secondary)"),
               "🚨 ContentView shows the notice in the secondary colour — a cancel the user asked for is not an error and must not be red")
     }
+    // 🚨 THE BUTTON'S LABEL AND ACTION ARE ONE RULE (the user's finding on 397,
+    // 2026-09-16): the label said "Disconnect" during pre-bootstrap while the
+    // action branched on the NE status, still .disconnected for that whole
+    // window — the tap ran Connect and was swallowed as a duplicate. And a
+    // Disconnect in that window must CANCEL the attempt: nothing has reached
+    // iOS, so there is no tunnel to stop and no stop reason to fetch.
+    do {
+        check(ConnectButtonAction.forTap(status: .disconnected, preBootstrapInProgress: true) == .disconnect,
+              "🚨 during pre-bootstrap the tap is a Disconnect although iOS still says .disconnected")
+        check(ConnectButtonAction.forTap(status: .connecting, preBootstrapInProgress: false) == .disconnect
+              && ConnectButtonAction.forTap(status: .connected, preBootstrapInProgress: false) == .disconnect,
+              "…and while iOS says connecting or connected")
+        check(ConnectButtonAction.forTap(status: .disconnected, preBootstrapInProgress: false) == .connect
+              && ConnectButtonAction.forTap(status: .invalid, preBootstrapInProgress: false) == .connect,
+              "…while an idle tunnel takes a Connect")
+        check(ConnectButtonAction.disconnect.label == "Disconnect" && ConnectButtonAction.connect.label == "Connect",
+              "the label is the action's")
+        let cvb = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+        check(cvb.components(separatedBy: "ConnectButtonAction.forTap(status: tunnel.status, preBootstrapInProgress: tunnel.preBootstrapInProgress)").count - 1 == 1
+              && cvb.contains("private var buttonText: String { buttonAction.label }")
+              && cvb.contains("if buttonAction == .disconnect {")
+              && !cvb.contains("if tunnel.status == .connected || tunnel.status == .connecting {"),
+              "🚨 ContentView takes BOTH the label and the action from the one rule — no status test of its own in the button")
+        check(tm.contains("private var connectAttempt: Task<Void, Never>?")
+              && tm.contains("connectAttempt = attempt")
+              && tm.contains("await attempt.value"),
+              "🚨 connect() runs its body as a stored task — the only thing a Disconnect in pre-bootstrap can cancel")
+        let dis = tm.range(of: "func disconnect() {")
+        var cancelsFirst = false
+        if let dis {
+            let body = String(tm[dis.upperBound...]).prefix(700)
+            if let a = body.range(of: "attempt.cancel()"), let b = body.range(of: "disconnectGate.stopRequestedByUser()") {
+                cancelsFirst = a.lowerBound < b.lowerBound && body.contains("if preBootstrapInProgress, let attempt = connectAttempt {")
+            }
+        }
+        check(cancelsFirst,
+              "🚨 disconnect() cancels a pre-bootstrap attempt AND still records the intent and stops — the window after startVPNTunnel() and before .connecting needs both")
+        let start = tm.range(of: "try manager.connection.startVPNTunnel()")
+        check(start != nil && String(tm[..<start!.lowerBound]).suffix(120).contains("try Task.checkCancellation()"),
+              "🚨 the last check sits right before startVPNTunnel() — past it the stop goes to iOS and the gate takes over")
+        check(tm.contains("} catch is CancellationError {") && tm.contains("private func attemptCancelled() -> Bool")
+              && tm.contains("noticeMessage = DisconnectReasonGate.cancelledByUserText"),
+              "🚨 a cancelled attempt ends in the NOTICE, never in connectFailure's error text")
+        check(tm.components(separatedBy: "if attemptCancelled() { return }").count - 1 >= 3,
+              "the attempt checks for the cancel after each of its waits, not only at the end")
+    }
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT
     // no-op — and that is the SAME population that hits the missing VPN

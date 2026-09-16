@@ -257,21 +257,18 @@ private struct ActiveServerControls: View {
         tunnel.status != .connected && tunnel.status != .connecting && configValidationError != nil
     }
 
-    private var buttonText: String {
-        if tunnel.preBootstrapInProgress { return "Disconnect" }
-        switch tunnel.status {
-        case .connected, .connecting: return "Disconnect"
-        default: return "Connect"
-        }
+    /// The label and the action come from ONE rule (ConnectButtonAction): a
+    /// label that said "Disconnect" over an action that branched on the NE
+    /// status ran Connect during pre-bootstrap (the user's finding, 2026-09-16).
+    private var buttonAction: ConnectButtonAction {
+        ConnectButtonAction.forTap(status: tunnel.status, preBootstrapInProgress: tunnel.preBootstrapInProgress)
     }
+
+    private var buttonText: String { buttonAction.label }
 
     private var buttonColor: Color {
         if connectBlocked { return .gray }
-        if tunnel.preBootstrapInProgress { return .red }
-        switch tunnel.status {
-        case .connected, .connecting: return .red
-        default: return .blue
-        }
+        return buttonAction == .disconnect ? .red : .blue
     }
 
     var body: some View {
@@ -334,7 +331,7 @@ private struct ActiveServerControls: View {
 
             // Connect / Disconnect button
             Button(action: {
-                if tunnel.status == .connected || tunnel.status == .connecting {
+                if buttonAction == .disconnect {
                     // Log user-initiated stop so we can later distinguish
                     // "user pressed Disconnect" from iOS-side stops with
                     // the same reason=1 (.userInitiated) NEProviderStopReason.
@@ -343,8 +340,8 @@ private struct ActiveServerControls: View {
                     // includeAllNetworks=true being the suspected case);
                     // having this log line lets us differentiate at triage
                     // time rather than guessing.
-                    NSLog("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
-                    SharedLogger.shared.log("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue))")
+                    NSLog("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue), preBootstrap=\(tunnel.preBootstrapInProgress))")
+                    SharedLogger.shared.log("[UI] user pressed Disconnect button (status=\(tunnel.status.rawValue), preBootstrap=\(tunnel.preBootstrapInProgress))")
                     tunnel.disconnect()
                 } else {
                     // Per-server fields come from the ACTIVE server (read from
