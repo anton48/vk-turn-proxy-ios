@@ -15,6 +15,8 @@ import (
 	"context"
 	"io"
 	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -94,6 +96,7 @@ func loopbackTURN(t *testing.T) string {
 // wait stands in for the loopback round trip (~1 ms).
 func TestLoopbackTURNClosesOnlyAfterItsConnectionsReleasedTheirAllocations(t *testing.T) {
 	var connClosedAt atomic.Int64 // unix nanoseconds; 0 until the delayed close
+	timersBefore := periodicTimerGoroutines()
 	// Registered BEFORE loopbackTURN, so it runs AFTER the server's cleanup
 	// (cleanups run last-in first-out): the moment it starts is the moment
 	// the server's cleanup finished.
@@ -102,6 +105,17 @@ func TestLoopbackTURNClosesOnlyAfterItsConnectionsReleasedTheirAllocations(t *te
 		closed := connClosedAt.Load()
 		if closed == 0 || done < closed {
 			t.Errorf("loopbackTURN closed the server before its connection had released the allocation (connection closed at %d, server cleanup done at %d)", closed, done)
+		}
+		// The client must leave nothing running: pion's relay conn keeps its
+		// refresh timers as goroutines until the allocation is CLOSED, and a
+		// fixture that only closed the socket left three per run — 3 → 30
+		// over ten runs, held objects and all (the user's review).
+		deadline := time.Now().Add(2 * time.Second)
+		for periodicTimerGoroutines() > timersBefore && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if n := periodicTimerGoroutines(); n > timersBefore {
+			t.Errorf("the fixture left %d PeriodicTimer goroutine(s) behind (%d before the test): the client's allocation was not closed", n-timersBefore, timersBefore)
 		}
 	})
 	addr := loopbackTURN(t)
@@ -122,7 +136,8 @@ func TestLoopbackTURNClosesOnlyAfterItsConnectionsReleasedTheirAllocations(t *te
 	if err := client.Listen(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Allocate(); err != nil {
+	relay, err := client.Allocate()
+	if err != nil {
 		t.Fatal(err)
 	}
 	// A permission on the allocation and nothing after it — the shape of the
@@ -142,9 +157,24 @@ func TestLoopbackTURNClosesOnlyAfterItsConnectionsReleasedTheirAllocations(t *te
 			time.Sleep(100 * time.Millisecond)
 			connClosedAt.Store(time.Now().UnixNano()) // before the close lands: the server's release is never earlier than this mark
 			_ = tcp.Close()
+			_ = relay.Close() // stops the allocation's refresh timers; its deallocate finds the socket closed, which is the point — the server releases on EOF
 			client.Close()
 		}()
 	})
+}
+
+// The goroutines running pion's client-side PeriodicTimer — the relay conn's
+// allocation and permission refreshers — counted by goroutine, not by frame.
+func periodicTimerGoroutines() int {
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	count := 0
+	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+		if strings.Contains(g, "PeriodicTimer") {
+			count++
+		}
+	}
+	return count
 }
 
 // stallingTap forwards a TCP connection to the TURN server; once `stall` is
