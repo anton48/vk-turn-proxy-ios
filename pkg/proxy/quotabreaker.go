@@ -68,6 +68,21 @@ import (
 // verdict on the identity. So the two native allocation sites mark the slot
 // the moment Allocate() succeeds, and the source scan pins the mark there.
 //
+// 🚨 THE MARK NAMES THE CREDENTIAL, NOT THE SLOT. The slot number a session
+// leased does not identify its credential once the relay's answer is late:
+// between the lease and the answer the slot can be cleared and refilled —
+// invalidate() on a Resume, invalidateEntry on another holder's 401/403, a
+// Phase-2 replacement of an idle saturated slot — and a slot-keyed mark then
+// certifies the NEW credential with the OLD one's success. The user's stand
+// on build 392: the TURN answer held, the old session cancelled, the slot
+// refilled, the answer released — 3/3 the new credential read allocated 1,
+// so its own 486s would have passed as its quota with the breaker silent.
+// The mark therefore carries the leased credential and counts only if the
+// slot still holds that identity, checked under the lock. The identity is
+// the username — what the relay keys its acceptance on, not our slot or our
+// copy of it: the same credential fetched into the slot again IS the
+// identity the relay accepted.
+//
 // 🚨 THE LADDER MUST NOT DECAY WHILE THE RELAY STILL REFUSES. A first cut
 // kept a window of trips and doubled per trip inside it, so a refusal that
 // outlasted the window LOST rungs: 30 → 60 → 120 → 240 → 300 → 120 (the
@@ -109,21 +124,33 @@ type quotaBreaker struct {
 	timer       *time.Timer   // broadcasts slot-available at the pause's end
 }
 
-// noteAllocated records a successful allocation on slot's credential — the
-// evidence that the relay accepts this identity, so a later 486 on it is
-// its quota, not a refusal. Native calls it the moment Allocate() succeeds
-// (runTURN, setupSRTPSession — before CreatePermission and any handshake);
-// csqtt through Credential.Allocated right after the relay dial. Nil-safe:
-// the transport helpers run in tests on a Proxy without a pool.
-func (cp *credPool) noteAllocated(slot int) {
-	if cp == nil || slot < 0 {
+// noteAllocated records a successful allocation on creds, the credential the
+// caller leased from slot — the evidence that the relay accepts this
+// identity, so a later 486 on it is its quota, not a refusal. Native calls it
+// the moment Allocate() succeeds (runTURN, setupSRTPSession — before
+// CreatePermission and any handshake); csqtt through Credential.Allocated
+// right after the relay dial. The slot number alone does not name the
+// credential (the doc block above): the mark is checked under the lock
+// against the credential the slot holds NOW, and a late mark for one the
+// slot no longer holds is dropped with a log line. Nil-safe: the transport
+// helpers run in tests on a Proxy without a pool.
+func (cp *credPool) noteAllocated(slot int, creds *TURNCreds) {
+	if cp == nil || slot < 0 || creds == nil || creds.Username == "" {
 		return
 	}
+	late := false
 	cp.mu.Lock()
 	if slot < cp.size && slot < len(cp.pool) {
-		cp.pool[slot].allocated++
+		if now := cp.pool[slot].creds; now != nil && now.Username == creds.Username {
+			cp.pool[slot].allocated++
+		} else {
+			late = true
+		}
 	}
 	cp.mu.Unlock()
+	if late {
+		log.Printf("credpool: a late allocation success on slot %d names a credential the slot no longer holds — not counted (the slot was refilled while the relay's answer was in flight)", slot)
+	}
 }
 
 // noteQuotaRefusalLocked records a 486 on slot. Called by markSaturated —

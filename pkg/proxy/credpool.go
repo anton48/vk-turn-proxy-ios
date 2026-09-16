@@ -230,10 +230,12 @@ func (p *CredPool) Release(slot int) { p.cp.release(slot) }
 // returns the cooldown applied.
 func (p *CredPool) MarkSaturated(slot int) time.Duration { return p.cp.markSaturated(slot) }
 
-// NoteAllocated records that the relay accepted an allocation on the slot's
-// credential — the relay-refusal breaker's evidence that a later 486 there
-// is the identity's quota, not a refusal (quotabreaker.go).
-func (p *CredPool) NoteAllocated(slot int) { p.cp.noteAllocated(slot) }
+// NoteAllocated reports that the relay ACCEPTED an allocation on creds, the
+// credential the caller leased from slot — the breaker's success key. The
+// mark counts only while the slot still holds that credential: a late
+// success of a credential the slot has since given up must not certify
+// the one there now (quotabreaker.go).
+func (p *CredPool) NoteAllocated(slot int, creds *TURNCreds) { p.cp.noteAllocated(slot, creds) }
 
 // RecordAuthError counts a 401/403 on the slot (pre-kill attribution).
 func (p *CredPool) RecordAuthError(slot int) { p.cp.recordAuthError(slot) }

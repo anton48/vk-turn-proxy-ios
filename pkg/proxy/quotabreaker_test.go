@@ -141,15 +141,16 @@ func TestARefusalOnACredentialWithASuccessIsItsQuotaNotARefusal(t *testing.T) {
 	var mints atomic.Int32
 	cp := breakerPool(t, &mints)
 	const relay = "95.163.34.180:19302"
+	full := make([]*TURNCreds, 2)
 	cp.mu.Lock()
 	for i := 0; i < 2; i++ {
-		cp.pool[i] = credPoolEntry{addr: relay, ts: time.Now(), active: 10,
-			creds: &TURNCreds{Username: fmt.Sprintf("%d:full-%d", time.Now().Add(8*time.Hour).Unix(), i), Password: "p", Address: relay, Addresses: []string{relay}}}
+		full[i] = &TURNCreds{Username: fmt.Sprintf("%d:full-%d", time.Now().Add(8*time.Hour).Unix(), i), Password: "p", Address: relay, Addresses: []string{relay}}
+		cp.pool[i] = credPoolEntry{addr: relay, ts: time.Now(), active: 10, creds: full[i]}
 	}
 	cp.mu.Unlock()
 	for i := 0; i < 2; i++ {
 		for k := 0; k < 9; k++ {
-			cp.noteAllocated(i) // nine allocations accepted on each identity
+			cp.noteAllocated(i, full[i]) // nine allocations accepted on each identity
 		}
 	}
 	cp.markSaturated(0) // the tenth refused
@@ -305,6 +306,21 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	}
 	if n := strings.Count(code, "noteAllocated("); n != 2 {
 		t.Errorf("proxy.go: %d noteAllocated calls, want 2 — one per allocation site, none at a session line", n)
+	}
+	// The mark carries the LEASED credential, not the slot number alone: the
+	// slot may have been refilled while the relay's answer was in flight
+	// (the user's stand on 392; allocmark_identity_test.go).
+	for _, call := range []string{"noteAllocated(slotIdx, creds)", "noteAllocated(credSlot, creds)"} {
+		if !strings.Contains(code, call) {
+			t.Errorf("proxy.go lacks %q — the mark must name the credential the session leased", call)
+		}
+	}
+	bridge, err := os.ReadFile("../../WireGuardBridge/csqtt_bridge.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(bridge), "NoteAllocated(slot, creds)") {
+		t.Error("csqtt_bridge.go: the adapter's Allocated callback does not hand the leased credential to NoteAllocated")
 	}
 	for _, lit := range []string{"DTLS+TURN session established", "direct TURN session established", "WRAP-A+TURN session established", "SRTP+TURN session established"} {
 		i := strings.Index(code, lit)

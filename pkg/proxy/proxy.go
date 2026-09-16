@@ -3594,12 +3594,14 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	if err != nil {
 		return fmt.Errorf("TURN allocate: %w", err)
 	}
-	// The relay accepted this identity: mark the slot NOW, before anything
+	// The relay accepted this identity: mark it NOW, before anything
 	// downstream — the permission, a handshake, the session above — can be
-	// delayed or fail. The mark means the allocation, not the session
-	// (quotabreaker.go; build 391 marked at "session established" and the
-	// user's control stand paused minting on a plain tenth-allocation quota).
-	p.credPool.noteAllocated(slotIdx)
+	// delayed or fail. The mark means the allocation, not the session, and it
+	// names the CREDENTIAL, not the slot: the slot may have been refilled
+	// while the relay's answer was in flight, and a late success of the old
+	// credential must not certify the new one (quotabreaker.go; builds 391
+	// and 392, both caught on the user's control stand).
+	p.credPool.noteAllocated(slotIdx, creds)
 	defer relayConn.Close()
 	// Registered AFTER relayConn.Close's defer, so LIFO runs it FIRST: the
 	// deallocate that Close writes goes out under relayCloseWriteBudget on
@@ -5537,10 +5539,11 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		_ = ctlConn.Close()
 		return nil, fmt.Errorf("turn allocate: %w", err)
 	}
-	// The relay accepted this identity: mark the slot NOW, before the
-	// permission and the SRTP handshake — the mark means the allocation, not
-	// the session (quotabreaker.go; see runTURN).
-	p.credPool.noteAllocated(credSlot)
+	// The relay accepted this identity: mark it NOW, before the permission
+	// and the SRTP handshake — the mark means the allocation, not the
+	// session, and names the credential, not the slot (quotabreaker.go; see
+	// runTURN).
+	p.credPool.noteAllocated(credSlot, creds)
 	allocDur := time.Since(allocStart)
 	// Surface the TURN-allocate roundtrip to the UI / Stats endpoint
 	// — same field runDTLSSession populates at proxy.go:2706, so the
