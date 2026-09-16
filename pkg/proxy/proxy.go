@@ -3682,6 +3682,17 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		// 2026-09-07: the defer was unreachable while the sender sat in
 		// Write). This path carries DTLS, WRAP, WRAP-A and WRAP-S.
 		_ = turnConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
+		// The forwarder may instead be WAITING in a transaction — the
+		// permission pion asks for on the first packet to the peer, against
+		// a relay that took the allocation and answers nothing more. No
+		// deadline reaches that wait; until build 394 it ended only when
+		// pion's next retransmit write failed the deadline above — the rtx
+		// ladder 200 → 400 → 800 → 1600 ms, 1.1–2.1 s after the cancel (Sep 6
+		// §63's narrower window). Closing the client closes its transaction
+		// map and nothing else — the socket stays ours for the deallocate
+		// below — and a closed transaction returns errTransactionClosed at
+		// once; the deferred Close after wg.Wait is then a no-op.
+		client.Close()
 	})
 
 	var peerAddr atomic.Value
@@ -5550,6 +5561,15 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	// "TURN RTT" tile shows the most recent successful allocate
 	// duration regardless of which session type produced it.
 	p.turnRTTns.Store(int64(allocDur))
+	// A cancel while the permission's transaction is pending — a relay that
+	// took the allocation and then went silent, a switch in the RTT between
+	// the two — must not wait out pion's retransmit ladder (7 × 200 → 1600
+	// ms, 7.8 s): closing the client closes its transaction map and nothing
+	// else, and a closed transaction returns at once. Scoped to this setup:
+	// the live session's own teardown closes tc in its order
+	// (srtpSessionConn.Close), so the hook is disarmed on return.
+	disarm := context.AfterFunc(ctx, func() { tc.Close() })
+	defer disarm()
 	if err := tc.CreatePermission(p.peer); err != nil {
 		_ = relayConn.Close()
 		tc.Close()
