@@ -2584,6 +2584,45 @@ do {
         check(tm.components(separatedBy: "if attemptCancelled() { return }").count - 1 >= 3,
               "the attempt checks for the cancel after each of its waits, not only at the end")
     }
+    // 🚨 "Get VK call URL" IS GATED BY THE SAVED LOGIN, NOT BY THE TOGGLE (the
+    // user's report, 2026-09-16): the OAuth flow cannot log in by itself (VK's
+    // sign-in form inside it is broken — issue #69's finding), so without the
+    // saved cookie pair the button flashed an empty screen and then blamed a
+    // login that did not exist. One rule decides the control's enabled state
+    // and the caption under it; the cookie-auth toggle is not an input.
+    do {
+        let past = Date(timeIntervalSinceNow: -60)
+        let future = Date(timeIntervalSinceNow: 3600)
+        let none = VKCallCreationGate.state(loginExpiry: nil)
+        let expired = VKCallCreationGate.state(loginExpiry: past)
+        let live = VKCallCreationGate.state(loginExpiry: future)
+        check(none == .noLogin && !VKCallCreationGate.isAvailable(none),
+              "🚨 with no saved VK login the control is unavailable")
+        check(expired == .loginExpired(past) && !VKCallCreationGate.isAvailable(expired),
+              "🚨 …and with an expired one — the flow would flash and fail the same way")
+        check(live == .available && VKCallCreationGate.isAvailable(live) && VKCallCreationGate.reason(live) == nil,
+              "…while a live login enables it with no caption")
+        let whyNone = VKCallCreationGate.reason(none) ?? ""
+        let whyExpired = VKCallCreationGate.reason(expired) ?? ""
+        check(whyNone.contains("Unavailable without a saved VK login") && whyNone.contains("Use VK account (cookie) auth") && whyNone.contains("turned off again"),
+              "🚨 the caption says WHY and HOW: no saved login, log in under the cookie-auth toggle, the toggle may go off again")
+        check(whyExpired.contains("expired") && whyExpired.contains("Use VK account (cookie) auth"),
+              "…and names the expiry when that is the reason")
+        let gateSrc = codeWithoutComments("VKTurnProxy/VKTurnProxy/VKCallCreationGate.swift")
+        check(!gateSrc.contains("vkAuthEnabled") && gateSrc.contains("static func state(loginExpiry: Date?, now: Date = Date()) -> State"),
+              "🚨 the rule takes the saved login's expiry and nothing else — the cookie-auth toggle is not the condition")
+        let cvg = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+        let label = cvg.range(of: "Label(\"Get VK call URL\", systemImage: \"phone.badge.plus\")")
+        check(label != nil && String(cvg[label!.upperBound...]).prefix(200).contains(".disabled(!VKCallCreationGate.isAvailable(vkCallGate))"),
+              "🚨 the button is disabled by the rule, right after its label")
+        check(cvg.contains("if let why = VKCallCreationGate.reason(vkCallGate) {")
+              && cvg.contains("private var vkCallGate: VKCallCreationGate.State {")
+              && cvg.contains("VKCallCreationGate.state(loginExpiry: vkCookieInfo?.expiry)"),
+              "🚨 the caption under the button comes from the same rule, fed from the saved login's record")
+        check(cvg.contains("vkCallStatus = VKCallCreationGate.reason(vkCallGate)")
+              && !cvg.contains("Uses the saved VK login if there is one."),
+              "🚨 the flow's needs-login answer defers to the rule's reason, and the description no longer calls the login optional")
+    }
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT
     // no-op — and that is the SAME population that hits the missing VPN

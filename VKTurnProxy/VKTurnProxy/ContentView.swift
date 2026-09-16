@@ -567,18 +567,30 @@ struct SettingsView: View {
                 // leaves, so links made today die immediately (older ones keep
                 // working) — GitHub issue #69. A call started via calls.start
                 // survives with nobody in it.
+                // 🚨 Enabled only with a SAVED VK LOGIN, and the caption says
+                // why when it is not: the flow cannot log in by itself (VK's
+                // sign-in form inside it is broken), so without the login it
+                // only flashed an empty screen and blamed a login that did not
+                // exist. The cookie-auth toggle is not the condition — the
+                // login is what the call is created from (VKCallCreationGate).
                 Button {
                     vkCallStatus = ""
                     showVKCallCreate = true
                 } label: {
                     Label("Get VK call URL", systemImage: "phone.badge.plus")
                 }
+                .disabled(!VKCallCreationGate.isAvailable(vkCallGate))
+                if let why = VKCallCreationGate.reason(vkCallGate) {
+                    Text(why)
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                }
                 if !vkCallStatus.isEmpty {
                     Text(vkCallStatus)
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
-                Text("Creates a new VK call FROM YOUR VK ACCOUNT and puts its link at the top of the field above. This is not anonymous: the call belongs to the account you confirm on the next screen, so a burner is recommended. Uses the saved VK login if there is one.")
+                Text("Creates a new VK call FROM YOUR VK ACCOUNT and puts its link at the top of the field above. This is not anonymous: the call belongs to the account you confirm on the next screen, so a burner is recommended. Created from the saved VK login; the cookie-auth toggle below may stay off.")
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
@@ -813,7 +825,11 @@ struct SettingsView: View {
                     vkCallStatus = "Creating the call…"
                     Task { await createVKCall(token: t) }
                 case .needsLogin:
-                    vkCallStatus = "VK did not recognise the saved login. Log in with “Use VK account (cookie) auth” below, then try again."
+                    // With a login on record VK refused it (its session may
+                    // have ended); without one the rule's own reason applies —
+                    // the button is disabled then, so this arm is a defence.
+                    vkCallStatus = VKCallCreationGate.reason(vkCallGate)
+                        ?? "VK did not recognise the saved login (its session may have ended). Log in again with “Use VK account (cookie) auth” below, then try again."
                 case let .failed(msg):
                     vkCallStatus = msg
                 case .cancelled:
@@ -939,6 +955,12 @@ struct SettingsView: View {
     }
 
     // MARK: - VK account (cookie) auth
+
+    /// The "Get VK call URL" control's state — from the saved login's record,
+    /// never from the cookie-auth toggle (the one rule, VKCallCreationGate).
+    private var vkCallGate: VKCallCreationGate.State {
+        VKCallCreationGate.state(loginExpiry: vkCookieInfo?.expiry)
+    }
 
     private var vkCookieStatusText: String {
         guard let info = vkCookieInfo else { return "Not logged in" }
