@@ -213,6 +213,11 @@ class TunnelManager: ObservableObject {
 
     @Published var status: NEVPNStatus = .disconnected
     @Published var errorMessage: String?
+    /// A notice, not an error: what the main screen says in place of a stop
+    /// reason when the user cancelled the start themselves (DisconnectReason).
+    /// Its own slot so the view styles it as information; cleared wherever a
+    /// new attempt begins and when the tunnel connects.
+    @Published var noticeMessage: String?
 
     /// The server the RUNNING session was started with — NOT the selected one.
     /// nil when nothing is running, and also when this app attached to a tunnel
@@ -387,6 +392,7 @@ class TunnelManager: ObservableObject {
         // Pre-bootstrap runs for seconds before that, and clearing the slot on
         // the line above is precisely what would let a fetch from the previous
         // death slip through its guard during the wait.
+        noticeMessage = nil
         disconnectGate.attemptBegan()
         preBootstrapInProgress = true
         defer { preBootstrapInProgress = false }
@@ -820,6 +826,7 @@ class TunnelManager: ObservableObject {
         guard let server = ServerStore.shared.servers.first(where: { $0.id == serverId }) else { return }
         // Same reason as connect(): this is where the attempt begins, and it runs
         // for a while before any status transition.
+        noticeMessage = nil
         disconnectGate.attemptBegan()
         SharedLogger.shared.log("[AppDebug] reconnect → \"\(server.serverName)\" "
             + "[\(server.modeLabel)] — \(reason.rawValue)")
@@ -1052,6 +1059,11 @@ class TunnelManager: ObservableObject {
     }
 
     func disconnect() {
+        // The user's intent, recorded BEFORE the stop: a stop during the start
+        // completes that start with the provider's stop error, which iOS then
+        // reports as the last disconnect error — and only this record lets the
+        // observer read it as the user's own Disconnect, not a death.
+        disconnectGate.stopRequestedByUser()
         manager?.connection.stopVPNTunnel()
     }
 
@@ -2071,6 +2083,7 @@ class TunnelManager: ObservableObject {
                     // "VK временно ограничивает запросы" while staring at a
                     // green 10/10 Connected status.
                     self.errorMessage = nil
+                    self.noticeMessage = nil
                     // Cancel any auto-refresh timer still running for the
                     // pre-bootstrap captcha session: the tunnel got up via
                     // a different path (PoW succeeded on a later probe, or
@@ -2137,7 +2150,14 @@ class TunnelManager: ObservableObject {
                                 guard self.disconnectGate.mayPublish(
                                         fetchedUnder: generation,
                                         messageNow: self.errorMessage) else { return }
-                                self.errorMessage = Self.failureText("The tunnel stopped", stop)
+                                if self.disconnectGate.wasCancelledByUser(stop, fetchedUnder: generation) {
+                                    // The user's own Disconnect during the start:
+                                    // a notice, not "The tunnel stopped" (Sep 14 §116).
+                                    SharedLogger.shared.log("[AppDebug] the start was cancelled by the user's Disconnect — shown as a notice, not an error")
+                                    self.noticeMessage = DisconnectReasonGate.cancelledByUserText
+                                } else {
+                                    self.errorMessage = Self.failureText("The tunnel stopped", stop)
+                                }
                             }
                         }
                     }

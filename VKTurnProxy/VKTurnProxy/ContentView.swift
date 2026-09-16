@@ -303,6 +303,16 @@ private struct ActiveServerControls: View {
                     .padding(.horizontal)
             }
 
+            // A notice, not an error: the user's own Disconnect during the
+            // start (DisconnectReason.cancelledByUserText) — secondary, not red.
+            if let notice = tunnel.noticeMessage {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+
             // Blocking config-validation error for the active server mode —
             // shown only while disconnected (it gates the Connect button
             // below). Required-field errors only; non-blocking format hints

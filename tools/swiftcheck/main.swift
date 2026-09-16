@@ -2245,6 +2245,81 @@ do {
               "🚨 the reason is asked for ONCE per death — iOS re-notifies terminal states, and "
               + "a second fetch would race the first")
     }
+
+    // 🚨 THE USER'S OWN DISCONNECT DURING THE START (Sep 14 §116; the user's
+    // screenshot, 2026-09-16): iOS completes the stopped start with the
+    // provider's stop error and reports it as the last disconnect error, so the
+    // screen read the user's own tap back as "The tunnel stopped: The tunnel was
+    // stopped while it was starting." The gate now carries the INTENT
+    // (stopRequestedByUser) and pairs it with the OUTCOME (domain VKTurnProxy,
+    // code 3) — both, never one alone.
+    do {
+        let stopped = NSError(domain: "VKTurnProxy", code: 3,
+                              userInfo: [NSLocalizedDescriptionKey: "The tunnel was stopped while it was starting."])
+        let csqtt = NSError(domain: "VKTurnProxy", code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: "csqtt: DENIED"])
+        var u = DisconnectReasonGate()
+        u.attemptBegan()
+        _ = u.observe(.connecting)
+        u.stopRequestedByUser()                      // the tap, while connecting
+        let death = u.observe(.disconnected)!
+        check(u.wasCancelledByUser(stopped, fetchedUnder: death),
+              "🚨 the stop-during-start error, fetched for the cycle the user stopped, IS the user's cancel")
+        check(!u.wasCancelledByUser(csqtt, fetchedUnder: death),
+              "🚨 …but any OTHER error after the tap — the extension's own reason — stays an error")
+        var n = DisconnectReasonGate()
+        n.attemptBegan()
+        _ = n.observe(.connecting)
+        let iosStop = n.observe(.disconnected)!
+        check(!n.wasCancelledByUser(stopped, fetchedUnder: iosStop),
+              "🚨 the SAME error WITHOUT the user's tap — iOS stopping a start on its own — is not the user's cancel")
+        var s = DisconnectReasonGate()
+        s.attemptBegan()
+        _ = s.observe(.connecting)
+        s.stopRequestedByUser()
+        let old = s.observe(.disconnected)!
+        s.attemptBegan()                             // the next Connect
+        _ = s.observe(.connecting)
+        let next = s.observe(.disconnected)!
+        check(!s.wasCancelledByUser(stopped, fetchedUnder: next),
+              "🚨 a Disconnect tapped in one cycle does not caption a death in the next — the intent is keyed on the generation")
+        check(!s.mayPublish(fetchedUnder: old, messageNow: nil),
+              "…and the old cycle's answer is dropped as before")
+        check(DisconnectReasonGate.cancelledByUserText == "Connection cancelled by the user",
+              "the notice's text — what the user asked for, and what the binary check greps")
+        check(DisconnectReasonGate.stoppedDuringStartDomain == "VKTurnProxy"
+              && DisconnectReasonGate.stoppedDuringStartCode == 3,
+              "the gate names the provider's stop-during-start error")
+    }
+    // The wiring, by spelling — TunnelManager cannot be driven here.
+    do {
+        let ptp = codeWithoutComments("VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift")
+        let sds = ptp.range(of: "static func stoppedDuringStartError() -> NSError {")
+        check(sds != nil && String(ptp[sds!.upperBound...]).prefix(200).contains("NSError(domain: \"VKTurnProxy\", code: 3,"),
+              "🚨 the provider's stop-during-start error is domain VKTurnProxy, code 3 — the gate's constants name THIS error")
+        let dis = tm.range(of: "func disconnect() {")
+        var recordedFirst = false
+        if let dis {
+            let body = String(tm[dis.upperBound...]).prefix(400)
+            if let a = body.range(of: "disconnectGate.stopRequestedByUser()"),
+               let b = body.range(of: "stopVPNTunnel()") {
+                recordedFirst = a.lowerBound < b.lowerBound
+            }
+        }
+        check(recordedFirst,
+              "🚨 disconnect() records the user's intent BEFORE stopVPNTunnel() — recorded after, a fast stop's answer could land first")
+        check(tm.contains("if self.disconnectGate.wasCancelledByUser(stop, fetchedUnder: generation) {")
+              && tm.contains("self.noticeMessage = DisconnectReasonGate.cancelledByUserText"),
+              "🚨 the observer's answer path asks the gate and publishes the NOTICE, not the error text, for the user's own cancel")
+        check(tm.contains("@Published var noticeMessage: String?"),
+              "the notice has its own published slot")
+        check(tm.components(separatedBy: "noticeMessage = nil").count - 1 >= 3,
+              "🚨 the notice is cleared where each attempt begins (both entry points) and when the tunnel connects")
+        let cvn = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+        let nb = cvn.range(of: "if let notice = tunnel.noticeMessage {")
+        check(nb != nil && String(cvn[nb!.upperBound...]).prefix(300).contains(".foregroundColor(.secondary)"),
+              "🚨 ContentView shows the notice in the secondary colour — a cancel the user asked for is not an error and must not be red")
+    }
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT
     // no-op — and that is the SAME population that hits the missing VPN

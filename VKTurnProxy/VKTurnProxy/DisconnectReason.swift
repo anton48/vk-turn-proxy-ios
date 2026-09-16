@@ -45,7 +45,51 @@ struct DisconnectReasonGate {
     /// two disagree and the answer belongs to a cycle nobody is looking at.
     private(set) var generation = 0
 
+    /// The generation whose stop the USER asked for — `disconnect()` records it
+    /// before `stopVPNTunnel()`. A stop asked for during the start still
+    /// completes that start with an error: iOS is owed a completion and has no
+    /// "cancelled" outcome, so the provider names the stop (domain
+    /// "VKTurnProxy", code 3) and iOS records it as the last disconnect error —
+    /// the fetch then read the user's own Disconnect back as "The tunnel
+    /// stopped: The tunnel was stopped while it was starting." (Sep 14 §116,
+    /// the user's screenshot on 2026-09-16). Keyed on the generation like
+    /// everything else here, so a Disconnect tapped in one cycle cannot caption
+    /// a death in the next.
+    private(set) var userStopGeneration: Int?
+
     init() {}
+
+    /// Call from `disconnect()`, BEFORE the stop is issued: the user's intent.
+    mutating func stopRequestedByUser() {
+        userStopGeneration = generation
+    }
+
+    /// The provider's stop-during-start outcome as it crosses the process
+    /// boundary (PacketTunnelProvider.stoppedDuringStartError); the domain and
+    /// code are pinned on both sides by swiftcheck.
+    static let stoppedDuringStartDomain = "VKTurnProxy"
+    static let stoppedDuringStartCode = 3
+
+    static func isStoppedDuringStart(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return ns.domain == stoppedDuringStartDomain && ns.code == stoppedDuringStartCode
+    }
+
+    /// What the main screen says instead of a stop reason when the user
+    /// cancelled the start themselves — a notice, not an error.
+    static let cancelledByUserText = "Connection cancelled by the user"
+
+    /// Whether a stop reason fetched under `fetchedUnder` is the user's own
+    /// Disconnect during the start: BOTH the intent (recorded for this
+    /// generation) AND the outcome (the provider's stop-during-start error).
+    /// The same error without the intent is iOS stopping a start on its own (a
+    /// reason=1 it fires for a network change under includeAllNetworks) and
+    /// keeps the honest text; any other error after a Disconnect — the cookie
+    /// watchdog's, csqtt's — is the extension's own reason and is shown as
+    /// such.
+    func wasCancelledByUser(_ stop: Error, fetchedUnder: Int) -> Bool {
+        userStopGeneration == fetchedUnder && Self.isStoppedDuringStart(stop)
+    }
 
     /// Call when a new attempt BEGINS — the user's intent, not the system's status.
     ///
