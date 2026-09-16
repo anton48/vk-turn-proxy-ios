@@ -1239,8 +1239,8 @@ do {
     // never happening — the operation succeeds and the user sees no evidence.
     check(caseBody.contains("await refreshNowAndWait()"),
           "🚨 the handler waits for the CARD too, not only the routing change")
-    check(controller.contains("await publishInFlight?.value"),
-          "and that wait reaches ActivityKit's own update, which is the detached part")
+    check(controller.contains("await publishChain.wait()"),
+          "and that wait reaches the chain that holds ActivityKit's own update — and, since 405, the card's end")
 
     // 🚨 A reconnect passes through .disconnected, on which the card is ENDED —
     // unrecoverably, while the app is in the background. The DIRECT repair
@@ -1305,8 +1305,9 @@ do {
     // 🚨 PUBLISHES ARE CHAINED. Overwriting the handle let two race, so an older
     // state could land last — and awaiting the newest handle returned while the
     // older Task was still pending, which made the wait prove nothing.
-    check(controller.contains("await previous?.value"),
-          "🚨 each publish waits for the one before it, so ActivityKit gets them in order")
+    check(source("VKTurnProxy/VKTurnProxy/PublishChain.swift").contains("await previous?.value")
+          && controller.contains("publishChain.append {"),
+          "🚨 each publish waits for the one before it, so ActivityKit gets them in order — the chain lives in PublishChain and the controller appends to it")
 
     // A log that names the wrong cause is worse than one that names none.
     check(tunnel.contains("enum ReconnectReason"),
@@ -2679,15 +2680,91 @@ do {
               "…and the refusal is logged (the phone's signature)")
         let lac = codeWithoutComments("VKTurnProxy/VKTurnProxy/LiveActivityController.swift")
         var releases = false
-        if let rh = lac.range(of: "func releaseHold() {") {
+        if let rh = lac.range(of: "func releaseHold() async {") {
             // The window ends at the function's closing brace: a fixed 120 chars
             // reached into the NEXT declaration — `private func pushNow()` — and
             // stayed green with the push removed (the sabotage caught it).
             let after = String(lac[rh.upperBound...])
             let body = after.range(of: "\n    }").map { String(after[..<$0.lowerBound]) } ?? String(after.prefix(120))
-            releases = body.contains("switchDeadline = nil") && body.contains("pushNow()")
+            releases = body.contains("switchDeadline = nil") && body.contains("await refreshNowAndWait()") && !body.contains("Task {")
         }
-        check(releases, "🚨 releasing the hold clears the switch window AND pushes the real state — the card ends instead of showing Connecting… for 150 s over a stopped tunnel")
+        check(releases, "🚨 releasing the hold clears the switch window AND awaits the publish that follows — the card's end included — instead of leaving Connecting… on screen or returning with the end still pending")
+    }
+    // 🚨 THE END OF THE CARD IS A PUBLISH, AND THE WAIT COVERS IT (the user's
+    // review of 404, on a stand with ActivityKit substituted): end() ran in a
+    // Task outside the publish chain, so refreshNowAndWait() returned while
+    // Activity.end was pending — and an intent's process is suspended the
+    // moment its handler returns, so the card the app had "ended" stayed up.
+    // One chain for updates and ends; the refusal path awaits it. The chain is
+    // DRIVEN here: a gated link holds the wait, and the links run in order.
+    do {
+        final class Probe: @unchecked Sendable {
+            let lock = NSLock()
+            var order: [Int] = []
+            var returned = false
+            var gate: CheckedContinuation<Void, Never>?
+            var earlyReturn = true
+            var finalCount = 0
+            func note(_ i: Int) { lock.lock(); order.append(i); lock.unlock() }
+            func setGate(_ c: CheckedContinuation<Void, Never>) { lock.lock(); gate = c; lock.unlock() }
+            func takeGate() -> CheckedContinuation<Void, Never>? { lock.lock(); defer { lock.unlock() }; let g = gate; gate = nil; return g }
+            func markReturned() { lock.lock(); returned = true; lock.unlock() }
+            func isReturned() -> Bool { lock.lock(); defer { lock.unlock() }; return returned }
+        }
+        let probe = Probe()
+        let done = DispatchSemaphore(value: 0)
+        Task.detached {
+            var chain = PublishChain()
+            chain.append {                                   // link 1: an update ActivityKit has not taken yet
+                await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in probe.setGate(c) }
+                probe.note(1)
+            }
+            chain.append { probe.note(2) }                   // link 2: the end, queued behind it
+            let waiter = Task { await chain.wait(); probe.markReturned() }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            probe.earlyReturn = probe.isReturned()           // the handler "returned" here on 404's shape
+            var gate = probe.takeGate()
+            var tries = 0
+            while gate == nil && tries < 200 {               // link 1 may not have reached its gate yet
+                try? await Task.sleep(nanoseconds: 10_000_000)
+                gate = probe.takeGate(); tries += 1
+            }
+            gate?.resume()                                   // ActivityKit completes the update
+            await waiter.value
+            probe.finalCount = chain.count
+            done.signal()
+        }
+        done.wait()
+        check(!probe.earlyReturn,
+              "🚨 the wait does not return while a link is still with ActivityKit — the stand's 'Activity.end completed=false' after the handler returned")
+        check(probe.isReturned() && probe.order == [1, 2],
+              "🚨 …and returns once every link has run, in the order appended — the end behind the update it was queued after (got \(probe.order))")
+        check(probe.finalCount == 2, "the chain counts its links")
+        // The wiring, by spelling.
+        let lac2 = codeWithoutComments("VKTurnProxy/VKTurnProxy/LiveActivityController.swift")
+        func fnBody(_ src: String, _ sig: String) -> String? {
+            guard let r = src.range(of: sig) else { return nil }
+            let after = String(src[r.upperBound...])
+            return after.range(of: "\n    }").map { String(after[..<$0.lowerBound]) }
+        }
+        let endBody = fnBody(lac2, "private func end() {") ?? ""
+        check(endBody.contains("publishChain.append {") && endBody.contains("await activity.end(nil, dismissalPolicy: .immediate)") && !endBody.contains("Task {"),
+              "🚨 end() is a link of the publish chain, not a Task of its own")
+        let updBody = fnBody(lac2, "private func update(_ state: VPNActivityAttributes.ContentState) {") ?? ""
+        check(updBody.contains("publishChain.append {") && !updBody.contains("Task {"),
+              "…and so is update()")
+        let waitBody = fnBody(lac2, "func refreshNowAndWait() async {") ?? ""
+        check(waitBody.contains("await publishChain.wait()") && !lac2.contains("publishInFlight"),
+              "🚨 refreshNowAndWait awaits the chain — the one wait, nothing left of the old handle")
+        var refusalAwaits = false
+        if let sw = tm.range(of: "func switchAndReconnect(") {
+            let body = String(tm[sw.upperBound...]).prefix(7000)
+            if let e = body.range(of: "errorMessage = why"), let ret = body.range(of: "return .refusedUnseeded(reason: why)") {
+                let arm = String(body[e.upperBound..<ret.lowerBound])
+                refusalAwaits = arm.contains("await LiveActivityController.shared.releaseHold()") && !arm.contains("Task {")
+            }
+        }
+        check(refusalAwaits, "🚨 the refusal path AWAITS the hold's release — an intent's handler must not return with the card's end in flight")
     }
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT

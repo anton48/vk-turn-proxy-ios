@@ -952,7 +952,7 @@ class TunnelManager: ObservableObject {
             SharedLogger.shared.log("[AppDebug] live-activity: csqtt start without a seed refused — the probe met a captcha; the tunnel stays stopped, the user presses Connect")
             errorMessage = why
             if #available(iOS 16.2, *) {
-                LiveActivityController.shared.releaseHold()
+                await LiveActivityController.shared.releaseHold()
             }
             return .refusedUnseeded(reason: why)
         }

@@ -211,7 +211,7 @@ final class LiveActivityController {
     /// user sees no evidence of it.
     func refreshNowAndWait() async {
         pushNow()
-        await publishInFlight?.value
+        await publishChain.wait()
     }
 
     /// Keep the card alive across a DELIBERATE reconnect.
@@ -234,10 +234,12 @@ final class LiveActivityController {
     /// tunnel is stopped and stays so, so the excuse ends now and the card
     /// follows the real state — it ends, as on any disconnect. Left to the
     /// window, "Connecting…" would sit on screen for up to 150 s over a tunnel
-    /// that is down.
-    func releaseHold() {
+    /// that is down. AWAITED: the push is the card's end, the caller is an
+    /// intent's handler, and returning before ActivityKit has ended the card
+    /// leaves it up (the user's stand on 404).
+    func releaseHold() async {
         switchDeadline = nil
-        pushNow()
+        await refreshNowAndWait()
     }
 
     private func pushNow() {
@@ -360,15 +362,17 @@ final class LiveActivityController {
         }
     }
 
-    /// The publish in flight, so a caller that must not return before the card
-    /// has actually changed can wait for it.
+    /// The publishes in flight — updates AND ends, one chain — so a caller that
+    /// must not return before the card has actually changed can wait for it.
     ///
     /// 🚨 THIS IS WHY `await setDirectMode` WAS NOT ENOUGH. The routing change
     /// was awaited and then the card update was handed to a detached Task — so
     /// perform() returned, the app was suspended, and the visible half of the
     /// operation might never happen. Awaiting the work and then detaching the
     /// last step of it is the same defect as not awaiting at all, one level down.
-    private var publishInFlight: Task<Void, Never>?
+    /// 🚨 And end() was that defect once more (the user's stand on 404): its
+    /// Task ran outside the chain, so the wait returned with the card still up.
+    private var publishChain = PublishChain()
 
     private func update(_ state: VPNActivityAttributes.ContentState) {
         guard let activity else { return }
@@ -377,15 +381,14 @@ final class LiveActivityController {
         // ActivityKit receives them in the order they were produced. Overwriting
         // the handle let two publishes race: an OLDER state could land LAST and
         // leave the card describing something that had already been superseded —
-        // and `await publishInFlight?.value` would have returned while that
+        // and a wait on the newest handle would have returned while that
         // older Task was still pending, so waiting for it proved nothing.
         //
         // The chain is also what makes the wait meaningful: awaiting the newest
         // link awaits every link behind it.
-        let previous = publishInFlight
-        publishInFlight = Task {
-            await previous?.value
-            await activity.update(ActivityContent(state: state, staleDate: staleDate(for: state.status)))
+        let content = ActivityContent(state: state, staleDate: staleDate(for: state.status))
+        publishChain.append {
+            await activity.update(content)
         }
     }
 
@@ -393,8 +396,12 @@ final class LiveActivityController {
         guard let activity else { return }
         self.activity = nil
         lastPushed = nil
-        SharedLogger.shared.log("[AppDebug] live-activity: ended")
-        Task {
+        // 🚨 A LINK OF THE CHAIN, like update(): the wait must cover it. Left in
+        // a Task of its own, refreshNowAndWait() returned while ActivityKit had
+        // not ended the card, and an intent's process is suspended the moment
+        // its handler returns — the card stayed (the user's stand on 404).
+        SharedLogger.shared.log("[AppDebug] live-activity: ending — chained behind the publishes in flight")
+        publishChain.append {
             await activity.end(nil, dismissalPolicy: .immediate)
         }
     }
