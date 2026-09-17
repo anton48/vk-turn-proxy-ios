@@ -782,8 +782,8 @@ struct SettingsView: View {
             // Shared with the tapped-link path so the two cannot drift apart.
             Text(ConnectionLinkPrompt.message(for: link))
         }
-        // Reset confirm — destructive button on the alert removes the
-        // creds-pool.json. UserDefaults are untouched.
+        // Reset confirm — destructive button on the alert removes every
+        // TURN credential cache (TurnCacheFiles). UserDefaults are untouched.
         .alert("Reset TURN Cache?", isPresented: $showResetConfirm) {
             Button("Reset", role: .destructive) {
                 handleReset()
@@ -936,7 +936,7 @@ struct SettingsView: View {
         do {
             try BackupManager.resetTurnCache()
             alertTitle = "TURN Cache Cleared"
-            alertMessage = "creds-pool.json deleted. The pool will be rebuilt on next connect."
+            alertMessage = "Cached TURN credentials deleted for every transport (native and csqtt). The pool will be rebuilt on next connect."
         } catch {
             alertTitle = "Reset Failed"
             alertMessage = error.localizedDescription

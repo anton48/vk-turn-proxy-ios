@@ -2766,6 +2766,83 @@ do {
         }
         check(refusalAwaits, "🚨 the refusal path AWAITS the hold's release — an intent's handler must not return with the card's end in flight")
     }
+    // 🚨 "FORGET THE CACHED CREDENTIALS" REACHES EVERY CACHE FILE (build 407).
+    // The extension keeps two — creds-pool.json (the native pool) and
+    // creds-pool-csqtt.json (csqtt's own pool: two pool objects in one reused
+    // extension process save whole snapshots, so they do not share a file) —
+    // and until 407 BackupManager.resetTurnCache() knew the first only. It has
+    // two callers: the Settings action, and clearCredCacheIfAuthModeChanged —
+    // where a burner credential left in csqtt's file was loaded into the next
+    // ANONYMOUS csqtt session (the okcdn user-id is the burner account). So
+    // the list lives once, in TurnCacheFiles, the reset is RUN here on a
+    // scratch directory, and the names are pinned against the Go side.
+    do {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("swiftcheck-turncache-\(UUID().uuidString)")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        func seed(_ names: [String]) {
+            for n in names { _ = fm.createFile(atPath: dir.appendingPathComponent(n).path, contents: Data("{}".utf8)) }
+        }
+        func exists(_ n: String) -> Bool { fm.fileExists(atPath: dir.appendingPathComponent(n).path) }
+        let native = "creds-pool.json", csqtt = "creds-pool-csqtt.json", profile = "vk_profile.json"
+
+        seed([native, csqtt, profile])
+        let both = TurnCacheFiles.reset(in: dir)
+        check(Set(both.deleted) == [native, csqtt] && both.absent.isEmpty && both.failed.isEmpty
+              && !exists(native) && !exists(csqtt),
+              "🚨 a reset deletes BOTH cache files — the native pool's and csqtt's (got deleted=\(both.deleted) absent=\(both.absent))")
+        check(exists(profile), "…and nothing else in the container (the captured browser profile has a reset of its own)")
+        let again = TurnCacheFiles.reset(in: dir)
+        check(again.deleted.isEmpty && Set(again.absent) == [native, csqtt] && again.failed.isEmpty,
+              "idempotent: files already gone are success, not a failure (got absent=\(again.absent) failed=\(again.failed))")
+        seed([csqtt])
+        let onlyCsqtt = TurnCacheFiles.reset(in: dir)
+        check(onlyCsqtt.deleted == [csqtt] && onlyCsqtt.absent == [native] && onlyCsqtt.failed.isEmpty && !exists(csqtt),
+              "🚨 csqtt's file alone is deleted — a user who only ever ran csqtt has no native file, and that must not end the reset")
+        // A failure on one file must not leave the other untouched: after an
+        // auth-mode change the post-condition wanted is "NO file survives".
+        final class FirstFileFails: FileManager {
+            override func removeItem(at URL: URL) throws {
+                if URL.lastPathComponent == "creds-pool.json" { throw CocoaError(.fileWriteNoPermission) }
+                try super.removeItem(at: URL)
+            }
+        }
+        seed([native, csqtt])
+        let partial = TurnCacheFiles.reset(in: dir, fileManager: FirstFileFails())
+        check(Array(partial.failed.keys) == [native] && partial.deleted == [csqtt] && exists(native) && !exists(csqtt),
+              "🚨 a file that cannot be deleted is reported AND the next one is still deleted (got failed=\(partial.failed.keys.sorted()) deleted=\(partial.deleted))")
+
+        // The names are the Go side's: a rename there must redden here, or the
+        // reset silently stops reaching the file the extension really writes.
+        let goNative = codeWithoutComments("WireGuardBridge/bridge.go")
+        let goCsqtt = codeWithoutComments("WireGuardBridge/csqtt_bridge.go")
+        check(goNative.contains("filepath.Join(dir, \"\(native)\")") && TurnCacheFiles.names.contains(native),
+              "🚨 the native pool's cache file is named as bridge.go names it")
+        check(goCsqtt.contains("filepath.Join(dir, \"\(csqtt)\")") && TurnCacheFiles.names.contains(csqtt),
+              "🚨 csqtt's cache file is named as csqtt_bridge.go names it")
+        check(TurnCacheFiles.names.count == 2, "two caches, two names — a third pool's file is added HERE, with its own pin")
+
+        // The wiring, by spelling: one rule, reached by both callers.
+        func body(_ src: String, _ sig: String) -> String {
+            guard let r = src.range(of: sig) else { return "" }
+            let after = String(src[r.upperBound...])
+            return after.range(of: "\n    }").map { String(after[..<$0.lowerBound]) } ?? ""
+        }
+        let bm = codeWithoutComments("VKTurnProxy/VKTurnProxy/BackupManager.swift")
+        let resetBody = body(bm, "static func resetTurnCache() throws {")
+        check(resetBody.contains("TurnCacheFiles.reset(in: dir)") && !resetBody.contains("removeItem("),
+              "🚨 BackupManager.resetTurnCache goes through TurnCacheFiles — it deletes no single file of its own")
+        check(resetBody.contains("if !result.failed.isEmpty {") && resetBody.contains("throw BackupError.writeFailed("),
+              "…and a file that survived is an error the caller sees, not a log line")
+        let modeBody = body(tm, "func clearCredCacheIfAuthModeChanged(config: TunnelConfig) {")
+        check(modeBody.contains("try? BackupManager.resetTurnCache()") && !modeBody.contains("removeItem(") && !modeBody.contains("cacheURL"),
+              "🚨 the auth-mode change clears the caches through the same rule — a burner credential must not survive in EITHER file")
+        let settings = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+        let handleBody = body(settings, "private func handleReset() {")
+        check(handleBody.contains("try BackupManager.resetTurnCache()") && !handleBody.contains("creds-pool.json deleted"),
+              "the Settings action calls the rule, and its alert no longer names one file")
+    }
     // 🚨 P1, caught in review: SharedLogger.shared.log is `guard let url = fileURL
     // else { return }`, so on a build with no App Group container it is a SILENT
     // no-op — and that is the SAME population that hits the missing VPN

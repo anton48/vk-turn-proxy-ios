@@ -537,8 +537,9 @@ class TunnelManager: ObservableObject {
             // VKAuth) changed since the last connect: anon and burner creds must
             // NOT bleed across modes — a burner cred carried into anonymous mode
             // would DEANONYMIZE it (the okcdn user-id IS the burner account). The
-            // extension loads creds-pool.json on bootstrap, so we delete it here
-            // (main app, before startVPNTunnel) on a mode switch.
+            // extension loads its cache on bootstrap — creds-pool.json for the
+            // native pool, creds-pool-csqtt.json for csqtt's — so BOTH are deleted
+            // here (main app, before startVPNTunnel) on a mode switch.
             clearCredCacheIfAuthModeChanged(config: config)
 
             var seededTURN: (address: String, username: String, password: String)? = nil

@@ -20,8 +20,10 @@
 // failure but don't try to roll back UserDefaults; the previous file
 // would be lost anyway.
 //
-// Reset just deletes creds-pool.json. The pool gets rebuilt on next
-// connect via the normal VK API + PoW path. No UserDefaults changes.
+// Reset deletes EVERY TURN credential cache (TurnCacheFiles: creds-pool.json
+// and csqtt's creds-pool-csqtt.json). The pools get rebuilt on next connect
+// via the normal VK API + PoW path. No UserDefaults changes. The backup
+// itself still carries the native pool's file alone.
 
 import Foundation
 
@@ -350,23 +352,29 @@ enum BackupManager {
 
     // MARK: - Reset TURN Cache
 
-    /// Deletes creds-pool.json. The pool will be rebuilt from scratch on
-    /// next connect via the normal VK API path. Idempotent — succeeds
-    /// silently if the file was already gone (ENOENT is treated as success
-    /// since the post-condition "no creds-pool.json exists" holds).
+    /// Deletes EVERY on-disk TURN credential cache — the native pool's
+    /// creds-pool.json and csqtt's creds-pool-csqtt.json (`TurnCacheFiles`,
+    /// the one list). Two callers depend on "every": the Settings action, and
+    /// the auth-mode change before a connect (`clearCredCacheIfAuthModeChanged`),
+    /// where a burner credential surviving in either file would be loaded into
+    /// an anonymous session of that transport. The pools are rebuilt from
+    /// scratch on the next connect via the normal VK API path. Idempotent — a
+    /// file that is already gone is success; a file that could not be deleted
+    /// throws, after the others were still attempted.
     static func resetTurnCache() throws {
-        guard let url = credsPoolURL else {
+        guard let dir = credsPoolURL?.deletingLastPathComponent() else {
             throw BackupError.noContainer
         }
-        do {
-            try FileManager.default.removeItem(at: url)
-            SharedLogger.shared.log("[AppDebug] Backup: deleted creds-pool.json (Reset TURN Cache)")
-        } catch CocoaError.fileNoSuchFile {
-            SharedLogger.shared.log("[AppDebug] Backup: Reset TURN Cache — file already absent")
-        } catch let nsErr as NSError where nsErr.code == NSFileNoSuchFileError {
-            SharedLogger.shared.log("[AppDebug] Backup: Reset TURN Cache — file already absent")
-        } catch {
-            throw BackupError.writeFailed("delete creds-pool.json: \(error.localizedDescription)")
+        let result = TurnCacheFiles.reset(in: dir)
+        for name in result.deleted {
+            SharedLogger.shared.log("[AppDebug] Backup: deleted \(name) (Reset TURN Cache)")
+        }
+        for name in result.absent {
+            SharedLogger.shared.log("[AppDebug] Backup: Reset TURN Cache — \(name) already absent")
+        }
+        if !result.failed.isEmpty {
+            let what = result.failed.keys.sorted().map { "\($0): \(result.failed[$0] ?? "")" }.joined(separator: "; ")
+            throw BackupError.writeFailed("delete TURN cache: \(what)")
         }
     }
 

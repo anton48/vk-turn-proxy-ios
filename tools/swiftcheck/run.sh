@@ -60,6 +60,7 @@ SOURCES=(
     "$S/VKCallCreationGate.swift"
     "$S/UnseededStartPolicy.swift"
     "$S/PublishChain.swift"
+    "$S/TurnCacheFiles.swift"
     "$S/SessionServer.swift"
     "$S/ConnectionLinkInbox.swift"
     "$S/DirectOutcome.swift"
