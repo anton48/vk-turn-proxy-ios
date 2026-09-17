@@ -2665,7 +2665,10 @@ do {
             let body = String(tm[sw.upperBound...]).prefix(7000)
             if let d = body.range(of: "UnseededStartPolicy.decide("),
                let e = body.range(of: "errorMessage = why"),
-               let r = body.range(of: "LiveActivityController.shared.releaseHold()"),
+               // Scoped to the ARM: since 408 the function releases the hold in an
+               // earlier arm too (a surviving cred cache), and "the first
+               // releaseHold in the function" would be that one.
+               let r = body.range(of: "LiveActivityController.shared.releaseHold()", range: e.upperBound..<body.endIndex),
                let ret = body.range(of: "return .refusedUnseeded(reason: why)"),
                let start = body.range(of: "try await applyConfigurationAndStart(config: config, seededTURN: seed)") {
                 refusal = d.lowerBound < e.lowerBound && e.lowerBound < r.lowerBound && r.lowerBound < ret.lowerBound
@@ -2776,6 +2779,16 @@ do {
     // ANONYMOUS csqtt session (the okcdn user-id is the burner account). So
     // the list lives once, in TurnCacheFiles, the reset is RUN here on a
     // scratch directory, and the names are pinned against the Go side.
+    //
+    // 🚨 Build 408, two holes of 407 found in review on a stand. (1) ABSENCE
+    // WAS INFERRED FROM fileExists, which answers false when the path cannot be
+    // examined too — on a directory without access rights the reset reported
+    // both files "already absent" with both still on disk; only a confirmed
+    // ENOENT from the removal is absence. (2) THE GUARD SWALLOWED THE FAILURE
+    // (`try?`) AND MOVED THE MODE MARKER ANYWAY: the connect went on with the
+    // old mode's cache — the real Go pool took a cached cookie-mode identity in
+    // preference to a fresh anonymous seed — and the next attempt skipped the
+    // clear. A survivor now BLOCKS the connect and leaves the marker alone.
     do {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory.appendingPathComponent("swiftcheck-turncache-\(UUID().uuidString)")
@@ -2813,6 +2826,84 @@ do {
         check(Array(partial.failed.keys) == [native] && partial.deleted == [csqtt] && exists(native) && !exists(csqtt),
               "🚨 a file that cannot be deleted is reported AND the next one is still deleted (got failed=\(partial.failed.keys.sorted()) deleted=\(partial.deleted))")
 
+        // 🚨 The reviewer's stands, on REAL directories. A directory that can be
+        // read but not written: nothing can be deleted, both files survive.
+        func locked(_ mode: Int, _ run: (URL) -> Void) {
+            let d = fm.temporaryDirectory.appendingPathComponent("swiftcheck-turncache-locked-\(UUID().uuidString)")
+            try? fm.createDirectory(at: d, withIntermediateDirectories: true)
+            for n in [native, csqtt] { _ = fm.createFile(atPath: d.appendingPathComponent(n).path, contents: Data("{}".utf8)) }
+            try? fm.setAttributes([.posixPermissions: mode], ofItemAtPath: d.path)
+            run(d)
+            try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: d.path)
+            let survived = [native, csqtt].filter { fm.fileExists(atPath: d.appendingPathComponent($0).path) }
+            check(survived == [native, csqtt], "   (the stand is real: both files are still on disk once the directory is unlocked — got \(survived))")
+            try? fm.removeItem(at: d)
+        }
+        locked(0o555) { d in
+            let r = TurnCacheFiles.reset(in: d)
+            check(Set(r.failed.keys) == [native, csqtt] && r.deleted.isEmpty && r.absent.isEmpty,
+                  "🚨 a read-only directory: both files are reported as SURVIVORS (got failed=\(r.failed.keys.sorted()) absent=\(r.absent))")
+        }
+        // …and a directory with NO access rights: fileExists answers false for
+        // both files there, which 407 read as "already absent".
+        locked(0o000) { d in
+            let r = TurnCacheFiles.reset(in: d)
+            check(Set(r.failed.keys) == [native, csqtt] && r.absent.isEmpty && r.deleted.isEmpty,
+                  "🚨 a directory without access rights: a path that cannot be EXAMINED is a survivor, never 'absent' (got failed=\(r.failed.keys.sorted()) absent=\(r.absent))")
+        }
+        // The same, without the file system's help: a FileManager whose
+        // fileExists always answers false (cannot examine / a file that appeared
+        // after a pre-check) and whose removal fails on permission.
+        final class CannotExamine: FileManager {
+            override func fileExists(atPath path: String) -> Bool { false }
+            override func removeItem(at URL: URL) throws { throw CocoaError(.fileWriteNoPermission) }
+        }
+        let blind = TurnCacheFiles.reset(in: dir, fileManager: CannotExamine())
+        check(Set(blind.failed.keys) == [native, csqtt] && blind.absent.isEmpty,
+              "🚨 absence is never inferred from fileExists — a permission error with fileExists=false is a survivor (got absent=\(blind.absent))")
+        final class PosixNoEntry: FileManager {
+            override func removeItem(at URL: URL) throws { throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)) }
+        }
+        let posix = TurnCacheFiles.reset(in: dir, fileManager: PosixNoEntry())
+        check(Set(posix.absent) == [native, csqtt] && posix.failed.isEmpty,
+              "a confirmed ENOENT — in POSIX's own domain too — is absence (got failed=\(posix.failed.keys.sorted()))")
+        check(!TurnCacheFiles.isNoSuchFile(CocoaError(.fileWriteNoPermission)) && !TurnCacheFiles.isNoSuchFile(NSError(domain: "anything", code: 4))
+              && TurnCacheFiles.isNoSuchFile(CocoaError(.fileNoSuchFile)),
+              "only ENOENT qualifies: not a permission error, not the same code in a foreign domain")
+
+        // 🚨 The guard's decision. The marker means "the caches on disk belong to
+        // this mode" — it moves only when the reset succeeded.
+        do {
+            struct Boom: Error, LocalizedError { var errorDescription: String? { "creds-pool-csqtt.json: permission denied" } }
+            var calls = 0
+            let first = AuthModeCacheGuard.run(last: nil, current: "anon") { calls += 1 }
+            check(first.outcome == .unchanged && first.marker == "anon" && calls == 0, "no record of a previous connect: nothing to clear, the marker is set")
+            let same = AuthModeCacheGuard.run(last: "cookie", current: "cookie") { calls += 1 }
+            check(same.outcome == .unchanged && same.marker == "cookie" && calls == 0, "the same mode: the reset is not even called")
+            let ok = AuthModeCacheGuard.run(last: "cookie", current: "anon") { calls += 1 }
+            check(ok.outcome == .cleared && ok.marker == "anon" && calls == 1, "the mode changed and the reset succeeded: cleared, the marker moves")
+            // The reviewer's sequence: the cookie cache cannot be deleted.
+            var stored: String? = "cookie"
+            var attempts = 0
+            func connectAnon() -> AuthModeCacheGuard.Outcome {
+                let d = AuthModeCacheGuard.run(last: stored, current: "anon") { attempts += 1; throw Boom() }
+                if let m = d.marker { stored = m }
+                return d.outcome
+            }
+            let a1 = connectAnon()
+            var blockedText = ""
+            if case .blocked(let why) = a1 { blockedText = why }
+            check(!blockedText.isEmpty && stored == "cookie",
+                  "🚨 a cache that SURVIVED the reset blocks the connect and the marker stays on the OLD mode (stored=\(stored ?? "nil"))")
+            check(blockedText.contains("VK-account (cookie)") && blockedText.contains("anonymous") && blockedText.contains("permission denied") && blockedText.contains("Reset TURN Cache"),
+                  "…and the reason names both modes, the failure and the way out")
+            let a2 = connectAnon()
+            var stillBlocked = false
+            if case .blocked = a2 { stillBlocked = true }
+            check(stillBlocked && attempts == 2,
+                  "🚨 the NEXT attempt clears again — a marker already moved would have skipped it (reset attempts=\(attempts))")
+        }
+
         // The names are the Go side's: a rename there must redden here, or the
         // reset silently stops reaching the file the extension really writes.
         let goNative = codeWithoutComments("WireGuardBridge/bridge.go")
@@ -2835,9 +2926,41 @@ do {
               "🚨 BackupManager.resetTurnCache goes through TurnCacheFiles — it deletes no single file of its own")
         check(resetBody.contains("if !result.failed.isEmpty {") && resetBody.contains("throw BackupError.writeFailed("),
               "…and a file that survived is an error the caller sees, not a log line")
-        let modeBody = body(tm, "func clearCredCacheIfAuthModeChanged(config: TunnelConfig) {")
-        check(modeBody.contains("try? BackupManager.resetTurnCache()") && !modeBody.contains("removeItem(") && !modeBody.contains("cacheURL"),
-              "🚨 the auth-mode change clears the caches through the same rule — a burner credential must not survive in EITHER file")
+        let filesSrc = codeWithoutComments("VKTurnProxy/VKTurnProxy/TurnCacheFiles.swift")
+        let coreBody = body(filesSrc, "static func reset(in directory: URL, fileManager: FileManager = .default) -> ResetResult {")
+        check(coreBody.contains("if isNoSuchFile(error) {") && !coreBody.contains("fileExists("),
+              "🚨 the reset decides absence from the removal's own error — no fileExists anywhere in it")
+        let modeBody = body(tm, "func clearCredCacheIfAuthModeChanged(config: TunnelConfig) -> String? {")
+        check(modeBody.contains("try BackupManager.resetTurnCache()") && !modeBody.contains("try?") && !modeBody.contains("removeItem(") && !modeBody.contains("cacheURL"),
+              "🚨 the auth-mode change clears the caches through the same rule and does NOT swallow its failure (no `try?`)")
+        check(modeBody.contains("AuthModeCacheGuard.run(last: last, current: curAuthMode) {")
+              && modeBody.contains("if let marker = decision.marker {")
+              && modeBody.components(separatedBy: "forKey: \"lastConnectAuthMode\"").count == 3
+              && modeBody.contains("if case .blocked(let reason) = decision.outcome {") && modeBody.contains("return reason"),
+              "🚨 the mode marker is written ONLY from the guard's decision (one read, one conditional write) and a block is returned to the caller")
+        var connectStops = false
+        if let c = tm.range(of: "if let blocked = clearCredCacheIfAuthModeChanged(config: config) {\n                errorMessage = blocked\n                return\n            }") {
+            // …and it stands BEFORE the first thing that reads the cache or probes.
+            let after = String(tm[c.upperBound...])
+            connectStops = after.range(of: "CredCache.loadValidCred()") != nil
+                && !String(tm[..<c.lowerBound]).hasSuffix("_ = ")
+        }
+        check(connectStops, "🚨 connect() stops on a surviving cache — before anything reads the cache or probes")
+        var switchStops = false
+        if let sw = tm.range(of: "func switchAndReconnect(") {
+            let sbody = String(tm[sw.upperBound...]).prefix(7000)
+            if let g = sbody.range(of: "if let blocked = clearCredCacheIfAuthModeChanged(config: config) {"),
+               let seedRead = sbody.range(of: "CredCache.loadValidCred()"), g.lowerBound < seedRead.lowerBound {
+                let arm = String(sbody[g.upperBound..<seedRead.lowerBound])
+                switchStops = arm.contains("errorMessage = blocked") && arm.contains("await LiveActivityController.shared.releaseHold()")
+                    && arm.contains("return .refusedUncleared(reason: blocked)")
+            }
+        }
+        check(switchStops, "🚨 the switch path refuses on a surviving cache — the reason in the app, the card's hold released, before the cache is read")
+        check(tm.contains("} else if case .refusedUncleared(let blocked) = outcome {"),
+              "…and the DIRECT repair says the tunnel was not rebuilt, as for 404's refusal")
+        check(tm.components(separatedBy: "clearCredCacheIfAuthModeChanged(config:").count == 4,
+              "the guard has exactly two callers (plus its declaration) — a third must decide what a block means for it")
         let settings = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
         let handleBody = body(settings, "private func handleReset() {")
         check(handleBody.contains("try BackupManager.resetTurnCache()") && !handleBody.contains("creds-pool.json deleted"),

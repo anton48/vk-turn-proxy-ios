@@ -19,7 +19,12 @@
 // transport, not an untidiness — which is why the list lives here, once, and
 // the names are pinned against the Go side by tools/swiftcheck.
 //
-// Foundation-only, so the harness can run it on a scratch directory.
+// The second half of the same rule is below: AuthModeCacheGuard. A reset that
+// FAILED is not a reset — the caches are still on disk and the extension
+// loads them whatever the mode — so the guard blocks the connect and keeps
+// the mode marker where it was.
+//
+// Foundation-only, so the harness can run both on scratch directories.
 
 import Foundation
 
@@ -37,19 +42,24 @@ enum TurnCacheFiles {
     /// Deletes every cache file in `directory`. EVERY file is attempted even
     /// when one fails: after an auth-mode change the point is that no file
     /// survives, and stopping at the first error would leave the next one
-    /// untouched. The post-condition is "the file does not exist", so a file
-    /// that was already gone is success (idempotent), whatever error the
-    /// removal reported for it.
+    /// untouched. A file that was already gone is success (idempotent) — but
+    /// ONLY on a confirmed "no such file" from the removal itself.
+    ///
+    /// 🚨 Absence is never inferred from `fileExists`: it answers false when
+    /// the path cannot be EXAMINED too (a directory without search permission),
+    /// so a permission failure would read as "already absent" with both files
+    /// still on disk; and a check made before the removal says nothing about a
+    /// file that appeared in between. Every error that is not ENOENT is a
+    /// survivor and goes to `failed`.
     static func reset(in directory: URL, fileManager: FileManager = .default) -> ResetResult {
         var result = ResetResult()
         for name in names {
             let url = directory.appendingPathComponent(name)
-            let existed = fileManager.fileExists(atPath: url.path)
             do {
                 try fileManager.removeItem(at: url)
                 result.deleted.append(name)
             } catch {
-                if !existed || !fileManager.fileExists(atPath: url.path) {
+                if isNoSuchFile(error) {
                     result.absent.append(name)
                 } else {
                     result.failed[name] = error.localizedDescription
@@ -57,5 +67,67 @@ enum TurnCacheFiles {
             }
         }
         return result
+    }
+
+    /// A removal's error that CONFIRMS the file is not there: ENOENT, as POSIX
+    /// says it or as Foundation translates it. Nothing else qualifies — not a
+    /// permission error, not an unknown one.
+    static func isNoSuchFile(_ error: Error) -> Bool {
+        let e = error as NSError
+        if e.domain == NSPOSIXErrorDomain { return e.code == Int(ENOENT) }
+        if e.domain == NSCocoaErrorDomain {
+            return e.code == NSFileNoSuchFileError || e.code == NSFileReadNoSuchFileError
+        }
+        return false
+    }
+}
+
+/// The auth-mode guard's decision, as a value: what happens to the caches and
+/// to the stored marker when a connect's auth mode (anonymous vs VKAuth cookie)
+/// differs from the last connect's.
+///
+/// The marker means "the caches on disk belong to THIS mode". It may move to
+/// the new mode only once the old mode's caches are verifiably gone. A reset
+/// that failed leaves them on disk; the extension loads its cache whatever the
+/// mode is (the Go pool took a cached cookie-mode identity in preference to a
+/// fresh anonymous seed); and a marker already moved would make the NEXT
+/// attempt skip the clear altogether. So a failed reset BLOCKS the connect and
+/// leaves the marker where it was — the next attempt tries the clear again.
+enum AuthModeCacheGuard {
+    enum Outcome: Equatable {
+        /// The same mode as the last connect, or no record of one: nothing to clear.
+        case unchanged
+        /// The mode changed and every cache file is gone.
+        case cleared
+        /// The mode changed and a cache file SURVIVED: this connect must not start.
+        case blocked(reason: String)
+    }
+
+    struct Decision: Equatable {
+        let outcome: Outcome
+        /// The marker to store; nil = leave the stored one untouched.
+        let marker: String?
+    }
+
+    static func run(last: String?, current: String, reset: () throws -> Void) -> Decision {
+        guard let last, last != current else {
+            return Decision(outcome: .unchanged, marker: current)
+        }
+        do {
+            try reset()
+            return Decision(outcome: .cleared, marker: current)
+        } catch {
+            return Decision(outcome: .blocked(reason: blockedReason(from: last, to: current, error: error)), marker: nil)
+        }
+    }
+
+    static func blockedReason(from last: String, to current: String, error: Error) -> String {
+        "The TURN credentials cached in \(label(last)) mode could not be deleted (\(error.localizedDescription)). "
+            + "Not connecting: the tunnel would reuse them in \(label(current)) mode. "
+            + "Try Settings → Reset TURN Cache, then Connect again."
+    }
+
+    private static func label(_ mode: String) -> String {
+        mode == "cookie" ? "VK-account (cookie)" : "anonymous"
     }
 }

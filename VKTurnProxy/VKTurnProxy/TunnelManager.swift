@@ -540,7 +540,12 @@ class TunnelManager: ObservableObject {
             // extension loads its cache on bootstrap — creds-pool.json for the
             // native pool, creds-pool-csqtt.json for csqtt's — so BOTH are deleted
             // here (main app, before startVPNTunnel) on a mode switch.
-            clearCredCacheIfAuthModeChanged(config: config)
+            // 🚨 A cache that SURVIVED the reset stops the attempt: the extension
+            // would load it whatever the mode is.
+            if let blocked = clearCredCacheIfAuthModeChanged(config: config) {
+                errorMessage = blocked
+                return
+            }
 
             var seededTURN: (address: String, username: String, password: String)? = nil
 
@@ -755,13 +760,26 @@ class TunnelManager: ObservableObject {
     /// switch is the first connect under the new mode. Skipping it would reuse a
     /// burner cred in anonymous mode, which DEANONYMISES the burner (the okcdn
     /// user-id is the account).
-    func clearCredCacheIfAuthModeChanged(config: TunnelConfig) {
+    ///
+    /// 🚨 Returns the reason this connect must NOT proceed, or nil. The marker
+    /// moves to the new mode only when the reset succeeded (`AuthModeCacheGuard`):
+    /// a swallowed failure used to connect on the old mode's cache AND mark the
+    /// mode as changed, so the next attempt skipped the clear altogether.
+    func clearCredCacheIfAuthModeChanged(config: TunnelConfig) -> String? {
         let curAuthMode = config.useCookieAuth ? "cookie" : "anon"
-        if let last = UserDefaults.standard.string(forKey: "lastConnectAuthMode"), last != curAuthMode {
-            SharedLogger.shared.log("[AppDebug] auth mode changed (\(last) → \(curAuthMode)) — clearing cred cache")
-            try? BackupManager.resetTurnCache()
+        let last = UserDefaults.standard.string(forKey: "lastConnectAuthMode")
+        let decision = AuthModeCacheGuard.run(last: last, current: curAuthMode) {
+            SharedLogger.shared.log("[AppDebug] auth mode changed (\(last ?? "?") → \(curAuthMode)) — clearing cred cache")
+            try BackupManager.resetTurnCache()
         }
-        UserDefaults.standard.set(curAuthMode, forKey: "lastConnectAuthMode")
+        if let marker = decision.marker {
+            UserDefaults.standard.set(marker, forKey: "lastConnectAuthMode")
+        }
+        if case .blocked(let reason) = decision.outcome {
+            SharedLogger.shared.log("[AppDebug] auth mode changed but a cred cache SURVIVED the reset — not connecting; the mode marker stays \"\(last ?? "?")\" so the next attempt clears again")
+            return reason
+        }
+        return nil
     }
 
     /// Block until the tunnel has settled into a terminal state.
@@ -889,6 +907,8 @@ class TunnelManager: ObservableObject {
     enum SwitchOutcome: Equatable {
         case started
         case refusedUnseeded(reason: String)
+        /// The auth mode changed and a cred cache of the old mode survived the reset.
+        case refusedUncleared(reason: String)
         case failed
     }
 
@@ -921,7 +941,15 @@ class TunnelManager: ObservableObject {
 
         ServerStore.shared.activate(serverId)
         let config = TunnelConfig.make(for: server)
-        clearCredCacheIfAuthModeChanged(config: config)
+        // 🚨 A cache that SURVIVED the reset refuses the switch: the tunnel is
+        // stopped by now and stays so, the reason in the app — as 404's refusal.
+        if let blocked = clearCredCacheIfAuthModeChanged(config: config) {
+            errorMessage = blocked
+            if #available(iOS 16.2, *) {
+                await LiveActivityController.shared.releaseHold()
+            }
+            return .refusedUncleared(reason: blocked)
+        }
         // A cached cred is free; otherwise go and get one, exactly as the
         // Connect button does — see probeFreshCredWithoutUI for why the
         // extension cannot be left to do it. The probe runs AFTER the stop on
@@ -1545,6 +1573,9 @@ class TunnelManager: ObservableObject {
             // Not rebuilt: a csqtt start the probe knew would meet a captcha was
             // refused, and the tunnel stays stopped until Connect.
             directModeError = "Routing could not be confirmed, and the tunnel could not be rebuilt from here. " + why
+        } else if case .refusedUncleared(let blocked) = outcome {
+            // Not rebuilt either: the old auth mode's cred cache could not be deleted.
+            directModeError = "Routing could not be confirmed, and the tunnel could not be rebuilt from here. " + blocked
         } else if directMode {
             // The rebuilt profile should be full-tunnel; if it is not, say so
             // rather than leaving the switch to imply everything is fine.
