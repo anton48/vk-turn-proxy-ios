@@ -10,10 +10,9 @@ package proxy
 // relay and 486), the cold-start cap inside get(), the grower's
 // fast-then-staggered fill, the on-disk cache, the pre-bootstrap seed in
 // slot 0, cookie auth and the TURN override — without that transport living
-// inside Proxy. This file
-// is ADDITIONS ONLY: Proxy keeps building its own pool exactly as before
-// (NewProxy → newCredPool with p.fetchFreshCreds; growCredPool unchanged),
-// and this wrapper reuses the same credPool type with an injected fetcher.
+// inside Proxy. Proxy keeps building its own pool exactly as before
+// (NewProxy → newCredPool with p.fetchFreshCreds), and this wrapper reuses
+// the same credPool type with an injected fetcher.
 //
 // What the wrapper's fetcher does NOT carry is the captcha: the WebView round
 // trip keeps its tokens in Proxy fields, and every acquire here is
@@ -22,9 +21,12 @@ package proxy
 // reports "authentication required". No solver is wired on this path by
 // design (a field that is never consulted would be a lie); stage-5 step D
 // (csqtt as a Proxy session mode) brings the app's captcha flow by
-// construction. ⚠️ Grow duplicates the state machine of Proxy.growCredPool
-// so that proxy.go stays untouched; step D makes Proxy delegate here and
-// deletes the copy.
+// construction.
+//
+// The grower's state machine exists ONCE — credPool.growLoop below. Both
+// owners wait for their own readiness and run it: Proxy.growCredPool with the
+// captcha-pending predicate, Grow with none. A fix to the fill logic goes
+// there and nowhere else (TestBothGrowersRunTheOneLoop).
 
 import (
 	"context"
@@ -329,10 +331,10 @@ func (p *CredPool) Stats() CredPoolStats {
 	}
 }
 
-// growPace is the grower's timing — Proxy.growCredPool's constants as a
-// value, so a test can run the state machine in milliseconds on its own pool
-// without touching package state. The production value is pinned by
-// TestCredPoolGrowPaceIsPinned.
+// growPace is the grower's timing as a value, so a test can run the state
+// machine in milliseconds on its own pool without touching package state.
+// Both owners run at defaultGrowPace in production — the numbers live here
+// alone, pinned by TestCredPoolGrowPaceIsPinned.
 type growPace struct {
 	fast, slow, staggerMin, staggerMax, bootstrap time.Duration
 }
@@ -345,11 +347,10 @@ var defaultGrowPace = growPace{
 
 // Grow runs the background fill loop for the pool's lifetime (Close ends
 // it): it waits for `ready` (the transport's first live connection; nil =
-// start now), then fills
-// slots fast until ceil(NumConns/10) are usable — the cold-start target — and
-// from then on adds one slot every 120–300 s so credential expiries stay
-// spread. Fetches never block on a captcha. This is Proxy.growCredPool's
-// state machine without the captcha-pending check (no captcha UI here).
+// start now), then runs credPool.growLoop — fast fills until ceil(NumConns/10)
+// slots are usable, the cold-start target, and from then on one slot every
+// 120–300 s so credential expiries stay spread. Fetches never block on a
+// captcha, and no captcha predicate is passed: this owner has no captcha UI.
 func (p *CredPool) Grow(ready <-chan struct{}) {
 	ctx := p.ctx
 	if ready != nil {
@@ -362,46 +363,116 @@ func (p *CredPool) Grow(ready <-chan struct{}) {
 			return
 		}
 	}
-	coldStartSlots := p.cp.coldStartTargetValue() // the same number get()'s cap uses
+	p.cp.growLoop(ctx, p.pace, nil)
+}
+
+// growLoop is THE grower: the one fill loop of a credPool, run by both of its
+// owners — Proxy.growCredPool (the native transports, after the bootstrap)
+// and CredPool.Grow (csqtt's standalone pool, after `ready`). It returns when
+// ctx ends.
+//
+//   - Fills with allowCaptchaBlock=false: a background fetch that meets a
+//     captcha records a cooldown on its slot instead of blocking on user input.
+//   - hold reports "a captcha is waiting for the user". While it answers true
+//     a tick adds no VK pressure — no fill, the slow interval: another fetch
+//     could invalidate the captcha session being solved. nil = the owner has
+//     no captcha UI and is never held.
+//   - Fast poll (pace.fast) while the cold-start target is unmet, slow poll
+//     (pace.slow) when every slot is full or on cooldown, a random
+//     pace.staggerMin…staggerMax pause between maintenance fills so creds do
+//     not end up with synchronised expiry timestamps.
+func (cp *credPool) growLoop(ctx context.Context, pace growPace, hold func() bool) {
+	// Cold-start fast-fill target: enough slots to host NumConns at VK's
+	// quota (10 conns/slot, see connsPerSlot in creds.go) — ceil(NumConns/10)
+	// bounded by the pool. ONE number with get()'s cold-start cap, set where
+	// the connection count is known (setColdStartTarget); computed apart, the
+	// two disagreed on the cookie pool (see credPool.coldStartTarget).
+	//
+	//   NumConns 10  → 1 slot fast
+	//   NumConns 30  → 3 slots fast → 9 maintenance (for pool=12)
+	//   NumConns 50  → 5 slots fast → 15 maintenance (for pool=20)
+	//
+	// The user needs JUST ENOUGH usable slots to host the configured conn
+	// count; every slot beyond that is reserve capacity — better to spread its
+	// fill so that 8 h later the expirations are spread too.
+	coldStartSlots := cp.coldStartTargetValue()
+	// Two-mode state machine:
+	//   coldStartMet=false  → fill fast, coldStartSlots passed as tryFill's
+	//                          abort guard so conn-driven fetches racing our
+	//                          mint don't over-shoot the target.
+	//   coldStartMet=true   → one fill per random stagger pause, no guard;
+	//                          each adds one more slot toward a full pool.
+	// The transition is one-way: once the target is met we never return to
+	// fast fill, even if the pool later drops below it (only a cred expiry
+	// does that, and one extra slow refill does not hurt).
 	coldStartMet := false
-	interval := p.pace.fast
+	interval := pace.fast
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(interval):
 		}
-		slot := p.cp.pickSlotToFill()
-		if slot < 0 {
-			interval = p.pace.slow
+
+		// Don't add VK pressure while a captcha is pending — the tick's first
+		// step, before a slot is even picked.
+		if hold != nil && hold() {
+			interval = pace.slow
 			continue
 		}
+
+		slot := cp.pickSlotToFill()
+		if slot < 0 {
+			// Everything filled or on cooldown — idle poll.
+			interval = pace.slow
+			continue
+		}
+
+		// Pre-fill check — conn-driven fetches may have met the target before
+		// the grower got to this tick: switch to maintenance now, so the fill
+		// below runs as the first maintenance fill (no abort guard) rather
+		// than as a cold-start one that tryFill would abort.
 		if !coldStartMet {
-			if available, _, total := p.cp.snapshotSize(); available >= coldStartSlots {
+			if available, _, total := cp.snapshotSize(); available >= coldStartSlots {
 				coldStartMet = true
-				log.Printf("credpool-grow: cold-start target %d reached at pool %d/%d (no fill needed) — switching to maintenance", coldStartSlots, available, total)
+				log.Printf("credpool-grow: cold-start target %d reached at pool %d/%d (no fill needed) — switching to maintenance",
+					coldStartSlots, available, total)
 			}
 		}
+
+		// abortIfAvailableGTE: only during cold start, and checked by tryFill
+		// BEFORE the fetch alone — a mint that conn-driven fetches in get() have
+		// already made redundant is not started. A mint that WAS started is
+		// kept even when the target is met while it runs (tryFill's doc says
+		// why). 0 in maintenance: every maintenance fill is meant to add one.
 		abortGuard := 0
 		if !coldStartMet {
 			abortGuard = coldStartSlots
 		}
-		success := p.cp.tryFill(slot, false, abortGuard)
+
+		success := cp.tryFill(slot, false, abortGuard)
+
+		// After-fill check — this fill may have crossed the threshold.
 		if !coldStartMet {
-			if available, _, total := p.cp.snapshotSize(); available >= coldStartSlots {
+			if available, _, total := cp.snapshotSize(); available >= coldStartSlots {
 				coldStartMet = true
-				log.Printf("credpool-grow: cold-start target %d reached at pool %d/%d — switching to maintenance", coldStartSlots, available, total)
+				log.Printf("credpool-grow: cold-start target %d reached at pool %d/%d — switching to maintenance",
+					coldStartSlots, available, total)
 			}
 		}
+
 		if coldStartMet {
-			interval = p.pace.staggerMin + time.Duration(mathrand.Int63n(int64(p.pace.staggerMax-p.pace.staggerMin)))
+			interval = pace.staggerMin + time.Duration(mathrand.Int63n(int64(pace.staggerMax-pace.staggerMin)))
 			if success {
 				log.Printf("credpool-grow: maintenance fill succeeded, next fill in %v", interval.Round(time.Second))
 			} else {
 				log.Printf("credpool-grow: maintenance fill skipped/failed, next attempt in %v", interval.Round(time.Second))
 			}
 		} else {
-			interval = p.pace.fast
+			// Below the target → keep filling fast; tryFill's per-slot cooldown
+			// prevents hammering a dead slot.
+			interval = pace.fast
 		}
 	}
 }

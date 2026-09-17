@@ -72,7 +72,7 @@ func TestColdStartCapOnACookieShapedPoolMintsTheThirdBucket(t *testing.T) {
 
 // Both constructors set the target from the connection count — NewCredPool
 // on the cookie pool sizes it 2 × links and still targets ceil(N/10) — and the
-// grower in proxy.go reads the pool's number rather than computing its own.
+// grower's one loop reads the pool's number rather than computing its own.
 func TestColdStartTargetIsSetWhereTheConnectionCountIsKnown(t *testing.T) {
 	t.Cleanup(func() { SetVKCookieAuth(false, "", nil) })
 	SetVKCookieAuth(true, "remixsid=x", []string{"https://vk.ru/call/join/aaaaaa", "https://vk.ru/call/join/bbbbbb", "https://vk.ru/call/join/cccccc"})
@@ -91,7 +91,7 @@ func TestColdStartTargetIsSetWhereTheConnectionCountIsKnown(t *testing.T) {
 	if i < 0 || !regexp.MustCompile(`(?s)p\.credPool = newCredPool\([^\n]*\n\s*p\.credPool\.setColdStartTarget\(cfg\.NumConns\)`).MatchString(s[i:]) {
 		t.Fatal("NewProxy does not set the pool's cold-start target from cfg.NumConns right after building the pool")
 	}
-	if !strings.Contains(s, "coldStartSlots := p.credPool.coldStartTargetValue()") {
-		t.Fatal("growCredPool computes its own cold-start target instead of reading the pool's")
+	if !strings.Contains(goFuncBody(t, "credpool.go", "func (cp *credPool) growLoop("), "coldStartSlots := cp.coldStartTargetValue()") {
+		t.Fatal("the grower's loop computes its own cold-start target instead of reading the pool's")
 	}
 }

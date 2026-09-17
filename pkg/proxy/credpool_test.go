@@ -146,10 +146,12 @@ func TestCredPoolRelayHostsSurviveAWarmCache(t *testing.T) {
 
 // The grower fills fast until ceil(NumConns/10) slots are usable, then adds
 // one slot per stagger interval, and Close ends it: nothing is minted after
-// Close. Run in milliseconds; the production pace is pinned separately.
-// Sabotages seen red: Grow never leaving cold start (the fourth mint follows
-// the third at the fast interval); Grow running on context.Background()
-// instead of the pool's lifetime (mints continue after Close).
+// Close. Run in milliseconds; the production pace is pinned separately. The
+// state machine under test is credPool.growLoop — the one body native's
+// grower runs too — reached through Grow. Sabotages seen red: the loop never
+// leaving cold start (the fourth mint follows the third at the fast interval);
+// Grow running it on context.Background() instead of the pool's lifetime
+// (mints continue after Close).
 func TestCredPoolGrowFastUntilTargetThenStaggers(t *testing.T) {
 	m := &fakeMinter{}
 	p := NewCredPool(context.Background(), CredPoolConfig{NumConns: 30, Fetch: m.fetch}) // target = 3 slots of 12
@@ -193,7 +195,10 @@ func TestCredPoolGrowFastUntilTargetThenStaggers(t *testing.T) {
 	}
 }
 
-// Production pace, as literals: Proxy.growCredPool's numbers.
+// Production pace, as literals. Both growers run at it: a new CredPool starts
+// at defaultGrowPace and Proxy.growCredPool passes it (the scan in
+// TestBothGrowersRunTheOneLoop) — native's bootstrap log line says "2m" in
+// its text, so a change of `bootstrap` changes that line too.
 func TestCredPoolGrowPaceIsPinned(t *testing.T) {
 	d := defaultGrowPace
 	if d.fast != 2*time.Second || d.slow != 30*time.Second || d.staggerMin != 120*time.Second || d.staggerMax != 300*time.Second || d.bootstrap != 2*time.Minute {
