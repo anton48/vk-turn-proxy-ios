@@ -1189,17 +1189,31 @@ type credPool struct {
 	size     int             // pool capacity, derived from NumConns via poolSizeForNumConns
 	cooldown time.Duration   // post-failure skip-fetch window (default 5m)
 
-	// liveLeases counts the leases get() has handed out and release() has not
-	// yet taken back — the sessions running on this pool's credentials, on
-	// whatever identity. It is a count of LEASES, not a sum over the entries:
-	// a refill of an in-use slot (the grower renews a credential ~30 min
-	// before it expires, whether or not sessions still run on it), invalidate()
-	// and invalidateEntry all replace an entry and restart its `active` at 0
-	// while the old identity's sessions live on; this number they never
-	// touch. The path-change gate reads it ("is anything live?") — the
-	// per-entry counts answered "nothing live" with forty sessions up
-	// (the field run of 2026-09-18). Under cp.mu.
-	liveLeases int
+	// holders is the pool's record of the leases still out — get() has handed
+	// them out, release() has not yet taken them back — by WHAT each was taken
+	// on: the slot and the credential it held then (leaseKey). It OUTLIVES the
+	// entries. A refill of an in-use slot (the grower renews a credential
+	// ~30 min before it expires, whether or not sessions still run on it),
+	// invalidate() and invalidateEntry all replace an entry while its holders'
+	// sessions live on; this record they never touch. Two readers:
+	//
+	//   - the path-change gate asks "is anything live?" — the per-entry counts
+	//     answered "nothing live" with forty sessions up (the field run of
+	//     2026-09-18);
+	//   - every publish of a credential into a slot takes the entry's `active`
+	//     FROM it (outstandingLocked), so a credential issued AGAIN into its
+	//     slot — cookie mode returns the same username for a slot until the
+	//     call's mint nears expiry, e.g. after a Resume's invalidate() — starts
+	//     with its previous holders still seated instead of at 0, and their
+	//     late releases free seats that were really taken (the user's review of
+	//     build 409: by username alone such a release read as the NEW
+	//     issuance's, made ten holders look like nine, announced room and let
+	//     an eleventh onto the credential).
+	//
+	// Invariant: a slot that holds a credential has active ==
+	// holders[{slot, its username}]; seatLocked and release move both
+	// together. A key is deleted when its count reaches zero. Under cp.mu.
+	holders map[leaseKey]int
 
 	// authErrors counts pion-reported 401/403 errors per slot since the
 	// slot was last (re)filled. Reset to 0 on seedSlot, tryFill success,
@@ -1321,6 +1335,21 @@ type credPool struct {
 
 	// quota is the relay-refusal breaker — see quotabreaker.go.
 	quota quotaBreaker
+}
+
+// leaseKey names what a lease was taken on: the slot and the credential
+// (username) the slot held at that moment. The SLOT is part of it — in cookie
+// mode the two relays of one call are two slots with ONE username, each its
+// own quota bucket at VK — and so is the USERNAME: a refill puts another
+// identity under the same slot number.
+type leaseKey struct {
+	slot     int
+	username string
+}
+
+// leaseKeyOf is the ONE place a lease's key is built. creds is not nil.
+func leaseKeyOf(slot int, creds *TURNCreds) leaseKey {
+	return leaseKey{slot: slot, username: creds.Username}
 }
 
 // poolSizeForNumConns derives the cred pool size from the configured
@@ -1453,9 +1482,10 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		displaced = &copyEntry
 	}
 	cp.pool[slot] = credPoolEntry{
-		addr:  addr,
-		creds: creds,
-		ts:    time.Now(),
+		addr:   addr,
+		creds:  creds,
+		ts:     time.Now(),
+		active: cp.outstandingLocked(slot, creds), // the record's count — see credPool.holders
 	}
 	// Dedup: clear any OTHER slot holding the same VK cred set. This
 	// happens when app-side reads creds-pool.json, picks an entry
@@ -1731,6 +1761,7 @@ func (cp *credPool) loadFromDisk() {
 			addr:        entry.Address,
 			creds:       creds,
 			ts:          now,
+			active:      cp.outstandingLocked(entry.Slot, creds), // the record's count — see credPool.holders
 			lastUsedAt:  lastUsed,
 			availableAt: availableAt,
 		}
@@ -2009,8 +2040,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// pickAcquireSlotLocked for the selection logic + rationale (each
 	// path event marks fewer slots when conns cluster).
 	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, true); slot >= 0 {
-		cp.pool[slot].active++
-		cp.liveLeases++
+		cp.seatLocked(slot)
 		e := cp.pool[slot]
 		cp.mu.Unlock()
 		var tag string
@@ -2189,8 +2219,27 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	if fetchErr == nil {
 		got, why := target, ""
 		if owns {
-			// Replacing an empty/stale slot — active was 0, now 1 (us).
-			cp.pool[target] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: 1, gen: gen}
+			// The entry's count comes from the record of leases still out on
+			// this very (slot, credential) — see credPool.holders. For a NEW
+			// identity that is 0 and we take the first seat. A credential issued
+			// AGAIN into its slot (cookie mode after a Resume's invalidate())
+			// starts with its previous holders still seated; with all ten out
+			// there is no seat for us either — an eleventh lease on one
+			// credential is what earns a 486 — so the credential is kept and we
+			// park: those holders' releases announce the room.
+			held := cp.outstandingLocked(target, creds)
+			cp.pool[target] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: held, gen: gen}
+			if held >= connsPerSlot {
+				wake := cp.slotAvailableCh
+				cp.mu.Unlock()
+				if target < len(cp.authErrors) {
+					cp.authErrors[target].Store(0)
+				}
+				cp.saveToDisk()
+				log.Printf("credpool: conn %d: slot %d's credential was issued again with its %d previous holders still out — kept, no seat until they release", connIdx, target, held)
+				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's credential was issued again with its %d previous holders still out — parking until they release", target, held), wake: wake}
+			}
+			cp.seatLocked(target)
 		} else {
 			got, why = cp.placeIntoEmptySlotLocked(addr, creds, 1)
 		}
@@ -2202,9 +2251,6 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			log.Printf("credpool: conn %d: slot %d changed hands during the fetch — fetched cred dropped (%s)", connIdx, target, why)
 			fetchErr = fmt.Errorf("credpool: slot %d changed hands during the fetch, fetched cred dropped (%s)", target, why)
 		} else {
-			// Seated on the credential just fetched — in its own slot or, moved,
-			// in an empty one: either way `active: 1` above is this lease.
-			cp.liveLeases++
 			filled := cp.countFreshLocked()
 			cp.mu.Unlock()
 			if got == target {
@@ -2239,8 +2285,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// one. logSkips=false because Phase 1's initial scan already
 	// emitted any per-slot "VK-saturated" lines for these slots.
 	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, false); slot >= 0 {
-		cp.pool[slot].active++
-		cp.liveLeases++
+		cp.seatLocked(slot)
 		e := cp.pool[slot]
 		cp.mu.Unlock()
 		var tag string
@@ -2282,10 +2327,19 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 // invalidateEntry empty a slot under its holders. What sits there then is
 // ANOTHER identity with its own holders: an old lease's release must not take
 // one of THEIR seats (the pool would under-count, seat an eleventh and earn a
-// 486), stamp THEIR lastUsedAt or announce room on THEIR slot. So the entry is
-// touched only while it still holds the leased username — holdsLocked, the
-// rule noteAllocated applies to the success mark — and the lease itself is
-// taken off liveLeases either way: it has ended whatever the slot holds.
+// 486), stamp THEIR lastUsedAt or announce room on THEIR slot. So the lease
+// comes off the record of what it was taken ON (credPool.holders — it has
+// ended whatever the slot holds now), and the entry is touched only while it
+// still holds the leased username (holdsLocked, the rule noteAllocated applies
+// to the success mark).
+//
+// 🚨 And when the slot holds the SAME username issued again — cookie mode
+// after a Resume's invalidate() — the entry IS this lease's: it was published
+// with the record's count (outstandingLocked), so the old holders are still
+// seated on it and this release frees a seat that was really taken. By
+// username alone, with the count restarted at 0, such a release made ten new
+// holders look like nine, announced room and let an eleventh onto the
+// credential (the user's review of build 409).
 func (cp *credPool) release(slot int, creds *TURNCreds) {
 	if slot < 0 {
 		return
@@ -2295,12 +2349,25 @@ func (cp *credPool) release(slot int, creds *TURNCreds) {
 		cp.mu.Unlock()
 		return
 	}
-	if cp.liveLeases > 0 {
-		cp.liveLeases--
+	// The lease comes off the record of what it was taken on. No such lease
+	// out — a stray or doubled release, a nil credential — changes nothing.
+	if creds == nil {
+		cp.mu.Unlock()
+		return
+	}
+	k := leaseKeyOf(slot, creds)
+	switch out := cp.holders[k]; {
+	case out == 0:
+		cp.mu.Unlock()
+		return
+	case out == 1:
+		delete(cp.holders, k)
+	default:
+		cp.holders[k] = out - 1
 	}
 	if !cp.holdsLocked(slot, creds) {
 		refilled := cp.pool[slot].creds != nil
-		live := cp.liveLeases
+		live := cp.liveLeasesLocked()
 		cp.mu.Unlock()
 		if refilled {
 			// An emptied slot (a Resume's invalidate) is the ordinary case and
@@ -2336,6 +2403,37 @@ func (cp *credPool) release(slot int, creds *TURNCreds) {
 	if slotBecomesUsable {
 		cp.broadcastSlotAvailable()
 	}
+}
+
+// outstandingLocked is how many leases are still out on (slot, creds) — what
+// an entry's `active` starts from when that credential is published into
+// that slot. Caller holds cp.mu.
+func (cp *credPool) outstandingLocked(slot int, creds *TURNCreds) int {
+	if creds == nil {
+		return 0
+	}
+	return cp.holders[leaseKeyOf(slot, creds)]
+}
+
+// seatLocked takes one more seat on the credential slot holds: the entry's
+// count and the record move together — the one way a seat is taken. Caller
+// holds cp.mu; the slot holds a credential.
+func (cp *credPool) seatLocked(slot int) {
+	cp.pool[slot].active++
+	if cp.holders == nil {
+		cp.holders = make(map[leaseKey]int)
+	}
+	cp.holders[leaseKeyOf(slot, cp.pool[slot].creds)]++
+}
+
+// liveLeasesLocked is the number of leases still out, on whatever credential.
+// Caller holds cp.mu.
+func (cp *credPool) liveLeasesLocked() int {
+	n := 0
+	for _, c := range cp.holders {
+		n += c
+	}
+	return n
 }
 
 // holdsLocked reports whether slot still holds the credential a lease named —
@@ -2540,14 +2638,15 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 	// the marking log itself was lost.
 	markedSlots := make([]int, 0, cp.size)
 	// live: sessions run on this pool's credentials right now — this event has
-	// something to protect and counts for cascade detection. 🚨 Counted per
-	// LEASE, not per entry: a slot the grower refilled under its sessions
-	// restarts its `active` at 0, and an entry-by-entry reading answered
+	// something to protect and counts for cascade detection. 🚨 Read from the
+	// record of leases still out (credPool.holders), not from the entries: a
+	// slot the grower refilled under its sessions starts its `active` at the NEW
+	// identity's count, 0, and an entry-by-entry reading answered
 	// "nothing live" with forty sessions up, leaving the cascade detector
 	// unarmed (the field run of 2026-09-18). The per-slot marking below still
 	// reads the entry's own `active`, and rightly: a refilled slot holds a new
 	// identity with no allocation at the relay — nothing there to bench.
-	live := cp.liveLeases > 0
+	live := len(cp.holders) > 0
 	for slot := 0; slot < cp.size && slot < len(cp.pool); slot++ {
 		e := cp.pool[slot]
 		// Skip already-saturated (re-marking is no-op but spams logs)
@@ -2837,7 +2936,11 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 		// is paid for, it goes into the slot whatever the count is now (see
 		// the doc comment — the discard this replaced cost more than it
 		// saved). The ownership check above is the only gate.
-		cp.pool[slot] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), gen: gen}
+		// `active` from the record of leases still out on this (slot,
+		// credential): 0 for a new identity — the old identity's sessions are
+		// counted under THEIR key and their releases never reach this entry —
+		// and the previous holders when the same credential is issued again.
+		cp.pool[slot] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: cp.outstandingLocked(slot, creds), gen: gen}
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()
 		log.Printf("credpool: background filled slot %d (%d/%d slots filled)", slot, filled, cp.size)
@@ -2916,7 +3019,10 @@ func (cp *credPool) placeIntoEmptySlotLocked(addr string, creds *TURNCreds, acti
 	for i := range cp.pool {
 		if cp.pool[i].creds == nil && !cp.pool[i].fetching {
 			cp.nextGen++
-			cp.pool[i] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: active, gen: cp.nextGen}
+			cp.pool[i] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: cp.outstandingLocked(i, creds), gen: cp.nextGen}
+			for n := 0; n < active; n++ {
+				cp.seatLocked(i) // the caller's own seat(s) — `active` of them
+			}
 			return i, ""
 		}
 	}

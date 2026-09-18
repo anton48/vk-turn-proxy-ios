@@ -180,8 +180,8 @@ func TestRetryWaitsTakeTheParkErrorsChannel(t *testing.T) {
 	}
 	c := string(creds)
 	parks := regexp.MustCompile(`&poolParkError\{`).FindAllStringIndex(c, -1)
-	if len(parks) != 4 {
-		t.Fatalf("creds.go constructs poolParkError %d times, want 4 (the pause, the relay-refusal breaker's mint pause, the cold-start cap, no slot)", len(parks))
+	if len(parks) != 5 {
+		t.Fatalf("creds.go constructs poolParkError %d times, want 5 (the pause, the relay-refusal breaker's mint pause, the cold-start cap, no slot, a credential issued again with all its previous holders still out)", len(parks))
 	}
 	for _, m := range parks {
 		window := c[max(0, m[0]-400):m[0]]

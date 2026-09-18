@@ -2042,6 +2042,18 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		default:
 			err = p.runDirectSession(connCtx, linkID, readyCh, &signaled, connIdx)
 		}
+		// The retry floor's streak (retryfloor.go) ends on a session that CAME
+		// UP in this iteration — whatever it returned afterwards. 🚨 Asked here,
+		// not under `err != nil` below: runSRTPSession and runDTLSSession return
+		// nil after wg.Wait, also when an established session has dropped, and
+		// the next iteration can no longer see this one's stamp (it asks
+		// "since MY start") — a streak kept across a working session would
+		// hold the next failure's wake for seconds instead of 250 ms (the
+		// user's review of build 409).
+		established := p.ups.since(connIdx, start)
+		if established {
+			floor.reset()
+		}
 		// A restart WE asked for (a path-up) ended this session, not the
 		// path: no failure count, no dormancy, a sub-second stagger so the
 		// thirty re-dials do not land in one instant, and on to a session
@@ -2070,15 +2082,12 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				return err
 			}
 
-			// The retry floor (retryfloor.go). A session that came up in this
-			// iteration ends the streak whatever ended it later; a failure with no
-			// session and no answer from the pool, VK or the relay is the network's
-			// — it extends the streak, and the wait below holds a slot-available
-			// wake back under the floor.
+			// The retry floor (retryfloor.go): a failure with no session in this
+			// iteration and no answer from the pool, VK or the relay is the
+			// network's — it extends the streak, and the wait below holds a
+			// slot-available wake back under the floor.
 			floored := false
-			if p.ups.since(connIdx, start) {
-				floor.reset()
-			} else if isNetworkClassFailure(err) {
+			if !established && isNetworkClassFailure(err) {
 				floor.noteNetworkFailure(time.Now())
 				floored = true
 			}

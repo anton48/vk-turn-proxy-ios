@@ -224,6 +224,97 @@ func TestAHerdOfInstantFailuresIsBoundedByTheFloor(t *testing.T) {
 	}
 }
 
+// A session that CAME UP ends the streak WHATEVER IT RETURNED (the user's review
+// of build 409). runSRTPSession and runDTLSSession return nil after wg.Wait —
+// also when an established session has dropped — and the reset sat under
+// `err != nil`: the next iteration cannot see the previous one's stamp, so the
+// streak survived a working session and the next failure's wake was held for
+// seconds. Through runConnection, one connection, slot-available broadcast every
+// 5 ms: two network-class failures (k = 2), a session that comes up and
+// returns, then a failure — its wake must be held ~250 ms (k = 1), not ~1 s
+// (k = 3). The arm whose session returns an ERROR was right before and must
+// stay so. Sabotages seen red: the reset back under the error branch (the nil
+// arm alone reddens: held 1 s); a failure after a session that came up still
+// classed as the network's (the error arm reddens: its next attempt waits
+// 250 ms instead of starting at once).
+func TestASessionThatCameUpEndsTheStreakWhateverItReturned(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		after error
+	}{
+		{"it returned nil, as the SRTP and DTLS sessions do after wg.Wait", nil},
+		{"it returned an error", errors.New("SRTP: read tcp: connection reset by peer")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cp := newCredPool(ctx, 12, 2*time.Minute, "", func(_ bool, slot int) (string, *TURNCreds, error) {
+				return "", nil, fmt.Errorf("unexpected mint into slot %d", slot)
+			})
+			p := &Proxy{ctx: ctx, credPool: cp}
+			var mu sync.Mutex
+			var starts []time.Time
+			p.sessionHook = func(hctx context.Context, connIdx int) error {
+				mu.Lock()
+				starts = append(starts, time.Now())
+				n := len(starts)
+				mu.Unlock()
+				switch n {
+				case 1, 2, 4:
+					return errors.New("SRTP setup: TURN dial: dial tcp 95.163.34.180:19302: connect: no route to host")
+				case 3:
+					p.noteSessionUp(connIdx) // the session came up …
+					return c.after           // … and ended
+				default:
+					<-hctx.Done()
+					return hctx.Err()
+				}
+			}
+			go func() { // every wait is signalled at once: only the floor holds a retry back
+				tick := time.NewTicker(5 * time.Millisecond)
+				defer tick.Stop()
+				for {
+					select {
+					case <-tick.C:
+						cp.broadcastSlotAvailable()
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+			done := make(chan struct{})
+			go func() { defer close(done); _ = p.runConnection(ctx, "", nil, 0) }()
+			deadline := time.After(6 * time.Second)
+			for {
+				mu.Lock()
+				n := len(starts)
+				mu.Unlock()
+				if n >= 5 {
+					break
+				}
+				select {
+				case <-deadline:
+					t.Fatalf("only %d attempts in 6 s", n)
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+			cancel()
+			<-done
+			mu.Lock()
+			defer mu.Unlock()
+			if g := starts[2].Sub(starts[1]); g < 450*time.Millisecond || g > 900*time.Millisecond {
+				t.Fatalf("the gap after the SECOND failure = %s, want ~500 ms — the fixture is not exercising the floor", g.Round(time.Millisecond))
+			}
+			if g := starts[3].Sub(starts[2]); g > 200*time.Millisecond {
+				t.Fatalf("the attempt after the session that came up started %s later, want at once — that iteration was no network failure", g.Round(time.Millisecond))
+			}
+			if g := starts[4].Sub(starts[3]); g < 200*time.Millisecond || g > 700*time.Millisecond {
+				t.Fatalf("the wake after the first failure FOLLOWING a session that came up was held %s, want ~250 ms (a new streak, k = 1) — the streak of the two failures before that session was kept (k = 3 holds 1 s)", g.Round(time.Millisecond))
+			}
+		})
+	}
+}
+
 // The wiring, by property: both retry waits go through waitRetry with the
 // connection's floor and its classification; the streak ends on the
 // connection's own session and on a restart by request, never on a signal
@@ -253,6 +344,12 @@ func TestTheRetryWaitsConsultTheFloor(t *testing.T) {
 	}
 	if i := strings.Index(rc, "case retryWakeSignal:"); i < 0 || strings.Contains(rc[i:], "floor.reset()") {
 		t.Error("runConnection: a signal wake resets the floor's streak (or the dormancy's signal arm is gone) — the streak ends on evidence that the network works, never on a wake")
+	}
+	if est, errBranch := strings.Index(rc, "established := p.ups.since(connIdx, start)"), strings.Index(rc, "if err != nil {"); est < 0 || errBranch < 0 || est > errBranch {
+		t.Error("runConnection asks whether a session came up inside the error branch (or not at all) — a session that came up and returned nil would keep the streak")
+	}
+	if !strings.Contains(rc, "if established {\n\t\t\tfloor.reset()") || !strings.Contains(rc, "if !established && isNetworkClassFailure(err) {") {
+		t.Error("runConnection: the streak's reset is conditioned on something besides the session having come up, or a failure after one still counts as the network's")
 	}
 	if !strings.Contains(rc, "p.ups.since(connIdx, start)") || !strings.Contains(rc, "isNetworkClassFailure(err)") {
 		t.Error("runConnection does not classify the failure by what happened: no session in this iteration and no answer from the pool, VK or the relay")

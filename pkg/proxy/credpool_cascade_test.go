@@ -9,12 +9,14 @@ import (
 
 const cascadeTestRelay = "95.163.34.180:19302"
 
-// seatLocked puts n holders on slot the way get() seats them: the entry's own
-// count and the pool's lease count move together (the path-change gate reads
-// the leases, the per-slot marking the entry). Caller holds cp.mu.
-func seatLocked(cp *credPool, slot, n int) {
-	cp.pool[slot].active += n
-	cp.liveLeases += n
+// seatHolders puts n holders on slot the way get() seats them — through the
+// pool's own seatLocked, so the entry's count and the record of leases still
+// out move together (the path-change gate reads the record, the per-slot
+// marking the entry). Caller holds cp.mu; the slot holds a credential.
+func seatHolders(cp *credPool, slot, n int) {
+	for i := 0; i < n; i++ {
+		cp.seatLocked(slot)
+	}
 }
 
 // cascadePool is a 12-slot pool with creds in the first three slots and
@@ -69,7 +71,7 @@ func TestStartReportOnAnIdlePoolDoesNotArmTheCascadeDetector(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	cp.mu.Lock()
 	for i := 0; i < 3; i++ {
-		seatLocked(cp, i, 10)
+		seatHolders(cp, i, 10)
 	}
 	cp.mu.Unlock()
 	cp.MarkInUseSlotsForPathChange()
@@ -161,7 +163,7 @@ func TestSaturatedSlotsWithSessionsStillCountAsLive(t *testing.T) {
 	cp.mu.Lock()
 	for i := 0; i < 3; i++ {
 		cp.pool[i].saturatedUntil = time.Now().Add(10 * time.Minute)
-		seatLocked(cp, i, 10)
+		seatHolders(cp, i, 10)
 	}
 	cp.mu.Unlock()
 	cp.MarkInUseSlotsForPathChange()
