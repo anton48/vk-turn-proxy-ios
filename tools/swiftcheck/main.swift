@@ -2624,6 +2624,40 @@ do {
               && !cvg.contains("Uses the saved VK login if there is one."),
               "🚨 the flow's needs-login answer defers to the rule's reason, and the description no longer calls the login optional")
     }
+    // 🚨 THE "Internet" BOX NEVER SHOWS A STALE ANSWER AS THE CURRENT ONE (the
+    // user's screenshot, 2026-09-19: "28 ms" over a tunnel dead for three
+    // hours). The box is the app's TCP connect through the tunnel; it was
+    // written only on success, so a failed or timed-out connect left the last
+    // good value standing. Every outcome now goes through one rule, and a
+    // measurement that did not complete clears the box ("—").
+    do {
+        typealias R = InternetRTTReading
+        check(R.value(after: .connected(milliseconds: 28.4)) == 28.4, "a completed connect shows its time")
+        check(R.value(after: .failed) == 0 && R.value(after: .timedOut) == 0,
+              "🚨 a failed or timed-out connect CLEARS the box — 0 is what the screen renders as \"—\"")
+        check(R.value(after: .connected(milliseconds: 0)) == 0 && R.value(after: .connected(milliseconds: -3)) == 0,
+              "a nonsensical time is no reading")
+
+        let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+        var body = ""
+        if let from = tm.range(of: "private func measureInternetRTT() {"),
+           let to = tm.range(of: "\n    }\n", range: from.upperBound..<tm.endIndex) {
+            body = String(tm[from.upperBound..<to.lowerBound])   // the scope ends at the function's closing brace
+        }
+        check(!body.isEmpty, "measureInternetRTT is where the harness expects it")
+        check(body.contains("publishInternetRTT(.connected(milliseconds: elapsed))")
+              && body.contains("publishInternetRTT(.failed)")
+              && body.contains("publishInternetRTT(.timedOut)"),
+              "🚨 all three ends of a measurement — connected, failed, timed out — publish their outcome")
+        check(!body.contains("internetRTTms"),
+              "🚨 the measurement writes the box through the rule only — no direct write that could skip the failed arms")
+        check(tm.contains("self?.live.internetRTTms = InternetRTTReading.value(after: outcome)")
+              && tm.components(separatedBy: "internetRTTms = ").count - 1 == 3,
+              "the box has three writers: the rule's, and the two resets on disconnect")
+        let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ContentView.swift")
+        check(cv.contains("live.internetRTTms > 0 ? String(format: \"%.0f ms\", live.internetRTTms) : \"—\""),
+              "the screen renders a cleared box as \"—\"")
+    }
     // 🚨 AN UNSEEDED csqtt START THAT WILL MEET A CAPTCHA IS NOT STARTED (§168,
     // the user's decisions, 2026-09-16): from the Live Activity's picker and the
     // DIRECT repair the app cannot show the captcha WebView, and a captcha on

@@ -54,7 +54,7 @@ func newFakeClient() *fakeClient {
 	return &fakeClient{
 		up: make(chan []byte, 64), down: make(chan []byte, 64), done: make(chan struct{}),
 		conf:  csqtt.ConfigResponse{TunnelIP: "10.66.67.3", DNS: "77.88.8.8,77.88.8.1", StreamRevision: "stream-v2", Raw: "TUNCONF:10.66.67.3:77.88.8.8,77.88.8.1:9000:stream-v2"},
-		stats: csqtt.Stats{TxBytes: 1234, RxBytes: 5678, Ready: 7, Total: 30, Restarts: 3, AllocateRTT: 131 * time.Millisecond},
+		stats: csqtt.Stats{TxBytes: 1234, RxBytes: 5678, Ready: 9, Live: 7, Total: 30, Restarts: 3, AllocateRTT: 131 * time.Millisecond},
 	}
 }
 
@@ -560,9 +560,11 @@ func TestCsqttClientDeathReachesSwift(t *testing.T) {
 
 // The stats JSON carries the keys Swift's TunnelStats decodes — pinned here
 // as the literal list from TunnelManager.swift's CodingKeys — with csqtt's
-// counters under the app's meanings: active/total conns are ready/total
-// workers, the RTT is the relay allocation, reconnects are restarts.
-// Sabotage seen red: active_conns mapped from Total.
+// counters under the app's meanings: active/total conns are LIVE/total
+// workers (the fake has nine ready and seven of them heard from lately — a
+// worker "ready" on a dead allocation is no connection), the RTT is the relay
+// allocation, reconnects are restarts. Sabotages seen red: active_conns
+// mapped from Total; active_conns mapped from Ready.
 func TestCsqttStatsCarryTheAppsKeys(t *testing.T) {
 	var mints atomic.Int32
 	installFakePool(t, mintingFetch(&mints))
@@ -589,7 +591,7 @@ func TestCsqttStatsCarryTheAppsKeys(t *testing.T) {
 	var st proxy.Stats
 	_ = json.Unmarshal([]byte(raw), &st)
 	if st.ActiveConns != 7 || st.TotalConns != 30 || st.Reconnects != 3 || st.TxBytes != 1234 || st.RxBytes != 5678 || st.TurnRTTms != 131 {
-		t.Fatalf("stats mapping: %+v — want ready 7 / total 30 / restarts 3 / bytes 1234,5678 / RTT 131 ms", st)
+		t.Fatalf("stats mapping: %+v — want live 7 (not ready 9) / total 30 / restarts 3 / bytes 1234,5678 / RTT 131 ms", st)
 	}
 	if st.CredPoolSize == 0 || st.CredPoolWithCreds == 0 {
 		t.Fatalf("pool stats missing: %+v", st)

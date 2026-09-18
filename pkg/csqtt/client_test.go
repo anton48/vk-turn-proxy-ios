@@ -866,3 +866,174 @@ func TestRefusedAllocationReachesTheLeaseBeforeRelease(t *testing.T) {
 		t.Fatalf("handed %d credentials, lease saw %q — want 2 handed and %q (the refusal first, with the relay's error, then the release)", handed, events, want)
 	}
 }
+
+// longReady makes every worker look ready for a minute: the deafness rule does
+// not judge a worker inside its readyGrace.
+func longReady(c *Client) {
+	for _, w := range c.workers {
+		w.readyAt.Store(time.Now().Add(-time.Minute).UnixNano())
+	}
+}
+
+func deafen(c *Client) {
+	for i := range c.workers {
+		c.Blackhole(i+1, true)
+	}
+}
+
+// oneNewPairForAll: the GETCONFs after `first` carry ONE identity, newer than
+// the first one, from every worker.
+func oneNewPairForAll(t *testing.T, srv *fakeServer, first []getconfSeen, workers int) {
+	t.Helper()
+	after := srv.seen()[len(first):]
+	seen := map[string]bool{}
+	for _, g := range after {
+		if g.gen <= first[0].gen || g.salt == first[0].salt || g.gen != after[0].gen || g.salt != after[0].salt {
+			t.Fatalf("a GETCONF after the restart-all: gen %s salt %s (was gen %s) — want ONE new pair for every worker: the server keys the epoch on the pair, and the old sessions must go", g.gen, g.salt, first[0].gen)
+		}
+		seen[g.worker] = true
+	}
+	if len(seen) != workers {
+		t.Fatalf("workers that re-announced: %v, want all %d", seen, workers)
+	}
+}
+
+// The monitor's side of deafness, driven tick by tick with the test's own
+// clock: every worker ready and deaf (the blackhole fault: the relay path is
+// dead from our side, nothing fails) — after thirty seconds of total silence
+// every ready worker is asked AT ONCE, and thirty seconds after an unanswered
+// round every worker is replaced under ONE new identity. Until the fix the
+// per-worker rule alone sat here for ever. Sabotages seen red: the monitor
+// never consulting the deafness rule; the restart-all keeping the old identity;
+// a probe round at every tick instead of one per silence.
+func TestAllDeafWorkersAreAskedAtOnceAndThenReplacedTogether(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	_, readies0, _ := srv.counts()
+	deafen(c)
+	start := time.Now() // the silence is counted from here, to the tick
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	step := func(from, to int) {
+		for s := from; s <= to; s += 5 {
+			c.monitorStep(start.Add(time.Duration(s) * time.Second))
+		}
+	}
+
+	step(5, 25)
+	if st := c.Stats(); st.Probes != 0 || st.DeafAll != 0 {
+		t.Fatalf("twenty-five seconds of silence already acted: %+v", st)
+	}
+	step(30, 30) // thirty seconds of total silence: the round
+	waitFor(t, "a READY from both workers — the round", func() bool { _, r, _ := srv.counts(); return r >= readies0+2 })
+	step(35, 55) // the answers are blackholed: still total silence, and the round is out
+	if st := c.Stats(); st.Probes != 2 || st.DeafAll != 0 {
+		t.Fatalf("twenty-five seconds after the round: probes %d (want 2 — ONE round, not one per tick), restart-alls %d (want 0)", st.Probes, st.DeafAll)
+	}
+	step(60, 60) // thirty seconds after the unanswered round
+	if st := c.Stats(); st.DeafAll != 1 {
+		t.Fatalf("restart-alls thirty seconds after an unanswered round: %d, want 1", st.DeafAll)
+	}
+	waitFor(t, "both workers back under the new identity", func() bool { g, _, _ := srv.counts(); return g >= len(first)+2 })
+	oneNewPairForAll(t, srv, first, 2)
+	waitFor(t, "both workers ready again", func() bool { return c.Stats().Ready == 2 })
+	if st := c.Stats(); st.LostWorkers != 0 || st.PathChanges != 0 {
+		t.Fatalf("the restart-all was booked as something else: %+v", st)
+	}
+}
+
+// The wake's side: the hook's probes are a round, and total silence
+// wakeDeafAfter later is the verdict — the user has the phone in hand. The
+// control is a healthy client: its probes are answered and nothing restarts.
+// And a verdict timer that fires LATE was frozen with the process — it judges
+// nothing. Sabotages seen red: the wake hook not arming the verdict; the late
+// timer acting all the same.
+func TestTheWakeVerdictReplacesDeafWorkersWithinSeconds(t *testing.T) {
+	old := wakeDeafAfter
+	wakeDeafAfter = 150 * time.Millisecond
+	defer func() { wakeDeafAfter = old }()
+
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+
+	c.WakeHealthCheck() // healthy: READY_OK comes back
+	time.Sleep(3 * wakeDeafAfter)
+	if g, _, _ := srv.counts(); g != len(first) || c.Stats().DeafAll != 0 {
+		t.Fatalf("a HEALTHY client was restarted after its wake: %d new GETCONF(s), %d restart-all(s)", g-len(first), c.Stats().DeafAll)
+	}
+
+	deafen(c)
+	// A wake round a minute old and unanswered, and its timer firing only now:
+	// the timer slept through a freeze with the process. (The state is set by
+	// hand — a real hook would arm a real timer — and the next wake replaces it.)
+	stale := time.Now().Add(-time.Minute).UnixNano()
+	c.anyRx.Store(stale)
+	c.roundIsWake.Store(true)
+	c.roundAt.Store(stale)
+	c.wakeVerdict(stale)
+	if st := c.Stats(); st.DeafAll != 0 {
+		t.Fatal("a wake verdict that fired a minute late judged all the same")
+	}
+
+	t0 := time.Now()
+	c.WakeHealthCheck()
+	waitFor(t, "both workers back under the new identity", func() bool { g, _, _ := srv.counts(); return g >= len(first)+2 })
+	if took := time.Since(t0); took > 2*time.Second {
+		t.Fatalf("the restart-all came %s after the wake", took.Round(10*time.Millisecond))
+	}
+	oneNewPairForAll(t, srv, first, 2)
+	if st := c.Stats(); st.DeafAll != 1 {
+		t.Fatalf("restart-alls after one deaf wake: %d, want 1", st.DeafAll)
+	}
+}
+
+// An unfreeze runs the monitor's LATE tick and the wake hook side by side.
+// When the hook gets in first, the late tick's clock reset must not make the
+// hook's probe round read as answered — the wake verdict would be lost exactly
+// when it is needed. Sabotage seen red: the reset voiding the round.
+func TestALateTickDoesNotVoidTheWakeRoundThatBeatIt(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	deafen(c)
+	now := time.Now()
+	c.lastTick.Store(now.Add(-10 * time.Minute).UnixNano()) // the monitor last ran before the freeze
+	prevBeforeHook := nanosTime(c.lastTick.Load())
+	c.WakeHealthCheck()                         // the hook first: clocks reset, a round out, the tick mark moved …
+	c.lastTick.Store(prevBeforeHook.UnixNano()) // … but this tick had read its mark BEFORE the hook moved it
+	c.monitorStep(time.Now())                   // late by ten minutes: every clock restarts
+	if st := c.Stats(); st.Descheduled != 1 || st.DeafAll != 0 {
+		t.Fatalf("the late tick: descheduled %d (want 1), restart-alls %d (want 0)", st.Descheduled, st.DeafAll)
+	}
+	c.monitorStep(time.Now().Add(wakeDeafAfter + time.Second)) // the round still stands, unanswered
+	if st := c.Stats(); st.DeafAll != 1 {
+		t.Fatalf("restart-alls once the wake round had gone unanswered: %d, want 1 — the late tick's reset made the round read as answered", st.DeafAll)
+	}
+}
+
+// What the app shows as connections is LIVE, not ready: a worker that reached
+// READY_OK once stays ready until something restarts it, and the field screen
+// read 30/30 over a dead tunnel. Sabotage seen red: Live counted as Ready.
+func TestStatsCountAsLiveOnlyWorkersHeardFromLately(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	if st := c.Stats(); st.Ready != 2 || st.Live != 2 {
+		t.Fatalf("two fresh workers: ready %d, live %d — want 2 and 2", st.Ready, st.Live)
+	}
+	c.workers[0].lastRx.Store(time.Now().Add(-liveWindow - time.Second).UnixNano())
+	if st := c.Stats(); st.Ready != 2 || st.Live != 1 {
+		t.Fatalf("one worker unheard for longer than the window: ready %d, live %d — want 2 and 1", st.Ready, st.Live)
+	}
+}

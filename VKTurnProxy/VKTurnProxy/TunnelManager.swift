@@ -2721,12 +2721,11 @@ class TunnelManager: ObservableObject {
                 done = true
                 let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
                 connection.cancel()
-                Task { @MainActor in
-                    self?.live.internetRTTms = elapsed
-                }
+                self?.publishInternetRTT(.connected(milliseconds: elapsed))
             case .failed(_):
                 done = true
                 connection.cancel()
+                self?.publishInternetRTT(.failed)
             case .cancelled:
                 done = true
             default:
@@ -2735,12 +2734,24 @@ class TunnelManager: ObservableObject {
         }
         connection.start(queue: queue)
 
-        // Timeout after 5 seconds
-        queue.asyncAfter(deadline: .now() + 5) {
+        // Timeout after 5 seconds. A connect that is still `.waiting` by then (no
+        // route, a dead tunnel) never reaches `.failed` — this is where a dead
+        // tunnel is SEEN, and the box must say so (InternetRTTReading).
+        queue.asyncAfter(deadline: .now() + 5) { [weak self] in
             if !done {
                 done = true
                 connection.cancel()
+                self?.publishInternetRTT(.timedOut)
             }
+        }
+    }
+
+    /// Every outcome of a measurement reaches the box through the one rule — a
+    /// failed or timed-out connect CLEARS it, it never leaves the last good
+    /// value standing.
+    private nonisolated func publishInternetRTT(_ outcome: InternetRTTReading.Outcome) {
+        Task { @MainActor [weak self] in
+            self?.live.internetRTTms = InternetRTTReading.value(after: outcome)
         }
     }
 

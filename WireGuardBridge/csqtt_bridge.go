@@ -856,13 +856,14 @@ func csqttLogPathSnapshot(handle C.int32_t, label *C.char) {
 		return
 	}
 	s := c.Stats()
-	log.Printf("csqtt: pathstats %s: workers %d/%d ready, restarts %d, repairs %d, probes %d, lost %d; tun in=%d out=%d",
-		l, s.Ready, s.Total, s.Restarts, s.Repairs, s.Probes, s.LostWorkers, e.tunIn.Load(), e.tunOut.Load())
+	log.Printf("csqtt: pathstats %s: workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d, lost %d, deaf restart-alls %d; tun in=%d out=%d",
+		l, s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.LostWorkers, s.DeafAll, e.tunIn.Load(), e.tunOut.Load())
 }
 
 // Stats in the app's shape — the same struct the WireGuard path marshals,
 // so the keys cannot drift from Swift's TunnelStats. active/total conns are
-// ready/total workers, the RTT is the last relay allocation, reconnects are
+// LIVE/total workers (live = ready AND heard from lately — see csqtt.Stats),
+// the RTT is the last relay allocation, reconnects are
 // worker restarts; auth_error is the cookie latch exactly as on the native
 // path (a csqtt terminal reason is csqttGetError's). "{}" on an unknown handle.
 //
@@ -903,7 +904,10 @@ func csqttAppStats(e *csqttEntry) proxy.Stats {
 		cs := c.Stats()
 		s.TxBytes = cs.TxBytes
 		s.RxBytes = cs.RxBytes
-		s.ActiveConns = int32(cs.Ready)
+		// LIVE, not ready: a worker stays "ready" on an allocation the relay no
+		// longer has (a freeze that outlasted it) until something restarts it,
+		// and the screen once read 30/30 over a tunnel dead for three hours.
+		s.ActiveConns = int32(cs.Live)
 		s.TotalConns = int32(cs.Total)
 		s.TurnRTTms = float64(cs.AllocateRTT) / 1e6
 		s.Reconnects = cs.Restarts

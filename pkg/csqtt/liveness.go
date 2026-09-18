@@ -150,3 +150,107 @@ func livenessVerdict(in livenessInput) livenessAction {
 	}
 	return livenessNone
 }
+
+// ─── deafness: NOBODY hears anything ────────────────────────────────────────
+
+// Rule 3 above leaves a silent worker alone while NO worker hears anything —
+// one worker's silence among deaf peers says nothing about that worker. But the
+// rule has no exit of its own, and a cause common to every worker is not always
+// "the path is down": an iOS freeze that outlasts the TURN allocations (field,
+// 2026-09-18: 578 s) leaves every worker "ready" on an allocation the relay no
+// longer has. Over a TCP relay leg that announces itself — the relay resets the
+// connection, the read fails, the worker restarts. Over UDP NOTHING announces
+// it: a UDP write never fails, the TURN library reports a refused refresh as a
+// success, and every probe goes into the void — the tunnel stayed dead for
+// three hours with thirty "ready" workers. So deafness is judged for the
+// client as a whole: ask every ready worker at once, and when none answers,
+// replace them all (a new identity, as a path change does). The relay dials of
+// the restarted workers then tell "the path is down" from "the allocations
+// were": nobody becomes ready on a dead path, and with nobody ready this rule
+// rests — the workers' own dial backoff is the recovery there.
+const (
+	deafSpacing    = 30 * time.Second // the least time between two restart-alls, doubled per round …
+	deafSpacingCap = 5 * time.Minute
+	deafQuiet      = 10 * time.Minute // … of a run; a restart-all this long ago ends the run
+
+	// liveWindow: a ready worker heard from within this is LIVE in the stats.
+	// An idle healthy worker is probed after probeAfter of silence, at the next
+	// tick, and answered an RTT later — so its silence peaks near 36 s.
+	liveWindow = 45 * time.Second
+)
+
+// wakeDeafAfter: how long after the WAKE hook's probe round total silence is a
+// verdict. The user has just picked the phone up, every ready worker was asked
+// at once, and an answer takes ~100 ms in the field; the monitor's own round
+// waits deadAfterProbe like any probe. A variable so a test need not wait it out.
+var wakeDeafAfter = 5 * time.Second
+
+// deafInput is the client's view at a monitor tick or at the wake verdict.
+type deafInput struct {
+	Now            time.Time
+	PrevTick       time.Time // the monitor's previous tick; zero when the caller is not the monitor
+	Judgeable      int       // workers ready for at least readyGrace
+	AnyRx          time.Time // last inbound on ANY worker — or the last clock reset
+	RoundAt        time.Time // when every ready worker was last probed as a ROUND; zero if never
+	RoundIsWake    bool      // that round was the wake hook's
+	LastRestartAll time.Time // zero if never
+	Rounds         int       // restart-alls in the current run
+}
+
+type deafAction int
+
+const (
+	deafNone       deafAction = iota
+	deafProbeAll              // total silence for probeAfter: ask every ready worker
+	deafRestartAll            // the round went unanswered: replace every worker
+	deafHeld                  // … but the previous restart-all is too recent
+)
+
+// deafSpacingFor is the least time after restart-all number `rounds` of a run
+// before the next one.
+func deafSpacingFor(rounds int) time.Duration {
+	if rounds <= 0 {
+		return 0
+	}
+	d := deafSpacing
+	for i := 1; i < rounds && d < deafSpacingCap; i++ {
+		d *= 2
+	}
+	if d > deafSpacingCap {
+		d = deafSpacingCap
+	}
+	return d
+}
+
+// deafVerdict is the rule, pure. Order of the checks is the rule:
+//  1. a late tick means descheduled — never judge (the monitor resets the clocks);
+//  2. with no worker ready past its grace there is nobody to be deaf: the
+//     workers are dialling, and their own backoff is the recovery;
+//  3. a probe round that is out and unanswered — nothing heard SINCE it — is a
+//     verdict once its wait has passed, unless the last restart-all is too recent;
+//  4. total silence for probeAfter with no round out → ask everybody.
+func deafVerdict(in deafInput) deafAction {
+	if !in.PrevTick.IsZero() && in.Now.Sub(in.PrevTick) > livenessTick+descheduledSlack {
+		return deafNone
+	}
+	if in.Judgeable == 0 {
+		return deafNone
+	}
+	if !in.RoundAt.IsZero() && !in.RoundAt.Before(in.AnyRx) {
+		wait := deadAfterProbe
+		if in.RoundIsWake {
+			wait = wakeDeafAfter
+		}
+		if in.Now.Sub(in.RoundAt) < wait {
+			return deafNone
+		}
+		if !in.LastRestartAll.IsZero() && in.Now.Sub(in.LastRestartAll) < deafSpacingFor(in.Rounds) {
+			return deafHeld
+		}
+		return deafRestartAll
+	}
+	if in.Now.Sub(in.AnyRx) >= probeAfter {
+		return deafProbeAll
+	}
+	return deafNone
+}

@@ -58,6 +58,7 @@ SOURCES=(
     "$S/DisconnectReason.swift"
     "$S/ConnectButtonAction.swift"
     "$S/VKCallCreationGate.swift"
+    "$S/InternetRTTReading.swift"
     "$S/UnseededStartPolicy.swift"
     "$S/PublishChain.swift"
     "$S/TurnCacheFiles.swift"

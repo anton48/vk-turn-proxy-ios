@@ -140,6 +140,17 @@ type Client struct {
 	lostToL  atomic.Int64 // workers restarted by the liveness verdict
 	lastTick atomic.Int64 // the monitor's previous tick (or a WakeHealthCheck), unix nanos
 
+	// deafness (see deafVerdict): judged for the client as a whole, by the
+	// monitor's tick and by the wake verdict — deafMu makes the two take turns,
+	// so one silence is answered by one restart-all.
+	deafMu       sync.Mutex
+	roundAt      atomic.Int64 // when every ready worker was last probed as a round, unix nanos; 0 if none is out
+	roundIsWake  atomic.Bool  // … by the wake hook
+	lastDeafAll  atomic.Int64 // the last restart-all, unix nanos
+	deafRounds   int          // restart-alls in the current run (under deafMu)
+	deafRestarts atomic.Int64 // restart-alls, ever
+	heldSaid     bool         // the spacing's hold was logged for this round (under deafMu)
+
 	// identity is the (generation, salt) pair every worker's GETCONF carries.
 	// OnPathChange replaces it ONCE for the whole client — the server's
 	// epoch rule then drops every session of the old pair — and every worker
@@ -223,6 +234,79 @@ func (c *Client) WakeHealthCheck() {
 	}
 	c.lastTick.Store(ns)
 	c.cfg.Logf("csqtt: wake — clocks reset, %d ready worker(s) probed", probed)
+	if probed == 0 {
+		return
+	}
+	// The probes just sent are a ROUND: if NO worker hears anything within
+	// wakeDeafAfter, every allocation died in the freeze (or the path did) and
+	// waiting for the monitor's thirty seconds serves nobody.
+	c.roundIsWake.Store(true)
+	c.roundAt.Store(ns)
+	time.AfterFunc(wakeDeafAfter, func() { c.wakeVerdict(ns) })
+}
+
+// wakeVerdict judges the wake hook's probe round. A timer that fires late was
+// itself frozen with the process: what it would read is older than it thinks,
+// and the next wake starts a round of its own.
+func (c *Client) wakeVerdict(armedNs int64) {
+	now := time.Now()
+	if c.ctx.Err() != nil || now.Sub(time.Unix(0, armedNs)) > wakeDeafAfter+descheduledSlack {
+		return
+	}
+	c.judgeDeaf(now, time.Time{})
+}
+
+// judgeDeaf applies deafVerdict. prevTick is the monitor's previous tick, zero
+// from the wake verdict (which checks its own lateness).
+func (c *Client) judgeDeaf(now, prevTick time.Time) {
+	c.deafMu.Lock()
+	defer c.deafMu.Unlock()
+	last := nanosTime(c.lastDeafAll.Load())
+	if !last.IsZero() && now.Sub(last) >= deafQuiet {
+		c.deafRounds = 0
+	}
+	in := deafInput{Now: now, PrevTick: prevTick, AnyRx: time.Unix(0, c.anyRx.Load()),
+		RoundAt: nanosTime(c.roundAt.Load()), RoundIsWake: c.roundIsWake.Load(),
+		LastRestartAll: last, Rounds: c.deafRounds}
+	for _, w := range c.workers {
+		if at := w.readyAt.Load(); at != 0 && now.Sub(time.Unix(0, at)) >= readyGrace {
+			in.Judgeable++
+		}
+	}
+	switch deafVerdict(in) {
+	case deafProbeAll:
+		probed := 0
+		for _, w := range c.workers {
+			if w.ready.Load() {
+				w.probe(now.UnixNano())
+				probed++
+			}
+		}
+		c.roundIsWake.Store(false)
+		c.roundAt.Store(now.UnixNano())
+		c.heldSaid = false
+		c.cfg.Logf("csqtt: no worker has heard anything for %s — %d ready worker(s) probed at once", now.Sub(in.AnyRx).Round(time.Second), probed)
+	case deafHeld:
+		if !c.heldSaid {
+			c.heldSaid = true
+			c.cfg.Logf("csqtt: deaf again — the restart of every worker is held until %s after the previous one (round %d of this run)",
+				deafSpacingFor(in.Rounds), in.Rounds)
+		}
+	case deafRestartAll:
+		c.identMu.Lock()
+		c.gen, c.salt = NewIdentity(c.gen)
+		gen := c.gen
+		c.identMu.Unlock()
+		c.deafRounds++
+		c.deafRestarts.Add(1)
+		c.lastDeafAll.Store(now.UnixNano())
+		c.roundAt.Store(0)
+		c.heldSaid = false
+		c.anyRx.Store(now.UnixNano()) // the silence that was judged ends here; the next one is counted afresh
+		c.cfg.Logf("csqtt: DEAF — %d ready worker(s) and not one answer %s after the probe round: every allocation is presumed dead, new identity gen=%d, restarting every worker (round %d)",
+			in.Judgeable, now.Sub(in.RoundAt).Round(100*time.Millisecond), gen, c.deafRounds)
+		c.restartAll("deaf: no worker heard anything after a probe round")
+	}
 }
 
 // Dial starts worker 1 and returns once it has a TUNCONF; the other workers
@@ -507,37 +591,51 @@ func (c *Client) monitor() {
 			return
 		case <-tick.C:
 		}
-		now := time.Now()
-		prev := nanosTime(c.lastTick.Load())
-		anyRx := time.Unix(0, c.anyRx.Load())
-		reset := false
-		for _, w := range c.workers {
-			in := livenessInput{Now: now, PrevTick: prev, AnyRx: anyRx,
-				ReadyAt: nanosTime(w.readyAt.Load()), LastRx: nanosTime(w.lastRx.Load()),
-				ProbeSentAt: nanosTime(w.probeAt.Load())}
-			switch livenessVerdict(in) {
-			case livenessResetAll:
-				reset = true
-			case livenessProbe:
-				w.probe(now.UnixNano())
-			case livenessRestart:
-				c.lostToL.Add(1)
-				w.restart("liveness: no inbound after a probe while other workers are live")
-			}
-		}
-		if reset {
-			// The process was not running: nothing observed in that gap means
-			// anything. Every clock starts over from now.
-			c.resets.Add(1)
-			c.cfg.Logf("csqtt: monitor tick %.0fs late — descheduled, clocks reset, no verdict", now.Sub(prev).Seconds())
-			c.anyRx.Store(now.UnixNano())
-			for _, w := range c.workers {
-				w.lastRx.Store(now.UnixNano())
-				w.probeAt.Store(0)
-			}
-		}
-		c.lastTick.Store(now.UnixNano())
+		c.monitorStep(time.Now())
 	}
+}
+
+// monitorStep is one tick of the monitor at `now`: the per-worker rule, the
+// deschedule reset, then the client-wide deafness rule.
+func (c *Client) monitorStep(now time.Time) {
+	prev := nanosTime(c.lastTick.Load())
+	anyRx := time.Unix(0, c.anyRx.Load())
+	reset := false
+	for _, w := range c.workers {
+		in := livenessInput{Now: now, PrevTick: prev, AnyRx: anyRx,
+			ReadyAt: nanosTime(w.readyAt.Load()), LastRx: nanosTime(w.lastRx.Load()),
+			ProbeSentAt: nanosTime(w.probeAt.Load())}
+		switch livenessVerdict(in) {
+		case livenessResetAll:
+			reset = true
+		case livenessProbe:
+			w.probe(now.UnixNano())
+		case livenessRestart:
+			c.lostToL.Add(1)
+			w.restart("liveness: no inbound after a probe while other workers are live")
+		}
+	}
+	if reset {
+		// The process was not running: nothing observed in that gap means
+		// anything. Every clock starts over from now.
+		c.resets.Add(1)
+		c.cfg.Logf("csqtt: monitor tick %.0fs late — descheduled, clocks reset, no verdict", now.Sub(prev).Seconds())
+		c.anyRx.Store(now.UnixNano())
+		for _, w := range c.workers {
+			w.lastRx.Store(now.UnixNano())
+			w.probeAt.Store(0)
+		}
+		// An unfreeze runs this late tick and the wake hook side by side. A
+		// hook that got in first has already asked every worker, and the reset
+		// above would make its round read as answered: keep the round standing,
+		// from now — the clocks just restarted.
+		if c.roundIsWake.Load() && c.roundAt.Load() > prev.UnixNano() {
+			c.roundAt.Store(now.UnixNano())
+		}
+	} else {
+		c.judgeDeaf(now, prev)
+	}
+	c.lastTick.Store(now.UnixNano())
 }
 
 func nanosTime(ns int64) time.Time {
@@ -575,7 +673,8 @@ type WorkerStats struct {
 type Stats struct {
 	TxBytes     int64         // plaintext bytes sent through the relays (IP packets + control)
 	RxBytes     int64         // plaintext bytes received
-	Ready       int           // workers with a live session
+	Ready       int           // workers with a session — READY_OK once, not restarted since
+	Live        int           // … of them, heard from within liveWindow: what the app shows as connections
 	Total       int           // workers configured
 	Restarts    int64         // worker restarts, all reasons
 	AllocateRTT time.Duration // the last relay allocation
@@ -592,6 +691,7 @@ type Stats struct {
 	Probes      int64 // liveness probes marked (the send is asynchronous)
 	Descheduled int64 // monitor ticks found late
 	LostWorkers int64 // workers restarted by the liveness verdict
+	DeafAll     int64 // restart-alls by the deafness verdict
 }
 
 // Stats snapshots the counters.
@@ -606,7 +706,9 @@ func (c *Client) Stats() Stats {
 		Probes:      c.probes.Load(),
 		Descheduled: c.resets.Load(),
 		LostWorkers: c.lostToL.Load(),
+		DeafAll:     c.deafRestarts.Load(),
 	}
+	now := time.Now()
 	s.AllocateRTT = time.Duration(c.allocRTT.Load())
 	s.Generation, _ = c.identity()
 	s.PathChanges = c.pathChanges.Load()
@@ -619,6 +721,9 @@ func (c *Client) Stats() Stats {
 		s.Restarts += ws.Restarts
 		if ws.Ready {
 			s.Ready++
+			if !ws.LastRx.IsZero() && now.Sub(ws.LastRx) <= liveWindow {
+				s.Live++
+			}
 		}
 	}
 	return s

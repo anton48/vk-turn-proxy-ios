@@ -182,3 +182,80 @@ func TestNextBackoffResetsAfterAHealthySession(t *testing.T) {
 		t.Fatalf("39 s session: %v, want doubled", got)
 	}
 }
+
+// Deafness — NO worker hears anything — is judged for the client as a whole.
+// The field case (2026-09-18, the UDP relay leg): a 578-second iOS freeze
+// outlasted every TURN allocation, every worker stayed "ready", a UDP write
+// never fails, and the per-worker rule's "nobody hears anything → the path, not
+// this worker" then held for three hours. The exit: ask everybody at once, and
+// when the round goes unanswered, replace everybody. Sabotages seen red: the
+// judgeable-worker check dropped; the wake round made to wait like the
+// monitor's; a round that WAS answered still judged; the late-tick guard
+// dropped; the spacing between restart-alls ignored.
+func TestDeafVerdict(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	now := t0.Add(10 * time.Minute)
+	base := deafInput{Now: now, PrevTick: now.Add(-livenessTick), Judgeable: 30, AnyRx: now.Add(-time.Second)}
+	cases := []struct {
+		name string
+		mod  func(*deafInput)
+		want deafAction
+	}{
+		{"something was heard a second ago → nothing", func(*deafInput) {}, deafNone},
+		{"total silence for 29 s → not yet", func(in *deafInput) { in.AnyRx = now.Add(-29 * time.Second) }, deafNone},
+		{"total silence for 30 s → ask every ready worker", func(in *deafInput) { in.AnyRx = now.Add(-30 * time.Second) }, deafProbeAll},
+		{"… but nobody is ready past its grace → the workers' own dialling is the recovery", func(in *deafInput) {
+			in.AnyRx, in.Judgeable = now.Add(-5*time.Minute), 0
+		}, deafNone},
+		{"the monitor's round is out for 29 s → wait", func(in *deafInput) {
+			in.AnyRx, in.RoundAt = now.Add(-59*time.Second), now.Add(-29*time.Second)
+		}, deafNone},
+		{"the monitor's round unanswered for 30 s → replace everybody", func(in *deafInput) {
+			in.AnyRx, in.RoundAt = now.Add(-60*time.Second), now.Add(-30*time.Second)
+		}, deafRestartAll},
+		{"the WAKE round is out for 4.9 s → wait", func(in *deafInput) {
+			in.AnyRx, in.RoundAt, in.RoundIsWake = now.Add(-4900*time.Millisecond), now.Add(-4900*time.Millisecond), true
+		}, deafNone},
+		{"the WAKE round unanswered for 5 s → replace everybody", func(in *deafInput) {
+			in.AnyRx, in.RoundAt, in.RoundIsWake = now.Add(-5*time.Second), now.Add(-5*time.Second), true
+		}, deafRestartAll},
+		{"a round that WAS answered is no verdict, however old", func(in *deafInput) {
+			in.RoundAt, in.RoundIsWake, in.AnyRx = now.Add(-20*time.Second), true, now.Add(-19*time.Second)
+		}, deafNone},
+		{"… and the silence after it is counted afresh", func(in *deafInput) {
+			in.RoundAt, in.AnyRx = now.Add(-2*time.Minute), now.Add(-31*time.Second)
+		}, deafProbeAll},
+		{"a late tick judges nothing", func(in *deafInput) {
+			in.PrevTick = now.Add(-livenessTick - descheduledSlack - time.Second)
+			in.AnyRx, in.RoundAt = now.Add(-10*time.Minute), now.Add(-9*time.Minute)
+		}, deafNone},
+		{"the wake verdict carries no tick and judges all the same", func(in *deafInput) {
+			in.PrevTick = time.Time{}
+			in.AnyRx, in.RoundAt, in.RoundIsWake = now.Add(-6*time.Second), now.Add(-6*time.Second), true
+		}, deafRestartAll},
+		{"deaf again 29 s after the first restart-all → held", func(in *deafInput) {
+			in.AnyRx, in.RoundAt, in.RoundIsWake = now.Add(-6*time.Second), now.Add(-6*time.Second), true
+			in.LastRestartAll, in.Rounds = now.Add(-29*time.Second), 1
+		}, deafHeld},
+		{"… 30 s after it → replace everybody again", func(in *deafInput) {
+			in.AnyRx, in.RoundAt, in.RoundIsWake = now.Add(-6*time.Second), now.Add(-6*time.Second), true
+			in.LastRestartAll, in.Rounds = now.Add(-30*time.Second), 1
+		}, deafRestartAll},
+		{"after the third of a run the hold is two minutes", func(in *deafInput) {
+			in.AnyRx, in.RoundAt, in.RoundIsWake = now.Add(-6*time.Second), now.Add(-6*time.Second), true
+			in.LastRestartAll, in.Rounds = now.Add(-119*time.Second), 3
+		}, deafHeld},
+	}
+	for _, c := range cases {
+		in := base
+		c.mod(&in)
+		if got := deafVerdict(in); got != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+	for rounds, want := range map[int]time.Duration{0: 0, 1: 30 * time.Second, 2: time.Minute, 3: 2 * time.Minute, 4: 4 * time.Minute, 5: 5 * time.Minute, 40: 5 * time.Minute} {
+		if got := deafSpacingFor(rounds); got != want {
+			t.Errorf("the hold after restart-all %d of a run: %s, want %s", rounds, got, want)
+		}
+	}
+}
