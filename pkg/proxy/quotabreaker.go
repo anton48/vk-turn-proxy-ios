@@ -153,9 +153,20 @@ func (cp *credPool) noteAllocated(slot int, creds *TURNCreds) {
 	}
 }
 
+// noteStaleQuotaRefusalLocked counts a 486 that named a credential its slot no
+// longer holds (markSaturated's identity check). It IS a 486 the pool was told
+// of, so the session's total carries it; it is NOT evidence about the entry
+// that sits in the slot now — its age, its success count — so the freshness
+// test below never sees it. Under cp.mu.
+func (cp *credPool) noteStaleQuotaRefusalLocked() {
+	cp.quota.refusals++
+}
+
 // noteQuotaRefusalLocked records a 486 on slot. Called by markSaturated —
 // the one place every 486 reaches the pool, native and csqtt alike — under
-// cp.mu, with the pool's clock as `now` so the tests can drive it.
+// cp.mu, with the pool's clock as `now` so the tests can drive it. The caller
+// has checked that the slot still holds the refused credential: the entry
+// read here is the one the relay refused.
 func (cp *credPool) noteQuotaRefusalLocked(slot int, now time.Time) {
 	q := &cp.quota
 	q.refusals++

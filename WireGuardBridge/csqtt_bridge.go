@@ -327,8 +327,8 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 			var once sync.Once
 			return csqtt.Credential{
 				TURNCredentials: csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: addr},
-				Release:         func() { once.Do(func() { a.pool.Release(slot) }) },
-				Failed:          func(err error) { a.refused(workerID, slot, err) },
+				Release:         func() { once.Do(func() { a.pool.Release(slot, creds) }) },
+				Failed:          func(err error) { a.refused(workerID, slot, creds, err) },
 				Allocated:       func() { a.pool.NoteAllocated(slot, creds) },
 			}, nil
 		}
@@ -357,14 +357,14 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 // exhausted credential back to the same worker on every retry — its slot
 // selection cannot act on what it is not told (the user's review,
 // 2026-09-06: two 486s, one mint, zero saturated slots).
-func (a *csqttPoolAdapter) refused(workerID, slot int, err error) {
+func (a *csqttPoolAdapter) refused(workerID, slot int, creds *proxy.TURNCreds, err error) {
 	switch {
 	case proxy.IsQuotaError(err):
-		cd := a.pool.MarkSaturated(slot)
+		cd := a.pool.MarkSaturated(slot, creds)
 		log.Printf("csqtt: worker %d: TURN allocate quota error (486) on slot %d (cooldown %s) — the next credential comes from another slot",
 			workerID, slot, cd.Round(time.Second))
 	case proxy.IsAuthError(err):
-		a.pool.InvalidateSlot(slot)
+		a.pool.InvalidateSlot(slot, creds)
 		log.Printf("csqtt: worker %d: TURN auth error on slot %d — invalidated", workerID, slot)
 	}
 }

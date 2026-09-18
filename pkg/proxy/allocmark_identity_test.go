@@ -47,10 +47,10 @@ func allocatedTotal(cp *credPool) int {
 func TestALateSuccessOfTheOldCredentialDoesNotCertifyTheNew(t *testing.T) {
 	paths := []struct {
 		name  string
-		clear func(cp *credPool, slot int)
+		clear func(cp *credPool, slot int, held *TURNCreds)
 	}{
-		{"invalidateEntry — another holder's 401/403 cleared the slot", func(cp *credPool, slot int) { cp.invalidateEntry(slot) }},
-		{"invalidate — a Resume rebuilt the pool", func(cp *credPool, _ int) { cp.invalidate() }},
+		{"invalidateEntry — another holder's 401/403 cleared the slot", func(cp *credPool, slot int, held *TURNCreds) { cp.invalidateEntry(slot, held) }},
+		{"invalidate — a Resume rebuilt the pool", func(cp *credPool, _ int, _ *TURNCreds) { cp.invalidate() }},
 	}
 	for _, path := range paths {
 		t.Run(path.name, func(t *testing.T) {
@@ -60,7 +60,7 @@ func TestALateSuccessOfTheOldCredentialDoesNotCertifyTheNew(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			path.clear(cp, slot)
+			path.clear(cp, slot, old)
 			_, fresh, got, err := cp.get(0, false) // the next session mints B — the same conn prefers the same slot
 			if err != nil {
 				t.Fatal(err)
@@ -72,8 +72,8 @@ func TestALateSuccessOfTheOldCredentialDoesNotCertifyTheNew(t *testing.T) {
 			if a := allocatedOn(cp, slot); a != 0 {
 				t.Fatalf("allocated on the refilled slot = %d after the OLD credential's late success, want 0 — a slot number is not a credential", a)
 			}
-			cp.markSaturated(slot) // B's own 486s: fresh, and nothing ever succeeded on B
-			cp.markSaturated(slot)
+			cp.markSaturated(slot, fresh) // B's own 486s: fresh, and nothing ever succeeded on B
+			cp.markSaturated(slot, fresh)
 			if refusals, paused := cp.quotaSnapshot(); refusals != 2 || paused <= 0 {
 				t.Fatalf("after two fresh 486s on the refilled credential: (%d, paused %s), want (2, > 0) — the breaker took the new credential for an accepted one", refusals, paused)
 			}
@@ -103,7 +103,7 @@ func TestALateSuccessOfTheOldCredentialDoesNotCertifyTheNew(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cp.invalidateEntry(slot)
+		cp.invalidateEntry(slot, old)
 		_, again, got, err := cp.get(0, false)
 		if err != nil {
 			t.Fatal(err)

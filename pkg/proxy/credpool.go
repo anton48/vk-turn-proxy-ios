@@ -225,12 +225,17 @@ func (p *CredPool) Acquire(connIdx int) (addr string, creds *TURNCreds, slot int
 }
 
 // Release returns a connection's hold on its slot (call when the allocation
-// is gone).
-func (p *CredPool) Release(slot int) { p.cp.release(slot) }
+// is gone). creds is the credential Acquire handed out with that slot: the
+// slot may have been refilled since, and a release counts only against the
+// credential it names (credPool.release).
+func (p *CredPool) Release(slot int, creds *TURNCreds) { p.cp.release(slot, creds) }
 
-// MarkSaturated records a 486 (allocation quota reached) on the slot and
-// returns the cooldown applied.
-func (p *CredPool) MarkSaturated(slot int) time.Duration { return p.cp.markSaturated(slot) }
+// MarkSaturated records a 486 (allocation quota reached) on creds, the
+// credential the caller leased from slot, and returns the cooldown applied —
+// zero when the slot no longer holds that credential (nothing is marked).
+func (p *CredPool) MarkSaturated(slot int, creds *TURNCreds) time.Duration {
+	return p.cp.markSaturated(slot, creds)
+}
 
 // NoteAllocated reports that the relay ACCEPTED an allocation on creds, the
 // credential the caller leased from slot — the breaker's success key. The
@@ -245,7 +250,9 @@ func (p *CredPool) RecordAuthError(slot int) { p.cp.recordAuthError(slot) }
 // InvalidateSlot drops the credential in ONE slot — a 401/403 at
 // allocation means the credential is dead; the pool re-mints into the slot.
 // This is what Proxy's own SRTP session does on an auth error at setup.
-func (p *CredPool) InvalidateSlot(slot int) { p.cp.invalidateEntry(slot) }
+// creds is the rejected credential: a slot that holds another one by now is
+// left alone.
+func (p *CredPool) InvalidateSlot(slot int, creds *TURNCreds) { p.cp.invalidateEntry(slot, creds) }
 
 // IsQuotaError reports a 486 Allocation Quota Reached from the relay: the
 // credential is fine, its allocations are used up — mark the slot

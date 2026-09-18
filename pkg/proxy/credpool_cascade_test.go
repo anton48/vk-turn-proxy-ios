@@ -9,6 +9,14 @@ import (
 
 const cascadeTestRelay = "95.163.34.180:19302"
 
+// seatLocked puts n holders on slot the way get() seats them: the entry's own
+// count and the pool's lease count move together (the path-change gate reads
+// the leases, the per-slot marking the entry). Caller holds cp.mu.
+func seatLocked(cp *credPool, slot, n int) {
+	cp.pool[slot].active += n
+	cp.liveLeases += n
+}
+
 // cascadePool is a 12-slot pool with creds in the first three slots and
 // nothing in flight; the caller sets active / lastUsedAt / saturation to
 // shape the event under test. No fetcher is ever reached.
@@ -61,7 +69,7 @@ func TestStartReportOnAnIdlePoolDoesNotArmTheCascadeDetector(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	cp.mu.Lock()
 	for i := 0; i < 3; i++ {
-		cp.pool[i].active = 10
+		seatLocked(cp, i, 10)
 	}
 	cp.mu.Unlock()
 	cp.MarkInUseSlotsForPathChange()
@@ -140,19 +148,20 @@ func TestACascadeEventReArmsEvenWithNothingLive(t *testing.T) {
 	}
 }
 
-// `live` is read BEFORE the per-slot skips: a slot already saturated (by the
-// first event of an iOS burst, or by a 486 with its other conns still bound)
-// still carries its sessions, and an event that finds them counts. Moving
-// the read below the saturation skip would leave a burst's later events
-// unarmed while the sessions live on.
+// `live` does not pass through the per-slot skips: a slot already saturated
+// (by the first event of an iOS burst, or by a 486 with its other conns still
+// bound) still carries its sessions, and an event that finds them counts. A
+// reading taken per entry BELOW the saturation skip would leave a burst's
+// later events unarmed while the sessions live on.
 //
-// Sabotage seen red: the active check moved below the saturated-slot skip.
+// Sabotage seen red: `live` read per entry (active > 0) below the
+// saturated-slot skip instead of from the pool's lease count.
 func TestSaturatedSlotsWithSessionsStillCountAsLive(t *testing.T) {
 	cp := cascadePool(t)
 	cp.mu.Lock()
 	for i := 0; i < 3; i++ {
 		cp.pool[i].saturatedUntil = time.Now().Add(10 * time.Minute)
-		cp.pool[i].active = 10
+		seatLocked(cp, i, 10)
 	}
 	cp.mu.Unlock()
 	cp.MarkInUseSlotsForPathChange()

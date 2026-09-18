@@ -278,6 +278,15 @@ type Proxy struct {
 	connCancel  []func()
 	pathRestart pathRestart
 
+	// ups records when sessions came up, per connection and proxy-wide — what
+	// the retry floor asks about (retryfloor.go).
+	ups sessionUps
+
+	// sessionHook, when set, stands in for the transport's session function —
+	// the first arm of runConnection's dispatch: the seam the retry-floor herd
+	// test drives. Nil in production.
+	sessionHook func(ctx context.Context, connIdx int) error
+
 	// TURN server IP discovered after connecting to VK
 	turnServerIP atomic.Value // stores string
 
@@ -1114,11 +1123,11 @@ func (p *Proxy) waitCaptchaAndRestart() {
 			// creating a self-amplifying decay loop. credPool.get below
 			// returns cached cred if available, otherwise fetches with
 			// allowCaptchaBlock=false (surfaces captcha as error w/o blocking).
-			_, _, probeSlot, probeErr := p.resolveTURNAddr(-1, false)
+			_, probeCreds, probeSlot, probeErr := p.resolveTURNAddr(-1, false)
 			// Probe is non-consuming; release whatever slot got acquired so
 			// it doesn't leak quota count for a cred we never used.
 			if probeErr == nil {
-				p.credPool.release(probeSlot)
+				p.credPool.release(probeSlot, probeCreds)
 				log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 				p.captchaImageURL.Store("")
 				p.Resume()
@@ -1997,6 +2006,7 @@ func (p *Proxy) StopWithTimeout(timeout time.Duration) {
 func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh chan<- struct{}, connIdx int) error {
 	signaled := false
 	shortFailures := 0
+	var floor retryFloor // this connection's retry floor — retryfloor.go
 
 	for {
 		select {
@@ -2021,6 +2031,8 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		p.beginConnSession(connIdx, connCancel)
 		var err error
 		switch {
+		case p.sessionHook != nil: // a test seam, nil in production
+			err = p.sessionHook(connCtx, connIdx)
 		case p.config.UseWrapA:
 			err = p.runWrapASession(connCtx, linkID, readyCh, &signaled, connIdx)
 		case p.config.UseSrtp:
@@ -2041,6 +2053,7 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 			log.Printf("proxy: [conn %d] session ended after %s by request (path change) — restarting now",
 				connIdx, time.Since(start).Round(time.Second))
 			shortFailures = 0
+			floor.reset() // a new network: the old one's failures say nothing about it
 			select {
 			case <-time.After(restartStagger()):
 			case <-sessCtx.Done():
@@ -2055,6 +2068,19 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 			log.Printf("proxy: [conn %d] session ended after %s: %s", connIdx, duration.Round(time.Second), err)
 			if !signaled && readyCh != nil {
 				return err
+			}
+
+			// The retry floor (retryfloor.go). A session that came up in this
+			// iteration ends the streak whatever ended it later; a failure with no
+			// session and no answer from the pool, VK or the relay is the network's
+			// — it extends the streak, and the wait below holds a slot-available
+			// wake back under the floor.
+			floored := false
+			if p.ups.since(connIdx, start) {
+				floor.reset()
+			} else if isNetworkClassFailure(err) {
+				floor.noteNetworkFailure(time.Now())
+				floored = true
 			}
 
 			// If the session ended because of a captcha requirement and
@@ -2093,8 +2119,12 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 				// — common during cascade reconnects — wait out the
 				// full random dormancy regardless of when slots reopen.
 				slotCh := p.wakeChannelFor(err)
-				select {
-				case <-time.After(dormantDuration):
+				woke, werr := p.waitRetry(sessCtx, connIdx, dormantDuration, slotCh, &floor, floored)
+				if werr != nil {
+					return werr
+				}
+				switch woke {
+				case retryWakeTimer:
 					shortFailures = 0 // reset after dormancy
 					log.Printf("proxy: waking from dormancy, retrying connection")
 					// DON'T wholesale-invalidate the pool here. This conn was
@@ -2104,19 +2134,20 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 					// If our retry uses a stale cred and gets a short-lived
 					// session, the per-slot invalidateEntry path (line ~1228)
 					// drops only that bad slot. Other conns keep their creds.
-				case <-slotCh:
+				case retryWakeSignal:
 					// Slot-state change happened. Reset the failure
 					// counter — the prior failures were "no slot
 					// available" or quota-driven, and external state
 					// changed in a way that may resolve them. Treat
 					// this as a fresh start instead of letting the
 					// next failure immediately re-trigger dormancy.
+					//
+					// 🚨 Not the retry floor's streak: after a network-class
+					// failure waitRetry has already held this wake back under
+					// the floor, and the streak resets only on evidence that
+					// the network works (retryfloor.go).
 					shortFailures = 0
 					log.Printf("proxy: waking from dormancy on slot-available signal, retrying")
-				case <-sessCtx.Done():
-					return sessCtx.Err()
-				case <-p.ctx.Done():
-					return p.ctx.Err()
 				}
 				continue
 			}
@@ -2128,16 +2159,17 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 			// dormancy comment above.
 			delay := time.Duration(2000+mathrand.Intn(5000)) * time.Millisecond
 			slotCh := p.wakeChannelFor(err)
-			select {
-			case <-time.After(delay):
-			case <-slotCh:
-			case <-sessCtx.Done():
-				return sessCtx.Err()
-			case <-p.ctx.Done():
-				return p.ctx.Err()
+			if _, werr := p.waitRetry(sessCtx, connIdx, delay, slotCh, &floor, floored); werr != nil {
+				return werr
 			}
 		}
 	}
+}
+
+// directMode reports the transport with nothing above the TURN relay (no
+// DTLS, WRAP-A or SRTP) — the default arm of runConnection's dispatch.
+func (p *Proxy) directMode() bool {
+	return !p.config.UseWrapA && !p.config.UseSrtp && !p.config.UseDTLS
 }
 
 // resolveTURNAddr returns (addr, creds, credSlot, err) for the given
@@ -2330,9 +2362,12 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// A defer pinned to currentSlot via closure releases the LATEST slot
 	// at function exit — important because the reconnect loop below may
 	// switch us to a different slot, and we need to release whatever
-	// slot we're holding when this conn's session finally ends.
-	currentSlot := credSlot
-	defer func() { p.credPool.release(currentSlot) }()
+	// slot we're holding when this conn's session finally ends. The lease is
+	// the PAIR — the slot and the credential it handed out: the slot may be
+	// refilled under us, and the pool counts a release only against the
+	// credential it names (credPool.release).
+	currentSlot, currentCreds := credSlot, creds
+	defer func() { p.credPool.release(currentSlot, currentCreds) }()
 
 	// Start TURN relay FIRST — DTLS handshake goes through it.
 	// TURN runs until it fails naturally (no forced lifetime).
@@ -2393,11 +2428,11 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// path-change like vpn.wifi-lte-wifi.1.log). It logs
 					// its own decision; here we only log the proxy-side
 					// context (which conn, which slot).
-					cooldown := p.credPool.markSaturated(credSlot)
+					cooldown := p.credPool.markSaturated(credSlot, creds)
 					log.Printf("proxy: [conn %d] TURN allocate quota error (486) on slot %d (cooldown %s)",
 						connIdx, credSlot, cooldown.Round(time.Second))
 				} else if isAuthError(turnErr) {
-					p.credPool.invalidateEntry(credSlot)
+					p.credPool.invalidateEntry(credSlot, creds)
 					log.Printf("proxy: [conn %d] bootstrap auth error on slot %d, invalidated",
 						connIdx, credSlot)
 				}
@@ -2451,6 +2486,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// every successful reconnect — sync.Once drops all calls after the first.
 	p.signalBootstrapDone(nil)
 
+	p.noteSessionUp(connIdx) // the retry floor's evidence that the network works — retryfloor.go
 	log.Printf("proxy: [conn %d, cred %d] DTLS+TURN session established", connIdx, credSlot)
 
 	// Reset this conn's last-pong time to "now" so the zombie watchdog
@@ -2968,8 +3004,9 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	if err != nil {
 		return err
 	}
-	currentSlot := credSlot
-	defer func() { p.credPool.release(currentSlot) }()
+	// The lease is the pair (slot, credential) — see runDTLSSession.
+	currentSlot, currentCreds := credSlot, creds
+	defer func() { p.credPool.release(currentSlot, currentCreds) }()
 
 	turnDone := make(chan error, 1)
 	go func() {
@@ -2986,6 +3023,10 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	// Signal proxy-lifetime bootstrap ready (sync.Once, idempotent).
 	p.signalBootstrapDone(nil)
 
+	// 🚨 No session-up stamp here: this line precedes the allocation (the
+	// session IS the TURN relay, started a moment ago and not yet answered). The
+	// retry floor's evidence for the direct mode is the allocation itself —
+	// runTURN stamps it (retryfloor.go).
 	log.Printf("proxy: [conn %d, cred %d] direct TURN session established", connIdx, credSlot)
 
 	// TURN reconnection loop (same as DTLS version but without DTLS)
@@ -3009,9 +3050,9 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			// Release before retry loop — see runDTLSSession for full
 			// rationale. Same pattern: avoid stale active counts during
 			// reconnect storm.
-			p.credPool.release(credSlot)
+			p.credPool.release(credSlot, currentCreds)
 			credSlot = -1
-			currentSlot = -1
+			currentSlot, currentCreds = -1, nil
 			retries := 0
 			for retries < 5 {
 				if connCtx.Err() != nil {
@@ -3029,7 +3070,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 					continue
 				}
 				credSlot = newSlot
-				currentSlot = newSlot
+				currentSlot, currentCreds = newSlot, newCreds
 				log.Printf("proxy: [conn %d, cred %d] starting new direct TURN session", connIdx, credSlot)
 				turnDone = make(chan error, 1)
 				go func() {
@@ -3135,8 +3176,9 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	if err != nil {
 		return err
 	}
-	currentSlot := credSlot
-	defer func() { p.credPool.release(currentSlot) }()
+	// The lease is the pair (slot, credential) — see runDTLSSession.
+	currentSlot, currentCreds := credSlot, creds
+	defer func() { p.credPool.release(currentSlot, currentCreds) }()
 
 	// TURN relay underneath (conn2 ↔ VK relay). Same spawn pattern as
 	// runDTLSSession: any TURN exit cancels the conn so the outer loop
@@ -3168,11 +3210,11 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 				// Mirror runDTLSSession's error attribution so quota / auth
 				// failures land on the slot that actually carried the cred.
 				if isQuotaError(turnErr) {
-					cooldown := p.credPool.markSaturated(credSlot)
+					cooldown := p.credPool.markSaturated(credSlot, creds)
 					log.Printf("proxy: [conn %d] WRAP-A TURN allocate quota error (486) on slot %d (cooldown %s)",
 						connIdx, credSlot, cooldown.Round(time.Second))
 				} else if isAuthError(turnErr) {
-					p.credPool.invalidateEntry(credSlot)
+					p.credPool.invalidateEntry(credSlot, creds)
 					log.Printf("proxy: [conn %d] WRAP-A bootstrap auth error on slot %d, invalidated", connIdx, credSlot)
 				}
 				return fmt.Errorf("WRAP-A DTLS failed: %w (TURN error: %v)", err, turnErr)
@@ -3208,6 +3250,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	*signaled = true
 	p.signalBootstrapDone(nil)
 
+	p.noteSessionUp(connIdx) // the retry floor's evidence that the network works — retryfloor.go
 	log.Printf("proxy: [conn %d, cred %d] WRAP-A+TURN session established (getconf ok)", connIdx, credSlot)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
@@ -3487,6 +3530,13 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// credential must not certify the new one (quotabreaker.go; builds 391
 	// and 392, both caught on the user's control stand).
 	p.credPool.noteAllocated(slotIdx, creds)
+	if p.directMode() {
+		// The direct session has nothing above the relay: the allocation is the
+		// session coming up — the retry floor's evidence that the network works
+		// (retryfloor.go). The other three transports stamp it where their
+		// handshake over the relay has completed.
+		p.noteSessionUp(connIdx)
+	}
 	defer relayConn.Close()
 	// Registered AFTER relayConn.Close's defer, so LIFO runs it FIRST: the
 	// deallocate that Close writes goes out under relayCloseWriteBudget on
@@ -4973,8 +5023,9 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	if err != nil {
 		return err
 	}
-	currentSlot := credSlot
-	defer func() { p.credPool.release(currentSlot) }()
+	// The lease is the pair (slot, credential) — see runDTLSSession.
+	currentSlot, currentCreds := credSlot, creds
+	defer func() { p.credPool.release(currentSlot, currentCreds) }()
 
 	// Set up TURN allocation and DTLS-SRTP handshake to the peer.
 	sessStart := time.Now()
@@ -4983,11 +5034,11 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		// Mirror runDTLSSession's error attribution so quota / auth
 		// failures land on the correct slot.
 		if isQuotaError(err) {
-			cooldown := p.credPool.markSaturated(credSlot)
+			cooldown := p.credPool.markSaturated(credSlot, creds)
 			log.Printf("proxy: [conn %d] SRTP TURN allocate quota error (486) on slot %d (cooldown %s)",
 				connIdx, credSlot, cooldown.Round(time.Second))
 		} else if isAuthError(err) {
-			p.credPool.invalidateEntry(credSlot)
+			p.credPool.invalidateEntry(credSlot, creds)
 			log.Printf("proxy: [conn %d] SRTP bootstrap auth error on slot %d, invalidated",
 				connIdx, credSlot)
 		}
@@ -5013,6 +5064,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	*signaled = true
 	p.signalBootstrapDone(nil)
 
+	p.noteSessionUp(connIdx) // the retry floor's evidence that the network works — retryfloor.go
 	log.Printf("proxy: [conn %d, cred %d] SRTP+TURN session established", connIdx, credSlot)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {

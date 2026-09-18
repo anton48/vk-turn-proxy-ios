@@ -34,6 +34,18 @@ func breakerPool(t *testing.T, mints *atomic.Int32) *credPool {
 	return cp
 }
 
+// heldBy is the credential slot holds now — what a holder that leased it names
+// when it tells the pool of a 486 or a 401 on it (the pool acts only on a
+// credential the slot still holds).
+func heldBy(cp *credPool, slot int) *TURNCreds {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if slot < 0 || slot >= len(cp.pool) {
+		return nil
+	}
+	return cp.pool[slot].creds
+}
+
 // mintFor is get() for connIdx when it is expected to MINT: the slot it
 // landed on, or a fatal.
 func mintFor(t *testing.T, cp *credPool, connIdx int) int {
@@ -57,12 +69,12 @@ func TestTwoFreshRefusalsPauseMinting(t *testing.T) {
 	cp := breakerPool(t, &mints)
 
 	a := mintFor(t, cp, 0)
-	cp.markSaturated(a) // 486 on a credential minted a moment ago: fresh refusal 1
+	cp.markSaturated(a, heldBy(cp, a)) // 486 on a credential minted a moment ago: fresh refusal 1
 	b := mintFor(t, cp, 1)
 	if b == a {
 		t.Fatalf("the second get seated on the saturated slot %d instead of minting", a)
 	}
-	cp.markSaturated(b) // fresh refusal 2 → the breaker trips
+	cp.markSaturated(b, heldBy(cp, b)) // fresh refusal 2 → the breaker trips
 	if got := mints.Load(); got != 2 {
 		t.Fatalf("mints before the trip = %d, want 2", got)
 	}
@@ -117,8 +129,8 @@ func TestARefusalOnAnOldCredentialIsNotFresh(t *testing.T) {
 			creds: &TURNCreds{Username: fmt.Sprintf("%d:old-%d", time.Now().Add(8*time.Hour).Unix(), i), Password: "p", Address: relay, Addresses: []string{relay}}}
 	}
 	cp.mu.Unlock()
-	cp.markSaturated(0)
-	cp.markSaturated(1)
+	cp.markSaturated(0, heldBy(cp, 0))
+	cp.markSaturated(1, heldBy(cp, 1))
 	refusals, paused := cp.quotaSnapshot()
 	if refusals != 2 || paused != 0 {
 		t.Fatalf("quotaSnapshot after two old-credential 486s = (%d, paused %s), want (2, 0) — old refusals must not trip the breaker", refusals, paused)
@@ -153,8 +165,8 @@ func TestARefusalOnACredentialWithASuccessIsItsQuotaNotARefusal(t *testing.T) {
 			cp.noteAllocated(i, full[i]) // nine allocations accepted on each identity
 		}
 	}
-	cp.markSaturated(0) // the tenth refused
-	cp.markSaturated(1)
+	cp.markSaturated(0, heldBy(cp, 0)) // the tenth refused
+	cp.markSaturated(1, heldBy(cp, 1))
 	refusals, paused := cp.quotaSnapshot()
 	if refusals != 2 || paused != 0 {
 		t.Fatalf("quotaSnapshot after two tenth-allocation 486s = (%d, paused %s), want (2, 0) — a refusal on a credential the relay has accepted is its quota, not the relay's refusal", refusals, paused)
@@ -181,8 +193,8 @@ func TestOverlappingHerdFailuresWithoutASuccessTripTheBreaker(t *testing.T) {
 	cp.pool[0] = credPoolEntry{addr: relay, ts: time.Now(), active: 10, // ten leases, all still held
 		creds: &TURNCreds{Username: fmt.Sprintf("%d:herd", time.Now().Add(8*time.Hour).Unix()), Password: "p", Address: relay, Addresses: []string{relay}}}
 	cp.mu.Unlock()
-	cp.markSaturated(0) // the first failure, nine others still in flight (active 10)
-	cp.markSaturated(0) // the second, overlapping (active still 10 — nobody released yet)
+	cp.markSaturated(0, heldBy(cp, 0)) // the first failure, nine others still in flight (active 10)
+	cp.markSaturated(0, heldBy(cp, 0)) // the second, overlapping (active still 10 — nobody released yet)
 	refusals, paused := cp.quotaSnapshot()
 	if refusals != 2 || paused <= 0 {
 		t.Fatalf("quotaSnapshot after two overlapping herd failures = (%d, paused %s), want (2, > 0) — the breaker missed a herd whose failures overlap", refusals, paused)
