@@ -53,3 +53,58 @@ func TestReadFrameSkipsTheChannelDataPadding(t *testing.T) {
 		t.Fatal("a first byte that is neither STUN nor ChannelData was accepted")
 	}
 }
+
+// A UDP datagram IS its frame. ChannelData padding is optional there (a relay
+// may send the bare payload), so the length field bounds the payload and
+// nothing past it is wanted; a STUN message must fill its datagram exactly; a
+// length that overruns the datagram is refused, not read. Sabotages seen red:
+// the stream's padded read used on a datagram (the unpadded frame is refused);
+// the overrun check dropped (a panic, caught as a failure).
+func TestParseDatagramTakesTheFrameAsItComes(t *testing.T) {
+	cd := func(payload string, pad int) []byte {
+		b := make([]byte, 4, 4+len(payload)+pad)
+		binary.BigEndian.PutUint16(b[0:2], firstChannel)
+		binary.BigEndian.PutUint16(b[2:4], uint16(len(payload)))
+		return append(append(b, payload...), make([]byte, pad)...)
+	}
+	for _, c := range []struct {
+		name string
+		in   []byte
+		want string
+	}{
+		{"ChannelData without padding", cd("12345", 0), "12345"},
+		{"ChannelData padded to four", cd("12345", 3), "12345"},
+		{"an empty ChannelData", cd("", 0), ""},
+	} {
+		kind, data, err := parseDatagram(c.in)
+		if err != nil || kind != frameChannelData || string(data) != c.want {
+			t.Fatalf("%s: kind %v, %q, %v — want ChannelData %q", c.name, kind, data, err, c.want)
+		}
+	}
+	msg, err := stun.Build(stun.TransactionID, stun.BindingSuccess, stun.Fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind, raw, err := parseDatagram(msg.Raw); err != nil || kind != frameSTUN || !bytes.Equal(raw, msg.Raw) {
+		t.Fatalf("a STUN datagram: kind %v, %v", kind, err)
+	}
+	overrun := cd("12345", 0)
+	binary.BigEndian.PutUint16(overrun[2:4], 500)
+	for name, in := range map[string][]byte{
+		"a ChannelData length past the datagram": overrun,
+		"a STUN message with a trailing byte":    append(append([]byte(nil), msg.Raw...), 0),
+		"three bytes":                            {0x40, 0, 0},
+		"neither STUN nor ChannelData":           {0x80, 0, 0, 0},
+	} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("%s: parseDatagram panicked: %v", name, r)
+				}
+			}()
+			if _, _, err := parseDatagram(in); err == nil {
+				t.Fatalf("%s was accepted", name)
+			}
+		}()
+	}
+}
