@@ -1072,6 +1072,119 @@ func TestAHeldRoundKeepsAskingSoAPathThatReturnedGetsNoVerdictAtTheHoldsEnd(t *t
 	}
 }
 
+// Build 420 — the review of 419: a round was asked again through the per-worker
+// probe states, and a worker WITHOUT one was skipped. But an unfreeze runs the
+// wake hook and the monitor's LATE tick side by side: the late tick keeps the
+// fresh wake round (it was published after the tick read its mark) and its
+// reset clears EVERY worker's probe. From then on "asked again" reached nobody:
+// the count of asks grew, not a packet left, and at the window's end the healthy
+// allocations were replaced (the reviewer's stand on short timers, 5 of 5:
+// RoundAsks 3, Reprobes 0, DeafAll 1, two new GETCONFs). A round that stands
+// unanswered is asked again of every READY worker — one whose probe is gone
+// gets a new one, published by CompareAndSwap from nothing. The second half is
+// the control: workers that really are silent are still replaced at the
+// window's end. Sabotages seen red: a worker without a probe skipped (419); an
+// ask that sent nothing counted.
+func TestAWakeRoundAfterALateTickIsStillAskedAgainWithPackets(t *testing.T) {
+	quickWake(t)
+	for _, silent := range []bool{false, true} {
+		srv := newFakeServer(t)
+		loopbackRelay(t, nil)
+		c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+		longReady(c)
+		first := srv.seen()
+		_, readies0, _ := srv.counts()
+		deafen(c)
+		c.lastTick.Store(time.Now().Add(-10 * time.Minute).UnixNano()) // the monitor last ran before the freeze
+		prevBeforeHook := nanosTime(c.lastTick.Load())
+		c.WakeHealthCheck()                         // the fresh round — into a path that is still dead
+		c.lastTick.Store(prevBeforeHook.UnixNano()) // this tick had read its mark BEFORE the hook moved it
+		c.monitorStep(time.Now())                   // late: the round stands, every worker's probe is cleared
+		if c.round.Load() == nil || probeOut(c.workers[0]) || probeOut(c.workers[1]) {
+			t.Fatalf("the fixture: after the late tick the fresh round must stand (%v) and no worker hold a probe (%v, %v)", c.round.Load() != nil, probeOut(c.workers[0]), probeOut(c.workers[1]))
+		}
+		waitFor(t, "the round's READYs at the server", func() bool { _, r, _ := srv.counts(); return r >= readies0+2 })
+		time.Sleep(wakeAskAgainEvery / 4) // their answers arrive and are dropped while the path is still dead
+		_, readies1, _ := srv.counts()
+		if !silent {
+			undeafen(c) // the path is back well inside the window; the tunnel is idle
+		}
+		time.Sleep(3 * wakeDeafAfter)
+		g, readies2, _ := srv.counts()
+		st := c.Stats()
+		c.Close()
+		if silent {
+			if st.DeafAll != 1 || g != len(first)+2 {
+				t.Fatalf("workers that really are silent, after the same late tick: restart-alls %d (want 1), %d new GETCONF(s) (want 2) — they are still replaced at the window's end", st.DeafAll, g-len(first))
+			}
+			continue
+		}
+		if sent := st.Probes + st.Reprobes - 2; st.DeafAll != 0 || g != len(first) || sent <= 0 || readies2 == readies1 {
+			t.Fatalf("a wake round whose workers' probes a late tick had cleared, the path back inside its window: restart-alls %d (want 0), %d new GETCONF(s) (want 0); probes marked after the wake's two: %d, READYs at the server after the path returned: %d (want > 0 each — asked again means PACKETS); the round counted as asked again %d time(s)",
+				st.DeafAll, g-len(first), sent, readies2-readies1, st.RoundAsks)
+		}
+	}
+}
+
+// What "asked again" means, piece by piece (the review of 419). A worker that
+// holds no probe gets one by CompareAndSwap from NOTHING — a probe somebody has
+// put there meanwhile stands untouched; a round that is no longer the standing
+// one, or has been answered, is asked of nobody; and an ask that reached nobody
+// is not counted and not logged — a counter of intentions had been telling a
+// healthy story while no packet left. And a restored probe is a FIRST probe like
+// any other: it never counts against the worker. Sabotages seen red: the restored
+// probe published over whatever stands; … published as a re-send made while the
+// client heard; the round's actuality not checked; an ask that reached nobody
+// counted.
+func TestAskingARoundAgainPieceByPiece(t *testing.T) {
+	quickWake(t)
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	w := c.workers[1]
+
+	stands := &probeState{firstAt: 1, lastAt: 1, rx: w.rx.Load(), seq: c.rxSeq.Load()}
+	w.probeSt.Store(stands)
+	if w.probeIfNone(time.Now().UnixNano()) || w.probeSt.Load() != stands {
+		t.Fatal("a worker that HOLDS a probe was given a new one over it — the restoring is a CompareAndSwap from nothing")
+	}
+	w.clearProbe()
+	c.Blackhole(2, true) // its answer never comes: the restored state stays to be looked at
+	if !w.probeIfNone(time.Now().UnixNano()) || w.probeSt.Load() == nil {
+		t.Fatal("a worker that holds NO probe was not given one")
+	}
+	if n := w.probeSt.Load().confirmed(true); n != 0 {
+		t.Fatalf("a restored probe, the client hearing right after it, counts as %d confirmed re-send(s) — want 0: it is a first probe like any other", n)
+	}
+	w.clearProbe()
+
+	deafen(c)
+	c.WakeHealthCheck() // a round, unanswered
+	r := c.round.Load()
+	if r == nil {
+		t.Fatal("no round after the wake")
+	}
+	for _, x := range c.workers {
+		x.clearProbe()
+		x.ready.Store(false) // nobody is ready: there is nobody to ask
+	}
+	before := c.Stats()
+	c.askRoundAgain(r, time.Second, time.Now())
+	if st := c.Stats(); st.RoundAsks != before.RoundAsks || st.Probes != before.Probes {
+		t.Fatalf("an ask that reached NOBODY: counted %d time(s), %d probe(s) marked — want 0 and 0", st.RoundAsks-before.RoundAsks, st.Probes-before.Probes)
+	}
+	for _, x := range c.workers {
+		x.ready.Store(true)
+	}
+	c.round.CompareAndSwap(r, &probeRound{at: time.Now().UnixNano(), wake: true, rxSeq: c.rxSeq.Load()}) // the round that was looked at no longer stands
+	c.askRoundAgain(r, time.Second, time.Now())
+	if st := c.Stats(); st.RoundAsks != before.RoundAsks || st.Probes != before.Probes || st.Reprobes != before.Reprobes {
+		t.Fatalf("a round that no longer STANDS was asked again: asks +%d, probes +%d, sent again +%d — want nothing", st.RoundAsks-before.RoundAsks, st.Probes-before.Probes, st.Reprobes-before.Reprobes)
+	}
+}
+
 // … and a held WAKE round is asked again too — by the monitor's tick: its
 // watcher asks inside the round's window only (every quarter of a second of a
 // hold that can last minutes would be a flood). Sabotage seen red: the monitor's

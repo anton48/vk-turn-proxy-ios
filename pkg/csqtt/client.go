@@ -137,7 +137,7 @@ type Client struct {
 	anyRx    atomic.Int64 // last inbound on any worker, unix nanos
 	probes   atomic.Int64 // liveness probes marked
 	reprobes atomic.Int64 // unanswered probes sent again — by the liveness rule, and by a round that is asked again
-	roundAsk atomic.Int64 // times a standing, unanswered probe round was asked again (each time: every ready worker)
+	roundAsk atomic.Int64 // times a standing, unanswered probe round was asked again — counted only when somebody WAS asked
 	witness  atomic.Int64 // READYs to a worker known to be alive, asked beside them (askWitness)
 	resets   atomic.Int64 // monitor ticks found late (descheduled)
 	lostToL  atomic.Int64 // workers restarted by the liveness verdict
@@ -321,23 +321,45 @@ func (c *Client) listenTo(r *probeRound) {
 	}
 }
 
-// askRoundAgain sends the probes of a round that stands unanswered AGAIN, to
-// every ready worker whose probe is still out. The round's own record is not
-// touched — its listening, and with it its verdict, is the first ask's. Each
-// probe is sent again the way the liveness rule does it (worker.reprobe): by
-// CompareAndSwap from the state that was read, and with the FACT of whether the
-// client has heard anything since the send before — in a silence it has not,
-// so these re-sends can never count against a worker.
+// askRoundAgain asks every READY worker again on behalf of a round that stands
+// unanswered. The round's own record is not touched — its listening, and with it
+// its verdict, is the first ask's.
+//
+// 🚨 EVERY ready worker, whether it still holds a probe or not. The per-worker
+// probe states are somebody else's bookkeeping, and the round outlives them: an
+// unfreeze runs the wake hook and the monitor's LATE tick side by side, the late
+// tick keeps the fresh wake round (published after it read its mark) and its
+// reset clears every worker's probe. Asked "of the workers whose probe is out",
+// the round was then asked of NOBODY — the count of asks grew, not a packet
+// left, and at the window's end healthy allocations were replaced. A worker
+// whose probe is out has it sent again the way the liveness rule does
+// (worker.reprobe: CompareAndSwap from the state read, with the FACT of whether
+// the client has heard anything since the send before — in a silence it has
+// not, so these re-sends never count against a worker); a worker with none gets
+// a first probe, published by CompareAndSwap from nothing (worker.probeIfNone).
+//
+// The round must still be the one that stands, and unanswered: the callers
+// looked a moment ago, and the wake hook takes turns with nobody.
 func (c *Client) askRoundAgain(r *probeRound, listened time.Duration, at time.Time) {
+	if c.round.Load() != r || c.rxSeq.Load() != r.rxSeq {
+		return
+	}
 	now := at.UnixNano()
 	n := 0
 	for _, w := range c.workers {
 		if !w.ready.Load() {
 			continue
 		}
-		if st := w.probeSt.Load(); st != nil && w.reprobe(st, now, c.rxSeq.Load() != st.seq) {
+		if st := w.probeSt.Load(); st != nil {
+			if w.reprobe(st, now, c.rxSeq.Load() != st.seq) {
+				n++
+			}
+		} else if w.probeIfNone(now) {
 			n++
 		}
+	}
+	if n == 0 {
+		return // nobody was asked: there is nothing to count and nothing to say
 	}
 	c.roundAsk.Add(1)
 	kind := "the round"
@@ -1045,6 +1067,21 @@ func (w *worker) probe(now int64) {
 // production. The read loop does not take turns with probe: an inbound can be
 // counted, and the probe cleared, in exactly that window.
 var probeSnapshotTaken atomic.Pointer[func(*worker)]
+
+// probeIfNone gives a worker that holds NO probe a first one — for a round that
+// is asked again after something cleared the workers' probes under it (see
+// askRoundAgain). By CompareAndSwap from nothing: a probe somebody has put there
+// meanwhile — the wake hook, the rule — stands, and nothing is sent. A first
+// probe like any other: it counts for nothing against the worker.
+func (w *worker) probeIfNone(now int64) bool {
+	st := &probeState{firstAt: now, lastAt: now, rx: w.rx.Load(), seq: w.c.rxSeq.Load()}
+	if !w.probeSt.CompareAndSwap(nil, st) {
+		return false
+	}
+	w.c.probes.Add(1)
+	w.sendProbe()
+	return true
+}
 
 // reprobe sends the unanswered probe AGAIN — the liveness rule's doing alone.
 // The new state takes the old one's place by CompareAndSwap: if the read loop
