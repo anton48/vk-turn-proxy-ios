@@ -92,9 +92,11 @@ func TestLivenessVerdict(t *testing.T) {
 		{"silent 31 s, others live → probe", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-31 * time.Second)
 		}, livenessProbe},
-		{"silent 31 s but probe already out → wait", func(in *livenessInput) {
+		{"silent 31 s but probe already out, sent a second ago → wait", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-31 * time.Second)
 			in.ProbeSentAt = in.Now.Add(-time.Second)
+			in.LastProbeAt = in.Now.Add(-time.Second)
+			in.LiveProbes = 1
 		}, livenessNone},
 		{"silent 29 s → not yet a probe", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-29 * time.Second)
@@ -102,14 +104,73 @@ func TestLivenessVerdict(t *testing.T) {
 		{"silent exactly 30 s → probe", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-30 * time.Second)
 		}, livenessProbe},
-		{"probe unanswered for 29 s → still waiting", func(in *livenessInput) {
+		{"probe unanswered for 29 s, asked again a second ago → still waiting", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-60 * time.Second)
 			in.ProbeSentAt = in.Now.Add(-29 * time.Second)
+			in.LastProbeAt = in.Now.Add(-time.Second)
+			in.LiveProbes = 6
 		}, livenessNone},
-		{"probe unanswered for 30 s → restart", func(in *livenessInput) {
+		{"probe unanswered for 30 s, asked while others heard and again since → restart", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-61 * time.Second)
 			in.ProbeSentAt = in.Now.Add(-30 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.LiveProbes = 6
 		}, livenessRestart},
+		// the re-send (build 415): a probe is sent once no more
+		{"probe out 5 s, unanswered, others live → asked again", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-35 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-5 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.LiveProbes = 1
+		}, livenessReprobe},
+		{"a tick a hair under five seconds after the last send still asks again", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-35 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-10 * time.Second)
+			in.LastProbeAt = in.Now.Add(-(livenessTick - 300*time.Microsecond))
+			in.LiveProbes = 2
+		}, livenessReprobe},
+		{"the wake hook's probe, five seconds old: asked again although the silence is only five seconds", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-5 * time.Second) // the wake reset the clock
+			in.ProbeSentAt = in.Now.Add(-5 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.LiveProbes = 0
+		}, livenessReprobe},
+		{"the round's probe went into a dead path 35 s ago, the path is back: asked again, NOT restarted", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-70 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-35 * time.Second)
+			in.LastProbeAt = in.Now.Add(-35 * time.Second)
+			in.LiveProbes = 0 // the round's probe was not sent while anybody heard
+		}, livenessReprobe},
+		{"… and one probe sent while others heard is not enough either", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-75 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-40 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.LiveProbes = 1
+		}, livenessReprobe},
+		{"… two of them unanswered, the last five seconds ago → restart", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-80 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-45 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.LiveProbes = 2
+		}, livenessRestart},
+		{"two live probes unanswered but the last went out a second ago → it gets its time", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-80 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-45 * time.Second)
+			in.LastProbeAt = in.Now.Add(-time.Second)
+			in.LiveProbes = 2
+		}, livenessNone},
+		{"asked again and again for 25 s: the first probe's clock has not run out → asked again, not restarted", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-55 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-25 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.LiveProbes = 5
+		}, livenessReprobe},
+		{"everyone silent → no re-send either: the path, not the worker", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-40 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-10 * time.Second)
+			in.LastProbeAt = in.Now.Add(-10 * time.Second)
+			in.AnyRx = in.Now.Add(-31 * time.Second)
+		}, livenessNone},
 		{"everyone silent → the path, not the worker", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-61 * time.Second)
 			in.ProbeSentAt = in.Now.Add(-30 * time.Second)

@@ -856,8 +856,8 @@ func csqttLogPathSnapshot(handle C.int32_t, label *C.char) {
 		return
 	}
 	s := c.Stats()
-	log.Printf("csqtt: pathstats %s: workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d, lost %d, deaf restart-alls %d; tun in=%d out=%d",
-		l, s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.LostWorkers, s.DeafAll, e.tunIn.Load(), e.tunOut.Load())
+	log.Printf("csqtt: pathstats %s: workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again), lost %d, deaf restart-alls %d; tun in=%d out=%d",
+		l, s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.LostWorkers, s.DeafAll, e.tunIn.Load(), e.tunOut.Load())
 }
 
 // Stats in the app's shape — the same struct the WireGuard path marshals,

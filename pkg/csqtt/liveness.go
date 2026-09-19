@@ -87,12 +87,34 @@ func (g *startGate) begin() (done func()) {
 
 // Liveness timings. A silent worker is first PROBED (READY, which the
 // server answers with READY_OK — the cheapest packet that elicits a reply),
-// and only given up on if the probe too goes unanswered.
+// the probe is sent AGAIN for as long as it stays unanswered, and the worker
+// is given up on only if probes sent while the path demonstrably worked went
+// unanswered too.
 const (
 	livenessTick   = 5 * time.Second
 	probeAfter     = 30 * time.Second // silence before a probe
-	deadAfterProbe = 30 * time.Second // silence after the probe before a restart
+	deadAfterProbe = 30 * time.Second // silence after the FIRST probe before a restart
 	readyGrace     = 20 * time.Second // a fresh worker is not judged yet
+
+	// reprobeEvery: an unanswered probe is sent again this long after the last
+	// send — at every on-time tick, in effect. A second short of the tick on
+	// purpose: measured tick gaps run a fraction of a millisecond under
+	// livenessTick, and a comparison with the tick itself would skip every
+	// other one. Over the UDP relay leg a datagram is simply lost now and then
+	// (≈1 % on that leg), and an idle worker hears nothing BUT the answer to
+	// its own probe: a probe sent once made every such loss a restart.
+	reprobeEvery = livenessTick - time.Second
+
+	// liveProbesToGiveUp: a worker is given up on only after this many RE-SENDS
+	// of its probe — each made WHILE OTHER WORKERS WERE HEARING — went unanswered
+	// (in the ordinary case there are five of them by the thirtieth second). 🚨 A probe sent
+	// when nobody is known to hear — the deafness round's, the wake hook's —
+	// proves nothing about the worker when it is lost: it may have gone into a
+	// dead path. Field, 2026-09-19: a 70-second block of the relay leg; the
+	// round's probes went into it, the path came back, and thirty-five seconds
+	// after the round twelve HEALTHY workers were restarted on those probes'
+	// word — their allocations alive, nine 486s on the way back in.
+	liveProbesToGiveUp = 2
 
 	// descheduledSlack: a monitor tick that arrives this much late means
 	// the PROCESS was not running (suspended, swapped, stalled), not that
@@ -108,7 +130,9 @@ type livenessInput struct {
 	PrevTick    time.Time // when the monitor last ran; zero on the first tick
 	ReadyAt     time.Time // when this worker became ready; zero if not ready
 	LastRx      time.Time // last inbound on this worker
-	ProbeSentAt time.Time // when a probe was sent for the current silence; zero if none
+	ProbeSentAt time.Time // when the FIRST probe of the current silence was sent — by this rule, the wake hook or the deafness round; zero if none. Any inbound clears it: a probe that is out is an unanswered one
+	LastProbeAt time.Time // when a probe of the current silence was last sent: the first one, or a re-send
+	LiveProbes  int       // a FACT, counted at the send: how many times THIS RULE sent the probe again — i.e. while other workers were hearing (rule 3 stands before every re-send)
 	AnyRx       time.Time // last inbound on ANY worker of the client
 }
 
@@ -120,6 +144,7 @@ const (
 	livenessProbe                   // send READY, record ProbeSentAt
 	livenessRestart                 // give up on the worker
 	livenessResetAll                // the process was descheduled: reset every clock, judge nothing
+	livenessReprobe                 // send READY again for the same silence: ProbeSentAt stays, LastProbeAt moves, LiveProbes grows
 )
 
 // livenessVerdict is the rule, pure. Order of the checks is the rule:
@@ -127,8 +152,15 @@ const (
 //  2. a worker that is not ready, or ready for less than readyGrace, is not judged;
 //  3. if NO worker has heard anything for probeAfter, the path is down, not
 //     this worker — restarting workers one by one would only churn allocations;
-//  4. silence past probeAfter with no probe out → probe;
-//  5. silence past deadAfterProbe after the probe → restart.
+//  4. a probe is out (and unanswered — any inbound clears it), whoever sent it:
+//     restart once deadAfterProbe has passed since the FIRST probe AND
+//     liveProbesToGiveUp re-sends — each made while others were hearing — have
+//     gone unanswered, the last of them at least reprobeEvery ago; otherwise
+//     send it again, reprobeEvery after the last send. 🚫 The restart's clock is
+//     the first probe's: a re-send never moves it, or a dead worker would be
+//     asked for ever. 🚫 And the round's or the wake's probe alone never
+//     restarts a worker — it was not sent while anybody was known to hear;
+//  5. no probe out: silence past probeAfter → probe.
 func livenessVerdict(in livenessInput) livenessAction {
 	if !in.PrevTick.IsZero() && in.Now.Sub(in.PrevTick) > livenessTick+descheduledSlack {
 		return livenessResetAll
@@ -139,16 +171,20 @@ func livenessVerdict(in livenessInput) livenessAction {
 	if in.Now.Sub(in.AnyRx) >= probeAfter {
 		return livenessNone
 	}
+	if !in.ProbeSentAt.IsZero() {
+		rested := in.Now.Sub(in.LastProbeAt) >= reprobeEvery
+		if rested && in.LiveProbes >= liveProbesToGiveUp && in.Now.Sub(in.ProbeSentAt) >= deadAfterProbe {
+			return livenessRestart
+		}
+		if rested {
+			return livenessReprobe
+		}
+		return livenessNone
+	}
 	if in.Now.Sub(in.LastRx) < probeAfter {
 		return livenessNone
 	}
-	if in.ProbeSentAt.IsZero() {
-		return livenessProbe
-	}
-	if in.Now.Sub(in.ProbeSentAt) >= deadAfterProbe {
-		return livenessRestart
-	}
-	return livenessNone
+	return livenessProbe
 }
 
 // ─── deafness: NOBODY hears anything ────────────────────────────────────────

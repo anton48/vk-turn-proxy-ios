@@ -954,6 +954,151 @@ func TestAllDeafWorkersAreAskedAtOnceAndThenReplacedTogether(t *testing.T) {
 	}
 }
 
+// othersHear makes the client look, at the monitor's synthetic `now`, the way
+// it looks while the path works: some worker has just heard something, and the
+// workers named have too (a test's real inbound is stamped with the REAL clock,
+// which the synthetic one has run ahead of).
+func othersHear(c *Client, now time.Time, live ...int) {
+	c.anyRx.Store(now.UnixNano())
+	for _, id := range live {
+		c.workers[id-1].lastRx.Store(now.UnixNano())
+	}
+}
+
+// Build 415 — the field case of 2026-09-19 (a 70-second block of the relay leg,
+// csqtt over UDP): the deafness round's probes went INTO the dead path, the path
+// came back, the round was answered by whoever heard first — and thirty-five
+// seconds after the round the per-worker rule restarted twelve HEALTHY workers
+// on the word of those lost probes (their allocations alive: nine 486s on the
+// re-dial). A probe sent when nobody is known to hear proves nothing; the rule
+// now asks AGAIN, while others hear, before it gives a worker up. Sabotages
+// seen red: the rule never asking again; a restart on a probe that was not sent
+// while others heard.
+func TestAProbeLostInADeadPathIsAskedAgainBeforeTheWorkerIsGivenUpOn(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	_, readiesAtStart, _ := srv.counts()
+	deafen(c)
+	start := time.Now()
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	for s := 5; s <= 30; s += 5 { // thirty seconds of total silence: the round, into the dead path
+		c.monitorStep(at(s))
+	}
+	// The test's thirty seconds are microseconds: let the round's two answers
+	// arrive and be DROPPED while the path is still dead — lifted first, the
+	// fault would let them through, and the probes would not be lost at all.
+	waitFor(t, "the round's READYs at the server", func() bool { _, r, _ := srv.counts(); return r >= readiesAtStart+2 })
+	time.Sleep(100 * time.Millisecond)
+	if st := c.Stats(); st.Probes != 2 || st.Reprobes != 0 {
+		t.Fatalf("the round: probes %d (want 2), sent again %d (want 0 — nobody hears, so nobody is asked again)", st.Probes, st.Reprobes)
+	}
+	for s := 35; s <= 55; s += 5 {
+		c.monitorStep(at(s))
+	}
+	// The path comes back — LATE, as in the field: by the next tick the round's
+	// probes are thirty seconds old. Worker 1 hears (it asks, and is answered: a REAL
+	// inbound, which answers the round); worker 2 is healthy too but hears
+	// nothing by itself — an idle worker's only inbound is the answer to its
+	// own probe, and its probe is long lost.
+	undeafen(c)
+	heard := c.rxSeq.Load()
+	c.workers[0].probe(time.Now().UnixNano())
+	waitFor(t, "worker 1 hears again", func() bool { return c.rxSeq.Load() > heard })
+	_, readies0, _ := srv.counts()
+	othersHear(c, at(60), 1)
+	c.monitorStep(at(60)) // thirty seconds after the round's probe to worker 2 — the tick that restarted it in the field
+	waitFor(t, "worker 2 asked AGAIN, and answered", func() bool {
+		_, r, _ := srv.counts()
+		return r > readies0 && c.workers[1].probeAt.Load() == 0
+	})
+	for s := 65; s <= 90; s += 5 {
+		othersHear(c, at(s), 1, 2) // both hear now
+		c.monitorStep(at(s))
+	}
+	g, _, _ := srv.counts()
+	if st := c.Stats(); st.LostWorkers != 0 || st.DeafAll != 0 || g != len(first) || st.Reprobes == 0 {
+		t.Fatalf("a HEALTHY worker whose probe had gone into a dead path: given up on %d time(s) (want 0), restart-alls %d, %d new GETCONF(s), asked again %d time(s) (want > 0)",
+			st.LostWorkers, st.DeafAll, g-len(first), st.Reprobes)
+	}
+}
+
+// The other side: a worker that is really dead is still given up on — thirty
+// seconds after its FIRST probe, exactly as before, having been asked at every
+// tick in between; and after a dead path came back, a dead worker is asked
+// twice more, while others hear, before it goes. Sabotages seen red: a re-send
+// moving the restart's clock (the worker is asked for ever); re-sends not
+// counted (never given up on); the round's own probe counted as one of them
+// (given up on a tick early, on ONE re-send).
+func TestADeadWorkerIsStillGivenUpOnThirtySecondsAfterItsFirstProbe(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	c.Blackhole(2, true) // worker 2 is dead: nothing it is sent arrives
+	start := time.Now()
+	c.lastTick.Store(start.UnixNano())
+	c.workers[1].lastRx.Store(start.UnixNano())
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	_, readies0, _ := srv.counts()
+	for s, sent := 5, 0; s <= 55; s += 5 {
+		othersHear(c, at(s), 1)
+		c.monitorStep(at(s))
+		if s >= 30 { // the first probe at +30 s of silence, then one more at every tick: +35 … +55
+			sent++ // (the test's ticks are microseconds apart: let each send leave — one is in flight per worker)
+			want := readies0 + sent
+			waitFor(t, "the READY of this tick from the dead worker", func() bool { _, r, _ := srv.counts(); return r >= want })
+		}
+	}
+	if st := c.Stats(); st.Probes != 1 || st.Reprobes != 5 || st.LostWorkers != 0 {
+		t.Fatalf("twenty-five seconds after the first probe: probes %d (want 1), sent again %d (want 5), given up on %d (want 0 — not before the thirty seconds)", st.Probes, st.Reprobes, st.LostWorkers)
+	}
+	othersHear(c, at(60), 1)
+	c.monitorStep(at(60))
+	if st := c.Stats(); st.LostWorkers != 1 {
+		t.Fatalf("thirty seconds after the FIRST probe: given up on %d worker(s), want 1 — a re-send must not move the restart's clock", st.LostWorkers)
+	}
+}
+
+func TestAfterADeadPathADeadWorkerGetsTwoLiveProbesBeforeItGoes(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	deafen(c)
+	start := time.Now()
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	for s := 5; s <= 55; s += 5 { // the round at +30, into the dead path
+		c.monitorStep(at(s))
+	}
+	c.Blackhole(1, false) // the path is back — late — for worker 1; worker 2 stays dead
+	heard := c.rxSeq.Load()
+	c.workers[0].probe(time.Now().UnixNano())
+	waitFor(t, "worker 1 hears again", func() bool { return c.rxSeq.Load() > heard })
+	for s := 60; s <= 70; s += 5 { // +60: the round's probe is 30 s old — asked again (1); +65: again (2); +70: two re-sends unanswered → it goes
+		othersHear(c, at(s), 1)
+		c.monitorStep(at(s))
+		waitFor(t, "this tick's send to leave", func() bool { return !c.workers[1].probing.Load() })
+		if s < 70 {
+			if st := c.Stats(); st.LostWorkers != 0 {
+				t.Fatalf("+%d s: worker 2 given up on after %d re-send(s) made while others heard — want two of them unanswered first (the round's own probe went into a dead path and counts for nothing)", s, c.workers[1].liveProbe.Load())
+			}
+		}
+	}
+	if st := c.Stats(); st.LostWorkers != 1 || st.DeafAll != 0 {
+		t.Fatalf("+70 s: given up on %d worker(s) (want 1 — the dead one, after two re-sends made while others heard), restart-alls %d (want 0)", st.LostWorkers, st.DeafAll)
+	}
+}
+
 // The wake's side: the hook's probes are a round with a watcher of its own,
 // and wakeDeafAfter of LISTENING without one real inbound is the verdict — the
 // user has the phone in hand. The control is a healthy client: its probes are
