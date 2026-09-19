@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -878,9 +879,9 @@ func longReady(c *Client) {
 // quickWake shortens the wake round's wait and its watcher's step.
 func quickWake(t *testing.T) {
 	t.Helper()
-	oldAfter, oldStep := wakeDeafAfter, wakeListenStep
-	wakeDeafAfter, wakeListenStep = 150*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { wakeDeafAfter, wakeListenStep = oldAfter, oldStep })
+	oldAfter, oldStep, oldAsk := wakeDeafAfter, wakeListenStep, wakeAskAgainEvery
+	wakeDeafAfter, wakeListenStep, wakeAskAgainEvery = 150*time.Millisecond, 20*time.Millisecond, 40*time.Millisecond
+	t.Cleanup(func() { wakeDeafAfter, wakeListenStep, wakeAskAgainEvery = oldAfter, oldStep, oldAsk })
 }
 
 func deafen(c *Client) {
@@ -951,6 +952,284 @@ func TestAllDeafWorkersAreAskedAtOnceAndThenReplacedTogether(t *testing.T) {
 	waitFor(t, "both workers ready again", func() bool { return c.Stats().Ready == 2 })
 	if st := c.Stats(); st.LostWorkers != 0 || st.PathChanges != 0 {
 		t.Fatalf("the restart-all was booked as something else: %+v", st)
+	}
+}
+
+// Build 419 — the deafness round's own probes were sent ONCE. A round that goes
+// whole into a dead path (a block of a minute, a Wi-Fi that is still joining)
+// is lost whole; when the path comes back onto a COMPLETELY idle tunnel nothing
+// arrives by itself — an idle worker hears nothing but the answers to its own
+// probes, the per-worker rule is held by rule 3 for as long as nobody has heard
+// anything — and thirty seconds of listening later the round counted as
+// unanswered: every worker replaced over a path that had been fine for a while
+// (over UDP with the old allocations alive: a quota refusal per worker on the
+// way back). A round that stands unanswered is asked AGAIN at every tick of its
+// wait; its clock — the listening — is not touched by that. Sabotage seen red:
+// the round never asked again (418).
+func TestARoundLostInADeadPathIsAskedAgainSoAPathThatReturnedGetsNoVerdict(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	_, readies0, _ := srv.counts()
+	deafen(c)
+	start := time.Now()
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	for s := 5; s <= 40; s += 5 { // +30: the round, into the dead path; +35, +40: still dead
+		c.monitorStep(at(s))
+		waitFor(t, "this tick's sends to leave", func() bool { return !c.workers[0].probing.Load() && !c.workers[1].probing.Load() })
+	}
+	waitFor(t, "the round's READYs at the server", func() bool { _, r, _ := srv.counts(); return r >= readies0+2 })
+	time.Sleep(100 * time.Millisecond) // their answers arrive and are DROPPED while the path is still dead
+	undeafen(c)                        // the path is back — and the tunnel is idle: nothing comes by itself
+	heard := c.rxSeq.Load()
+	for s := 45; s <= 75; s += 5 { // the verdict of a round sent once falls at +60
+		c.monitorStep(at(s))
+		waitFor(t, "this tick's sends to leave", func() bool { return !c.workers[0].probing.Load() && !c.workers[1].probing.Load() })
+		time.Sleep(20 * time.Millisecond) // an answer, if anybody was asked
+	}
+	g, _, _ := srv.counts()
+	if st := c.Stats(); st.DeafAll != 0 || st.LostWorkers != 0 || g != len(first) || c.rxSeq.Load() == heard {
+		t.Fatalf("a round lost whole into a dead path, the path back for thirty seconds before its verdict: restart-alls %d (want 0), given up on %d (want 0), %d new GETCONF(s) (want 0), heard anything after the path returned: %v (want true — somebody has to ASK: an idle tunnel says nothing by itself)",
+			st.DeafAll, st.LostWorkers, g-len(first), c.rxSeq.Load() != heard)
+	}
+}
+
+// The wake round's side: its probes go out the instant the process unfreezes —
+// into a Wi-Fi that is still joining, a radio still coming up. Lost whole, with
+// the path back a moment later and the tunnel idle, the round counted as
+// unanswered at wakeDeafAfter and every worker was replaced. Its watcher asks
+// again after every wakeAskAgainEvery of listening. Sabotage seen red: the
+// watcher never asking again.
+func TestAWakeRoundLostInADeadPathIsAskedAgainInsideItsWindow(t *testing.T) {
+	quickWake(t)
+
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	_, readies0, _ := srv.counts()
+	deafen(c)
+	c.WakeHealthCheck() // the round: into the dead path
+	waitFor(t, "the round's READYs at the server", func() bool { _, r, _ := srv.counts(); return r >= readies0+2 })
+	time.Sleep(wakeAskAgainEvery / 4) // their answers arrive and are dropped while the path is still dead
+	undeafen(c)                       // the path is back well inside the window; the tunnel is idle
+	time.Sleep(3 * wakeDeafAfter)
+	g, _, _ := srv.counts()
+	if st := c.Stats(); st.DeafAll != 0 || g != len(first) || st.RoundAsks == 0 {
+		t.Fatalf("a wake round lost into a path that came back inside its window: restart-alls %d (want 0), %d new GETCONF(s) (want 0), the round asked again %d time(s) (want > 0)", st.DeafAll, g-len(first), st.RoundAsks)
+	}
+}
+
+// A HELD round keeps asking. The hold — the spacing between two restart-alls —
+// can last minutes; a path that comes back in them onto an idle tunnel must not
+// find, at the hold's end, a verdict on probes nobody repeated. Sabotage seen
+// red: a held round not asked again.
+func TestAHeldRoundKeepsAskingSoAPathThatReturnedGetsNoVerdictAtTheHoldsEnd(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	deafen(c)
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	c.deafMu.Lock()
+	c.deafRounds = 3 // the third restart-all of a run was a moment ago: the next is held for deafSpacingFor(3) = 120 s
+	c.deafMu.Unlock()
+	c.lastDeafAll.Store(start.UnixNano())
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	step := func(s int) {
+		c.monitorStep(at(s))
+		waitFor(t, "this tick's sends to leave", func() bool { return !c.workers[0].probing.Load() && !c.workers[1].probing.Load() })
+	}
+	for s := 5; s <= 70; s += 5 { // +30 the round; +60 its verdict is due — and HELD; +65, +70: held
+		step(s)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if st := c.Stats(); st.DeafAll != 0 {
+		t.Fatalf("the fixture: a restart-all inside the hold (%d)", st.DeafAll)
+	}
+	undeafen(c) // the path is back, the tunnel idle, fifty seconds of hold to go
+	heard := c.rxSeq.Load()
+	step(75)
+	waitFor(t, "the held round, asked again, to be answered", func() bool { return c.rxSeq.Load() > heard })
+	for s := 80; s <= 130; s += 5 { // the hold ends at +120
+		c.anyRx.Store(at(s - 1).UnixNano()) // the answers, in the monitor's time
+		step(s)
+	}
+	g, _, _ := srv.counts()
+	if st := c.Stats(); st.DeafAll != 0 || g != len(first) {
+		t.Fatalf("a held round, the path back fifty seconds before the hold's end: restart-alls %d (want 0), %d new GETCONF(s) (want 0)", st.DeafAll, g-len(first))
+	}
+}
+
+// … and a held WAKE round is asked again too — by the monitor's tick: its
+// watcher asks inside the round's window only (every quarter of a second of a
+// hold that can last minutes would be a flood). Sabotage seen red: the monitor's
+// tick asking for its own rounds alone.
+func TestAHeldWakeRoundIsAskedAgainByTheMonitorsTick(t *testing.T) {
+	quickWake(t)
+
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	deafen(c)
+	c.deafMu.Lock()
+	c.deafRounds = 3 // held for deafSpacingFor(3) = 120 s after the restart-all of a moment ago
+	c.deafMu.Unlock()
+	c.lastDeafAll.Store(time.Now().UnixNano())
+	c.WakeHealthCheck()
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	time.Sleep(3 * wakeDeafAfter) // the window is over, the verdict due — and held
+	if st := c.Stats(); st.DeafAll != 0 {
+		t.Fatalf("the fixture: a restart-all inside the hold (%d)", st.DeafAll)
+	}
+	step := func(s int) {
+		c.monitorStep(at(s))
+		waitFor(t, "this tick's sends to leave", func() bool { return !c.workers[0].probing.Load() && !c.workers[1].probing.Load() })
+	}
+	for s := 5; s <= 30; s += 5 { // the path stays dead; past +30 the per-worker rule is held by its rule 3 — nobody has heard anything
+		step(s)
+	}
+	time.Sleep(100 * time.Millisecond)
+	undeafen(c) // the path is back, the tunnel idle, the hold has a minute and a half to go
+	heard := c.rxSeq.Load()
+	step(35) // nobody but the held round's own asking is left to ask
+	waitFor(t, "the held wake round, asked again by the monitor's tick, to be answered", func() bool { return c.rxSeq.Load() > heard })
+	g, _, _ := srv.counts()
+	if st := c.Stats(); st.DeafAll != 0 || g != len(first) {
+		t.Fatalf("a held wake round, the path back inside the hold: restart-alls %d (want 0), %d new GETCONF(s) (want 0)", st.DeafAll, g-len(first))
+	}
+}
+
+// A round's re-sends go out in a SILENCE — nobody has heard anything — and count
+// against nobody, exactly as the per-worker rule's re-sends into a blackout do
+// not: whether a re-send counts is the FACT of the client hearing before it and
+// after it (probeState.confirmed), whoever sent it. A worker that really is dead
+// goes two confirmed re-sends after the path returned, not one tick sooner.
+// Sabotage seen red: the round's re-sends marked as made while the client heard.
+func TestARoundsResendsIntoASilenceAreNotEvidenceAgainstAWorker(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	deafen(c)
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	for s := 5; s <= 45; s += 5 { // +30 the round; +35, +40, +45: asked again, into the silence
+		c.monitorStep(at(s))
+		waitFor(t, "this tick's sends to leave", func() bool { return !c.workers[0].probing.Load() && !c.workers[1].probing.Load() })
+	}
+	time.Sleep(100 * time.Millisecond)
+	c.Blackhole(1, false) // the path is back; worker 2 stays dead
+	heard := c.rxSeq.Load()
+	c.monitorStep(at(50)) // the round asked again: worker 1 answers — the round is answered
+	waitFor(t, "worker 1 hears again", func() bool { return c.rxSeq.Load() > heard })
+	for s := 55; s <= 65; s += 5 { // +55: worker 2 asked again, the first re-send made while the path works; +60: confirmed (1); +65: two → it goes
+		othersHear(c, at(s-2), 1)
+		tick(t, c, at(s))
+		if st := c.Stats(); s < 65 && st.LostWorkers != 0 {
+			t.Fatalf("+%d s: worker 2 given up on — but only %d re-send(s) had been made while the path worked; the round's, made into the silence, count for nothing", s, (s-55)/5)
+		}
+	}
+	if st := c.Stats(); st.LostWorkers != 1 || st.DeafAll != 0 {
+		t.Fatalf("+65 s: given up on %d worker(s) (want 1 — the dead one, after two confirmed re-sends), restart-alls %d (want 0)", st.LostWorkers, st.DeafAll)
+	}
+}
+
+// A FIRST probe never counts against a worker, whatever is heard after it: the
+// wake hook's and the round's go out when nobody is known to hear, and the
+// rule's own is not a re-send. (Until the round was asked again, a scenario
+// test carried this — the round's first probe, thirty seconds old when the
+// path returned; now the round's re-sends replace that state long before, and
+// the scenario cannot see the first probe's marking any more. The property is
+// pinned where it is made.) Sabotage seen red: a first probe published as a
+// re-send made while the client heard.
+func TestAFirstProbeNeverCountsWhateverIsHeardAfterIt(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	w := c.workers[1]
+	c.Blackhole(2, true) // its answer never comes: the state stays to be looked at
+	w.probe(time.Now().UnixNano())
+	st := w.probeSt.Load()
+	if st == nil {
+		t.Fatal("no probe state published")
+	}
+	if n := st.confirmed(true); n != 0 {
+		t.Fatalf("a first probe, the client hearing right after it, counts as %d confirmed re-send(s) — want 0: it was sent when nobody was known to hear", n)
+	}
+}
+
+// One line per tick that sends probes again, split by the fact the counting
+// rests on — the client hearing since the send before, or not. The stop line's
+// total cannot say which (the field run of 2026-09-19: "+28 sent again" over a
+// run with a block in it). Sabotages seen red: no line; every re-send reported
+// as made while the path worked.
+func TestATickThatSendsProbesAgainSaysSoAndSaysIntoWhat(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	var mu sync.Mutex
+	var lines []string
+	cfg := testConfig(srv, 2, (&lease{}).creds)
+	cfg.Logf = func(f string, a ...any) {
+		mu.Lock()
+		lines = append(lines, fmt.Sprintf(f, a...))
+		mu.Unlock()
+	}
+	c := dialReady(t, cfg)
+	defer c.Close()
+	longReady(c)
+	said := func(what string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, l := range lines {
+			if strings.Contains(l, what) {
+				n++
+			}
+		}
+		return n
+	}
+	c.Blackhole(2, true) // worker 2 is dead; worker 1 hears
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	c.lastTick.Store(start.UnixNano())
+	c.workers[1].lastRx.Store(start.UnixNano())
+	for s := 5; s <= 35; s += 5 { // +30: the first probe (and a witness, which answers); +35: sent again — the client HAS heard since
+		othersHear(c, at(s), 1)
+		tick(t, c, at(s))
+	}
+	if n := said("liveness — 1 unanswered probe(s) sent again: 1 with the client hearing since the send before (the path works), 0 into silence"); n != 1 {
+		t.Fatalf("a probe sent again while the witness answered: %d line(s) saying so, want 1; the log: %q", n, lines)
+	}
+	othersHear(c, at(37), 1) // the witness's last answer, in the monitor's time (the read loop stamped the real clock) …
+	deafen(c)                // … and now a blackout: rule 3 still lets the rule through, and nothing is heard any more
+	tick(t, c, at(40))
+	if n := said("liveness — 1 unanswered probe(s) sent again: 0 with the client hearing since the send before (the path works), 1 into silence"); n != 0 {
+		// +40's re-send still had the +35 witness's answer before it: it is +45's that goes out into silence
+		t.Fatalf("the fixture: +40's re-send was made after the witness's last answer — it is not the silent one (%d)", n)
+	}
+	tick(t, c, at(45))
+	if n := said("liveness — 1 unanswered probe(s) sent again: 0 with the client hearing since the send before (the path works), 1 into silence"); n != 1 {
+		t.Fatalf("a probe sent again into a blackout: %d line(s) saying so, want 1; the log: %q", n, lines)
 	}
 }
 

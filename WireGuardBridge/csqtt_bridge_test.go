@@ -637,7 +637,7 @@ func TestCsqttStopLeavesTheClientsCountersInTheLog(t *testing.T) {
 	var mints atomic.Int32
 	installFakePool(t, mintingFetch(&mints))
 	fc := newFakeClient()
-	fc.stats.Repairs, fc.stats.Probes, fc.stats.Reprobes, fc.stats.Witnesses, fc.stats.LostWorkers, fc.stats.DeafAll = 4, 41, 7, 9, 2, 1
+	fc.stats.Repairs, fc.stats.Probes, fc.stats.Reprobes, fc.stats.Witnesses, fc.stats.RoundAsks, fc.stats.LostWorkers, fc.stats.DeafAll = 4, 41, 7, 9, 5, 2, 1
 	installFakeDial(t, fc)
 	csqttSeededSettle = 0
 	var out lockedLog
@@ -668,7 +668,7 @@ func TestCsqttStopLeavesTheClientsCountersInTheLog(t *testing.T) {
 	if atStop == "" {
 		t.Fatalf("the stop left no counters in the log — a run without a path event carries none at all:\n%s", strings.Join(out.lines(), "\n"))
 	}
-	for _, want := range []string{"workers 9/30 ready (7 heard from lately)", "restarts 3, repairs 4", "probes 41 (+7 sent again, 9 witnesses)", "lost 2, deaf restart-alls 1"} {
+	for _, want := range []string{"workers 9/30 ready (7 heard from lately)", "restarts 3, repairs 4", "probes 41 (+7 sent again, 9 witnesses)", "rounds asked again 5", "lost 2, deaf restart-alls 1"} {
 		if !strings.Contains(atStop, want) {
 			t.Fatalf("the stop's counters lack %q — they are the client's as it RAN (a closed client has nobody ready): %q", want, atStop)
 		}
@@ -678,6 +678,75 @@ func TestCsqttStopLeavesTheClientsCountersInTheLog(t *testing.T) {
 	}
 	if atEvent == "" || atEvent != atStop {
 		t.Fatalf("the path-event snapshot and the stop line word the same counters differently — one formatter serves both:\n  at a path event: %q\n  at the stop:     %q", atEvent, atStop)
+	}
+}
+
+// … and the counters reach the log BY THEMSELVES, once a minute, as native's
+// pathstats do: the snapshot needs a path event and the stop line a stop, and a
+// log exported with the tunnel still up — from a run without a path change —
+// had neither. The same formatter again; the ticker ends with the tunnel (the
+// stop joins it with the pumps). Sabotages seen red: the ticker not started;
+// its line worded on its own; the ticker outliving the stop.
+func TestCsqttCountersReachTheLogByThemselves(t *testing.T) {
+	var mints atomic.Int32
+	installFakePool(t, mintingFetch(&mints))
+	fc := newFakeClient()
+	fc.stats.Probes, fc.stats.Reprobes, fc.stats.Witnesses, fc.stats.RoundAsks = 41, 7, 9, 5
+	installFakeDial(t, fc)
+	installPairTun(t)
+	csqttSeededSettle = 0
+	every := csqttStatsEvery
+	csqttStatsEvery = 20 * time.Millisecond
+	t.Cleanup(func() { csqttStatsEvery = every })
+	var out lockedLog
+	prev := log.Writer()
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	h := startCsqtt(t, "")
+	if rc := csqttWaitReadyImpl(h, 3000*time.Millisecond); rc != 1 {
+		t.Fatalf("csqttWaitReady: %d", rc)
+	}
+	mine, theirs := socketPair(t)
+	defer unix.Close(theirs)
+	if rc := csqttAttachImpl(h, mine); rc != 1 {
+		t.Fatalf("csqttAttach: %d", rc)
+	}
+	const tick, stop = "csqtt: pathstats tick: ", "csqtt: pathstats at stop: "
+	ticks := func() (n int, text string) {
+		for _, l := range out.lines() {
+			if i := strings.Index(l, tick); i >= 0 {
+				n, text = n+1, l[i+len(tick):]
+			}
+		}
+		return
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for n, _ := ticks(); n < 2 && time.Now().Before(deadline); n, _ = ticks() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	n, atTick := ticks()
+	if n < 2 {
+		t.Fatalf("%d line(s) from the ticker after a hundred of its periods, want at least 2 — without a path event or a stop the log carries no counters", n)
+	}
+	t0 := time.Now()
+	csqttTurnOffImpl(h)
+	if took := time.Since(t0); took > time.Second {
+		t.Fatalf("the stop took %s — the ticker did not end with the tunnel (the join budget ran out)", took.Round(10*time.Millisecond))
+	}
+	n, _ = ticks()
+	time.Sleep(10 * csqttStatsEvery)
+	if after, _ := ticks(); after != n {
+		t.Fatalf("%d line(s) from the ticker AFTER the stop — it outlived the tunnel", after-n)
+	}
+	var atStop string
+	for _, l := range out.lines() {
+		if i := strings.Index(l, stop); i >= 0 {
+			atStop = l[i+len(stop):]
+		}
+	}
+	if atTick == "" || atTick != atStop {
+		t.Fatalf("the ticker's line and the stop line word the same counters differently — one formatter serves all three:\n  the ticker: %q\n  the stop:   %q", atTick, atStop)
 	}
 }
 

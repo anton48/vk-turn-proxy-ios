@@ -136,7 +136,8 @@ type Client struct {
 	gate     *startGate
 	anyRx    atomic.Int64 // last inbound on any worker, unix nanos
 	probes   atomic.Int64 // liveness probes marked
-	reprobes atomic.Int64 // unanswered probes sent again by the liveness rule
+	reprobes atomic.Int64 // unanswered probes sent again — by the liveness rule, and by a round that is asked again
+	roundAsk atomic.Int64 // times a standing, unanswered probe round was asked again (each time: every ready worker)
 	witness  atomic.Int64 // READYs to a worker known to be alive, asked beside them (askWitness)
 	resets   atomic.Int64 // monitor ticks found late (descheduled)
 	lostToL  atomic.Int64 // workers restarted by the liveness verdict
@@ -300,6 +301,7 @@ var wakeListenSleep = func(ctx context.Context, d time.Duration) time.Duration {
 // did not hear while nobody was listening; the next wake, or the monitor's
 // thirty seconds of silence, asks again.
 func (c *Client) listenTo(r *probeRound) {
+	nextAsk := wakeAskAgainEvery
 	for {
 		took := wakeListenSleep(c.ctx, wakeListenStep)
 		if c.ctx.Err() != nil || c.round.Load() != r || c.rxSeq.Load() != r.rxSeq {
@@ -309,10 +311,40 @@ func (c *Client) listenTo(r *probeRound) {
 			c.round.CompareAndSwap(r, nil)
 			return
 		}
-		if time.Duration(r.listened.Add(int64(took))) >= wakeDeafAfter {
-			c.judgeDeaf(time.Now(), time.Time{}) // held by the spacing, the round stands and is judged again next step
+		listened := time.Duration(r.listened.Add(int64(took)))
+		if listened >= wakeDeafAfter {
+			c.judgeDeaf(time.Now(), time.Time{}) // held by the spacing, the round stands and is judged again next step — and asked again at the monitor's ticks, not here
+		} else if listened >= nextAsk {
+			nextAsk = listened + wakeAskAgainEvery
+			c.askRoundAgain(r, listened, time.Now())
 		}
 	}
+}
+
+// askRoundAgain sends the probes of a round that stands unanswered AGAIN, to
+// every ready worker whose probe is still out. The round's own record is not
+// touched — its listening, and with it its verdict, is the first ask's. Each
+// probe is sent again the way the liveness rule does it (worker.reprobe): by
+// CompareAndSwap from the state that was read, and with the FACT of whether the
+// client has heard anything since the send before — in a silence it has not,
+// so these re-sends can never count against a worker.
+func (c *Client) askRoundAgain(r *probeRound, listened time.Duration, at time.Time) {
+	now := at.UnixNano()
+	n := 0
+	for _, w := range c.workers {
+		if !w.ready.Load() {
+			continue
+		}
+		if st := w.probeSt.Load(); st != nil && w.reprobe(st, now, c.rxSeq.Load() != st.seq) {
+			n++
+		}
+	}
+	c.roundAsk.Add(1)
+	kind := "the round"
+	if r.wake {
+		kind = "the wake round"
+	}
+	c.cfg.Logf("csqtt: not one answer %s into %s — %d ready worker(s) asked again", listened.Round(100*time.Millisecond), kind, n)
 }
 
 // dropRoundBefore is the monitor's part of the same rule, at a late tick: a
@@ -383,11 +415,20 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 		}
 		c.heldSaid = false
 		c.cfg.Logf("csqtt: no worker has heard anything for %s — %d ready worker(s) probed at once", now.Sub(in.AnyRx).Round(time.Second), probed)
+	case deafAskAgain:
+		c.askRoundAgain(r, in.RoundListened, now)
 	case deafHeld:
 		if !c.heldSaid {
 			c.heldSaid = true
 			c.cfg.Logf("csqtt: deaf again — the restart of every worker is held until %s after the previous one (round %d of this run)",
 				deafSpacingFor(in.Rounds), in.Rounds)
+		}
+		// A held round keeps asking — the hold can last minutes, and the path
+		// may come back in them onto an idle tunnel. At the MONITOR's ticks,
+		// whoever's round it is: a wake round's watcher asks inside its window
+		// only, and comes here every quarter of a second while the hold lasts.
+		if !prevTick.IsZero() {
+			c.askRoundAgain(r, in.RoundListened, now)
 		}
 	case deafRestartAll:
 		// COMMIT: the judged round comes down, by CompareAndSwap, and only if
@@ -707,6 +748,7 @@ func (c *Client) monitorStep(now time.Time) {
 	anyRx := time.Unix(0, c.anyRx.Load())
 	reset := false
 	asked := false
+	again, againHeard := 0, 0 // this tick's re-sends, and how many of them with the client hearing since the send before
 	for _, w := range c.workers {
 		in := livenessInput{Now: now, PrevTick: prev, AnyRx: anyRx,
 			ReadyAt: nanosTime(w.readyAt.Load()), LastRx: nanosTime(w.lastRx.Load())}
@@ -731,6 +773,10 @@ func (c *Client) monitorStep(now time.Time) {
 		case livenessReprobe:
 			if w.reprobe(st, now.UnixNano(), heardSince) {
 				asked = true
+				again++
+				if heardSince {
+					againHeard++
+				}
 			}
 		case livenessAnswered:
 			// The probe has been answered: its state comes down — here, and not
@@ -760,6 +806,14 @@ func (c *Client) monitorStep(now time.Time) {
 	}
 	if asked && !reset {
 		c.askWitness()
+	}
+	if again > 0 {
+		// One line per tick that sends probes again, split by the FACT the
+		// counting rests on: a total alone cannot say whether the re-sends went
+		// out while the path worked or into a silence (field, 2026-09-19: "+28
+		// sent again" over a run with a block in it — unreadable).
+		c.cfg.Logf("csqtt: liveness — %d unanswered probe(s) sent again: %d with the client hearing since the send before (the path works), %d into silence",
+			again, againHeard, again-againHeard)
 	}
 	if reset {
 		// The process was not running: nothing observed in that gap means
@@ -837,7 +891,8 @@ type Stats struct {
 	Reassembled int64
 	Repairs     int64
 	Probes      int64 // liveness probes marked (the send is asynchronous)
-	Reprobes    int64 // unanswered probes the liveness rule sent again
+	Reprobes    int64 // unanswered probes sent again — per worker, whoever sent them again
+	RoundAsks   int64 // times a standing, unanswered probe ROUND was asked again
 	Witnesses   int64 // READYs to a worker known to be alive, asked beside them
 	Descheduled int64 // monitor ticks found late
 	LostWorkers int64 // workers restarted by the liveness verdict
@@ -855,6 +910,7 @@ func (c *Client) Stats() Stats {
 		Repairs:     c.repairs.Load(),
 		Probes:      c.probes.Load(),
 		Reprobes:    c.reprobes.Load(),
+		RoundAsks:   c.roundAsk.Load(),
 		Witnesses:   c.witness.Load(),
 		Descheduled: c.resets.Load(),
 		LostWorkers: c.lostToL.Load(),

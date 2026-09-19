@@ -283,6 +283,17 @@ const (
 var (
 	wakeDeafAfter  = 5 * time.Second
 	wakeListenStep = 250 * time.Millisecond
+
+	// wakeAskAgainEvery: a wake round that stands unanswered is asked again
+	// after every this much LISTENING (the monitor's round: at every on-time
+	// tick). 🚨 A round's probes go out when nobody is known to hear — into
+	// a Wi-Fi that is still joining after the wake, a radio still coming up, a
+	// block of a minute — and may be lost WHOLE; when the path comes back onto
+	// an idle tunnel nothing arrives by itself (a worker hears nothing but the
+	// answers to its own probes, and the per-worker rule is held by its rule 3
+	// while nobody has heard anything): asked once, such a round ended in a
+	// restart of every worker over a path that was fine.
+	wakeAskAgainEvery = time.Second
 )
 
 // deafInput is the client's view at a monitor tick or at the wake verdict.
@@ -327,6 +338,7 @@ const (
 	deafProbeAll              // total silence for probeAfter: ask every ready worker
 	deafRestartAll            // the round went unanswered: replace every worker
 	deafHeld                  // … but the previous restart-all is too recent
+	deafAskAgain              // the monitor's round stands unanswered, its wait not over: send its probes again
 )
 
 // deafSpacingFor is the least time after restart-all number `rounds` of a run
@@ -352,7 +364,11 @@ func deafSpacingFor(rounds int) time.Duration {
 //  3. a probe round that stands UNANSWERED — no real inbound since its probes
 //     went out, whatever the clocks were reset to meanwhile — is a verdict once
 //     it has been LISTENED to for its wait, unless the last restart-all is too
-//     recent;
+//     recent; until then it is ASKED AGAIN — the monitor's round at every
+//     on-time tick (here), the wake round by its watcher inside its window —
+//     and so is a round whose verdict is held, at the monitor's ticks
+//     (judgeDeaf). 🚫 Asking again never touches the round's listening: the
+//     wait is the first ask's;
 //  4. otherwise, total silence for probeAfter → ask everybody.
 func deafVerdict(in deafInput) deafAction {
 	if !in.PrevTick.IsZero() && in.Now.Sub(in.PrevTick) > livenessTick+descheduledSlack {
@@ -367,7 +383,10 @@ func deafVerdict(in deafInput) deafAction {
 			wait = wakeDeafAfter
 		}
 		if in.RoundListened < wait {
-			return deafNone
+			if in.RoundIsWake {
+				return deafNone // its watcher asks again, in steps of its own
+			}
+			return deafAskAgain
 		}
 		if !in.LastRestartAll.IsZero() && in.Now.Sub(in.LastRestartAll) < deafSpacingFor(in.Rounds) {
 			return deafHeld

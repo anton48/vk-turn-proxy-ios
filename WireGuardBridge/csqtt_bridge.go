@@ -671,12 +671,36 @@ func csqttAttachImpl(handle int32, tunFd int) int32 {
 		return -4
 	}
 	e.dev = dev
-	e.pumps.Add(3)
+	e.pumps.Add(4)
 	go e.pumpUp(dev, client)
 	go e.pumpDown(dev, client)
 	go e.drainEvents(dev)
+	go e.logStatsEvery(client)
 	log.Printf("csqttAttach: tunnel %d attached (fd %d → dup %d)", e.id, tunFd, dupFd)
 	return 1
+}
+
+// csqttStatsEvery: the client's counters reach the log by themselves this
+// often, as native's pathstats do. 🚨 The other two places that print them need
+// an EVENT — a path change, the stop — and a log exported with the tunnel still
+// up, from a run without a path change, had neither. A frozen process logs
+// nothing; the ticker's first fire after an unfreeze is the line at the wake.
+var csqttStatsEvery = 60 * time.Second
+
+// logStatsEvery ends with the tunnel's context, and the stop joins it with the
+// pumps.
+func (e *csqttEntry) logStatsEvery(client csqttClient) {
+	defer e.pumps.Done()
+	tick := time.NewTicker(csqttStatsEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-tick.C:
+			log.Printf("csqtt: pathstats tick: %s", csqttStatsLine(client.Stats(), e.tunIn.Load(), e.tunOut.Load()))
+		}
+	}
 }
 
 // pumpUp: TUN → relays. The only caller of WritePacket (not concurrency-safe
@@ -849,7 +873,8 @@ func csqttWakeHealthCheckImpl(handle int32) {
 }
 
 // One log line on demand, the csqtt shape of pathstats — Swift asks for it at
-// every path event. The stop prints the same counters (csqttTurnOffImpl).
+// every path event. The stop prints the same counters (csqttTurnOffImpl), and so
+// does a ticker once a minute (logStatsEvery).
 //
 //export csqttLogPathSnapshot
 func csqttLogPathSnapshot(handle C.int32_t, label *C.char) {
@@ -870,12 +895,12 @@ func csqttLogPathSnapshotImpl(handle int32, label string) {
 }
 
 // csqttStatsLine is the ONE wording of the client's counters in the log: the
-// path-event snapshot and the stop line both print it, so whichever of the two a
-// log has is read by the same eye and the same grep — and a counter added here
-// reaches both.
+// path-event snapshot, the once-a-minute line and the stop line all print it, so
+// whichever of them a log has is read by the same eye and the same grep — and a
+// counter added here reaches all three.
 func csqttStatsLine(s csqtt.Stats, tunIn, tunOut int64) string {
-	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), lost %d, deaf restart-alls %d; tun in=%d out=%d",
-		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.LostWorkers, s.DeafAll, tunIn, tunOut)
+	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d",
+		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut)
 }
 
 // Stats in the app's shape — the same struct the WireGuard path marshals,

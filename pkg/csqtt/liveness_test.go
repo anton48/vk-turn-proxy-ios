@@ -328,16 +328,26 @@ func TestDeafVerdict(t *testing.T) {
 		{"… but nobody is ready past its grace → the workers' own dialling is the recovery", func(in *deafInput) {
 			in.AnyRx, in.Judgeable = now.Add(-5*time.Minute), 0
 		}, deafNone},
-		{"the monitor's round has been listened to for 29 s → wait", func(in *deafInput) {
+		{"the monitor's round has been listened to for 29 s → no verdict yet — and asked AGAIN", func(in *deafInput) {
 			in.AnyRx, in.RoundOut, in.RoundListened = now.Add(-59*time.Second), true, 29*time.Second
-		}, deafNone},
+		}, deafAskAgain},
 		{"the monitor's round unanswered after 30 s of listening → replace everybody", func(in *deafInput) {
 			in.AnyRx, in.RoundOut, in.RoundListened = now.Add(-60*time.Second), true, 30*time.Second
 		}, deafRestartAll},
 		{"the WAKE round has been listened to for 4.9 s → wait", wakeRound(4900 * time.Millisecond), deafNone},
 		{"the WAKE round unanswered after 5 s of listening → replace everybody", wakeRound(5 * time.Second), deafRestartAll},
-		{"five seconds is not enough for the monitor's round", func(in *deafInput) {
+		{"five seconds is not enough for the monitor's round — asked again", func(in *deafInput) {
 			in.RoundOut, in.RoundListened = true, 5*time.Second
+		}, deafAskAgain},
+		// build 419
+		{"a WAKE round inside its wait is left to its watcher: the monitor's tick neither judges nor asks", func(in *deafInput) {
+			in.RoundOut, in.RoundIsWake, in.RoundListened = true, true, 2*time.Second
+		}, deafNone},
+		{"an ANSWERED round is not asked again", func(in *deafInput) {
+			in.RoundOut, in.RoundAnswered, in.RoundListened = true, true, 5*time.Second
+		}, deafNone},
+		{"a late tick asks nobody again either", func(in *deafInput) {
+			in.PrevTick, in.RoundOut, in.RoundListened = now.Add(-90*time.Second), true, 5*time.Second
 		}, deafNone},
 		{"a round that WAS answered is no verdict, however long it was listened to", func(in *deafInput) {
 			wakeRound(time.Minute)(in)
