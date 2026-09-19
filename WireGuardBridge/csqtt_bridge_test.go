@@ -12,11 +12,13 @@ package main
 // comment on each test names it.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"regexp"
 	"strings"
@@ -82,7 +84,14 @@ func (f *fakeClient) Close() error {
 	}
 	return nil
 }
-func (f *fakeClient) Stats() csqtt.Stats           { return f.stats }
+func (f *fakeClient) Stats() csqtt.Stats {
+	if f.closed.Load() { // what Close leaves behind: a torn-down client, nobody ready
+		s := f.stats
+		s.Ready, s.Live = 0, 0
+		return s
+	}
+	return f.stats
+}
 func (f *fakeClient) Config() csqtt.ConfigResponse { return f.conf }
 func (f *fakeClient) OnPathChange()                { f.pathChg.Add(1) }
 func (f *fakeClient) WakeHealthCheck()             { f.wakes.Add(1) }
@@ -595,6 +604,80 @@ func TestCsqttStatsCarryTheAppsKeys(t *testing.T) {
 	}
 	if st.CredPoolSize == 0 || st.CredPoolWithCreds == 0 {
 		t.Fatalf("pool stats missing: %+v", st)
+	}
+}
+
+// lockedLog collects the bridge's log lines: they come from several goroutines,
+// and the test reads while some of them may still be writing.
+type lockedLog struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLog) lines() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Split(l.b.String(), "\n")
+}
+
+// The client's counters reach the log at the STOP too — read from the client as
+// it RAN, not as Close leaves it. The path-event snapshot is the only other
+// place they are printed, and a run without a path event (a control that ends
+// in a plain Disconnect) used to carry none of them. Both lines come from ONE
+// formatter: the same counters in the same words, whichever the log has.
+// Sabotages seen red: the stop printing no counters; the counters read after
+// the Close; the stop line worded on its own; the snapshot worded on its own.
+func TestCsqttStopLeavesTheClientsCountersInTheLog(t *testing.T) {
+	var mints atomic.Int32
+	installFakePool(t, mintingFetch(&mints))
+	fc := newFakeClient()
+	fc.stats.Repairs, fc.stats.Probes, fc.stats.Reprobes, fc.stats.Witnesses, fc.stats.LostWorkers, fc.stats.DeafAll = 4, 41, 7, 9, 2, 1
+	installFakeDial(t, fc)
+	csqttSeededSettle = 0
+	var out lockedLog
+	prev := log.Writer()
+	log.SetOutput(&out)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	h := startCsqtt(t, "")
+	if rc := csqttWaitReadyImpl(h, 3000*time.Millisecond); rc != 1 {
+		t.Fatalf("csqttWaitReady: %d", rc)
+	}
+	csqttLogPathSnapshotImpl(h, "a path event")
+	csqttTurnOffImpl(h)
+
+	const snapshot, stop, closed = "csqtt: pathstats a path event: ", "csqtt: pathstats at stop: ", "client.Close took"
+	var atEvent, atStop string
+	stopAt, closedAt := -1, -1
+	for i, l := range out.lines() {
+		switch {
+		case strings.Contains(l, snapshot):
+			atEvent = l[strings.Index(l, snapshot)+len(snapshot):]
+		case strings.Contains(l, stop):
+			atStop, stopAt = l[strings.Index(l, stop)+len(stop):], i
+		case strings.Contains(l, closed):
+			closedAt = i
+		}
+	}
+	if atStop == "" {
+		t.Fatalf("the stop left no counters in the log — a run without a path event carries none at all:\n%s", strings.Join(out.lines(), "\n"))
+	}
+	for _, want := range []string{"workers 9/30 ready (7 heard from lately)", "restarts 3, repairs 4", "probes 41 (+7 sent again, 9 witnesses)", "lost 2, deaf restart-alls 1"} {
+		if !strings.Contains(atStop, want) {
+			t.Fatalf("the stop's counters lack %q — they are the client's as it RAN (a closed client has nobody ready): %q", want, atStop)
+		}
+	}
+	if closedAt < 0 || stopAt > closedAt {
+		t.Fatalf("the counters were logged at line %d, the client's Close at line %d — want the counters first", stopAt, closedAt)
+	}
+	if atEvent == "" || atEvent != atStop {
+		t.Fatalf("the path-event snapshot and the stop line word the same counters differently — one formatter serves both:\n  at a path event: %q\n  at the stop:     %q", atEvent, atStop)
 	}
 }
 

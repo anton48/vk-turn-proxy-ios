@@ -773,6 +773,13 @@ func csqttTurnOffImpl(handle int32) {
 		log.Printf("csqttTurnOff: tunnel %d: the dial is still in flight after %s — its client will close itself", e.id, csqttDialJoinBudget)
 	}
 	if c := e.clientNow(); c != nil {
+		// The client's counters, read BEFORE the Close — what Close leaves behind
+		// is a torn-down client with nobody ready. 🚨 The snapshot below is
+		// printed at PATH EVENTS alone, so without this line a run that has none —
+		// a control that ends in a plain Disconnect — leaves no liveness counter
+		// in its log at all (field, 2026-09-19: a pf-block control came back
+		// without the one number that would have shown the re-sends acting).
+		log.Printf("csqtt: pathstats at stop: %s", csqttStatsLine(c.Stats(), e.tunIn.Load(), e.tunOut.Load()))
 		t := time.Now()
 		_ = c.Close()
 		log.Printf("csqttTurnOff: tunnel %d client.Close took %s", e.id, time.Since(t).Round(time.Millisecond))
@@ -841,23 +848,34 @@ func csqttWakeHealthCheckImpl(handle int32) {
 	}
 }
 
-// One log line on demand, the csqtt shape of pathstats.
+// One log line on demand, the csqtt shape of pathstats — Swift asks for it at
+// every path event. The stop prints the same counters (csqttTurnOffImpl).
 //
 //export csqttLogPathSnapshot
 func csqttLogPathSnapshot(handle C.int32_t, label *C.char) {
-	e := csqttLookup(int32(handle))
+	csqttLogPathSnapshotImpl(int32(handle), C.GoString(label))
+}
+
+func csqttLogPathSnapshotImpl(handle int32, label string) {
+	e := csqttLookup(handle)
 	if e == nil {
 		return
 	}
-	l := C.GoString(label)
 	c := e.clientNow()
 	if c == nil {
-		log.Printf("csqtt: pathstats %s: not ready yet", l)
+		log.Printf("csqtt: pathstats %s: not ready yet", label)
 		return
 	}
-	s := c.Stats()
-	log.Printf("csqtt: pathstats %s: workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), lost %d, deaf restart-alls %d; tun in=%d out=%d",
-		l, s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.LostWorkers, s.DeafAll, e.tunIn.Load(), e.tunOut.Load())
+	log.Printf("csqtt: pathstats %s: %s", label, csqttStatsLine(c.Stats(), e.tunIn.Load(), e.tunOut.Load()))
+}
+
+// csqttStatsLine is the ONE wording of the client's counters in the log: the
+// path-event snapshot and the stop line both print it, so whichever of the two a
+// log has is read by the same eye and the same grep — and a counter added here
+// reaches both.
+func csqttStatsLine(s csqtt.Stats, tunIn, tunOut int64) string {
+	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), lost %d, deaf restart-alls %d; tun in=%d out=%d",
+		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.LostWorkers, s.DeafAll, tunIn, tunOut)
 }
 
 // Stats in the app's shape — the same struct the WireGuard path marshals,
