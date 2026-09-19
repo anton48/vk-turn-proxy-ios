@@ -732,9 +732,19 @@ func (c *Client) monitorStep(now time.Time) {
 			if w.reprobe(st, now.UnixNano(), heardSince) {
 				asked = true
 			}
+		case livenessAnswered:
+			// The probe has been answered: its state comes down — here, and not
+			// only in the read loop, which clears on an inbound and so cannot clear
+			// a state PUBLISHED after the inbound that answers it (see worker.probe).
+			// By CompareAndSwap from the state that was looked at: a fresh probe
+			// the wake hook has put in its place meanwhile is not the one removed.
+			if hook := livenessVerdictReached.Load(); hook != nil {
+				(*hook)(w, livenessAnswered)
+			}
+			w.probeSt.CompareAndSwap(st, nil)
 		case livenessRestart:
 			if hook := livenessVerdictReached.Load(); hook != nil {
-				(*hook)(w)
+				(*hook)(w, livenessRestart)
 			}
 			// COMMIT, as for the deafness verdict: the probe's state comes down by
 			// CompareAndSwap from the one the verdict was reached on, the worker's
@@ -958,11 +968,27 @@ func (w *worker) restart(reason string) {
 // against the worker; what can count is the re-sends: see reprobe. It REPLACES
 // whatever probe stood (a wake is a boundary; the round asks everybody afresh).
 // The two counts are read before the send: no answer can precede its probe.
+// 🚨 But an inbound CAN land between the reading of the counts and the
+// publication — the read loop does not take turns with this function — and it
+// has then done all it will ever do about this probe (counted, cleared what
+// stood) BEFORE the state exists: the state is born answered with nobody left
+// to clear it. The monitor takes an answered state down itself
+// (livenessAnswered); that, not the read loop, is what ends such a probe.
 func (w *worker) probe(now int64) {
-	w.probeSt.Store(&probeState{firstAt: now, lastAt: now, rx: w.rx.Load(), seq: w.c.rxSeq.Load()})
+	st := &probeState{firstAt: now, lastAt: now, rx: w.rx.Load(), seq: w.c.rxSeq.Load()}
+	if hook := probeSnapshotTaken.Load(); hook != nil {
+		(*hook)(w)
+	}
+	w.probeSt.Store(st)
 	w.c.probes.Add(1)
 	w.sendProbe()
 }
+
+// probeSnapshotTaken is a test's window INSIDE worker.probe, between the
+// reading of the two counts and the publication of the probe's state — nil in
+// production. The read loop does not take turns with probe: an inbound can be
+// counted, and the probe cleared, in exactly that window.
+var probeSnapshotTaken atomic.Pointer[func(*worker)]
 
 // reprobe sends the unanswered probe AGAIN — the liveness rule's doing alone.
 // The new state takes the old one's place by CompareAndSwap: if the read loop
@@ -998,9 +1024,10 @@ func (w *worker) clearProbe() {
 	w.probeSt.Store(nil)
 }
 
-// livenessVerdictReached is a test's window between the liveness rule's
-// restart verdict and its execution — nil in production.
-var livenessVerdictReached atomic.Pointer[func(*worker)]
+// livenessVerdictReached is a test's window between a verdict of the liveness
+// rule that changes the probe's state — a restart, an answered probe taken down
+// — and its execution; nil in production.
+var livenessVerdictReached atomic.Pointer[func(*worker, livenessAction)]
 
 // askWitness sends ONE READY to the worker most likely to be alive — ready, no
 // probe out, the most recently heard from — at every tick at which the liveness

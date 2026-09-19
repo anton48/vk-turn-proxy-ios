@@ -183,6 +183,7 @@ const (
 	livenessRestart                 // give up on the worker
 	livenessResetAll                // the process was descheduled: reset every clock, judge nothing
 	livenessReprobe                 // send READY again for the same silence: ProbeSentAt stays, LastProbeAt moves, LiveProbes grows
+	livenessAnswered                // the probe that is out HAS been answered: no verdict — and its state comes down (the monitor, by CompareAndSwap)
 )
 
 // livenessVerdict is the rule, pure. Order of the checks is the rule:
@@ -191,9 +192,17 @@ const (
 //  3. if NO worker has heard anything for probeAfter, the path is down, not
 //     this worker — restarting workers one by one would only churn allocations;
 //  4. a probe is out, whoever sent it. If it has been ANSWERED — the worker's
-//     own inbound count has moved; the read loop is about to clear the probe,
-//     and the monitor does not take turns with it — nothing: a verdict on the
-//     old probe fields would restart a worker that has just answered.
+//     own inbound count has moved — there is no verdict: one on the old probe
+//     fields would restart a worker that has just answered. And its state
+//     COMES DOWN, by the monitor's own hand (livenessAnswered). 🚨 The read
+//     loop clears a probe only on an inbound that arrives AFTER the state was
+//     published; worker.probe reads the count and then publishes, and the read
+//     loop does not take turns with it: an inbound counted — and the clearing
+//     done — in between leaves a state born answered, after the only event
+//     that would ever have cleared it. Merely passed over, such a state stands
+//     for ever, and the worker is never asked again and never given up on,
+//     however long it stays silent afterwards (while the others hear, the
+//     deafness rule does not help either).
 //     Otherwise restart once deadAfterProbe has passed since the FIRST probe
 //     AND liveProbesToGiveUp re-sends made while the path demonstrably worked
 //     have gone unanswered, the last send at least reprobeEvery ago; otherwise
@@ -216,7 +225,7 @@ func livenessVerdict(in livenessInput) livenessAction {
 	}
 	if !in.ProbeSentAt.IsZero() {
 		if in.Answered {
-			return livenessNone
+			return livenessAnswered
 		}
 		rested := in.Now.Sub(in.LastProbeAt) >= reprobeEvery
 		if rested && in.LiveProbes >= liveProbesToGiveUp && in.Now.Sub(in.ProbeSentAt) >= deadAfterProbe {

@@ -166,19 +166,26 @@ func TestLivenessVerdict(t *testing.T) {
 			in.LiveProbes = 5
 		}, livenessReprobe},
 		// the review of 415 (build 416)
-		{"ripe for the restart by every other field — but the probe has been ANSWERED → nothing", func(in *livenessInput) {
+		{"ripe for the restart by every other field — but the probe has been ANSWERED → no verdict; its state comes down", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-80 * time.Second)
 			in.ProbeSentAt = in.Now.Add(-45 * time.Second)
 			in.LastProbeAt = in.Now.Add(-5 * time.Second)
 			in.LiveProbes = 5
 			in.Answered = true
-		}, livenessNone},
-		{"answered → not asked again either", func(in *livenessInput) {
+		}, livenessAnswered},
+		{"answered → not asked again either; its state comes down", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-35 * time.Second)
 			in.ProbeSentAt = in.Now.Add(-5 * time.Second)
 			in.LastProbeAt = in.Now.Add(-5 * time.Second)
 			in.Answered = true
-		}, livenessNone},
+		}, livenessAnswered},
+		// the review of 416 (build 417)
+		{"answered long ago and silent ever since — the state was published BEHIND its answer, nobody else will clear it → it comes down, at any age", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-150 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-150 * time.Second)
+			in.LastProbeAt = in.Now.Add(-150 * time.Second)
+			in.Answered = true
+		}, livenessAnswered},
 		{"thirty seconds out and asked five times — every time into a blackout, none confirmed → asked again, NOT restarted", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-60 * time.Second)
 			in.ProbeSentAt = in.Now.Add(-30 * time.Second)

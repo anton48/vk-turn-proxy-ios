@@ -1206,7 +1206,11 @@ func TestAnAnswerThatHasArrivedVoidsTheVerdictOnTheOldProbeFields(t *testing.T) 
 	}
 	readLoopStamped.Store(&hook)
 	verdicts := 0
-	reached := func(*worker) { verdicts++ }
+	reached := func(_ *worker, a livenessAction) {
+		if a == livenessRestart {
+			verdicts++
+		}
+	}
 	livenessVerdictReached.Store(&reached)
 	t.Cleanup(func() { readLoopStamped.Store(nil); livenessVerdictReached.Store(nil) })
 	defer close(release)
@@ -1252,8 +1256,8 @@ func TestAnAnswerBetweenTheVerdictAndItsExecutionVoidsTheRestart(t *testing.T) {
 		}
 	}
 	reached := 0
-	hook := func(w *worker) {
-		if w != w2 {
+	hook := func(w *worker, a livenessAction) {
+		if w != w2 || a != livenessRestart {
 			return
 		}
 		reached++
@@ -1295,8 +1299,8 @@ func TestAWakeBetweenTheVerdictAndItsExecutionVoidsTheRestart(t *testing.T) {
 	c.Blackhole(2, true) // nothing arrives for worker 2: only the hook's fresh probe can void the verdict
 	ripeProbe(c, w2, at(0), at(25))
 	reached := 0
-	hook := func(w *worker) {
-		if w == w2 {
+	hook := func(w *worker, a livenessAction) {
+		if w == w2 && a == livenessRestart {
 			reached++
 			c.WakeHealthCheck()
 		}
@@ -1349,6 +1353,183 @@ func TestAfterAGeneralBlackoutADeadWorkerGoesOnConfirmedResendsOnly(t *testing.T
 	}
 	if st := c.Stats(); st.LostWorkers != 1 {
 		t.Fatalf("+70 s: given up on %d worker(s), want 1 — the dead one, after two confirmed re-sends", st.LostWorkers)
+	}
+}
+
+// Build 417 — the review of 416: worker.probe reads the worker's inbound count
+// and THEN publishes the probe's state, and the read loop — which does not take
+// turns with it — can count an inbound AND clear the probe in between. The
+// state is then born ANSWERED (the count has moved past its snapshot) after the
+// only event that would ever have cleared it. The rule said "answered —
+// nothing" at every tick: a worker that went silent right then was never asked
+// again and never given up on, and with the other workers hearing the deafness
+// rule does not help either (the reviewer's stand, a real packet and a
+// controlled pause before the publication, 5 of 5; 180 s of model time: Probes
+// 1 → 1, Reprobes 0 → 0, LostWorkers 0 → 0, the old state still standing). An
+// answered state is TAKEN DOWN by the monitor, not just passed over.
+//
+// anInboundOutrunsTheProbesPublication arms that window for worker w: the first
+// time a probe of w's has read its counts and not yet published, a REAL inbound
+// arrives for w and is handled to the end, and then w goes silent for good —
+// the probe that follows goes into a dead path. (The sentinel only makes the
+// read loop's clearing observable: in the field there is nothing to clear at
+// that moment, which is the point.)
+func anInboundOutrunsTheProbesPublication(t *testing.T, c *Client, w *worker, id int) {
+	t.Helper()
+	var once sync.Once
+	hook := func(x *worker) {
+		if x != w {
+			return
+		}
+		once.Do(func() {
+			w.probeSt.Store(&probeState{})
+			w.sendProbe() // a READY of its own: the server's READY_OK is the real inbound
+			waitFor(t, "the inbound to be counted and the probe cleared, inside the probe's window", func() bool {
+				return w.probeSt.Load() == nil && !w.probing.Load()
+			})
+			c.Blackhole(id, true)
+		})
+	}
+	probeSnapshotTaken.Store(&hook)
+	t.Cleanup(func() { probeSnapshotTaken.Store(nil) })
+}
+
+func TestAProbePublishedAfterItsAnswerDoesNotSwitchTheWorkersRecoveryOff(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	w2 := c.workers[1]
+	c.lastTick.Store(start.UnixNano())
+	w2.lastRx.Store(start.UnixNano()) // worker 2: idle, silent from the start
+	anInboundOutrunsTheProbesPublication(t, c, w2, 2)
+	for s := 5; s <= 30; s += 5 { // +30: worker 2's first probe — and inside it, between the counts and the publication, the inbound
+		othersHear(c, at(s), 1)
+		tick(t, c, at(s))
+	}
+	w2.lastRx.Store(at(30).UnixNano()) // that inbound, in the monitor's time (the read loop stamped the real clock)
+	if st := w2.probeSt.Load(); st == nil || st.rx == w2.rx.Load() {
+		t.Fatalf("the fixture: the probe's state was to be published AFTER an inbound its snapshot had not seen (published: %v)", st != nil)
+	}
+	othersHear(c, at(35), 1)
+	tick(t, c, at(35))
+	standsAt35 := probeOut(w2)
+	for s := 40; s <= 180; s += 5 { // silent since +30: asked afresh at +60, again at every tick, given up on at +90
+		if c.Stats().LostWorkers != 0 {
+			break
+		}
+		othersHear(c, at(s), 1)
+		tick(t, c, at(s))
+	}
+	if st := c.Stats(); standsAt35 || st.Probes != 2 || st.Reprobes != 5 || st.LostWorkers != 1 {
+		t.Fatalf("a worker that went silent right after a probe published BEHIND its own answer, 180 s on: the answered state still standing a tick later: %v (want false — nobody else is left to clear it); probes %d (want 2 — asked afresh thirty seconds into the silence), sent again %d (want 5), given up on %d (want 1): its recovery was switched off",
+			standsAt35, st.Probes, st.Reprobes, st.LostWorkers)
+	}
+}
+
+// The same window in the WAKE HOOK's probe — where the field is most likely to
+// meet it: at an unfreeze the read loops drain what the sockets had buffered at
+// the very moment the hook probes every worker.
+func TestAWakeProbePublishedAfterItsAnswerDoesNotSwitchTheWorkersRecoveryOffEither(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	w2 := c.workers[1]
+	anInboundOutrunsTheProbesPublication(t, c, w2, 2)
+	c.WakeHealthCheck()
+	waitFor(t, "worker 1's wake probe to be answered", func() bool { return !probeOut(c.workers[0]) })
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	c.lastTick.Store(start.UnixNano())
+	w2.lastRx.Store(start.UnixNano())
+	if st := w2.probeSt.Load(); st == nil || st.rx == w2.rx.Load() {
+		t.Fatalf("the fixture: the wake probe's state was to be published AFTER an inbound its snapshot had not seen (published: %v)", st != nil)
+	}
+	for s := 5; s <= 180; s += 5 { // +5: the answered state comes down; +30: asked afresh; +60: given up on
+		if c.Stats().LostWorkers != 0 {
+			break
+		}
+		othersHear(c, at(s), 1)
+		tick(t, c, at(s))
+	}
+	if st := c.Stats(); st.Probes != 3 || st.Reprobes != 5 || st.LostWorkers != 1 || st.DeafAll != 0 {
+		t.Fatalf("a worker that went silent right after a WAKE probe published behind its own answer, 180 s on: probes %d (want 3 — the wake's two and a fresh one thirty seconds into the silence), sent again %d (want 5), given up on %d (want 1), restart-alls %d (want 0)",
+			st.Probes, st.Reprobes, st.LostWorkers, st.DeafAll)
+	}
+}
+
+// … and the monitor's taking-down is the SECOND line, for the state nobody else
+// can clear: an inbound still ends its probe AT ONCE, in the read loop — the
+// worker is a witness again and out of suspicion that instant, not a tick
+// later. (With the monitor able to take an answered state down, the read loop's
+// clearing could be dropped and everything that WAITS for the probe to end
+// would still pass a tick later: the sabotage "an answer does not end the
+// probe" went green the moment the monitor's layer was added. This test sees
+// which of the two acted.)
+func TestAnInboundEndsItsProbeAtOnceNotTheMonitorATickLater(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	w2 := c.workers[1]
+	var byMonitor atomic.Int32
+	hook := func(w *worker, a livenessAction) {
+		if w == w2 && a == livenessAnswered {
+			byMonitor.Add(1)
+		}
+	}
+	livenessVerdictReached.Store(&hook)
+	t.Cleanup(func() { livenessVerdictReached.Store(nil) })
+	rx0 := w2.rx.Load()
+	w2.probe(time.Now().UnixNano())
+	waitFor(t, "worker 2's answer to be counted", func() bool { return w2.rx.Load() > rx0 })
+	for deadline := time.Now().Add(time.Second); probeOut(w2) && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond) // the clearing follows the count within the same read-loop iteration
+	}
+	if probeOut(w2) || byMonitor.Load() != 0 {
+		t.Fatalf("a second after its answer was counted: the probe still out: %v, taken down by the monitor %d time(s) — want false and 0: the inbound itself ends the probe, in the read loop", probeOut(w2), byMonitor.Load())
+	}
+}
+
+// The taking-down is a CompareAndSwap from the state that was looked at: the
+// wake hook does not take turns with the monitor, and a fresh probe it has put
+// in the answered one's place between the look and the removal is a wake's —
+// a freeze boundary's — and must stand. (Removed by a plain clearing, worker 2
+// would lose its wake probe, and a dead worker found by a wake would wait the
+// monitor's thirty seconds of silence instead.)
+func TestAWakeBetweenFindingAProbeAnsweredAndTakingItDownKeepsTheFreshProbe(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	w2 := c.workers[1]
+	c.Blackhole(2, true) // nothing arrives for worker 2: the hook's fresh probe stays out, to be looked at
+	born := &probeState{firstAt: at(0).UnixNano(), lastAt: at(0).UnixNano(), rx: w2.rx.Load() - 1, seq: c.rxSeq.Load()}
+	w2.probeSt.Store(born) // a state born answered: the count had moved before it was published
+	reached := 0
+	hook := func(w *worker, a livenessAction) {
+		if w == w2 && a == livenessAnswered {
+			reached++
+			c.WakeHealthCheck()
+		}
+	}
+	livenessVerdictReached.Store(&hook)
+	t.Cleanup(func() { livenessVerdictReached.Store(nil) })
+	c.lastTick.Store(at(0).UnixNano())
+	othersHear(c, at(5), 1)
+	c.monitorStep(at(5))
+	if st := w2.probeSt.Load(); reached != 1 || st == nil || st == born {
+		t.Fatalf("the probe was found answered %d time(s) (want 1); a WAKE put a fresh probe in its place before it was taken down — and what stands afterwards: a probe %v, the answered one itself %v (want the wake's fresh probe: true, false)",
+			reached, st != nil, st == born)
 	}
 }
 
