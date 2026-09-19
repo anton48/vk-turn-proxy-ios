@@ -228,7 +228,15 @@ func (c *Client) OnPathChange() {
 // write (see worker.probe): it runs on the extension's wake/path callback.
 func (c *Client) WakeHealthCheck() {
 	ns := time.Now().UnixNano()
-	heard := c.rxSeq.Load() // before the probes go out: whatever arrives from here on answers the round
+	// A wake is a freeze boundary, and it is PUBLISHED as one before anything
+	// else happens: from this Store on, a verdict that judgeDeaf — which does
+	// not take turns with this hook — reached on an older round can no longer
+	// be committed (its CompareAndSwap fails). Published after the probes, the
+	// window would be theirs: asked again, not yet answered, and restarted on
+	// the old round's word. The count is read first: whatever arrives from here
+	// on answers the round.
+	r := &probeRound{at: ns, wake: true, rxSeq: c.rxSeq.Load()}
+	c.round.Store(r) // a wake is a freeze boundary: whatever round stood before it is replaced
 	c.anyRx.Store(ns)
 	probed := 0
 	for _, w := range c.workers {
@@ -242,13 +250,12 @@ func (c *Client) WakeHealthCheck() {
 	c.lastTick.Store(ns)
 	c.cfg.Logf("csqtt: wake — clocks reset, %d ready worker(s) probed", probed)
 	if probed == 0 {
+		c.round.CompareAndSwap(r, nil) // nobody was asked: there is no round to listen to
 		return
 	}
-	// The probes just sent are a ROUND: if NO worker hears anything within
-	// wakeDeafAfter, every allocation died in the freeze (or the path did) and
-	// waiting for the monitor's thirty seconds serves nobody.
-	r := &probeRound{at: ns, wake: true, rxSeq: heard}
-	c.round.Store(r) // a wake is a freeze boundary: whatever round stood before it is replaced
+	// The probes just sent are the ROUND: if NO worker hears anything in
+	// wakeDeafAfter of listening, every allocation died in the freeze (or the
+	// path did) and waiting for the monitor's thirty seconds serves nobody.
 	c.listenMu.Lock()
 	if !c.closing.Load() {
 		c.listeners.Add(1)
@@ -317,8 +324,22 @@ func (c *Client) dropRoundBefore(mark time.Time) {
 	}
 }
 
+// deafVerdictReached is a test's window between a verdict and its execution:
+// the wake hook is not serialized with judgeDeaf, and what it publishes in that
+// window decides whether the verdict may still be carried out. nil in production.
+var deafVerdictReached func(deafAction)
+
 // judgeDeaf applies deafVerdict. prevTick is the monitor's previous tick, zero
-// from the wake verdict (which checks its own lateness).
+// from a wake round's watcher (which notices a freeze by its own steps).
+//
+// 🚨 A verdict belongs to the ROUND it was reached on, and it is COMMITTED by
+// taking that round down with a CompareAndSwap — before anything else is
+// changed. The wake hook publishes from its own callback at any moment: if a
+// fresher round stands by then, a wake has happened — a freeze boundary — and
+// the old verdict is void; nothing is touched, the fresh round gets its own
+// listening and its own verdict. (Build 413 ignored the CompareAndSwap's
+// answer: the fresh round survived, and the healthy workers that had just
+// answered it were restarted all the same.)
 func (c *Client) judgeDeaf(now, prevTick time.Time) {
 	c.deafMu.Lock()
 	defer c.deafMu.Unlock()
@@ -338,18 +359,26 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 			in.Judgeable++
 		}
 	}
-	switch deafVerdict(in) {
+	action := deafVerdict(in)
+	if deafVerdictReached != nil && action != deafNone {
+		deafVerdictReached(action)
+	}
+	switch action {
 	case deafProbeAll:
-		probed, heard := 0, c.rxSeq.Load()
+		// The round is published FIRST, over the round that was judged and no
+		// other: if the wake hook has just asked everybody itself, its round
+		// stands and this one is not sent. (The count is read before the probes
+		// go out: no answer can precede its probe.)
+		if !c.round.CompareAndSwap(r, &probeRound{at: now.UnixNano(), rxSeq: c.rxSeq.Load()}) {
+			return
+		}
+		probed := 0
 		for _, w := range c.workers {
 			if w.ready.Load() {
 				w.probe(now.UnixNano())
 				probed++
 			}
 		}
-		// Over the round that was judged, and over no other: the wake hook may
-		// have published a fresher one meanwhile, and that one stands.
-		c.round.CompareAndSwap(r, &probeRound{at: now.UnixNano(), rxSeq: heard})
 		c.heldSaid = false
 		c.cfg.Logf("csqtt: no worker has heard anything for %s — %d ready worker(s) probed at once", now.Sub(in.AnyRx).Round(time.Second), probed)
 	case deafHeld:
@@ -359,6 +388,12 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 				deafSpacingFor(in.Rounds), in.Rounds)
 		}
 	case deafRestartAll:
+		// COMMIT: the judged round comes down, by CompareAndSwap, and only if
+		// that succeeds — and if not one real inbound has arrived up to this
+		// very moment — is the verdict carried out. Otherwise nothing changes.
+		if !c.round.CompareAndSwap(r, nil) || c.rxSeq.Load() != r.rxSeq {
+			return
+		}
 		c.identMu.Lock()
 		c.gen, c.salt = NewIdentity(c.gen)
 		gen := c.gen
@@ -366,7 +401,6 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 		c.deafRounds++
 		c.deafRestarts.Add(1)
 		c.lastDeafAll.Store(now.UnixNano())
-		c.round.CompareAndSwap(r, nil)
 		c.heldSaid = false
 		c.anyRx.Store(now.UnixNano()) // the silence that was judged ends here; the next one is counted afresh
 		c.cfg.Logf("csqtt: DEAF — %d ready worker(s) and not one answer in %s of listening after the probe round: every allocation is presumed dead, new identity gen=%d, restarting every worker (round %d)",

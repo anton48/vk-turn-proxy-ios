@@ -1197,8 +1197,8 @@ func TestAFreezeInsideTheWakeWindowDropsTheRound(t *testing.T) {
 // from its own callback at any moment, and a Store would take a fresh round
 // with it. The one Store is the hook's — a wake is a freeze boundary, and
 // whatever stood before it is meant to go. A race cannot be pinned by running
-// it; the form is pinned here. Sabotage seen red: the late tick's drop as a
-// Store(nil).
+// it; the form is pinned here. Sabotages seen red: the late tick's drop as a
+// Store(nil); the wake hook publishing its round after its probes.
 func TestARoundIsOnlyEverTakenDownByCompareAndSwap(t *testing.T) {
 	raw, err := os.ReadFile("client.go")
 	if err != nil {
@@ -1207,6 +1207,14 @@ func TestARoundIsOnlyEverTakenDownByCompareAndSwap(t *testing.T) {
 	src := string(raw)
 	if n := strings.Count(src, "c.round.Store("); n != 1 || !strings.Contains(src, "c.round.Store(r) // a wake is a freeze boundary") {
 		t.Fatalf("c.round.Store( appears %d time(s) — want exactly one, the wake hook's publication", n)
+	}
+	// … and the hook publishes BEFORE its probes go out: judgeDeaf does not take
+	// turns with it, and a verdict on the older round must fail its commit from
+	// the first moment of the wake — not only once the probes are on their way.
+	hook := src[strings.Index(src, "func (c *Client) WakeHealthCheck() {"):]
+	hook = hook[:strings.Index(hook, "\n}\n")]
+	if pub, probe := strings.Index(hook, "c.round.Store(r)"), strings.Index(hook, "w.probe(ns)"); pub < 0 || probe < 0 || pub > probe {
+		t.Fatalf("the wake hook publishes its round at %d and probes at %d — want the publication first", pub, probe)
 	}
 	for _, fn := range []string{"func (c *Client) dropRoundBefore(", "func (c *Client) listenTo(", "func (c *Client) judgeDeaf("} {
 		from := strings.Index(src, fn)
@@ -1220,6 +1228,173 @@ func TestARoundIsOnlyEverTakenDownByCompareAndSwap(t *testing.T) {
 		if !strings.Contains(body, "c.round.CompareAndSwap(r, ") {
 			t.Fatalf("%s… takes a round down without CompareAndSwap from the round it looked at", fn)
 		}
+	}
+}
+
+// driveToTheVerdict deafens every worker and drives the monitor, tick by tick
+// with the test's clock, up to the tick at which the verdict on the monitor's
+// own round falls due (sixty seconds in); it returns that tick as a func.
+func driveToTheVerdict(c *Client) (verdictTick func()) {
+	deafen(c)
+	start := time.Now()
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	for s := 5; s <= 55; s += 5 {
+		c.monitorStep(start.Add(time.Duration(s) * time.Second))
+	}
+	return func() { c.monitorStep(start.Add(60 * time.Second)) }
+}
+
+func undeafen(c *Client) {
+	for i := range c.workers {
+		c.Blackhole(i+1, false)
+	}
+}
+
+// A verdict belongs to the round it was reached on (the user's review of 413).
+// The wake hook is not serialized with judgeDeaf: between the verdict and its
+// execution it can publish a FRESH round — a wake is a freeze boundary — which
+// healthy workers then answer. 413 took the old round down with a
+// CompareAndSwap and ignored its answer: the fresh round survived, and the
+// identity was changed and every worker restarted all the same (the reviewer's
+// stand with a controlled pause before the execution: 5 of 5). Now the
+// CompareAndSwap COMMITS the verdict, before anything else is changed.
+//
+// First half: the fresh round is ANSWERED — nothing may happen. Second half, on
+// a new client: the fresh round is published and stays unanswered — the OLD
+// verdict is void all the same (this is what pins the CompareAndSwap's own
+// check: no answer arrives to void it by other means), and the fresh round's
+// own listening ends in a restart-all of its own: truly silent workers are
+// still replaced. Sabotage seen red: the verdict carried out although its round
+// was replaced.
+func TestAVerdictOnAReplacedRoundIsNotCarriedOut(t *testing.T) {
+	defer func() { deafVerdictReached = nil }() // after the Closes below: nobody reads it any more
+	quickWake(t)
+
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	gen := c.Stats().Generation
+	verdictTick := driveToTheVerdict(c)
+	reached := 0
+	deafVerdictReached = func(a deafAction) {
+		if a != deafRestartAll {
+			return
+		}
+		if reached++; reached > 1 {
+			return
+		}
+		undeafen(c) // the path is back …
+		heard := c.rxSeq.Load()
+		c.WakeHealthCheck() // … a wake publishes a fresh round …
+		waitFor(t, "real answers to the fresh round", func() bool { return c.rxSeq.Load() >= heard+2 })
+	}
+	verdictTick()
+	if reached != 1 {
+		t.Fatalf("the fixture never reached a restart-all verdict (%d)", reached)
+	}
+	time.Sleep(3 * wakeDeafAfter)
+	st := c.Stats()
+	if g, _, _ := srv.counts(); st.DeafAll != 0 || st.Generation != gen || g != len(first) {
+		t.Fatalf("a verdict reached on a round that a wake had REPLACED — and whose replacement was answered — was carried out: restart-alls %d, generation %d → %d, %d new GETCONF(s)",
+			st.DeafAll, gen, st.Generation, g-len(first))
+	}
+
+	srv2 := newFakeServer(t)
+	c2 := dialReady(t, testConfig(srv2, 2, (&lease{}).creds))
+	defer c2.Close()
+	longReady(c2)
+	verdictTick2 := driveToTheVerdict(c2)
+	reached = 0
+	var fresh *probeRound
+	deafVerdictReached = func(a deafAction) {
+		if a != deafRestartAll {
+			return
+		}
+		if reached++; reached > 1 {
+			return
+		}
+		c2.WakeHealthCheck() // a wake — and the workers are still deaf
+		fresh = c2.round.Load()
+	}
+	probesBefore := c2.Stats().Probes
+	verdictTick2()
+	if st := c2.Stats(); st.DeafAll != 0 || c2.round.Load() != fresh || fresh == nil || !fresh.wake {
+		t.Fatalf("right after the old verdict: restart-alls %d (want 0 — its round was replaced by a wake's), the fresh wake round standing: %v",
+			st.DeafAll, c2.round.Load() == fresh && fresh != nil)
+	}
+	waitFor(t, "the fresh round's OWN verdict: truly silent workers are still replaced", func() bool { return c2.Stats().DeafAll == 1 })
+	if st := c2.Stats(); st.Probes != probesBefore+2 {
+		t.Fatalf("probes %d → %d: the restart-all must rest on the fresh round's two probes", probesBefore, st.Probes)
+	}
+}
+
+// … and the facts are read once more at the moment of commitment: a real
+// inbound that arrives between the verdict and its execution — with no new
+// round published — voids it too. Sabotage seen red: the last look dropped.
+func TestAnAnswerAtTheLastInstantVoidsTheVerdict(t *testing.T) {
+	defer func() { deafVerdictReached = nil }()
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	verdictTick := driveToTheVerdict(c)
+	reached := 0
+	deafVerdictReached = func(a deafAction) {
+		if a != deafRestartAll {
+			return
+		}
+		if reached++; reached > 1 {
+			return
+		}
+		undeafen(c)
+		heard := c.rxSeq.Load()
+		c.workers[0].probe(time.Now().UnixNano()) // one worker asks, and is answered: a real inbound, no new round
+		waitFor(t, "the late answer", func() bool { return c.rxSeq.Load() > heard })
+	}
+	verdictTick()
+	if g, _, _ := srv.counts(); reached != 1 || c.Stats().DeafAll != 0 || g != len(first) {
+		t.Fatalf("reached %d; an answer had arrived before the verdict was carried out, and it was carried out: restart-alls %d, %d new GETCONF(s)",
+			reached, c.Stats().DeafAll, g-len(first))
+	}
+}
+
+// The same commitment for the monitor's own round: when the wake hook has just
+// asked everybody, the monitor's round is not published and its probes are not
+// sent — the hook's round stands, with its two probes and no more. Sabotage
+// seen red: the monitor probing whether or not its round was published.
+func TestTheMonitorDoesNotAskAgainWhenTheWakeHookJustDid(t *testing.T) {
+	defer func() { deafVerdictReached = nil }()
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	deafen(c)
+	start := time.Now()
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	for s := 5; s <= 25; s += 5 {
+		c.monitorStep(start.Add(time.Duration(s) * time.Second))
+	}
+	reached := 0
+	deafVerdictReached = func(a deafAction) {
+		if a == deafProbeAll {
+			if reached++; reached == 1 {
+				c.WakeHealthCheck() // default timings: its watcher's verdict is seconds away, the test is over before
+			}
+		}
+	}
+	c.monitorStep(start.Add(30 * time.Second)) // thirty seconds of silence: the monitor wants to ask — the hook just did
+	r := c.round.Load()
+	if st := c.Stats(); reached != 1 || st.Probes != 2 || r == nil || !r.wake {
+		t.Fatalf("reached %d; probes %d (want 2 — the wake hook's round and no second one), the standing round is the hook's: %v",
+			reached, st.Probes, r != nil && r.wake)
 	}
 }
 
