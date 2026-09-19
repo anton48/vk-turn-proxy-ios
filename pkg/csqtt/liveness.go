@@ -179,11 +179,20 @@ const (
 	liveWindow = 45 * time.Second
 )
 
-// wakeDeafAfter: how long after the WAKE hook's probe round total silence is a
-// verdict. The user has just picked the phone up, every ready worker was asked
-// at once, and an answer takes ~100 ms in the field; the monitor's own round
-// waits deadAfterProbe like any probe. A variable so a test need not wait it out.
-var wakeDeafAfter = 5 * time.Second
+// wakeDeafAfter: how much LISTENING after the WAKE hook's probe round makes
+// total silence a verdict. The user has just picked the phone up, every ready
+// worker was asked at once, and an answer takes ~100 ms in the field; the
+// monitor's own round listens for deadAfterProbe like any probe.
+//
+// wakeListenStep: a wake round's listening is counted in steps this long by a
+// watcher of its own (the monitor's five-second tick is too coarse for a
+// five-second wait). A step that takes more than twice its length means the
+// process did not run — see deafInput.RoundListened. Variables so a test need
+// not wait them out.
+var (
+	wakeDeafAfter  = 5 * time.Second
+	wakeListenStep = 250 * time.Millisecond
+)
 
 // deafInput is the client's view at a monitor tick or at the wake verdict.
 //
@@ -196,16 +205,28 @@ var wakeDeafAfter = 5 * time.Second
 // away. (Build 411 read the fact off the clocks: a reset that landed after the
 // answers made an answered round read as unanswered, and every healthy worker
 // was restarted.)
+//
+// 🚨 And a round's wait is LISTENING, not wall time: RoundListened is the time
+// the running process has been observed to spend since the probes went out —
+// the monitor adds its on-time tick gaps to a round of its own, a wake round's
+// watcher its on-time steps. A freeze is not listening, and a round that
+// predates a DETECTED freeze does not stand at all: what it did not hear while
+// the process was frozen proves nothing about the path now, and a verdict
+// needs a fresh ask. (Build 412 measured the wait from the round's wall-clock
+// time and kept the round through a late tick: a probe, ninety frozen seconds,
+// a late tick, and the next tick restarted everybody on the old deadline —
+// without having asked anyone again.)
 type deafInput struct {
 	Now            time.Time
-	PrevTick       time.Time // the monitor's previous tick; zero when the caller is not the monitor
-	Judgeable      int       // workers ready for at least readyGrace
-	AnyRx          time.Time // the silence CLOCK: last inbound on any worker, or the last clock reset
-	RoundAt        time.Time // when every ready worker was last probed as a ROUND; zero if none stands
-	RoundIsWake    bool      // that round was the wake hook's
-	RoundAnswered  bool      // a real inbound arrived, on any worker, after that round's probes went out
-	LastRestartAll time.Time // zero if never
-	Rounds         int       // restart-alls in the current run
+	PrevTick       time.Time     // the monitor's previous tick; zero when the caller is not the monitor
+	Judgeable      int           // workers ready for at least readyGrace
+	AnyRx          time.Time     // the silence CLOCK: last inbound on any worker, or the last clock reset
+	RoundOut       bool          // a probe round stands
+	RoundIsWake    bool          // … the wake hook's
+	RoundAnswered  bool          // a real inbound arrived, on any worker, after that round's probes went out
+	RoundListened  time.Duration // awake time observed since then — never wall time
+	LastRestartAll time.Time     // zero if never
+	Rounds         int           // restart-alls in the current run
 }
 
 type deafAction int
@@ -239,7 +260,8 @@ func deafSpacingFor(rounds int) time.Duration {
 //     workers are dialling, and their own backoff is the recovery;
 //  3. a probe round that stands UNANSWERED — no real inbound since its probes
 //     went out, whatever the clocks were reset to meanwhile — is a verdict once
-//     its wait has passed, unless the last restart-all is too recent;
+//     it has been LISTENED to for its wait, unless the last restart-all is too
+//     recent;
 //  4. otherwise, total silence for probeAfter → ask everybody.
 func deafVerdict(in deafInput) deafAction {
 	if !in.PrevTick.IsZero() && in.Now.Sub(in.PrevTick) > livenessTick+descheduledSlack {
@@ -248,12 +270,12 @@ func deafVerdict(in deafInput) deafAction {
 	if in.Judgeable == 0 {
 		return deafNone
 	}
-	if !in.RoundAt.IsZero() && !in.RoundAnswered {
+	if in.RoundOut && !in.RoundAnswered {
 		wait := deadAfterProbe
 		if in.RoundIsWake {
 			wait = wakeDeafAfter
 		}
-		if in.Now.Sub(in.RoundAt) < wait {
+		if in.RoundListened < wait {
 			return deafNone
 		}
 		if !in.LastRestartAll.IsZero() && in.Now.Sub(in.LastRestartAll) < deafSpacingFor(in.Rounds) {

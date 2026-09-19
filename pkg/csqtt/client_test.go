@@ -875,6 +875,14 @@ func longReady(c *Client) {
 	}
 }
 
+// quickWake shortens the wake round's wait and its watcher's step.
+func quickWake(t *testing.T) {
+	t.Helper()
+	oldAfter, oldStep := wakeDeafAfter, wakeListenStep
+	wakeDeafAfter, wakeListenStep = 150*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { wakeDeafAfter, wakeListenStep = oldAfter, oldStep })
+}
+
 func deafen(c *Client) {
 	for i := range c.workers {
 		c.Blackhole(i+1, true)
@@ -946,16 +954,13 @@ func TestAllDeafWorkersAreAskedAtOnceAndThenReplacedTogether(t *testing.T) {
 	}
 }
 
-// The wake's side: the hook's probes are a round, and total silence
-// wakeDeafAfter later is the verdict — the user has the phone in hand. The
-// control is a healthy client: its probes are answered and nothing restarts.
-// And a verdict timer that fires LATE was frozen with the process — it judges
-// nothing. Sabotages seen red: the wake hook not arming the verdict; the late
-// timer acting all the same.
+// The wake's side: the hook's probes are a round with a watcher of its own,
+// and wakeDeafAfter of LISTENING without one real inbound is the verdict — the
+// user has the phone in hand. The control is a healthy client: its probes are
+// answered and nothing restarts. Sabotages seen red: the wake hook not starting
+// the watcher; the wake round made to wait like the monitor's.
 func TestTheWakeVerdictReplacesDeafWorkersWithinSeconds(t *testing.T) {
-	old := wakeDeafAfter
-	wakeDeafAfter = 150 * time.Millisecond
-	defer func() { wakeDeafAfter = old }()
+	quickWake(t)
 
 	srv := newFakeServer(t)
 	loopbackRelay(t, nil)
@@ -971,17 +976,6 @@ func TestTheWakeVerdictReplacesDeafWorkersWithinSeconds(t *testing.T) {
 	}
 
 	deafen(c)
-	// A wake round a minute old and unanswered, and its timer firing only now:
-	// the timer slept through a freeze with the process. (The state is set by
-	// hand — a real hook would arm a real timer — and the next wake replaces it.)
-	stale := time.Now().Add(-time.Minute).UnixNano()
-	c.anyRx.Store(stale)
-	c.round.Store(&probeRound{at: stale, wake: true, rxSeq: c.rxSeq.Load()})
-	c.wakeVerdict(stale)
-	if st := c.Stats(); st.DeafAll != 0 {
-		t.Fatal("a wake verdict that fired a minute late judged all the same")
-	}
-
 	t0 := time.Now()
 	c.WakeHealthCheck()
 	waitFor(t, "both workers back under the new identity", func() bool { g, _, _ := srv.counts(); return g >= len(first)+2 })
@@ -1001,9 +995,12 @@ func TestTheWakeVerdictReplacesDeafWorkersWithinSeconds(t *testing.T) {
 //
 // This half: DEAF workers. The reset restarts the silence clock after the
 // round went out; read off the clocks, that would look like an answer and the
-// wake verdict would be lost exactly when it is needed. Sabotage seen red:
-// "answered" read off the silence clock.
+// wake verdict would be lost exactly when it is needed. Nor may the tick DROP
+// the round as one that predates the freeze: it was published after this tick
+// read its mark. Sabotages seen red: "answered" read off the silence clock; the
+// late tick dropping whatever round stands.
 func TestALateTickDoesNotVoidTheWakeRoundThatBeatIt(t *testing.T) {
+	quickWake(t)
 	srv := newFakeServer(t)
 	loopbackRelay(t, nil)
 	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
@@ -1016,26 +1013,24 @@ func TestALateTickDoesNotVoidTheWakeRoundThatBeatIt(t *testing.T) {
 	c.WakeHealthCheck()                         // the hook first: clocks reset, a round out, the tick mark moved …
 	c.lastTick.Store(prevBeforeHook.UnixNano()) // … but this tick had read its mark BEFORE the hook moved it
 	c.monitorStep(time.Now())                   // late by ten minutes: every clock restarts
-	if st := c.Stats(); st.Descheduled != 1 || st.DeafAll != 0 {
-		t.Fatalf("the late tick: descheduled %d (want 1), restart-alls %d (want 0)", st.Descheduled, st.DeafAll)
+	if st := c.Stats(); st.Descheduled != 1 {
+		t.Fatalf("the fixture's tick was not late: descheduled %d", st.Descheduled)
 	}
-	c.monitorStep(time.Now().Add(wakeDeafAfter + time.Second)) // the round still stands, unanswered
-	if st := c.Stats(); st.DeafAll != 1 {
-		t.Fatalf("restart-alls once the wake round had gone unanswered: %d, want 1 — the late tick's reset made the round read as answered", st.DeafAll)
+	if c.round.Load() == nil {
+		t.Fatal("the late tick dropped the round the wake hook had just published — it is FRESH: sent after the unfreeze, after this tick read its mark")
 	}
+	waitFor(t, "the restart-all once the fresh round has gone unanswered", func() bool { return c.Stats().DeafAll == 1 })
 }
 
 // The other half, the user's review of 411: HEALTHY workers. The hook's round
 // is ANSWERED, and then the late tick's reset lands (it had read its tick mark
 // before the hook moved it). 411 re-stamped the round on that reset, the answer
 // was forgotten, and wakeDeafAfter later every healthy worker was restarted —
-// 3 of 3 on the reviewer's stand with the real timer. The real timer runs here
-// too. Sabotages seen red: the reset re-stamping the round; a real inbound not
+// 3 of 3 on the reviewer's stand with the real timer. The round's real watcher
+// runs here too. Sabotages seen red: the reset re-stamping the round; a real inbound not
 // counted.
 func TestALateTickDoesNotUnanswerTheWakeRound(t *testing.T) {
-	old := wakeDeafAfter
-	wakeDeafAfter = 150 * time.Millisecond
-	defer func() { wakeDeafAfter = old }()
+	quickWake(t)
 
 	srv := newFakeServer(t)
 	loopbackRelay(t, nil)
@@ -1054,11 +1049,177 @@ func TestALateTickDoesNotUnanswerTheWakeRound(t *testing.T) {
 	if st := c.Stats(); st.Descheduled != 1 {
 		t.Fatalf("the fixture's tick was not late: descheduled %d", st.Descheduled)
 	}
-	time.Sleep(3 * wakeDeafAfter)                              // the hook's own timer has fired by now
+	time.Sleep(3 * wakeDeafAfter)                              // the round's watcher has listened its fill by now
 	c.monitorStep(time.Now().Add(wakeDeafAfter + time.Second)) // … and the monitor has looked once more
 	if g, _, _ := srv.counts(); g != len(first) || c.Stats().DeafAll != 0 {
 		t.Fatalf("HEALTHY workers whose round was answered were restarted: %d new GETCONF(s), %d restart-all(s) — a clock reset un-answered the round",
 			g-len(first), c.Stats().DeafAll)
+	}
+}
+
+// A round sent BEFORE a freeze proves nothing after it (the user's review of
+// 412): the path may have changed while the process was frozen, and a verdict
+// needs a fresh ask. 412 kept the round through the late tick and measured its
+// wait in wall time, so: a probe, ninety frozen seconds, a late tick, the next
+// tick five seconds on — every worker restarted on the OLD deadline with
+// Probes 2 → 2, nobody having been asked again. Now the late tick drops the
+// round, the wait is LISTENING (awake time the monitor's on-time ticks add up),
+// and the restart comes only after a fresh round went unanswered. Sabotages
+// seen red: the late tick keeping the pre-freeze round; the monitor's ticks not
+// adding up the listening.
+func TestARoundSentBeforeAFreezeIsDroppedNotJudged(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	deafen(c)
+	start := time.Now()
+	c.lastTick.Store(start.UnixNano())
+	c.anyRx.Store(start.UnixNano())
+	at := func(s int) { c.monitorStep(start.Add(time.Duration(s) * time.Second)) }
+
+	for s := 5; s <= 35; s += 5 { // the round at thirty seconds of silence, five seconds of listening after it
+		at(s)
+	}
+	if st := c.Stats(); st.Probes != 2 || c.round.Load() == nil {
+		t.Fatalf("before the freeze: probes %d (want 2), a round standing: %v", st.Probes, c.round.Load() != nil)
+	}
+	at(35 + 90) // ninety seconds frozen: this tick is late
+	if st := c.Stats(); st.Descheduled != 1 || st.DeafAll != 0 || c.round.Load() != nil {
+		t.Fatalf("the late tick: descheduled %d (want 1), restart-alls %d (want 0), the pre-freeze round still standing: %v (want dropped)",
+			st.Descheduled, st.DeafAll, c.round.Load() != nil)
+	}
+	for s := 130; s <= 150; s += 5 { // the next ticks are on time — and have nothing to judge
+		at(s)
+		if st := c.Stats(); st.DeafAll != 0 || st.Probes != 2 {
+			t.Fatalf("%d s after the freeze: restart-alls %d, probes %d — every worker restarted (or asked) on a round that predates the freeze", s-125, st.DeafAll, st.Probes)
+		}
+	}
+	at(155) // thirty seconds of silence since the reset: the FRESH ask
+	if st := c.Stats(); st.Probes != 4 || st.DeafAll != 0 {
+		t.Fatalf("thirty seconds after the freeze: probes %d (want 4 — a fresh round), restart-alls %d (want 0)", st.Probes, st.DeafAll)
+	}
+	for s := 160; s <= 180; s += 5 {
+		at(s)
+	}
+	if st := c.Stats(); st.DeafAll != 0 {
+		t.Fatalf("restarted after %d s of listening to the fresh round", 180-155)
+	}
+	at(185) // thirty seconds of listening to the fresh round, not one answer
+	if st := c.Stats(); st.DeafAll != 1 || st.Probes != 4 {
+		t.Fatalf("after the fresh round went unanswered: restart-alls %d (want 1), probes %d", st.DeafAll, st.Probes)
+	}
+	waitFor(t, "both workers back under the new identity", func() bool { g, _, _ := srv.counts(); return g >= len(first)+2 })
+}
+
+// The same for the WAKE hook's round when the process resumes WITHOUT a new
+// wake: the hook moved the tick mark when it published, so at the late tick the
+// round is at or before the mark — it predates the freeze, and goes.
+func TestAWakeRoundSentBeforeAFreezeIsDroppedToo(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	deafen(c)
+	c.WakeHealthCheck() // default timings: its watcher needs five seconds, the test is over long before
+	if c.round.Load() == nil {
+		t.Fatal("the wake hook published no round")
+	}
+	c.monitorStep(time.Now().Add(90 * time.Second)) // resumed with no new wake: a late tick
+	if st := c.Stats(); st.Descheduled != 1 || st.DeafAll != 0 || c.round.Load() != nil {
+		t.Fatalf("the late tick after a freeze with no new wake: descheduled %d, restart-alls %d, the old wake round standing: %v (want dropped)",
+			st.Descheduled, st.DeafAll, c.round.Load() != nil)
+	}
+}
+
+// A wake round's listening is its WATCHER's to count, in short steps that notice
+// a freeze. The monitor's tick must not add its five-second gap to it: the
+// monitor takes a gap of up to ten seconds for "on time", so a freeze of a few
+// seconds would pass as listening — and one tick alone would fill the wake
+// round's whole wait. Sabotage seen red: the monitor adding its gap to a wake
+// round.
+func TestTheMonitorsTickIsNotAWakeRoundsListening(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	deafen(c)
+	c.WakeHealthCheck()                            // default timings: the watcher has counted next to nothing yet
+	c.monitorStep(time.Now().Add(6 * time.Second)) // an on-time tick, six seconds "later"
+	if st := c.Stats(); st.DeafAll != 0 {
+		t.Fatalf("restart-alls right after a wake: %d — the monitor's tick gap was counted as the wake round's listening", st.DeafAll)
+	}
+	if r := c.round.Load(); r == nil || time.Duration(r.listened.Load()) > time.Second {
+		t.Fatalf("the wake round after an on-time monitor tick: %+v — want it standing, with only its watcher's steps counted", r)
+	}
+}
+
+// A wake round's five seconds are LISTENING, counted by its watcher in short
+// steps. A step that takes ninety seconds is a freeze: the round predates it
+// and is dropped — not judged on what it did not hear while nobody listened.
+// The next wake asks again, and that round's verdict stands. Sabotage seen red:
+// a frozen step counted as listening.
+func TestAFreezeInsideTheWakeWindowDropsTheRound(t *testing.T) {
+	quickWake(t)
+	realSleep := wakeListenSleep
+	var steps atomic.Int32
+	wakeListenSleep = func(ctx context.Context, d time.Duration) time.Duration {
+		took := realSleep(ctx, d)
+		if steps.Add(1) == 2 {
+			return 90 * time.Second // the process was frozen inside this step
+		}
+		return took
+	}
+	defer func() { wakeListenSleep = realSleep }()
+
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	deafen(c)
+	c.WakeHealthCheck()
+	waitFor(t, "the watcher to drop the round that predates the freeze", func() bool { return c.round.Load() == nil })
+	time.Sleep(3 * wakeDeafAfter)
+	if st := c.Stats(); st.DeafAll != 0 {
+		t.Fatalf("restart-alls on a round that was frozen through: %d, want 0", st.DeafAll)
+	}
+	c.WakeHealthCheck() // the next wake asks again; no step of this round is frozen
+	waitFor(t, "the restart-all after the fresh wake round went unanswered", func() bool { return c.Stats().DeafAll == 1 })
+}
+
+// A round is dropped, replaced by the monitor's, or cleared by a verdict ONLY
+// by CompareAndSwap from the round that was looked at: the wake hook publishes
+// from its own callback at any moment, and a Store would take a fresh round
+// with it. The one Store is the hook's — a wake is a freeze boundary, and
+// whatever stood before it is meant to go. A race cannot be pinned by running
+// it; the form is pinned here. Sabotage seen red: the late tick's drop as a
+// Store(nil).
+func TestARoundIsOnlyEverTakenDownByCompareAndSwap(t *testing.T) {
+	raw, err := os.ReadFile("client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	if n := strings.Count(src, "c.round.Store("); n != 1 || !strings.Contains(src, "c.round.Store(r) // a wake is a freeze boundary") {
+		t.Fatalf("c.round.Store( appears %d time(s) — want exactly one, the wake hook's publication", n)
+	}
+	for _, fn := range []string{"func (c *Client) dropRoundBefore(", "func (c *Client) listenTo(", "func (c *Client) judgeDeaf("} {
+		from := strings.Index(src, fn)
+		if from < 0 {
+			t.Fatalf("%s… is not where the scan expects it", fn)
+		}
+		body := src[from:]
+		if end := strings.Index(body, "\n}\n"); end >= 0 {
+			body = body[:end] // the scope ends at the function's closing brace
+		}
+		if !strings.Contains(body, "c.round.CompareAndSwap(r, ") {
+			t.Fatalf("%s… takes a round down without CompareAndSwap from the round it looked at", fn)
+		}
 	}
 }
 

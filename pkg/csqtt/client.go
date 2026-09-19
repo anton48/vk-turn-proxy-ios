@@ -150,6 +150,8 @@ type Client struct {
 	// prove nothing about reception.
 	rxSeq        atomic.Uint64
 	round        atomic.Pointer[probeRound] // the probe round that stands; nil if none
+	listenMu     sync.Mutex                 // starting a wake round's watcher vs Close: no Add after the Wait began
+	listeners    sync.WaitGroup             // the wake rounds' watchers, joined by Close
 	lastDeafAll  atomic.Int64               // the last restart-all, unix nanos
 	deafRounds   int                        // restart-alls in the current run (under deafMu)
 	deafRestarts atomic.Int64               // restart-alls, ever
@@ -245,29 +247,74 @@ func (c *Client) WakeHealthCheck() {
 	// The probes just sent are a ROUND: if NO worker hears anything within
 	// wakeDeafAfter, every allocation died in the freeze (or the path did) and
 	// waiting for the monitor's thirty seconds serves nobody.
-	c.round.Store(&probeRound{at: ns, wake: true, rxSeq: heard})
-	time.AfterFunc(wakeDeafAfter, func() { c.wakeVerdict(ns) })
+	r := &probeRound{at: ns, wake: true, rxSeq: heard}
+	c.round.Store(r) // a wake is a freeze boundary: whatever round stood before it is replaced
+	c.listenMu.Lock()
+	if !c.closing.Load() {
+		c.listeners.Add(1)
+		go func() {
+			defer c.listeners.Done()
+			c.listenTo(r)
+		}()
+	}
+	c.listenMu.Unlock()
 }
 
 // probeRound is one round of probes to every ready worker: when it went out,
 // who sent it, and the real-inbound count at that moment — the round is
-// answered once the count has moved. One immutable value behind one pointer,
-// so a reader never sees half of a newer round.
+// answered once the count has moved. Its identity never changes (one pointer:
+// a reader never sees half of a newer round, and a drop is a CompareAndSwap
+// that cannot take a newer round with it); only `listened` grows.
 type probeRound struct {
-	at    int64 // unix nanos
-	wake  bool
-	rxSeq uint64
+	at       int64        // unix nanos: tells a round published AFTER a late tick read its mark from one that predates the freeze
+	wake     bool         // the wake hook's: its listening is counted by listenTo, the monitor's by the monitor's ticks
+	rxSeq    uint64       // Client.rxSeq when the probes went out
+	listened atomic.Int64 // nanos of AWAKE time observed since — a freeze is never in it
 }
 
-// wakeVerdict judges the wake hook's probe round. A timer that fires late was
-// itself frozen with the process: what it would read is older than it thinks,
-// and the next wake starts a round of its own.
-func (c *Client) wakeVerdict(armedNs int64) {
-	now := time.Now()
-	if c.ctx.Err() != nil || now.Sub(time.Unix(0, armedNs)) > wakeDeafAfter+descheduledSlack {
-		return
+// wakeListenSleep waits one step and says how long it really took; a test
+// makes a step "take" ninety seconds to stand in for a freeze.
+var wakeListenSleep = func(ctx context.Context, d time.Duration) time.Duration {
+	t0 := time.Now()
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
 	}
-	c.judgeDeaf(now, time.Time{})
+	return time.Since(t0)
+}
+
+// listenTo is a wake round's watcher: it counts the round's LISTENING in short
+// steps and asks for the verdict once there is wakeDeafAfter of it. It ends
+// with the round — answered, replaced by a newer one, dropped, or judged. A
+// step that took far longer than it should means the process was frozen in it:
+// the round then predates a freeze and is dropped — never judged on what it
+// did not hear while nobody was listening; the next wake, or the monitor's
+// thirty seconds of silence, asks again.
+func (c *Client) listenTo(r *probeRound) {
+	for {
+		took := wakeListenSleep(c.ctx, wakeListenStep)
+		if c.ctx.Err() != nil || c.round.Load() != r || c.rxSeq.Load() != r.rxSeq {
+			return
+		}
+		if took > 2*wakeListenStep {
+			c.round.CompareAndSwap(r, nil)
+			return
+		}
+		if time.Duration(r.listened.Add(int64(took))) >= wakeDeafAfter {
+			c.judgeDeaf(time.Now(), time.Time{}) // held by the spacing, the round stands and is judged again next step
+		}
+	}
+}
+
+// dropRoundBefore is the monitor's part of the same rule, at a late tick: a
+// round sent before the freeze goes. One published AFTER this tick read its
+// mark — the wake hook runs side by side with the late tick at an unfreeze —
+// is fresh and stays; and the drop is a CompareAndSwap, so a round published
+// between the look and the drop is not the one dropped.
+func (c *Client) dropRoundBefore(mark time.Time) {
+	if r := c.round.Load(); r != nil && r.at <= mark.UnixNano() {
+		c.round.CompareAndSwap(r, nil)
+	}
 }
 
 // judgeDeaf applies deafVerdict. prevTick is the monitor's previous tick, zero
@@ -281,8 +328,9 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 	}
 	in := deafInput{Now: now, PrevTick: prevTick, AnyRx: time.Unix(0, c.anyRx.Load()),
 		LastRestartAll: last, Rounds: c.deafRounds}
-	if r := c.round.Load(); r != nil {
-		in.RoundAt, in.RoundIsWake = time.Unix(0, r.at), r.wake
+	r := c.round.Load()
+	if r != nil {
+		in.RoundOut, in.RoundIsWake, in.RoundListened = true, r.wake, time.Duration(r.listened.Load())
 		in.RoundAnswered = c.rxSeq.Load() != r.rxSeq // a FACT the read loops counted, not a comparison of clocks
 	}
 	for _, w := range c.workers {
@@ -299,7 +347,9 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 				probed++
 			}
 		}
-		c.round.Store(&probeRound{at: now.UnixNano(), rxSeq: heard})
+		// Over the round that was judged, and over no other: the wake hook may
+		// have published a fresher one meanwhile, and that one stands.
+		c.round.CompareAndSwap(r, &probeRound{at: now.UnixNano(), rxSeq: heard})
 		c.heldSaid = false
 		c.cfg.Logf("csqtt: no worker has heard anything for %s — %d ready worker(s) probed at once", now.Sub(in.AnyRx).Round(time.Second), probed)
 	case deafHeld:
@@ -316,11 +366,11 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 		c.deafRounds++
 		c.deafRestarts.Add(1)
 		c.lastDeafAll.Store(now.UnixNano())
-		c.round.Store(nil)
+		c.round.CompareAndSwap(r, nil)
 		c.heldSaid = false
 		c.anyRx.Store(now.UnixNano()) // the silence that was judged ends here; the next one is counted afresh
-		c.cfg.Logf("csqtt: DEAF — %d ready worker(s) and not one answer %s after the probe round: every allocation is presumed dead, new identity gen=%d, restarting every worker (round %d)",
-			in.Judgeable, now.Sub(in.RoundAt).Round(100*time.Millisecond), gen, c.deafRounds)
+		c.cfg.Logf("csqtt: DEAF — %d ready worker(s) and not one answer in %s of listening after the probe round: every allocation is presumed dead, new identity gen=%d, restarting every worker (round %d)",
+			in.Judgeable, in.RoundListened.Round(100*time.Millisecond), gen, c.deafRounds)
 		c.restartAll("deaf: no worker heard anything after a probe round")
 	}
 }
@@ -504,10 +554,13 @@ func (c *Client) Close() error {
 			w.closeRelay()
 		}(w)
 	}
+	c.listenMu.Lock() // closing is set: no watcher starts from here on, and one that raced us has added itself
+	c.listenMu.Unlock()
 	joined := make(chan struct{})
 	go func() {
 		closers.Wait()
 		c.wg.Wait()
+		c.listeners.Wait() // each ends within a step of the stop
 		close(joined)
 	}()
 	select {
@@ -641,11 +694,16 @@ func (c *Client) monitorStep(now time.Time) {
 			w.lastRx.Store(now.UnixNano())
 			w.probeAt.Store(0)
 		}
-		// 🚨 The probe ROUND is not a clock and is not touched here. An unfreeze
-		// runs this late tick and the wake hook side by side: a round the hook
-		// has sent stands as it is — answered if the read loops counted an
-		// inbound since, unanswered if not — whichever of the two ran first.
+		// 🚨 The probe ROUND is not a clock, and the reset above neither answers
+		// nor un-answers one. But a round sent BEFORE this freeze goes: it
+		// proves nothing now. A round the wake hook published while this late
+		// tick was under way — the two run side by side at an unfreeze — is
+		// fresh and stands as it is, whichever of the two ran first.
+		c.dropRoundBefore(prev)
 	} else {
+		if r := c.round.Load(); r != nil && !r.wake && now.After(prev) {
+			r.listened.Add(int64(now.Sub(prev))) // an on-time tick: the process ran, and listened, since the previous one
+		}
 		c.judgeDeaf(now, prev)
 	}
 	c.lastTick.Store(now.UnixNano())
