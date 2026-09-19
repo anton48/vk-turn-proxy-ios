@@ -976,8 +976,7 @@ func TestTheWakeVerdictReplacesDeafWorkersWithinSeconds(t *testing.T) {
 	// hand — a real hook would arm a real timer — and the next wake replaces it.)
 	stale := time.Now().Add(-time.Minute).UnixNano()
 	c.anyRx.Store(stale)
-	c.roundIsWake.Store(true)
-	c.roundAt.Store(stale)
+	c.round.Store(&probeRound{at: stale, wake: true, rxSeq: c.rxSeq.Load()})
 	c.wakeVerdict(stale)
 	if st := c.Stats(); st.DeafAll != 0 {
 		t.Fatal("a wake verdict that fired a minute late judged all the same")
@@ -995,10 +994,15 @@ func TestTheWakeVerdictReplacesDeafWorkersWithinSeconds(t *testing.T) {
 	}
 }
 
-// An unfreeze runs the monitor's LATE tick and the wake hook side by side.
-// When the hook gets in first, the late tick's clock reset must not make the
-// hook's probe round read as answered — the wake verdict would be lost exactly
-// when it is needed. Sabotage seen red: the reset voiding the round.
+// An unfreeze runs the monitor's LATE tick and the wake hook side by side, and
+// the late tick's clock reset may land AFTER the hook's probe round — before
+// the answers or after them. Whether the round was answered is a fact the read
+// loops counted; the reset must neither grant it nor take it away.
+//
+// This half: DEAF workers. The reset restarts the silence clock after the
+// round went out; read off the clocks, that would look like an answer and the
+// wake verdict would be lost exactly when it is needed. Sabotage seen red:
+// "answered" read off the silence clock.
 func TestALateTickDoesNotVoidTheWakeRoundThatBeatIt(t *testing.T) {
 	srv := newFakeServer(t)
 	loopbackRelay(t, nil)
@@ -1021,6 +1025,43 @@ func TestALateTickDoesNotVoidTheWakeRoundThatBeatIt(t *testing.T) {
 	}
 }
 
+// The other half, the user's review of 411: HEALTHY workers. The hook's round
+// is ANSWERED, and then the late tick's reset lands (it had read its tick mark
+// before the hook moved it). 411 re-stamped the round on that reset, the answer
+// was forgotten, and wakeDeafAfter later every healthy worker was restarted —
+// 3 of 3 on the reviewer's stand with the real timer. The real timer runs here
+// too. Sabotages seen red: the reset re-stamping the round; a real inbound not
+// counted.
+func TestALateTickDoesNotUnanswerTheWakeRound(t *testing.T) {
+	old := wakeDeafAfter
+	wakeDeafAfter = 150 * time.Millisecond
+	defer func() { wakeDeafAfter = old }()
+
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+
+	c.lastTick.Store(time.Now().Add(-10 * time.Minute).UnixNano()) // the monitor last ran before the freeze
+	prevBeforeHook := c.lastTick.Load()
+	heard := c.rxSeq.Load()
+	c.WakeHealthCheck() // the hook first: a round goes out …
+	waitFor(t, "the round's answers", func() bool { return c.rxSeq.Load() >= heard+2 })
+	c.lastTick.Store(prevBeforeHook) // … and the late tick, which had read its mark BEFORE the hook moved it,
+	c.monitorStep(time.Now())        // resets every clock AFTER the answers came
+	if st := c.Stats(); st.Descheduled != 1 {
+		t.Fatalf("the fixture's tick was not late: descheduled %d", st.Descheduled)
+	}
+	time.Sleep(3 * wakeDeafAfter)                              // the hook's own timer has fired by now
+	c.monitorStep(time.Now().Add(wakeDeafAfter + time.Second)) // … and the monitor has looked once more
+	if g, _, _ := srv.counts(); g != len(first) || c.Stats().DeafAll != 0 {
+		t.Fatalf("HEALTHY workers whose round was answered were restarted: %d new GETCONF(s), %d restart-all(s) — a clock reset un-answered the round",
+			g-len(first), c.Stats().DeafAll)
+	}
+}
+
 // What the app shows as connections is LIVE, not ready: a worker that reached
 // READY_OK once stays ready until something restarts it, and the field screen
 // read 30/30 over a dead tunnel. Sabotage seen red: Live counted as Ready.
@@ -1032,8 +1073,67 @@ func TestStatsCountAsLiveOnlyWorkersHeardFromLately(t *testing.T) {
 	if st := c.Stats(); st.Ready != 2 || st.Live != 2 {
 		t.Fatalf("two fresh workers: ready %d, live %d — want 2 and 2", st.Ready, st.Live)
 	}
-	c.workers[0].lastRx.Store(time.Now().Add(-liveWindow - time.Second).UnixNano())
+	c.workers[0].heardAt.Store(time.Now().Add(-liveWindow - time.Second).UnixNano())
 	if st := c.Stats(); st.Ready != 2 || st.Live != 1 {
 		t.Fatalf("one worker unheard for longer than the window: ready %d, live %d — want 2 and 1", st.Ready, st.Live)
 	}
+}
+
+// LIVE is counted from REAL reception (the user's review of 411). The liveness
+// clocks restart on a wake and on a late tick without a single packet having
+// arrived; read from them, a clock reset alone made two fully deaf workers
+// "live" again — Live 0 → 2 with RxBytes unchanged — and the screen showed
+// connections until the (never coming) answers. The stats have a stamp of their
+// own that only the read loop writes. Sabotages seen red: the wake hook
+// stamping it; the late tick's reset stamping it; Live read from the liveness
+// clock.
+func TestNoClockResetMakesADeafWorkerLive(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	longAgo := time.Now().Add(-liveWindow - time.Minute).UnixNano()
+	age := func() {
+		for _, w := range c.workers {
+			w.heardAt.Store(longAgo)
+		}
+	}
+
+	deafen(c)
+	age()
+	before := c.Stats()
+	if before.Ready != 2 || before.Live != 0 {
+		t.Fatalf("two deaf workers unheard for minutes: ready %d, live %d — want 2 and 0", before.Ready, before.Live)
+	}
+	c.WakeHealthCheck() // clocks reset, probes out — and nothing comes back
+	c.lastTick.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+	c.monitorStep(time.Now()) // a late tick: clocks reset again
+	time.Sleep(50 * time.Millisecond)
+	if st := c.Stats(); st.Live != 0 || st.RxBytes != before.RxBytes || st.Descheduled != 1 {
+		t.Fatalf("after a wake and a late tick, with not a byte received (rx %d → %d): live %d, want 0 (descheduled %d)",
+			before.RxBytes, st.RxBytes, st.Live, st.Descheduled)
+	}
+	for _, ws := range c.Stats().Workers {
+		if time.Since(ws.LastRx) < liveWindow {
+			t.Fatalf("worker %d reports its last inbound %s ago — a clock reset, not a packet", ws.ID, time.Since(ws.LastRx).Round(time.Millisecond))
+		}
+	}
+}
+
+// … and a REAL answer does: a healthy client unheard for minutes (a freeze) is
+// live again as soon as its wake probes are answered.
+func TestARealAnswerMakesAWorkerLiveAgain(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	for _, w := range c.workers {
+		w.heardAt.Store(time.Now().Add(-liveWindow - time.Minute).UnixNano())
+	}
+	if st := c.Stats(); st.Live != 0 {
+		t.Fatalf("unheard for minutes: live %d, want 0", st.Live)
+	}
+	c.WakeHealthCheck()
+	waitFor(t, "both workers live again on their READY_OK", func() bool { return c.Stats().Live == 2 })
 }

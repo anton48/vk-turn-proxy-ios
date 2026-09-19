@@ -143,13 +143,17 @@ type Client struct {
 	// deafness (see deafVerdict): judged for the client as a whole, by the
 	// monitor's tick and by the wake verdict — deafMu makes the two take turns,
 	// so one silence is answered by one restart-all.
-	deafMu       sync.Mutex
-	roundAt      atomic.Int64 // when every ready worker was last probed as a round, unix nanos; 0 if none is out
-	roundIsWake  atomic.Bool  // … by the wake hook
-	lastDeafAll  atomic.Int64 // the last restart-all, unix nanos
-	deafRounds   int          // restart-alls in the current run (under deafMu)
-	deafRestarts atomic.Int64 // restart-alls, ever
-	heldSaid     bool         // the spacing's hold was logged for this round (under deafMu)
+	deafMu sync.Mutex
+	// rxSeq counts REAL inbound datagrams on every worker and nothing else — no
+	// clock reset touches it. "Was the round answered" is read from it; the
+	// clocks (anyRx, a worker's lastRx) restart on a wake and on a late tick and
+	// prove nothing about reception.
+	rxSeq        atomic.Uint64
+	round        atomic.Pointer[probeRound] // the probe round that stands; nil if none
+	lastDeafAll  atomic.Int64               // the last restart-all, unix nanos
+	deafRounds   int                        // restart-alls in the current run (under deafMu)
+	deafRestarts atomic.Int64               // restart-alls, ever
+	heldSaid     bool                       // the spacing's hold was logged for this round (under deafMu)
 
 	// identity is the (generation, salt) pair every worker's GETCONF carries.
 	// OnPathChange replaces it ONCE for the whole client — the server's
@@ -222,6 +226,7 @@ func (c *Client) OnPathChange() {
 // write (see worker.probe): it runs on the extension's wake/path callback.
 func (c *Client) WakeHealthCheck() {
 	ns := time.Now().UnixNano()
+	heard := c.rxSeq.Load() // before the probes go out: whatever arrives from here on answers the round
 	c.anyRx.Store(ns)
 	probed := 0
 	for _, w := range c.workers {
@@ -240,9 +245,18 @@ func (c *Client) WakeHealthCheck() {
 	// The probes just sent are a ROUND: if NO worker hears anything within
 	// wakeDeafAfter, every allocation died in the freeze (or the path did) and
 	// waiting for the monitor's thirty seconds serves nobody.
-	c.roundIsWake.Store(true)
-	c.roundAt.Store(ns)
+	c.round.Store(&probeRound{at: ns, wake: true, rxSeq: heard})
 	time.AfterFunc(wakeDeafAfter, func() { c.wakeVerdict(ns) })
+}
+
+// probeRound is one round of probes to every ready worker: when it went out,
+// who sent it, and the real-inbound count at that moment — the round is
+// answered once the count has moved. One immutable value behind one pointer,
+// so a reader never sees half of a newer round.
+type probeRound struct {
+	at    int64 // unix nanos
+	wake  bool
+	rxSeq uint64
 }
 
 // wakeVerdict judges the wake hook's probe round. A timer that fires late was
@@ -266,8 +280,11 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 		c.deafRounds = 0
 	}
 	in := deafInput{Now: now, PrevTick: prevTick, AnyRx: time.Unix(0, c.anyRx.Load()),
-		RoundAt: nanosTime(c.roundAt.Load()), RoundIsWake: c.roundIsWake.Load(),
 		LastRestartAll: last, Rounds: c.deafRounds}
+	if r := c.round.Load(); r != nil {
+		in.RoundAt, in.RoundIsWake = time.Unix(0, r.at), r.wake
+		in.RoundAnswered = c.rxSeq.Load() != r.rxSeq // a FACT the read loops counted, not a comparison of clocks
+	}
 	for _, w := range c.workers {
 		if at := w.readyAt.Load(); at != 0 && now.Sub(time.Unix(0, at)) >= readyGrace {
 			in.Judgeable++
@@ -275,15 +292,14 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 	}
 	switch deafVerdict(in) {
 	case deafProbeAll:
-		probed := 0
+		probed, heard := 0, c.rxSeq.Load()
 		for _, w := range c.workers {
 			if w.ready.Load() {
 				w.probe(now.UnixNano())
 				probed++
 			}
 		}
-		c.roundIsWake.Store(false)
-		c.roundAt.Store(now.UnixNano())
+		c.round.Store(&probeRound{at: now.UnixNano(), rxSeq: heard})
 		c.heldSaid = false
 		c.cfg.Logf("csqtt: no worker has heard anything for %s — %d ready worker(s) probed at once", now.Sub(in.AnyRx).Round(time.Second), probed)
 	case deafHeld:
@@ -300,7 +316,7 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 		c.deafRounds++
 		c.deafRestarts.Add(1)
 		c.lastDeafAll.Store(now.UnixNano())
-		c.roundAt.Store(0)
+		c.round.Store(nil)
 		c.heldSaid = false
 		c.anyRx.Store(now.UnixNano()) // the silence that was judged ends here; the next one is counted afresh
 		c.cfg.Logf("csqtt: DEAF — %d ready worker(s) and not one answer %s after the probe round: every allocation is presumed dead, new identity gen=%d, restarting every worker (round %d)",
@@ -625,13 +641,10 @@ func (c *Client) monitorStep(now time.Time) {
 			w.lastRx.Store(now.UnixNano())
 			w.probeAt.Store(0)
 		}
-		// An unfreeze runs this late tick and the wake hook side by side. A
-		// hook that got in first has already asked every worker, and the reset
-		// above would make its round read as answered: keep the round standing,
-		// from now — the clocks just restarted.
-		if c.roundIsWake.Load() && c.roundAt.Load() > prev.UnixNano() {
-			c.roundAt.Store(now.UnixNano())
-		}
+		// 🚨 The probe ROUND is not a clock and is not touched here. An unfreeze
+		// runs this late tick and the wake hook side by side: a round the hook
+		// has sent stands as it is — answered if the read loops counted an
+		// inbound since, unanswered if not — whichever of the two ran first.
 	} else {
 		c.judgeDeaf(now, prev)
 	}
@@ -759,7 +772,8 @@ type worker struct {
 	txBytes   atomic.Int64
 	rxBytes   atomic.Int64
 	restarts  atomic.Int64
-	lastRx    atomic.Int64 // unix nanos
+	lastRx    atomic.Int64 // the liveness CLOCK, unix nanos: last inbound OR the last clock reset (a wake, a late tick)
+	heardAt   atomic.Int64 // the last REAL inbound, unix nanos — no reset touches it; what the stats report
 	lastTx    atomic.Int64
 	readyAt   atomic.Int64 // unix nanos; 0 while not ready
 	blackhole atomic.Bool  // FAULT INJECTION: drop every inbound datagram of the current session
@@ -781,7 +795,7 @@ func newWorker(c *Client, id int, cipher *Cipher) *worker {
 
 func (w *worker) stats() WorkerStats {
 	s := WorkerStats{ID: w.id, Ready: w.ready.Load(), TxPkts: w.tx.Load(), RxPkts: w.rx.Load(), Restarts: w.restarts.Load()}
-	if ns := w.lastRx.Load(); ns != 0 {
+	if ns := w.heardAt.Load(); ns != 0 { // the real one: a clock reset must not make a deaf worker look heard-from
 		s.LastRx = time.Unix(0, ns)
 	}
 	if p := w.relayStr.Load(); p != nil {
@@ -1136,8 +1150,10 @@ func (w *worker) readLoop(conn net.PacketConn, control chan<- []byte, readErr ch
 		w.rxBytes.Add(int64(len(plain)))
 		now := time.Now().UnixNano()
 		w.lastRx.Store(now)
+		w.heardAt.Store(now)
 		w.probeAt.Store(0) // any inbound answers the probe
 		w.c.anyRx.Store(now)
+		w.c.rxSeq.Add(1)
 		if IsIdleKeepalive(plain) {
 			continue
 		}

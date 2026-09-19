@@ -188,10 +188,14 @@ func TestNextBackoffResetsAfterAHealthySession(t *testing.T) {
 // outlasted every TURN allocation, every worker stayed "ready", a UDP write
 // never fails, and the per-worker rule's "nobody hears anything → the path, not
 // this worker" then held for three hours. The exit: ask everybody at once, and
-// when the round goes unanswered, replace everybody. Sabotages seen red: the
-// judgeable-worker check dropped; the wake round made to wait like the
-// monitor's; a round that WAS answered still judged; the late-tick guard
-// dropped; the spacing between restart-alls ignored.
+// when the round goes unanswered, replace everybody. Whether a round was
+// answered is a FACT the rule is handed (real inbound counted since the probes
+// went out); the silence clock restarts on every reset and proves nothing about
+// reception — the two rows that pair a reset with a round pin that. Sabotages
+// seen red: the judgeable-worker check dropped; the wake round made to wait
+// like the monitor's; a round that WAS answered still judged; the late-tick
+// guard dropped; the spacing between restart-alls ignored; "answered" read off
+// the silence clock again (a reset after the round then answers it).
 func TestDeafVerdict(t *testing.T) {
 	t0 := time.Unix(1_700_000_000, 0)
 	now := t0.Add(10 * time.Minute)
@@ -220,11 +224,17 @@ func TestDeafVerdict(t *testing.T) {
 			in.AnyRx, in.RoundAt, in.RoundIsWake = now.Add(-5*time.Second), now.Add(-5*time.Second), true
 		}, deafRestartAll},
 		{"a round that WAS answered is no verdict, however old", func(in *deafInput) {
-			in.RoundAt, in.RoundIsWake, in.AnyRx = now.Add(-20*time.Second), true, now.Add(-19*time.Second)
+			in.RoundAt, in.RoundIsWake, in.RoundAnswered, in.AnyRx = now.Add(-20*time.Second), true, true, now.Add(-19*time.Second)
 		}, deafNone},
 		{"… and the silence after it is counted afresh", func(in *deafInput) {
-			in.RoundAt, in.AnyRx = now.Add(-2*time.Minute), now.Add(-31*time.Second)
+			in.RoundAt, in.RoundAnswered, in.AnyRx = now.Add(-2*time.Minute), true, now.Add(-31*time.Second)
 		}, deafProbeAll},
+		{"a clock reset AFTER an answered round does not un-answer it", func(in *deafInput) {
+			in.RoundAt, in.RoundIsWake, in.RoundAnswered, in.AnyRx = now.Add(-6*time.Second), true, true, now
+		}, deafNone},
+		{"a clock reset AFTER an unanswered round does not answer it", func(in *deafInput) {
+			in.RoundAt, in.RoundIsWake, in.AnyRx = now.Add(-6*time.Second), true, now.Add(-time.Second)
+		}, deafRestartAll},
 		{"a late tick judges nothing", func(in *deafInput) {
 			in.PrevTick = now.Add(-livenessTick - descheduledSlack - time.Second)
 			in.AnyRx, in.RoundAt = now.Add(-10*time.Minute), now.Add(-9*time.Minute)

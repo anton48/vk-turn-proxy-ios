@@ -186,13 +186,24 @@ const (
 var wakeDeafAfter = 5 * time.Second
 
 // deafInput is the client's view at a monitor tick or at the wake verdict.
+//
+// 🚨 Two kinds of thing are in it and they must not be mixed. AnyRx is a CLOCK:
+// it restarts on every inbound AND on every clock reset (a wake, a late tick),
+// so that frozen time is never counted as silence — it says how long the
+// running process has heard nothing, and it is NEVER evidence that something
+// was received. RoundAnswered is a FACT: real inbound counted by the read
+// loops since the round's probes went out, which no reset can grant or take
+// away. (Build 411 read the fact off the clocks: a reset that landed after the
+// answers made an answered round read as unanswered, and every healthy worker
+// was restarted.)
 type deafInput struct {
 	Now            time.Time
 	PrevTick       time.Time // the monitor's previous tick; zero when the caller is not the monitor
 	Judgeable      int       // workers ready for at least readyGrace
-	AnyRx          time.Time // last inbound on ANY worker — or the last clock reset
-	RoundAt        time.Time // when every ready worker was last probed as a ROUND; zero if never
+	AnyRx          time.Time // the silence CLOCK: last inbound on any worker, or the last clock reset
+	RoundAt        time.Time // when every ready worker was last probed as a ROUND; zero if none stands
 	RoundIsWake    bool      // that round was the wake hook's
+	RoundAnswered  bool      // a real inbound arrived, on any worker, after that round's probes went out
 	LastRestartAll time.Time // zero if never
 	Rounds         int       // restart-alls in the current run
 }
@@ -226,9 +237,10 @@ func deafSpacingFor(rounds int) time.Duration {
 //  1. a late tick means descheduled — never judge (the monitor resets the clocks);
 //  2. with no worker ready past its grace there is nobody to be deaf: the
 //     workers are dialling, and their own backoff is the recovery;
-//  3. a probe round that is out and unanswered — nothing heard SINCE it — is a
-//     verdict once its wait has passed, unless the last restart-all is too recent;
-//  4. total silence for probeAfter with no round out → ask everybody.
+//  3. a probe round that stands UNANSWERED — no real inbound since its probes
+//     went out, whatever the clocks were reset to meanwhile — is a verdict once
+//     its wait has passed, unless the last restart-all is too recent;
+//  4. otherwise, total silence for probeAfter → ask everybody.
 func deafVerdict(in deafInput) deafAction {
 	if !in.PrevTick.IsZero() && in.Now.Sub(in.PrevTick) > livenessTick+descheduledSlack {
 		return deafNone
@@ -236,7 +248,7 @@ func deafVerdict(in deafInput) deafAction {
 	if in.Judgeable == 0 {
 		return deafNone
 	}
-	if !in.RoundAt.IsZero() && !in.RoundAt.Before(in.AnyRx) {
+	if !in.RoundAt.IsZero() && !in.RoundAnswered {
 		wait := deadAfterProbe
 		if in.RoundIsWake {
 			wait = wakeDeafAfter
