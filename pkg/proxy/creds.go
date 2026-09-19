@@ -52,12 +52,21 @@ const vkCallJoinBase = "https://vk.ru/call/join/"
 // at which we consider the cred no longer fresh and start refreshing. The
 // expiry comes from VK's TURN REST API (draft-uberti-behave-turn-rest):
 // the credentials Username is "<expiry_unix_timestamp>:<key_id>", with the
-// timestamp being the moment after which VK's TURN server rejects the
-// cred with error 401. We stop using the cred before that point so an
-// in-flight TURN refresh (every ~5 min via pion) doesn't surprise us with
-// a 401 mid-session, and we have enough headroom for the fresh-fetch path
-// to finish (including a possible captcha solve, which can take many
-// seconds on a hostile VK day).
+// timestamp being the moment after which VK's TURN server rejects an
+// ALLOCATE under the cred with error 401 — and that is all it gates.
+// Measured 2026-09-19 against the VK relay: the same cred allocated 82 s
+// before its timestamp and was refused 39 s after it (nine of nine expired
+// creds refused, an unexpired control accepted beside each), while forty
+// allocations made BEFORE their cred's timestamp were refreshed for 4h10m
+// past it, every Refresh granted its 600 s — the re-authentication after a
+// stale nonce included. A running session does not meet a 401 at its cred's
+// expiry and needs no protection from one. The buffer is for the connection
+// that (re)starts: it must never be handed a cred it can no longer allocate
+// under, and the fresh-fetch path needs headroom to finish first (including
+// a possible captcha solve, which can take many seconds on a hostile VK
+// day), clock skew against VK included.
+// 🚫 Do not shorten the buffer because sessions outlive their cred — their
+// restarts do not; 🚫 and do not end a session because its cred expired.
 //
 // 30 min works out to ~7h 30m of usage on VK's typical 8h-validity creds —
 // one fetch per cred-lifetime, no thrashing, plenty of margin if
