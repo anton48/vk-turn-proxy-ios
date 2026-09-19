@@ -165,6 +165,26 @@ func TestLivenessVerdict(t *testing.T) {
 			in.LastProbeAt = in.Now.Add(-5 * time.Second)
 			in.LiveProbes = 5
 		}, livenessReprobe},
+		// the review of 415 (build 416)
+		{"ripe for the restart by every other field — but the probe has been ANSWERED → nothing", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-80 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-45 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.LiveProbes = 5
+			in.Answered = true
+		}, livenessNone},
+		{"answered → not asked again either", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-35 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-5 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.Answered = true
+		}, livenessNone},
+		{"thirty seconds out and asked five times — every time into a blackout, none confirmed → asked again, NOT restarted", func(in *livenessInput) {
+			in.LastRx = in.Now.Add(-60 * time.Second)
+			in.ProbeSentAt = in.Now.Add(-30 * time.Second)
+			in.LastProbeAt = in.Now.Add(-5 * time.Second)
+			in.LiveProbes = 0
+		}, livenessReprobe},
 		{"everyone silent → no re-send either: the path, not the worker", func(in *livenessInput) {
 			in.LastRx = in.Now.Add(-40 * time.Second)
 			in.ProbeSentAt = in.Now.Add(-10 * time.Second)
@@ -199,6 +219,30 @@ func TestLivenessVerdict(t *testing.T) {
 		c.mod(&in)
 		if got := livenessVerdict(in); got != c.want {
 			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// Which re-sends count against a worker (the review of 415): only one that had
+// a real inbound on the client in the tick BEFORE it went out and in the tick
+// AFTER. A first probe never counts — the wake hook's and the round's go out
+// blind.
+func TestOnlyAResendMadeWhileThePathWorkedCountsAgainstAWorker(t *testing.T) {
+	cases := []struct {
+		name       string
+		st         probeState
+		heardSince bool
+		want       int
+	}{
+		{"a first probe, the client heard since → nothing to count", probeState{}, true, 0},
+		{"a re-send with inbound before it and after it → counted", probeState{resent: true, heardBefore: true, counted: 1}, true, 2},
+		{"a re-send into a blackout: nothing before it, nothing after", probeState{resent: true, counted: 1}, false, 1},
+		{"nothing before it, the path back after it (it was lost in the dead path) → not counted", probeState{resent: true, counted: 1}, true, 1},
+		{"inbound before it, none after (the path died under it) → not counted", probeState{resent: true, heardBefore: true, counted: 1}, false, 1},
+	}
+	for _, c := range cases {
+		if got := c.st.confirmed(c.heardSince); got != c.want {
+			t.Errorf("%s: %d, want %d", c.name, got, c.want)
 		}
 	}
 }

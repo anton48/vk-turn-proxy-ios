@@ -137,6 +137,7 @@ type Client struct {
 	anyRx    atomic.Int64 // last inbound on any worker, unix nanos
 	probes   atomic.Int64 // liveness probes marked
 	reprobes atomic.Int64 // unanswered probes sent again by the liveness rule
+	witness  atomic.Int64 // READYs to a worker known to be alive, asked beside them (askWitness)
 	resets   atomic.Int64 // monitor ticks found late (descheduled)
 	lostToL  atomic.Int64 // workers restarted by the liveness verdict
 	lastTick atomic.Int64 // the monitor's previous tick (or a WakeHealthCheck), unix nanos
@@ -705,22 +706,50 @@ func (c *Client) monitorStep(now time.Time) {
 	prev := nanosTime(c.lastTick.Load())
 	anyRx := time.Unix(0, c.anyRx.Load())
 	reset := false
+	asked := false
 	for _, w := range c.workers {
 		in := livenessInput{Now: now, PrevTick: prev, AnyRx: anyRx,
-			ReadyAt: nanosTime(w.readyAt.Load()), LastRx: nanosTime(w.lastRx.Load()),
-			ProbeSentAt: nanosTime(w.probeAt.Load()), LastProbeAt: nanosTime(w.lastProbe.Load()),
-			LiveProbes: int(w.liveProbe.Load())}
+			ReadyAt: nanosTime(w.readyAt.Load()), LastRx: nanosTime(w.lastRx.Load())}
+		// The probe's state is ONE value, loaded once; the facts beside it are
+		// read AFTER it — the read loop counts an inbound (w.rx) before anything
+		// else, so an answer that has reached it is seen here whatever it has
+		// or has not got round to yet.
+		st := w.probeSt.Load()
+		heardSince := false
+		if st != nil {
+			heardSince = c.rxSeq.Load() != st.seq
+			in.ProbeSentAt, in.LastProbeAt = nanosTime(st.firstAt), nanosTime(st.lastAt)
+			in.LiveProbes = st.confirmed(heardSince)
+			in.Answered = w.rx.Load() != st.rx
+		}
 		switch livenessVerdict(in) {
 		case livenessResetAll:
 			reset = true
 		case livenessProbe:
 			w.probe(now.UnixNano())
+			asked = true
 		case livenessReprobe:
-			w.reprobe(now.UnixNano())
+			if w.reprobe(st, now.UnixNano(), heardSince) {
+				asked = true
+			}
 		case livenessRestart:
+			if hook := livenessVerdictReached.Load(); hook != nil {
+				(*hook)(w)
+			}
+			// COMMIT, as for the deafness verdict: the probe's state comes down by
+			// CompareAndSwap from the one the verdict was reached on, the worker's
+			// inbound count is read once more beside it, and only then is anything
+			// done. An answer that landed meanwhile — or a fresh probe from the
+			// wake hook — voids the verdict.
+			if !w.probeSt.CompareAndSwap(st, nil) || w.rx.Load() != st.rx {
+				continue
+			}
 			c.lostToL.Add(1)
 			w.restart("liveness: no inbound after a probe while other workers are live")
 		}
+	}
+	if asked && !reset {
+		c.askWitness()
 	}
 	if reset {
 		// The process was not running: nothing observed in that gap means
@@ -799,6 +828,7 @@ type Stats struct {
 	Repairs     int64
 	Probes      int64 // liveness probes marked (the send is asynchronous)
 	Reprobes    int64 // unanswered probes the liveness rule sent again
+	Witnesses   int64 // READYs to a worker known to be alive, asked beside them
 	Descheduled int64 // monitor ticks found late
 	LostWorkers int64 // workers restarted by the liveness verdict
 	DeafAll     int64 // restart-alls by the deafness verdict
@@ -815,6 +845,7 @@ func (c *Client) Stats() Stats {
 		Repairs:     c.repairs.Load(),
 		Probes:      c.probes.Load(),
 		Reprobes:    c.reprobes.Load(),
+		Witnesses:   c.witness.Load(),
 		Descheduled: c.resets.Load(),
 		LostWorkers: c.lostToL.Load(),
 		DeafAll:     c.deafRestarts.Load(),
@@ -873,12 +904,10 @@ type worker struct {
 	lastRx    atomic.Int64 // the liveness CLOCK, unix nanos: last inbound OR the last clock reset (a wake, a late tick)
 	heardAt   atomic.Int64 // the last REAL inbound, unix nanos — no reset touches it; what the stats report
 	lastTx    atomic.Int64
-	readyAt   atomic.Int64 // unix nanos; 0 while not ready
-	blackhole atomic.Bool  // FAULT INJECTION: drop every inbound datagram of the current session
-	probeAt   atomic.Int64 // unix nanos of the FIRST probe for the current silence — the restart's clock; 0 if none. Any inbound clears it
-	lastProbe atomic.Int64 // unix nanos of the latest send for the current silence: the first probe, or a re-send
-	liveProbe atomic.Int32 // a FACT, counted at the send: RE-SENDS of the current silence's probe — the liveness rule's, so sent while other workers were hearing
-	probing   atomic.Bool  // a READY probe is in its write (at most one goroutine behind a blocked relay)
+	readyAt   atomic.Int64               // unix nanos; 0 while not ready
+	blackhole atomic.Bool                // FAULT INJECTION: drop every inbound datagram of the current session
+	probeSt   atomic.Pointer[probeState] // the probe that is out for the current silence; nil if none. Any inbound clears it
+	probing   atomic.Bool                // a READY probe is in its write (at most one goroutine behind a blocked relay)
 	relayStr  atomic.Pointer[string]
 	relayRef  atomic.Pointer[Relay] // the live allocation, for closeRelay — no mutex, a blocked send holds mu
 
@@ -925,36 +954,79 @@ func (w *worker) restart(reason string) {
 //
 // This is the FIRST probe of a silence, and it starts the restart's clock. As
 // the wake hook and the deafness round send it, nobody is known to be hearing —
-// such a probe may go into a dead path — so it is never counted against the
-// worker (liveProbe starts at 0); what counts is the re-sends: see reprobe.
+// such a probe may go into a dead path — so a first probe is never counted
+// against the worker; what can count is the re-sends: see reprobe. It REPLACES
+// whatever probe stood (a wake is a boundary; the round asks everybody afresh).
+// The two counts are read before the send: no answer can precede its probe.
 func (w *worker) probe(now int64) {
-	w.probeAt.Store(now)
-	w.lastProbe.Store(now)
-	w.liveProbe.Store(0)
+	w.probeSt.Store(&probeState{firstAt: now, lastAt: now, rx: w.rx.Load(), seq: w.c.rxSeq.Load()})
 	w.c.probes.Add(1)
 	w.sendProbe()
 }
 
-// reprobe sends the unanswered probe AGAIN. Only the liveness rule does, and
-// only past its rule 3 — while other workers are hearing — so a re-send that
-// goes unanswered is evidence about THIS worker, and is counted as such.
-// 🚫 It does not touch probeAt: the restart's clock is the first
-// probe's, and a re-send that moved it would keep a dead worker for ever. A
-// probe whose write is still blocked is counted all the same: the mark goes
-// first, as for the first probe — a relay that takes no bytes is no answer.
-func (w *worker) reprobe(now int64) {
-	w.lastProbe.Store(now)
-	w.liveProbe.Add(1)
+// reprobe sends the unanswered probe AGAIN — the liveness rule's doing alone.
+// The new state takes the old one's place by CompareAndSwap: if the read loop
+// has cleared the probe meanwhile (the answer came), or the wake hook or the
+// round has put a fresh one there, theirs stands and nothing is sent. 🚫 The
+// first probe's time and the worker's inbound count at that time are carried
+// over untouched: the restart's clock is the first probe's, and "answered" is
+// asked of the whole silence. Whether this re-send will count against the
+// worker is decided by facts — heardSince now (the client really received
+// something since the send before), and again at the next tick
+// (probeState.confirmed). A probe whose write is still blocked is a probe all
+// the same: the mark goes first — a relay that takes no bytes is no answer.
+func (w *worker) reprobe(st *probeState, now int64, heardSince bool) bool {
+	next := &probeState{firstAt: st.firstAt, lastAt: now, rx: st.rx, seq: w.c.rxSeq.Load(),
+		resent: true, heardBefore: heardSince, counted: st.confirmed(heardSince)}
+	if !w.probeSt.CompareAndSwap(st, next) {
+		return false
+	}
 	w.c.reprobes.Add(1)
 	w.sendProbe()
+	return true
 }
+
+// readLoopStamped is a test's window INSIDE the read loop, between the stamps
+// of a real inbound and the clearing of the probe — nil in production. The
+// monitor does not take turns with the read loop, and a verdict must hold in
+// that window too.
+var readLoopStamped atomic.Pointer[func(*worker)]
 
 // clearProbe: the silence is over — an inbound arrived — or whatever was
 // observed of it means nothing any more (a wake, a late tick, the session's end).
 func (w *worker) clearProbe() {
-	w.probeAt.Store(0)
-	w.lastProbe.Store(0)
-	w.liveProbe.Store(0)
+	w.probeSt.Store(nil)
+}
+
+// livenessVerdictReached is a test's window between the liveness rule's
+// restart verdict and its execution — nil in production.
+var livenessVerdictReached atomic.Pointer[func(*worker)]
+
+// askWitness sends ONE READY to the worker most likely to be alive — ready, no
+// probe out, the most recently heard from — at every tick at which the liveness
+// rule has asked a silent worker anything. Its answer is the
+// FACT the rule's evidence rests on: on an idle tunnel a worker hears nothing
+// but the answers to its own probes, and after a wake or a deafness round every
+// worker's cycle runs in step — half a minute can pass without one inbound
+// while the path is perfectly well; the re-sends to a dead worker would then
+// never be confirmed (probeState.confirmed), and it would stay. The witness
+// keeps no probe state: it is not under suspicion, and a lost answer of its
+// costs nothing but a tick of evidence.
+func (c *Client) askWitness() {
+	var best *worker
+	var bestAt int64
+	for _, w := range c.workers {
+		if !w.ready.Load() || w.probeSt.Load() != nil { // a worker with a probe out is itself under suspicion — and may be the very one being asked
+			continue
+		}
+		if h := w.heardAt.Load(); best == nil || h > bestAt {
+			best, bestAt = w, h
+		}
+	}
+	if best != nil {
+		c.witness.Add(1)
+		best.sendProbe()
+	}
 }
 
 func (w *worker) sendProbe() {
@@ -1284,6 +1356,9 @@ func (w *worker) readLoop(conn net.PacketConn, control chan<- []byte, readErr ch
 		now := time.Now().UnixNano()
 		w.lastRx.Store(now)
 		w.heardAt.Store(now)
+		if hook := readLoopStamped.Load(); hook != nil {
+			(*hook)(w)
+		}
 		w.clearProbe() // any inbound answers the probe
 		w.c.anyRx.Store(now)
 		w.c.rxSeq.Add(1)

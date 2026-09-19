@@ -88,8 +88,9 @@ func (g *startGate) begin() (done func()) {
 // Liveness timings. A silent worker is first PROBED (READY, which the
 // server answers with READY_OK — the cheapest packet that elicits a reply),
 // the probe is sent AGAIN for as long as it stays unanswered, and the worker
-// is given up on only if probes sent while the path demonstrably worked went
-// unanswered too.
+// is given up on only if re-sends made while the path DEMONSTRABLY worked —
+// the client really received something just before and just after them —
+// went unanswered too.
 const (
 	livenessTick   = 5 * time.Second
 	probeAfter     = 30 * time.Second // silence before a probe
@@ -106,8 +107,9 @@ const (
 	reprobeEvery = livenessTick - time.Second
 
 	// liveProbesToGiveUp: a worker is given up on only after this many RE-SENDS
-	// of its probe — each made WHILE OTHER WORKERS WERE HEARING — went unanswered
-	// (in the ordinary case there are five of them by the thirtieth second). 🚨 A probe sent
+	// of its probe went unanswered WHILE THE PATH WORKED — see
+	// probeState.confirmed for what that means (in the ordinary case five of
+	// them are confirmed by the thirtieth second). 🚨 A probe sent
 	// when nobody is known to hear — the deafness round's, the wake hook's —
 	// proves nothing about the worker when it is lost: it may have gone into a
 	// dead path. Field, 2026-09-19: a 70-second block of the relay leg; the
@@ -132,8 +134,44 @@ type livenessInput struct {
 	LastRx      time.Time // last inbound on this worker
 	ProbeSentAt time.Time // when the FIRST probe of the current silence was sent — by this rule, the wake hook or the deafness round; zero if none. Any inbound clears it: a probe that is out is an unanswered one
 	LastProbeAt time.Time // when a probe of the current silence was last sent: the first one, or a re-send
-	LiveProbes  int       // a FACT, counted at the send: how many times THIS RULE sent the probe again — i.e. while other workers were hearing (rule 3 stands before every re-send)
+	LiveProbes  int       // a FACT: re-sends of the probe that count against the worker — made while the path demonstrably worked (probeState.confirmed)
+	Answered    bool      // a FACT: THIS worker's real-inbound count has moved since its first probe went out. 🚫 Not "LastRx is fresh": that is a clock, which a wake and a late tick reset — and the read loop stamps it BEFORE it clears the probe
 	AnyRx       time.Time // last inbound on ANY worker of the client
+}
+
+// probeState is what is known about the probe that is out for a worker's
+// current silence: ONE immutable value behind one pointer (nil: no probe out),
+// replaced whole by whoever changes it. A reader never sees half of it; an
+// answer that lands between a verdict and its execution fails the verdict's
+// CompareAndSwap; a re-send cannot resurrect a probe the read loop has just
+// cleared.
+type probeState struct {
+	firstAt int64  // unix nanos of the FIRST probe of the silence — the restart's clock; a re-send never moves it
+	lastAt  int64  // unix nanos of the latest send
+	rx      int64  // THIS worker's real-inbound count when the first probe went out: the probe is answered once it has moved
+	seq     uint64 // the CLIENT's real-inbound count (Client.rxSeq) when the latest send went out
+
+	resent      bool // the latest send was a re-send by the liveness rule — not a first probe: the wake hook's and the deafness round's go out blind, and the rule's own first one is not counted either
+	heardBefore bool // … and the client had really received something since the send before it
+	counted     int  // re-sends already counted against the worker
+}
+
+// confirmed is how many re-sends count against the worker as of now, given
+// whether the client has really received anything SINCE the latest send. A
+// re-send counts only if the client heard something in the tick BEFORE it went
+// out AND in the tick AFTER: then the path worked around the moment it
+// travelled, and its silence is the worker's. 🚨 Both are facts — the client's
+// real-inbound count moving — and not the age of anyRx: a re-send made into a
+// general blackout (nothing before it, nothing after) counts for nothing,
+// however young the last inbound still looked when it went out. What this
+// cannot exclude is a path that dies and revives in step with the ticks; two
+// confirmed re-sends, and a witness asked beside each (askWitness), make that
+// two coincidences.
+func (st *probeState) confirmed(heardSince bool) int {
+	if st.resent && st.heardBefore && heardSince {
+		return st.counted + 1
+	}
+	return st.counted
 }
 
 // livenessAction is what the monitor should do for a worker.
@@ -152,14 +190,19 @@ const (
 //  2. a worker that is not ready, or ready for less than readyGrace, is not judged;
 //  3. if NO worker has heard anything for probeAfter, the path is down, not
 //     this worker — restarting workers one by one would only churn allocations;
-//  4. a probe is out (and unanswered — any inbound clears it), whoever sent it:
-//     restart once deadAfterProbe has passed since the FIRST probe AND
-//     liveProbesToGiveUp re-sends — each made while others were hearing — have
-//     gone unanswered, the last of them at least reprobeEvery ago; otherwise
-//     send it again, reprobeEvery after the last send. 🚫 The restart's clock is
-//     the first probe's: a re-send never moves it, or a dead worker would be
-//     asked for ever. 🚫 And the round's or the wake's probe alone never
-//     restarts a worker — it was not sent while anybody was known to hear;
+//  4. a probe is out, whoever sent it. If it has been ANSWERED — the worker's
+//     own inbound count has moved; the read loop is about to clear the probe,
+//     and the monitor does not take turns with it — nothing: a verdict on the
+//     old probe fields would restart a worker that has just answered.
+//     Otherwise restart once deadAfterProbe has passed since the FIRST probe
+//     AND liveProbesToGiveUp re-sends made while the path demonstrably worked
+//     have gone unanswered, the last send at least reprobeEvery ago; otherwise
+//     send it again, reprobeEvery after the last send. 🚫 The restart's clock
+//     is the first probe's: a re-send never moves it, or a dead worker would be
+//     asked for ever. 🚫 Rule 3 above is NOT "the path works": it lets the rule
+//     through while the OLD anyRx is younger than probeAfter, although nobody
+//     may have received anything since (a general blackout's first half
+//     minute) — which is why the re-sends are counted by facts, not by it;
 //  5. no probe out: silence past probeAfter → probe.
 func livenessVerdict(in livenessInput) livenessAction {
 	if !in.PrevTick.IsZero() && in.Now.Sub(in.PrevTick) > livenessTick+descheduledSlack {
@@ -172,6 +215,9 @@ func livenessVerdict(in livenessInput) livenessAction {
 		return livenessNone
 	}
 	if !in.ProbeSentAt.IsZero() {
+		if in.Answered {
+			return livenessNone
+		}
 		rested := in.Now.Sub(in.LastProbeAt) >= reprobeEvery
 		if rested && in.LiveProbes >= liveProbesToGiveUp && in.Now.Sub(in.ProbeSentAt) >= deadAfterProbe {
 			return livenessRestart

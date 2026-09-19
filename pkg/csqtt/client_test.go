@@ -1012,14 +1012,14 @@ func TestAProbeLostInADeadPathIsAskedAgainBeforeTheWorkerIsGivenUpOn(t *testing.
 	waitFor(t, "worker 1 hears again", func() bool { return c.rxSeq.Load() > heard })
 	_, readies0, _ := srv.counts()
 	othersHear(c, at(60), 1)
-	c.monitorStep(at(60)) // thirty seconds after the round's probe to worker 2 — the tick that restarted it in the field
+	tick(t, c, at(60)) // thirty seconds after the round's probe to worker 2 — the tick that restarted it in the field
 	waitFor(t, "worker 2 asked AGAIN, and answered", func() bool {
 		_, r, _ := srv.counts()
-		return r > readies0 && c.workers[1].probeAt.Load() == 0
+		return r > readies0 && !probeOut(c.workers[1])
 	})
 	for s := 65; s <= 90; s += 5 {
 		othersHear(c, at(s), 1, 2) // both hear now
-		c.monitorStep(at(s))
+		tick(t, c, at(s))
 	}
 	g, _, _ := srv.counts()
 	if st := c.Stats(); st.LostWorkers != 0 || st.DeafAll != 0 || g != len(first) || st.Reprobes == 0 {
@@ -1047,22 +1047,19 @@ func TestADeadWorkerIsStillGivenUpOnThirtySecondsAfterItsFirstProbe(t *testing.T
 	c.workers[1].lastRx.Store(start.UnixNano())
 	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
 	_, readies0, _ := srv.counts()
-	for s, sent := 5, 0; s <= 55; s += 5 {
+	for s := 5; s <= 55; s += 5 { // the first probe at +30 s of silence, then one more at every tick: +35 … +55 — and a witness beside each
 		othersHear(c, at(s), 1)
-		c.monitorStep(at(s))
-		if s >= 30 { // the first probe at +30 s of silence, then one more at every tick: +35 … +55
-			sent++ // (the test's ticks are microseconds apart: let each send leave — one is in flight per worker)
-			want := readies0 + sent
-			waitFor(t, "the READY of this tick from the dead worker", func() bool { _, r, _ := srv.counts(); return r >= want })
-		}
+		tick(t, c, at(s))
 	}
-	if st := c.Stats(); st.Probes != 1 || st.Reprobes != 5 || st.LostWorkers != 0 {
-		t.Fatalf("twenty-five seconds after the first probe: probes %d (want 1), sent again %d (want 5), given up on %d (want 0 — not before the thirty seconds)", st.Probes, st.Reprobes, st.LostWorkers)
+	_, readies, _ := srv.counts()
+	if st := c.Stats(); st.Probes != 1 || st.Reprobes != 5 || st.Witnesses != 6 || readies != readies0+12 || st.LostWorkers != 0 {
+		t.Fatalf("twenty-five seconds after the first probe: probes %d (want 1), sent again %d (want 5), witnesses asked %d (want 6), READYs at the server %d (want 12), given up on %d (want 0 — not before the thirty seconds)",
+			st.Probes, st.Reprobes, st.Witnesses, readies-readies0, st.LostWorkers)
 	}
 	othersHear(c, at(60), 1)
-	c.monitorStep(at(60))
+	tick(t, c, at(60))
 	if st := c.Stats(); st.LostWorkers != 1 {
-		t.Fatalf("thirty seconds after the FIRST probe: given up on %d worker(s), want 1 — a re-send must not move the restart's clock", st.LostWorkers)
+		t.Fatalf("thirty seconds after the FIRST probe: given up on %d worker(s), want 1 — the re-sends were made while the witness answered; and a re-send must not move the restart's clock", st.LostWorkers)
 	}
 }
 
@@ -1084,18 +1081,274 @@ func TestAfterADeadPathADeadWorkerGetsTwoLiveProbesBeforeItGoes(t *testing.T) {
 	heard := c.rxSeq.Load()
 	c.workers[0].probe(time.Now().UnixNano())
 	waitFor(t, "worker 1 hears again", func() bool { return c.rxSeq.Load() > heard })
-	for s := 60; s <= 70; s += 5 { // +60: the round's probe is 30 s old — asked again (1); +65: again (2); +70: two re-sends unanswered → it goes
+	for s := 60; s <= 70; s += 5 { // +60: the round's probe is 30 s old — asked again; +65: that re-send confirmed (1), asked again; +70: confirmed (2) → it goes
 		othersHear(c, at(s), 1)
-		c.monitorStep(at(s))
-		waitFor(t, "this tick's send to leave", func() bool { return !c.workers[1].probing.Load() })
+		tick(t, c, at(s))
 		if s < 70 {
 			if st := c.Stats(); st.LostWorkers != 0 {
-				t.Fatalf("+%d s: worker 2 given up on after %d re-send(s) made while others heard — want two of them unanswered first (the round's own probe went into a dead path and counts for nothing)", s, c.workers[1].liveProbe.Load())
+				t.Fatalf("+%d s: worker 2 given up on — want two re-sends made while the path worked, and unanswered, first (the round's own probe went into a dead path and counts for nothing)", s)
 			}
 		}
 	}
 	if st := c.Stats(); st.LostWorkers != 1 || st.DeafAll != 0 {
-		t.Fatalf("+70 s: given up on %d worker(s) (want 1 — the dead one, after two re-sends made while others heard), restart-alls %d (want 0)", st.LostWorkers, st.DeafAll)
+		t.Fatalf("+70 s: given up on %d worker(s) (want 1 — the dead one, after two confirmed re-sends), restart-alls %d (want 0)", st.LostWorkers, st.DeafAll)
+	}
+}
+
+// ripeProbe puts worker w where the rule gives it up: a probe out since
+// `first`, asked again (last at `last`) often enough, while others heard.
+func ripeProbe(c *Client, w *worker, first, last time.Time) {
+	w.lastRx.Store(first.Add(-30 * time.Second).UnixNano())
+	w.probeSt.Store(&probeState{firstAt: first.UnixNano(), lastAt: last.UnixNano(), rx: w.rx.Load(), seq: c.rxSeq.Load(),
+		resent: true, heardBefore: true, counted: 4})
+}
+
+// probeOut: a probe stands for the worker's current silence.
+func probeOut(w *worker) bool { return w.probeSt.Load() != nil }
+
+// tick runs one monitor step at the synthetic `now` and then lets what it sent
+// leave and be answered: the test's five seconds are microseconds, a worker has
+// one send in flight, and the facts the rule counts are REAL inbound — a
+// witness's READY_OK has to come back before the next tick can see it.
+func tick(t *testing.T, c *Client, now time.Time) {
+	t.Helper()
+	w0, r0 := c.Stats().Witnesses, c.rxSeq.Load()
+	c.monitorStep(now)
+	waitFor(t, "this tick's sends to leave", func() bool {
+		for _, w := range c.workers {
+			if w.probing.Load() {
+				return false
+			}
+		}
+		return true
+	})
+	if c.Stats().Witnesses > w0 { // a witness was asked: if it can answer, let it
+		deadline := time.Now().Add(150 * time.Millisecond)
+		for c.rxSeq.Load() == r0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// Build 416 — the review of 415, finding 1: rule 3 lets the rule through for as
+// long as the OLD anyRx is younger than thirty seconds, although nobody has
+// received anything since — so re-sends made INTO a general blackout were
+// counted as "sent while others heard". The reviewer's stand: the first probe
+// and five re-sends lost in a general silence, the path back just before the
+// thirtieth second, one worker answers — and the healthy idle worker is given
+// up on at once, without being asked again after the recovery (5 of 5).
+// "Others hear" is a FACT — the client's real-inbound count moving around the
+// send — never the age of a clock.
+func TestResendsMadeIntoAGeneralBlackoutAreNotEvidenceAgainstAWorker(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	c.lastTick.Store(start.UnixNano())
+	c.workers[1].lastRx.Store(start.UnixNano()) // worker 2: idle, silent from the start
+	for s := 5; s <= 25; s += 5 {
+		othersHear(c, at(s), 1)
+		c.monitorStep(at(s))
+	}
+	// The blackout begins — for everybody — with anyRx 27 s into the run: the
+	// clock stays "younger than thirty seconds" up to +55.
+	othersHear(c, at(27), 1)
+	deafen(c)
+	for s := 30; s <= 55; s += 5 { // +30: worker 2's first probe; +35 … +55: five re-sends — every one of them into the blackout
+		tick(t, c, at(s))
+	}
+	if st := c.Stats(); st.LostWorkers != 0 {
+		t.Fatalf("given up on %d worker(s) INSIDE the blackout", st.LostWorkers)
+	}
+	time.Sleep(100 * time.Millisecond) // the blackholed answers arrive and are dropped while the path is still dead
+	// The path is back just before the thirtieth second; worker 1 asks and is answered.
+	undeafen(c)
+	heard := c.rxSeq.Load()
+	c.workers[0].probe(time.Now().UnixNano())
+	waitFor(t, "worker 1 hears again", func() bool { return c.rxSeq.Load() > heard })
+	othersHear(c, at(58), 1) // rule 3's clock, in the monitor's time
+	tick(t, c, at(60))       // thirty seconds after worker 2's first probe
+	waitFor(t, "worker 2 asked AGAIN after the recovery, and answered", func() bool { return !probeOut(c.workers[1]) })
+	g, _, _ := srv.counts()
+	if st := c.Stats(); st.LostWorkers != 0 || g != len(first) {
+		t.Fatalf("a HEALTHY idle worker, every probe of which went into a general blackout: given up on %d time(s) (want 0 — it was never asked while the path worked), %d new GETCONF(s)", st.LostWorkers, g-len(first))
+	}
+}
+
+// Finding 2: the read loop stamps a real inbound (lastRx, heardAt) BEFORE it
+// clears the probe, and the monitor does not take turns with it: a verdict
+// computed in that window saw the old probe fields — thirty seconds out, enough
+// re-sends — and restarted a worker that had just ANSWERED (10 of 10 on the
+// reviewer's stand with a pause before the clearing). Whether the probe was
+// answered is a fact of its own — the worker's real-inbound count since the
+// probe went out — and it voids the verdict whatever the other fields say.
+func TestAnAnswerThatHasArrivedVoidsTheVerdictOnTheOldProbeFields(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	w2 := c.workers[1]
+	ripeProbe(c, w2, at(0), at(25)) // out for thirty seconds at +30, asked again and again while others heard
+	stamped, release := make(chan struct{}), make(chan struct{})
+	hook := func(w *worker) {
+		if w == w2 {
+			close(stamped)
+			<-release
+		}
+	}
+	readLoopStamped.Store(&hook)
+	verdicts := 0
+	reached := func(*worker) { verdicts++ }
+	livenessVerdictReached.Store(&reached)
+	t.Cleanup(func() { readLoopStamped.Store(nil); livenessVerdictReached.Store(nil) })
+	defer close(release)
+	w2.sendProbe() // … and NOW the answer comes: a real READY_OK, stamped — and the read loop held right before it clears the probe
+	select {
+	case <-stamped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the answer never reached the read loop")
+	}
+	c.lastTick.Store(at(25).UnixNano())
+	othersHear(c, at(29), 1)
+	c.monitorStep(at(30))
+	g, _, _ := srv.counts()
+	if st := c.Stats(); st.LostWorkers != 0 || g != len(first) || verdicts != 0 {
+		t.Fatalf("a worker whose answer had ARRIVED (stamped, the probe not cleared yet): given up on %d time(s), %d new GETCONF(s), the restart verdict reached %d time(s) — want 0, 0, and 0: an answered probe is no verdict at all (the commit's last look is the second line of defence, not the first)",
+			st.LostWorkers, g-len(first), verdicts)
+	}
+}
+
+// … and the other half of the same seam: the verdict was reached on a probe
+// that really was unanswered, and the answer reaches the read loop BEFORE it is
+// carried out — counted, the probe not cleared yet (the read loop is held
+// there). The restart is COMMITTED, as the deafness verdict is since 414: the
+// probe's state comes down by CompareAndSwap from the one the verdict was
+// reached on, and the worker's inbound count is read once more beside it — it
+// is that last look that voids the verdict here.
+func TestAnAnswerBetweenTheVerdictAndItsExecutionVoidsTheRestart(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	w2 := c.workers[1]
+	ripeProbe(c, w2, at(0), at(25))
+	stamped, release := make(chan struct{}), make(chan struct{})
+	held := func(w *worker) {
+		if w == w2 {
+			close(stamped)
+			<-release
+		}
+	}
+	reached := 0
+	hook := func(w *worker) {
+		if w != w2 {
+			return
+		}
+		reached++
+		readLoopStamped.Store(&held)
+		w2.sendProbe() // the answer comes now, between the verdict and the restart …
+		select {
+		case <-stamped: // … counted by the read loop, which is held before it clears the probe
+		case <-time.After(5 * time.Second):
+			t.Error("the late answer never reached the read loop")
+		}
+	}
+	livenessVerdictReached.Store(&hook)
+	t.Cleanup(func() { livenessVerdictReached.Store(nil); readLoopStamped.Store(nil) })
+	defer close(release)
+	c.lastTick.Store(at(25).UnixNano())
+	othersHear(c, at(29), 1)
+	c.monitorStep(at(30))
+	g, _, _ := srv.counts()
+	if st := c.Stats(); reached != 1 || st.LostWorkers != 0 || g != len(first) {
+		t.Fatalf("the verdict was reached %d time(s) (want 1); the answer arrived before it was carried out, and it was carried out: given up on %d, %d new GETCONF(s)", reached, st.LostWorkers, g-len(first))
+	}
+}
+
+// The commit's other clause: between the verdict and its execution the WAKE
+// HOOK ran — a freeze boundary: whatever was observed before it means nothing,
+// and the hook has put a fresh probe in the old one's place. No answer has
+// arrived, so the last look at the inbound count says nothing; it is the
+// CompareAndSwap that fails, and the restart is not carried out.
+func TestAWakeBetweenTheVerdictAndItsExecutionVoidsTheRestart(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	first := srv.seen()
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	w2 := c.workers[1]
+	c.Blackhole(2, true) // nothing arrives for worker 2: only the hook's fresh probe can void the verdict
+	ripeProbe(c, w2, at(0), at(25))
+	reached := 0
+	hook := func(w *worker) {
+		if w == w2 {
+			reached++
+			c.WakeHealthCheck()
+		}
+	}
+	livenessVerdictReached.Store(&hook)
+	t.Cleanup(func() { livenessVerdictReached.Store(nil) })
+	c.lastTick.Store(at(25).UnixNano())
+	othersHear(c, at(29), 1)
+	c.monitorStep(at(30))
+	g, _, _ := srv.counts()
+	if st := c.Stats(); reached != 1 || st.LostWorkers != 0 || g != len(first) {
+		t.Fatalf("the verdict was reached %d time(s) (want 1); a WAKE came before it was carried out, and it was carried out: given up on %d, %d new GETCONF(s)", reached, st.LostWorkers, g-len(first))
+	}
+}
+
+// After a general blackout a worker that really is dead still goes — but on
+// re-sends made while the path WORKED: the five made into the blackout count
+// for nothing, and neither does the last of them for having the recovery after
+// it (nothing had been heard before it went out).
+func TestAfterAGeneralBlackoutADeadWorkerGoesOnConfirmedResendsOnly(t *testing.T) {
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	start := time.Now()
+	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
+	c.lastTick.Store(start.UnixNano())
+	c.workers[1].lastRx.Store(start.UnixNano())
+	for s := 5; s <= 25; s += 5 {
+		othersHear(c, at(s), 1)
+		c.monitorStep(at(s))
+	}
+	othersHear(c, at(27), 1)
+	deafen(c)
+	for s := 30; s <= 55; s += 5 { // the first probe and five re-sends, all into the blackout
+		tick(t, c, at(s))
+	}
+	time.Sleep(100 * time.Millisecond)
+	c.Blackhole(1, false) // the path is back; worker 2 stays dead
+	heard := c.rxSeq.Load()
+	c.workers[0].probe(time.Now().UnixNano())
+	waitFor(t, "worker 1 hears again", func() bool { return c.rxSeq.Load() > heard })
+	for s := 60; s <= 70; s += 5 { // +60: asked again, the first re-send made while the path works; +65: it is confirmed (1); +70: two → it goes
+		othersHear(c, at(s-2), 1)
+		tick(t, c, at(s))
+		if st := c.Stats(); s < 70 && st.LostWorkers != 0 {
+			t.Fatalf("+%d s: worker 2 given up on — but only %d re-send(s) had been made while the path worked; the ones made into the blackout count for nothing", s, (s-60)/5)
+		}
+	}
+	if st := c.Stats(); st.LostWorkers != 1 {
+		t.Fatalf("+70 s: given up on %d worker(s), want 1 — the dead one, after two confirmed re-sends", st.LostWorkers)
 	}
 }
 
