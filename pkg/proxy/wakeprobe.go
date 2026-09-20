@@ -57,11 +57,15 @@ var (
 	wakeProbeClock       = time.Now
 )
 
+// wakeProbeAfterVerdict is a test's window between the probe's verdict and its return; nil outside tests.
+var wakeProbeAfterVerdict func()
+
 type wakeProbeVerdict int
 
 const (
 	wakeProbeWait   wakeProbeVerdict = iota // keep listening
 	wakeProbeResend                         // ask again now
+	wakeProbeThawed                         // a freeze has just ended: ask again now, and only a pong of a ping sent from here on answers the probe
 	wakeProbeEchoed                         // a pong of one of the probe's pings has arrived
 	wakeProbeDead                           // thirty seconds of listening, asked to the last, nothing heard
 )
@@ -77,20 +81,25 @@ type wakeProbeState struct {
 }
 
 // step takes one poll step — how long it lasted and the pong mark read AFTER
-// it — and says what to do. The mark is looked at first, so no verdict is
-// ever reached past an answer that is already in.
+// it — and says what to do. After the freeze check the mark is looked at
+// before anything is counted, so no verdict is ever reached past an answer
+// that is already in.
 func (s *wakeProbeState) step(took time.Duration, pongMark uint64) wakeProbeVerdict {
-	if pongMark >= s.first {
-		return wakeProbeEchoed
-	}
 	if took > wakeProbeFreezeStep {
 		// The process did not run for most of this step: it heard nothing
-		// because it could not. None of it counts, and whatever the path was
-		// before the freeze, it is asked again now.
+		// because it could not. None of it counts — and an answer that is
+		// already in counts least of all: it is from BEFORE the freeze (the
+		// ping it answers was sent before it), and a sleep is exactly when the
+		// server reaps a session or a mapping goes. Asked FIRST, before the
+		// mark (build 425): the caller pings again and re-bases `first` on
+		// that ping.
 		s.freezes++
 		s.resends++
 		s.sinceSend = 0
-		return wakeProbeResend
+		return wakeProbeThawed
+	}
+	if pongMark >= s.first {
+		return wakeProbeEchoed
 	}
 	s.listened += took
 	s.sinceSend += took
@@ -190,10 +199,13 @@ func (w *wakeWatch) serve(ctx context.Context, connIdx, credSlot int, label stri
 			return true, false, ctx.Err()
 		}
 	}
-	alive, err = w.p.runWakeProbe(ctx, connIdx, credSlot, label, seq, lastPingAt, send)
-	// The probe asks again at every thaw inside its wait: whatever woke the
-	// phone while it ran has been served by it.
-	w.served = w.p.wakeEpoch.Load()
+	alive, covered, err := w.p.runWakeProbe(ctx, connIdx, credSlot, label, seq, lastPingAt, send)
+	// The probe asks again at every thaw inside its wait, so whatever woke the
+	// phone while it ran is served by it — UP TO the epoch its verdict read
+	// beside the pong mark, and not one wake further (build 425).
+	if err == nil {
+		w.served = covered
+	}
 	return alive, true, err
 }
 
@@ -234,9 +246,13 @@ func echoAfter(listened, took time.Duration) time.Duration {
 // moment it has decided to probe. seq is the goroutine's ping counter,
 // lastPingAt the time of its latest ping (the periodic tick's included), send
 // writes one ping. It returns alive = false when the connection is to be
-// killed, and an error when the goroutine should simply end (a failed write,
-// the connection's context done).
-func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label string, seq *uint64, lastPingAt *time.Time, send func(seq uint64, now time.Time) error) (alive bool, err error) {
+// killed, an error when the goroutine should simply end (a failed write, the
+// connection's context done) — and the wake epoch its verdict COVERS: read
+// together with the pong mark, before it (build 425). A wake broadcast after
+// that reading — while the verdict is logged, or across a freeze before this
+// function returns — was looked at by nobody and must stay pending; up to 424
+// serve took the epoch as it stood after the return and swallowed it.
+func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label string, seq *uint64, lastPingAt *time.Time, send func(seq uint64, now time.Time) error) (alive bool, covered uint64, err error) {
 	now := wakeProbeClock()
 	p.lastActiveProbeAt[connIdx].Store(now.Unix())
 	// stepStart is where the current poll step began. A ping is SENT when its
@@ -260,7 +276,7 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 	adopted := *seq > 0 && !lastPingAt.IsZero() && now.Sub(*lastPingAt) < wakeProbeAdopt
 	if !adopted {
 		if err := ping(); err != nil {
-			return true, err
+			return true, 0, err
 		}
 	}
 	st := wakeProbeState{first: *seq}
@@ -270,23 +286,30 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
-			return true, ctx.Err()
+			return true, 0, ctx.Err()
 		}
 		now = wakeProbeClock()
 		took := now.Sub(stepStart)
 		stepStart = now
-		switch st.step(took, p.lastPongSeq[connIdx].Load()) {
+		covered = p.wakeEpoch.Load() // BEFORE the mark: a wake broadcast after this line is not this verdict's
+		switch v := st.step(took, p.lastPongSeq[connIdx].Load()); v {
 		case wakeProbeEchoed:
+			if wakeProbeAfterVerdict != nil {
+				wakeProbeAfterVerdict()
+			}
 			detail := ""
 			if adopted || st.resends > 0 || st.freezes > 0 {
 				detail = wakeProbeDetail(adopted, &st)
 			}
 			log.Printf("proxy: [conn %d] %sactive probe (post-wake) echo received in %s (sentSeq=%d)%s",
 				connIdx, label, echoAfter(st.listened, took).Round(10*time.Millisecond), *seq, detail)
-			return true, nil
-		case wakeProbeResend:
+			return true, covered, nil
+		case wakeProbeResend, wakeProbeThawed:
 			if err := ping(); err != nil {
-				return true, err
+				return true, 0, err
+			}
+			if v == wakeProbeThawed {
+				st.first = *seq // what was heard before the freeze answers nothing after it
 			}
 		case wakeProbeDead:
 			lastPongS := p.lastPongSeq[connIdx].Load()
@@ -296,7 +319,7 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 			}
 			log.Printf("proxy: [conn %d on slot %d] %sactive probe (post-wake) no echo within %s of listening (sentSeq=%d lastPongSeq=%d sentSinceLastPong=%d authErrorsOnSlot=%d%s), killing",
 				connIdx, credSlot, label, wakeProbeWindow, *seq, lastPongS, sentSinceLastPong, p.credPool.authErrorCount(credSlot), wakeProbeDetail(adopted, &st))
-			return false, nil
+			return false, covered, nil
 		}
 		timer.Reset(wakeProbePoll)
 	}
