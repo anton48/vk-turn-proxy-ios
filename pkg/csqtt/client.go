@@ -1176,6 +1176,7 @@ func (w *worker) run() {
 	for w.c.ctx.Err() == nil {
 		started := time.Now()
 		err := w.session()
+		lived := time.Since(started)
 		if w.c.ctx.Err() != nil {
 			return
 		}
@@ -1185,16 +1186,24 @@ func (w *worker) run() {
 			return
 		}
 		w.restarts.Add(1)
-		// A restart WE asked for (path change, panel restart, REPAIR, the
-		// liveness verdict) is not a failure of the path: re-dial at once —
-		// the start gate spaces the allocations — and leave the backoff
-		// where it was. Only a session that ended on its own backs off.
+		// What the session's end does to the delay is ONE rule for both
+		// exits (backoffAfter) and it is asked here, before they part: a
+		// restart WE asked for (path change, panel restart, REPAIR, a
+		// liveness or deafness verdict) re-dials at once — the start gate
+		// spaces the allocations — but a session that HELD still ends the run
+		// of failures behind it. Asked only on the failure exit, as it was,
+		// the reset was out of reach on a night of healthy sessions that all
+		// ended on the deafness verdict: each quota refusal that followed
+		// lived milliseconds and only ever doubled the delay — 2 s, 4, 8, 16,
+		// 30 — and the morning's pick-up waited the full maxBackoff.
 		var asked *restartRequest
-		if errors.As(err, &asked) {
+		isAsked := errors.As(err, &asked)
+		var wait bool
+		backoff, wait = backoffAfter(backoff, lived, isAsked)
+		if !wait {
 			w.c.cfg.Logf("csqtt: worker %d: restarting now (%s)", w.id, asked.reason)
 			continue
 		}
-		backoff = nextBackoff(backoff, time.Since(started))
 		w.c.cfg.Logf("csqtt: worker %d: %v — restarting in %s", w.id, err, backoff)
 		select {
 		case <-time.After(backoff):
@@ -1217,8 +1226,30 @@ type restartRequest struct{ reason string }
 func (r *restartRequest) Error() string { return "restart requested: " + r.reason }
 
 // healthySession is how long a session must have lived for its end to
-// count as a fresh failure rather than the next in a run of them.
-const healthySession = 2 * readyGrace
+// count as a fresh failure rather than the next in a run of them. A var so
+// that a test can shrink it; nothing else writes it.
+var healthySession = 2 * readyGrace
+
+// backoffAfter is what a session's end does to the worker's restart delay,
+// for BOTH ways a session can end. asked = the session ended because we asked
+// (worker.restart): no wait, and the delay stays where it was — unless the
+// session HELD for healthySession, which ends the run of failures however the
+// session ended. Not asked = it failed: nextBackoff, and the wait.
+//
+// The reset must not depend on HOW a healthy session ended. It once lived on
+// the failure exit alone, judged by the failed session's own life; on a
+// sleeping phone every healthy session ends on an asked restart (the deafness
+// verdict at the wake) and every failure after it is a quota refusal a few
+// milliseconds old — so the run never ended and the delay sat at maxBackoff.
+func backoffAfter(prev, lived time.Duration, asked bool) (next time.Duration, wait bool) {
+	if !asked {
+		return nextBackoff(prev, lived), true
+	}
+	if lived >= healthySession {
+		return restartBackoff, false
+	}
+	return prev, false
+}
 
 // nextBackoff is the restart delay after a session that lived `lived`:
 // a session that held for healthySession resets the run — the delay starts

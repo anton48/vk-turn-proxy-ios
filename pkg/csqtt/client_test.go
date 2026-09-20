@@ -2202,6 +2202,154 @@ func TestARoundIsOnlyEverTakenDownByCompareAndSwap(t *testing.T) {
 	}
 }
 
+// What a session's end does to the restart delay, for both ways a session can
+// end. The thresholds are literals on purpose (a fixture that derives them
+// from the constants relaxes with the constants).
+func TestBackoffAfterIsOneRuleForBothExits(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		prev     time.Duration
+		lived    time.Duration
+		asked    bool
+		want     time.Duration
+		wantWait bool
+	}{
+		{"a failure at once doubles the delay, and waits", time.Second, 5 * time.Millisecond, false, 2 * time.Second, true},
+		{"a failure at the cap stays at the cap", 30 * time.Second, time.Second, false, 30 * time.Second, true},
+		{"a failure after a session that held starts over", 16 * time.Second, 40 * time.Second, false, time.Second, true},
+		{"an asked restart never waits, and a short session leaves the delay alone", 8 * time.Second, 39 * time.Second, true, 8 * time.Second, false},
+		{"an asked restart after a session that HELD ends the run of failures", 30 * time.Second, 40 * time.Second, true, time.Second, false},
+		{"… however long it held", 30 * time.Second, 10 * time.Minute, true, time.Second, false},
+	} {
+		got, wait := backoffAfter(tc.prev, tc.lived, tc.asked)
+		if got != tc.want || wait != tc.wantWait {
+			t.Errorf("%s: backoffAfter(%v, %v, asked=%v) = (%v, wait=%v), want (%v, wait=%v)", tc.name, tc.prev, tc.lived, tc.asked, got, wait, tc.want, tc.wantWait)
+		}
+	}
+}
+
+// The night of 2026-09-20, as the rule sees it: healthy ten-minute sessions
+// that all end on an ASKED restart (the deafness verdict at the wake), each
+// followed by a quota refusal a few milliseconds old. Every refusal must wait
+// the FIRST step. On 420 the delays read 2 s, 4, 8, 16, 30, 30, 30 — the reset
+// sat on the failure exit alone and this sequence never reached it.
+func TestANightOfHealthySessionsEndedOnRequestNeverLeavesTheFirstStep(t *testing.T) {
+	delay := restartBackoff
+	for night := 1; night <= 7; night++ {
+		var wait bool
+		if delay, wait = backoffAfter(delay, 10*time.Minute, true); wait {
+			t.Fatalf("event %d: the asked restart waited", night)
+		}
+		if delay, wait = backoffAfter(delay, 5*time.Millisecond, false); !wait || delay != 2*time.Second {
+			t.Fatalf("event %d: the refusal after a healthy session waits %v (wait=%v), want the first step, 2s", night, delay, wait)
+		}
+	}
+	// … and the control: asked restarts after sessions that did NOT hold end nothing.
+	delay = restartBackoff
+	for i, want := range []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second} {
+		delay, _ = backoffAfter(delay, time.Second, true)
+		if delay, _ = backoffAfter(delay, 5*time.Millisecond, false); delay != want {
+			t.Fatalf("control step %d: %v, want %v — short sessions must not end the run", i+1, delay, want)
+		}
+	}
+}
+
+// The same through the worker's own loop against the fake server: a run of
+// failed dials raises the delay, a session HOLDS, it ends because we asked, and
+// the dial after it fails at once — the wait it logs is the first step.
+// (Red on the 420 loop: "restarting in 16s".)
+func TestAHealthySessionEndsTheRunOfFailuresHoweverItEnded(t *testing.T) {
+	prevHealthy := healthySession
+	healthySession = 300 * time.Millisecond
+	t.Cleanup(func() { healthySession = prevHealthy })
+	srv := newFakeServer(t)
+	var failing atomic.Bool
+	loopbackRelay(t, func(TURNCredentials) error {
+		if failing.Load() {
+			return errors.New("the test refuses this dial")
+		}
+		return nil
+	})
+	var mu sync.Mutex
+	var delays []string
+	l := &lease{}
+	cfg := testConfig(srv, 1, l.creds)
+	cfg.Logf = func(format string, a ...any) {
+		line := fmt.Sprintf(format, a...)
+		if i := strings.Index(line, "restarting in "); i >= 0 {
+			mu.Lock()
+			delays = append(delays, line[i+len("restarting in "):])
+			mu.Unlock()
+		}
+	}
+	c := dialReady(t, cfg)
+	defer c.Close()
+	seen := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), delays...) }
+
+	// A run of failures: each path change cuts the wait short, and the dial fails again.
+	failing.Store(true)
+	for i := 1; i <= 3; i++ {
+		c.OnPathChange()
+		waitFor(t, fmt.Sprintf("failure %d", i), func() bool { return len(seen()) == i })
+	}
+	if got := strings.Join(seen(), " "); got != "2s 4s 8s" {
+		t.Fatalf("the run of failures waited %q, want \"2s 4s 8s\" — the fixture did not build the run", got)
+	}
+	// A session that HOLDS …
+	failing.Store(false)
+	c.OnPathChange()
+	waitFor(t, "the worker ready again", func() bool { return c.Stats().Ready == 1 })
+	time.Sleep(3 * healthySession)
+	// … ends because we ASKED, and the dial after it fails at once.
+	failing.Store(true)
+	c.OnPathChange()
+	waitFor(t, "the failure after the healthy session", func() bool { return len(seen()) == 4 })
+	if got := seen()[3]; got != "2s" {
+		t.Fatalf("after a session that held and ended on request, the next failure waits %s — want the first step, 2s", got)
+	}
+}
+
+// run asks the one rule ONCE, before its two exits part — a reset that lives
+// on one exit of a loop is out of reach of the sessions that leave by the
+// other. A scan, because the order is the property.
+func TestRunAsksTheBackoffRuleBeforeItsExitsPart(t *testing.T) {
+	raw, err := os.ReadFile("client.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	from := strings.Index(src, "func (w *worker) run() {")
+	if from < 0 {
+		t.Fatal("worker.run is not where the scan expects it")
+	}
+	body := src[from:]
+	body = body[:strings.Index(body, "\n}\n")] // the scope ends at the function's closing brace
+	var code []string
+	for _, line := range strings.Split(body, "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		code = append(code, line)
+	}
+	body = strings.Join(code, "\n")
+	if n := strings.Count(body, "backoffAfter("); n != 1 {
+		t.Fatalf("run calls backoffAfter %d time(s), want exactly once", n)
+	}
+	if strings.Contains(body, "nextBackoff(") {
+		t.Fatal("run calls nextBackoff itself — the delay is backoffAfter's alone")
+	}
+	if n := strings.Count(body, "backoff = "); n != 0 {
+		t.Fatalf("run assigns the delay %d time(s) beside the rule's answer", n)
+	}
+	rule, exit := strings.Index(body, "backoffAfter("), strings.Index(body, "continue")
+	if exit < 0 || rule > exit {
+		t.Fatalf("the rule is asked at %d, the asked exit leaves at %d — want the rule first", rule, exit)
+	}
+	if !strings.Contains(body, "lived := time.Since(started)") || strings.Index(body, "lived := time.Since(started)") > rule {
+		t.Fatal("the session's life is not measured before the rule is asked")
+	}
+}
+
 // driveToTheVerdict deafens every worker and drives the monitor, tick by tick
 // with the test's clock, up to the tick at which the verdict on the monitor's
 // own round falls due (sixty seconds in); it returns that tick as a func.
