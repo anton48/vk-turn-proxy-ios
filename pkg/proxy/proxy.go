@@ -2497,6 +2497,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 
 	p.noteSessionUp(connIdx) // the retry floor's evidence that the network works — retryfloor.go
 	log.Printf("proxy: [conn %d, cred %d] DTLS+TURN session established", connIdx, credSlot)
+	p.resetProbeMarks(connIdx) // this session's pings start from seq 1, and so do its marks — wakeprobe.go
 
 	// Reset this conn's last-pong time to "now" so the zombie watchdog
 	// gives the conn a fresh probeStaleThreshold window before it
@@ -2523,6 +2524,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		var seq uint64
+		var lastPingAt time.Time // of this goroutine's latest ping, the tick's included: runWakeProbe adopts a ping sent a moment ago
 		pingPkt := make([]byte, len(probePingMagic)+8)
 		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
 		// M3 group hello. Sent IMMEDIATELY rather than waiting for the first
@@ -2589,6 +2591,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// stop sending probes.
 					return
 				}
+				lastPingAt = now
 				// Diagnostic bookkeeping (no per-send log — would be
 				// 50 conns × 30/hr = 1500 lines/hr of noise). Just record
 				// the latest seq so the zombie-kill log can show how many
@@ -2723,96 +2726,26 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 						return
 					}
 				}
-				now := time.Now()
-				p.lastActiveProbeAt[connIdx].Store(now.Unix())
-
-				seq++
-				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
-				dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
-				if _, err := dtlsConn.Write(pingPkt); err != nil {
+				// The probe itself — asked again while nothing answers, judged by LISTENING,
+				// answered by any pong of its own pings — is ONE body for both session
+				// kinds: wakeprobe.go (build 422).
+				alive, err := p.runWakeProbe(connCtx, connIdx, credSlot, "", &seq, &lastPingAt, func(s uint64, now time.Time) error {
+					binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], s)
+					dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
+					if _, err := dtlsConn.Write(pingPkt); err != nil {
+						return err
+					}
+					p.lastPingSeq[connIdx].Store(s)
+					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
+					return nil
+				})
+				if err != nil {
 					return
 				}
-				p.lastPingSeq[connIdx].Store(seq)
-				p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
-				sentSeq := seq
-
-				// Poll for echo every 100ms up to 30s. Polling beats a
-				// dedicated per-conn pong-notify channel here — the
-				// pong receiver already updates lastPongSeq atomically,
-				// and a 300-iteration tight check is much cheaper than
-				// the channel plumbing it would replace.
-				//
-				// Deadline timeline:
-				//   5s  (build 36): 302 kills / 0 echos in 3.5h
-				//   15s (build 36+): 451 kills / 2198 echos in 6.7h,
-				//                    ratio 4.87, but pool collapsed to
-				//                    3/6/6 because the kill churn drove
-				//                    Phase 2 fetch demand high enough to
-				//                    trip VK's per-cred 486 (Allocation
-				//                    Quota), saturating slots for 10min
-				//                    each (vpn.wifi.1.log 2026-05-04).
-				//   30s: trying to break the positive-feedback loop —
-				//        fewer false-positive kills → less Phase 2
-				//        demand → fewer VK saturations → pool stays
-				//        healthier → fewer "no slot available" loops.
-				//        Still 4× faster than the timer-based 120s
-				//        zombie threshold. Real zombies pay an extra
-				//        15s before recovery starts; that's acceptable.
-				probeStart := time.Now()
-				deadline := probeStart.Add(30 * time.Second)
-				echoed := false
-				// Reusable timer to avoid spawning a fresh *time.Timer +
-				// channel per loop iteration. With time.After(100ms) every
-				// iteration leaks a transient timer until it fires; under
-				// wake-event bursts (30 conns × ~7 iterations until pong
-				// arrives) the burst of ~210 transient timers contributes
-				// to GC pressure that pushed us past the iOS NE per-process
-				// memory limit on SRTP path (see build 130 fix in bridge.go
-				// and open_problem_srtp_silent_extension_restarts.md). One
-				// NewTimer + Reset reuses the same runtime timer slot. Same
-				// fix applied below in runSRTPSession (proxy.go:3981+).
-				pollTimer := time.NewTimer(100 * time.Millisecond)
-				for time.Now().Before(deadline) {
-					if p.lastPongSeq[connIdx].Load() >= sentSeq {
-						echoed = true
-						break
-					}
-					select {
-					case <-pollTimer.C:
-						pollTimer.Reset(100 * time.Millisecond)
-					case <-connCtx.Done():
-						pollTimer.Stop()
-						return
-					}
-				}
-				pollTimer.Stop()
-				if !echoed {
-					lastPongS := p.lastPongSeq[connIdx].Load()
-					authCount := p.credPool.authErrorCount(credSlot)
-					// Same uint64 underflow guard as the zombie-detect path above:
-					// concurrent periodic-probe goroutine can push lastPongS past
-					// this active probe's sentSeq before our deadline expires.
-					var sentSinceLastPong uint64
-					if sentSeq >= lastPongS {
-						sentSinceLastPong = sentSeq - lastPongS
-					}
-					log.Printf("proxy: [conn %d on slot %d] active probe (post-wake) no echo within 30s (sentSeq=%d lastPongSeq=%d sentSinceLastPong=%d authErrorsOnSlot=%d), killing",
-						connIdx, credSlot, sentSeq, lastPongS, sentSinceLastPong, authCount)
+				if !alive {
 					connCancel()
 					return
 				}
-				// Echo arrived — log the round-trip latency so we can
-				// post-hoc compute the kill/echo ratio (a healthy
-				// ratio means the deadline is well-tuned; lots of
-				// kills with no echos means we're killing too eagerly,
-				// lots of echos with few kills means we could shrink
-				// the deadline to recover faster).
-				rtt := time.Since(probeStart).Round(10 * time.Millisecond)
-				log.Printf("proxy: [conn %d] active probe (post-wake) echo received in %s (sentSeq=%d)",
-					connIdx, rtt, sentSeq)
-				// Reset lastTickAt so the regular tick path doesn't
-				// immediately treat the time spent waiting here as a
-				// freeze gap.
 				lastTickAt = time.Now()
 			case <-connCtx.Done():
 				return
@@ -2952,7 +2885,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					var pongSeq uint64
 					if n >= len(probePingMagic)+8 {
 						pongSeq = binary.BigEndian.Uint64(buf[len(probePingMagic) : len(probePingMagic)+8])
-						p.lastPongSeq[connIdx].Store(pongSeq)
+						p.notePongSeq(connIdx, pongSeq) // forward only — wakeprobe.go
 					}
 					// One-shot first-pong log: shows when end-to-end
 					// probing actually started working for this conn,
@@ -5075,6 +5008,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 
 	p.noteSessionUp(connIdx) // the retry floor's evidence that the network works — retryfloor.go
 	log.Printf("proxy: [conn %d, cred %d] SRTP+TURN session established", connIdx, credSlot)
+	p.resetProbeMarks(connIdx) // this session's pings start from seq 1, and so do its marks — wakeprobe.go
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
 		p.lastPongTimes[connIdx].Store(time.Now().Unix())
@@ -5139,6 +5073,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		var seq uint64
+		var lastPingAt time.Time // of this goroutine's latest ping, the tick's included: runWakeProbe adopts a ping sent a moment ago
 		pingPkt := make([]byte, len(probePingMagic)+8)
 		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
 		// M3 group hello. Sent IMMEDIATELY rather than waiting for the first
@@ -5170,6 +5105,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				if _, err := srtpConn.Write(pingPkt); err != nil {
 					return
 				}
+				lastPingAt = now
 				if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
 					p.lastPingSeq[connIdx].Store(seq)
 					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
@@ -5249,55 +5185,26 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 						return
 					}
 				}
-				now := time.Now()
-				p.lastActiveProbeAt[connIdx].Store(now.Unix())
-				seq++
-				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
-				_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
-				if _, err := srtpConn.Write(pingPkt); err != nil {
+				// The probe itself — asked again while nothing answers, judged by LISTENING,
+				// answered by any pong of its own pings — is ONE body for both session
+				// kinds: wakeprobe.go (build 422).
+				alive, err := p.runWakeProbe(connCtx, connIdx, credSlot, "SRTP ", &seq, &lastPingAt, func(s uint64, now time.Time) error {
+					binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], s)
+					_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
+					if _, err := srtpConn.Write(pingPkt); err != nil {
+						return err
+					}
+					p.lastPingSeq[connIdx].Store(s)
+					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
+					return nil
+				})
+				if err != nil {
 					return
 				}
-				p.lastPingSeq[connIdx].Store(seq)
-				p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
-				sentSeq := seq
-				probeStart := time.Now()
-				deadline := probeStart.Add(30 * time.Second)
-				echoed := false
-				// Reusable timer — see matching fix in runDTLSSession
-				// active-probe-on-wake polling loop (proxy.go:2293+) for
-				// rationale. Avoid per-iteration time.After allocation
-				// burst that contributed to jetsam on SRTP path before
-				// build 130.
-				pollTimer := time.NewTimer(100 * time.Millisecond)
-				for time.Now().Before(deadline) {
-					if p.lastPongSeq[connIdx].Load() >= sentSeq {
-						echoed = true
-						break
-					}
-					select {
-					case <-pollTimer.C:
-						pollTimer.Reset(100 * time.Millisecond)
-					case <-connCtx.Done():
-						pollTimer.Stop()
-						return
-					}
-				}
-				pollTimer.Stop()
-				if !echoed {
-					lastPongS := p.lastPongSeq[connIdx].Load()
-					authCount := p.credPool.authErrorCount(credSlot)
-					var sentSinceLastPong uint64
-					if sentSeq >= lastPongS {
-						sentSinceLastPong = sentSeq - lastPongS
-					}
-					log.Printf("proxy: [conn %d on slot %d] SRTP active probe (post-wake) no echo within 30s (sentSeq=%d lastPongSeq=%d sentSinceLastPong=%d authErrorsOnSlot=%d), killing",
-						connIdx, credSlot, sentSeq, lastPongS, sentSinceLastPong, authCount)
+				if !alive {
 					connCancel()
 					return
 				}
-				rtt := time.Since(probeStart).Round(10 * time.Millisecond)
-				log.Printf("proxy: [conn %d] SRTP active probe (post-wake) echo received in %s (sentSeq=%d)",
-					connIdx, rtt, sentSeq)
 				lastTickAt = time.Now()
 			case <-connCtx.Done():
 				return
@@ -5402,7 +5309,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					var pongSeq uint64
 					if n >= len(probePingMagic)+8 {
 						pongSeq = binary.BigEndian.Uint64(buf[len(probePingMagic) : len(probePingMagic)+8])
-						p.lastPongSeq[connIdx].Store(pongSeq)
+						p.notePongSeq(connIdx, pongSeq) // forward only — wakeprobe.go
 					}
 					if p.firstPongAt[connIdx].CompareAndSwap(0, nowUnix) {
 						firstPing := p.firstPingAt[connIdx].Load()
