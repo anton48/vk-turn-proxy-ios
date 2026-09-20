@@ -143,18 +143,33 @@ func (p *Proxy) notePongSeq(connIdx int, seq uint64) {
 func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label string, seq *uint64, lastPingAt *time.Time, send func(seq uint64, now time.Time) error) (alive bool, err error) {
 	now := wakeProbeClock()
 	p.lastActiveProbeAt[connIdx].Store(now.Unix())
+	// stepStart is where the current poll step began. A ping is SENT when its
+	// write is over: the step — and with it the ping's second and the
+	// listening — starts THERE, so the time a write takes is never part of a
+	// step. Counted into the step (422 restarted the step's clock before the
+	// write) it was the ping's listening — a slow write left the latest ping
+	// less than its second before the verdict — and a write slower than
+	// wakeProbeFreezeStep read as a freeze: nothing was ever listened, the
+	// probe asked again at once, and an unanswered probe never ended.
+	stepStart := now
+	ping := func() error {
+		*seq++
+		if err := send(*seq, wakeProbeClock()); err != nil {
+			return err
+		}
+		stepStart = wakeProbeClock()
+		*lastPingAt = stepStart
+		return nil
+	}
 	adopted := *seq > 0 && !lastPingAt.IsZero() && now.Sub(*lastPingAt) < wakeProbeAdopt
 	if !adopted {
-		*seq++
-		if err := send(*seq, now); err != nil {
+		if err := ping(); err != nil {
 			return true, err
 		}
-		*lastPingAt = now
 	}
 	st := wakeProbeState{first: *seq}
 	timer := time.NewTimer(wakeProbePoll)
 	defer timer.Stop()
-	stepStart := now
 	for {
 		select {
 		case <-timer.C:
@@ -174,11 +189,9 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 				connIdx, label, st.listened.Round(10*time.Millisecond), *seq, detail)
 			return true, nil
 		case wakeProbeResend:
-			*seq++
-			if err := send(*seq, now); err != nil {
+			if err := ping(); err != nil {
 				return true, err
 			}
-			*lastPingAt = now
 		case wakeProbeDead:
 			lastPongS := p.lastPongSeq[connIdx].Load()
 			var sentSinceLastPong uint64

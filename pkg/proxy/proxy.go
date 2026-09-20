@@ -2591,7 +2591,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// stop sending probes.
 					return
 				}
-				lastPingAt = now
+				lastPingAt = time.Now() // a ping is sent when its write is over — wakeprobe.go
 				// Diagnostic bookkeeping (no per-send log — would be
 				// 50 conns × 30/hr = 1500 lines/hr of noise). Just record
 				// the latest seq so the zombie-kill log can show how many
@@ -5105,7 +5105,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				if _, err := srtpConn.Write(pingPkt); err != nil {
 					return
 				}
-				lastPingAt = now
+				lastPingAt = time.Now() // a ping is sent when its write is over — wakeprobe.go
 				if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
 					p.lastPingSeq[connIdx].Store(seq)
 					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())

@@ -281,8 +281,8 @@ func TestAFreezeInsideTheWaitIsNotListening(t *testing.T) {
 	alive, err := p.runWakeProbe(context.Background(), 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
 		sent.add(s)
 		switch s {
-		case 1:
-			leap.Store(int64(90 * time.Second)) // the process freezes right after its first ping
+		case 1: // the process freezes a moment AFTER its first ping has been written — inside a poll step, not inside the write
+			go func() { time.Sleep(5 * time.Millisecond); leap.Store(int64(90 * time.Second)) }()
 		case 2:
 			go func() { time.Sleep(time.Millisecond); p.notePongSeq(0, 2) }() // the thaw's ping is answered
 		}
@@ -293,6 +293,95 @@ func TestAFreezeInsideTheWaitIsNotListening(t *testing.T) {
 	}
 	if got := sent.all(); len(got) != 2 {
 		t.Errorf("pings sent %v, want exactly two: the first, and one at the thaw", got)
+	}
+}
+
+// fakeProbeClock: every reading moves it on by tick — one poll step — and a
+// test's send moves it further: a write that takes time.
+type fakeProbeClock struct {
+	mu   sync.Mutex
+	t    time.Time
+	tick time.Duration
+}
+
+func (c *fakeProbeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(c.tick)
+	return c.t
+}
+
+func (c *fakeProbeClock) add(d time.Duration) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+	return c.t
+}
+
+// The review of 422: the step's clock was restarted BEFORE the ping was
+// written, so the time the write took was counted as the ping's listening — a
+// slow write left the latest ping less than its second.
+func TestTheTimeAWriteTakesIsNotThePingsListening(t *testing.T) {
+	shrinkWakeProbe(t) // the window 300 ms, a re-send after 30 ms of listening
+	clk := &fakeProbeClock{t: time.Unix(1_700_000_000, 0), tick: 10 * time.Millisecond}
+	wakeProbeClock = clk.now
+	const write = 20 * time.Millisecond
+	type span struct{ start, end time.Time }
+	var writes []span
+	p := probeProxy()
+	var seq uint64
+	var lastPingAt time.Time
+	alive, err := p.runWakeProbe(context.Background(), 0, 0, "", &seq, &lastPingAt, func(_ uint64, now time.Time) error {
+		writes = append(writes, span{now, clk.add(write)}) // the write takes 20 ms
+		return nil
+	})
+	if err != nil || alive {
+		t.Fatalf("alive %v err %v — nothing ever answered", alive, err)
+	}
+	for k := 1; k < len(writes); k++ {
+		if got := writes[k].start.Sub(writes[k-1].end); got < 30*time.Millisecond {
+			t.Errorf("ping %d had %s between the end of its write and the next ping, want its full 30ms of listening — the time a write takes is not listening", k, got)
+		}
+	}
+	verdictAt := clk.add(0)
+	if listened := verdictAt.Sub(writes[0].end) - time.Duration(len(writes)-1)*write; listened < 300*time.Millisecond {
+		t.Errorf("dead after %s outside the writes (%d pings), want the whole 300ms window listened", listened, len(writes))
+	}
+	if !lastPingAt.Equal(writes[len(writes)-1].end) && lastPingAt.Before(writes[len(writes)-1].end) {
+		t.Errorf("lastPingAt %s lies before the end of the last write %s — a ping is sent when its write is over", lastPingAt.Format("05.000"), writes[len(writes)-1].end.Format("05.000"))
+	}
+}
+
+// …and a write slower than a freeze step was taken for a FREEZE: nothing was
+// ever listened, the probe asked again at once, and an unanswered probe never
+// reached its verdict.
+func TestWritesSlowerThanAFreezeStepStillEndInAVerdict(t *testing.T) {
+	shrinkWakeProbe(t)
+	wakeProbeFreezeStep = 50 * time.Millisecond
+	clk := &fakeProbeClock{t: time.Unix(1_700_000_000, 0), tick: 10 * time.Millisecond}
+	wakeProbeClock = clk.now
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sends := 0
+	p := probeProxy()
+	var seq uint64
+	var lastPingAt time.Time
+	alive, err := p.runWakeProbe(ctx, 0, 0, "", &seq, &lastPingAt, func(uint64, time.Time) error {
+		sends++
+		clk.add(120 * time.Millisecond) // every write takes longer than a freeze step
+		if sends > 100 {
+			cancel() // the guard: on 422 the loop never ends by itself
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("after %d pings the probe had reached no verdict (%v): a slow write was taken for a freeze, so nothing was ever listened", sends, err)
+	}
+	if alive {
+		t.Fatalf("alive — nothing ever answered")
+	}
+	if sends > 15 {
+		t.Errorf("%d pings for a 300-ms window asked again every 30 ms, want about ten", sends)
 	}
 }
 
@@ -362,6 +451,30 @@ func TestBothSessionKindsRunTheOneWakeProbe(t *testing.T) {
 			t.Errorf("probe goroutine %d: no p.resetProbeMarks(connIdx) between its session's \"established\" line and its ticker", k)
 		}
 		rest = rest[tick+len("time.NewTicker(probeInterval)"):]
+	}
+	// The tick's ping is stamped when its write is OVER (the probe adopts a ping "sent" a moment ago).
+	stamps := 0
+	for at := 0; ; {
+		k := strings.Index(src[at:], "lastPingAt = ")
+		if k < 0 {
+			break
+		}
+		k += at
+		at = k + 1
+		stamps++
+		line := src[k:]
+		if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+			line = line[:nl]
+		}
+		if strings.TrimSpace(strings.TrimPrefix(line, "lastPingAt = ")) == "now" {
+			t.Errorf("proxy.go: %q — the tick's ping is stamped with the time taken BEFORE its write", line)
+		}
+		if w, n := strings.LastIndex(src[:k], ".Write(pingPkt)"), strings.LastIndex(src[:k], "now := time.Now()"); w < n {
+			t.Errorf("proxy.go: %q does not follow the tick's Write", line)
+		}
+	}
+	if stamps != 2 {
+		t.Errorf("proxy.go stamps lastPingAt %d times, want 2 — once per session kind's tick", stamps)
 	}
 	body := read("wakeprobe.go")
 	i := strings.Index(body, "func (p *Proxy) runWakeProbe(")
