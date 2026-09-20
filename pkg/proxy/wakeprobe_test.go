@@ -499,7 +499,9 @@ func TestServeProbesAndMarksWhatWokeThePhoneMeanwhile(t *testing.T) {
 	var seq uint64
 	var lastPingAt time.Time
 	alive, probed, err := w.serve(context.Background(), 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
-		p.broadcastWake() // the phone sleeps and wakes again while the probe runs: the probe asks again at every thaw by itself
+		if s == 1 {
+			p.broadcastWake() // the phone sleeps and wakes again while the probe runs — inside its first write: a fresh ping follows by itself
+		}
 		go func() { time.Sleep(time.Millisecond); p.notePongSeq(0, s) }()
 		return nil
 	})
@@ -586,6 +588,81 @@ func TestAPongFromBeforeAFreezeAnswersNothingAfterIt(t *testing.T) {
 	}
 	if got := sent.all(); len(got) < 2 {
 		t.Errorf("pings %v — the probe asks again at the thaw", got)
+	}
+}
+
+// The review of 425: the ping is out and its pong is in; the process freezes
+// while still INSIDE send (after the Write, before the callback returns); the
+// phone wakes — a new wake epoch. The step's clock restarts after send, so the
+// next step looks short: no thaw was seen, the OLD pong answered, and the
+// verdict covered the new wake.
+func TestAWakeWhileAPingIsBeingWrittenVoidsWhatWasHeardBefore(t *testing.T) {
+	shrinkWakeProbe(t)
+	clk := &fakeProbeClock{t: time.Unix(1_700_000_000, 0), tick: 10 * time.Millisecond}
+	wakeProbeClock = clk.now
+	p := probeProxy()
+	var sent sentPings
+	var seq uint64
+	var lastPingAt time.Time
+	alive, _, err := p.runWakeProbe(context.Background(), 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
+		sent.add(s)
+		if s == 1 {
+			p.notePongSeq(0, 1)        // the pong is in…
+			clk.add(150 * time.Second) // …the process freezes inside send, the server reaps the session…
+			p.broadcastWake()          // …and the phone wakes before send has returned
+		}
+		return nil // nothing sent after that wake is ever answered
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alive {
+		t.Fatalf("alive on the word of a pong from before the wake that fell inside send; pings %v", sent.all())
+	}
+	if got := sent.all(); len(got) < 2 || got[1] != 2 {
+		t.Errorf("pings %v — a fresh ping follows a wake that crossed the write", got)
+	}
+}
+
+// …and the same at a RE-SEND: the probe is re-based on the fresh ping, so the pong that came in before the wake answers nothing.
+func TestAWakeWhileARepeatedPingIsBeingWrittenRebasesTheProbe(t *testing.T) {
+	shrinkWakeProbe(t)
+	clk := &fakeProbeClock{t: time.Unix(1_700_000_000, 0), tick: 10 * time.Millisecond}
+	wakeProbeClock = clk.now
+	p := probeProxy()
+	var sent sentPings
+	var seq uint64
+	var lastPingAt time.Time
+	alive, _, err := p.runWakeProbe(context.Background(), 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
+		sent.add(s)
+		if s == 2 { // the first ping went unanswered; the second is answered — and the phone sleeps and wakes inside its write
+			p.notePongSeq(0, 2)
+			clk.add(150 * time.Second)
+			p.broadcastWake()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alive {
+		t.Fatalf("alive on the word of pong 2, heard before the wake that fell inside its write; pings %v", sent.all())
+	}
+}
+
+func TestATickPingIsAdoptableOnlyIfNoWakeAndNoFreezeCrossedItsWrite(t *testing.T) {
+	p := probeProxy()
+	epoch := p.wakeEpoch.Load()
+	start := time.Now()
+	if !p.tickPingAdoptable(epoch, start) {
+		t.Error("an ordinary tick ping must be adoptable")
+	}
+	if p.tickPingAdoptable(epoch, start.Add(-3*time.Second)) {
+		t.Error("a write that took three seconds may hide a freeze: its ping is not the probe's first (the probe sends its own — that is all)")
+	}
+	p.broadcastWake()
+	if p.tickPingAdoptable(epoch, time.Now()) {
+		t.Error("a wake was broadcast while the tick's ping was being written: that ping may have left before the sleep — not adoptable")
 	}
 }
 
@@ -676,6 +753,9 @@ func TestBothSessionKindsRunTheOneWakeProbe(t *testing.T) {
 		if w, n := strings.LastIndex(src[:k], ".Write(pingPkt)"), strings.LastIndex(src[:k], "now := time.Now()"); w < n {
 			t.Errorf("proxy.go: %q does not follow the tick's Write", line)
 		}
+	}
+	if n := strings.Count(src, "if p.tickPingAdoptable(tickEpoch, now) {"); n != 2 {
+		t.Errorf("proxy.go guards the tick's stamp %d times, want 2 — a tick ping written across a wake or a freeze is not the probe's first", n)
 	}
 	if stamps != 2 {
 		t.Errorf("proxy.go stamps lastPingAt %d times, want 2 — once per session kind's tick", stamps)

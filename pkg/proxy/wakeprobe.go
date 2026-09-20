@@ -264,22 +264,50 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 	// wakeProbeFreezeStep read as a freeze: nothing was ever listened, the
 	// probe asked again at once, and an unanswered probe never ended.
 	stepStart := now
-	ping := func() error {
+	ping := func() (wokeInside bool, err error) {
 		*seq++
+		epoch := p.wakeEpoch.Load()
 		if err := send(*seq, wakeProbeClock()); err != nil {
-			return err
+			return false, err
 		}
 		stepStart = wakeProbeClock()
 		*lastPingAt = stepStart
-		return nil
+		return p.wakeEpoch.Load() != epoch, nil
+	}
+	// pingFresh sends a ping — and another if the phone slept and WOKE while the
+	// first was being written (the wake epoch moved across send: a freeze after
+	// the Write, before the callback returned). The step's clock restarts after
+	// send, so the step that follows looks short and no thaw is seen: up to 425
+	// a pong from before that sleep then answered the probe, and its verdict
+	// covered the new wake. A wake that crossed the write voids whatever was
+	// heard before it, that ping included: a fresh one goes out at once and the
+	// caller re-bases the probe on it. An ordinary slow write moves no epoch and
+	// is still no freeze (423).
+	var st wakeProbeState
+	pingFresh := func() (crossed bool, err error) {
+		for tries := 0; ; tries++ {
+			wokeInside, err := ping()
+			if err != nil || !wokeInside {
+				return crossed, err
+			}
+			crossed = true
+			st.freezes++
+			if tries == 2 {
+				// Wake upon wake across three writes running: stop pinging in a
+				// row. Nothing sent so far may answer — the caller re-bases on
+				// the NEXT ping, which goes out after a second of listening.
+				*seq++
+				return true, nil
+			}
+		}
 	}
 	adopted := *seq > 0 && !lastPingAt.IsZero() && now.Sub(*lastPingAt) < wakeProbeAdopt
 	if !adopted {
-		if err := ping(); err != nil {
+		if _, err := pingFresh(); err != nil {
 			return true, 0, err
 		}
 	}
-	st := wakeProbeState{first: *seq}
+	st.first = *seq
 	timer := time.NewTimer(wakeProbePoll)
 	defer timer.Stop()
 	for {
@@ -305,10 +333,11 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 				connIdx, label, echoAfter(st.listened, took).Round(10*time.Millisecond), *seq, detail)
 			return true, covered, nil
 		case wakeProbeResend, wakeProbeThawed:
-			if err := ping(); err != nil {
+			crossed, err := pingFresh()
+			if err != nil {
 				return true, 0, err
 			}
-			if v == wakeProbeThawed {
+			if v == wakeProbeThawed || crossed {
 				st.first = *seq // what was heard before the freeze answers nothing after it
 			}
 		case wakeProbeDead:
@@ -331,4 +360,14 @@ func wakeProbeDetail(adopted bool, st *wakeProbeState) string {
 		first = "the tick's"
 	}
 	return fmt.Sprintf(" — first ping %s (seq %d), sent again %d×, %d freeze(s) inside the wait", first, st.first, st.resends, st.freezes)
+}
+
+// tickPingAdoptable: may the periodic tick's ping, just written, serve as the
+// first ping of a wake probe that starts within the next second? Only if the
+// phone did not sleep across its write — no wake was broadcast meanwhile, and
+// the write did not take long enough to hide a freeze: such a ping may have
+// left BEFORE the sleep, and its pong says nothing about now. Not adoptable
+// costs nothing but the probe's own ping.
+func (p *Proxy) tickPingAdoptable(epochBefore uint64, started time.Time) bool {
+	return p.wakeEpoch.Load() == epochBefore && wakeProbeClock().Sub(started) <= wakeProbeFreezeStep
 }

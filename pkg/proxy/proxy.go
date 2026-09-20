@@ -2592,6 +2592,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					continue
 				}
 				lastTickAt = now
+				tickEpoch := p.wakeEpoch.Load() // a wake broadcast while this ping is written makes it unadoptable — wakeprobe.go
 				seq++
 				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
 				dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
@@ -2602,7 +2603,9 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// stop sending probes.
 					return
 				}
-				lastPingAt = time.Now() // a ping is sent when its write is over — wakeprobe.go
+				if p.tickPingAdoptable(tickEpoch, now) {
+					lastPingAt = time.Now() // a ping is sent when its write is over — wakeprobe.go
+				}
 				// Diagnostic bookkeeping (no per-send log — would be
 				// 50 conns × 30/hr = 1500 lines/hr of noise). Just record
 				// the latest seq so the zombie-kill log can show how many
@@ -5059,13 +5062,16 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					continue
 				}
 				lastTickAt = now
+				tickEpoch := p.wakeEpoch.Load() // a wake broadcast while this ping is written makes it unadoptable — wakeprobe.go
 				seq++
 				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
 				_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
 				if _, err := srtpConn.Write(pingPkt); err != nil {
 					return
 				}
-				lastPingAt = time.Now() // a ping is sent when its write is over — wakeprobe.go
+				if p.tickPingAdoptable(tickEpoch, now) {
+					lastPingAt = time.Now() // a ping is sent when its write is over — wakeprobe.go
+				}
 				if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
 					p.lastPingSeq[connIdx].Store(seq)
 					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
