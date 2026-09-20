@@ -98,6 +98,35 @@ func TestWakeProbeStepIsFactsAndListening(t *testing.T) {
 			t.Errorf("a full second after the thaw's ping, thirty seconds listened: verdict %d, want dead", v)
 		}
 	})
+	t.Run("while a fresh ping is OWED there is no verdict — the window run out or not — and the pause is not listening", func(t *testing.T) {
+		s := wakeProbeState{first: 5, owed: true, listened: 29950 * ms}
+		for i := 1; i <= 9; i++ {
+			if v := s.step(100*ms, 0); v != wakeProbeWait {
+				t.Fatalf("%d00 ms into the pause: verdict %d, want wait", i, v)
+			}
+		}
+		if v := s.step(100*ms, 0); v != wakeProbeResend {
+			t.Fatalf("a second after the three crossed writes, the window long run out: verdict %d, want the owed ping sent — never dead", v)
+		}
+		if s.listened != 29950*ms {
+			t.Errorf("listened %s, want it unchanged at 29.95s — nothing that could be heard was out", s.listened)
+		}
+		if s.resends != 1 || s.sinceSend != 0 {
+			t.Errorf("resends %d sinceSend %s, want 1 and 0", s.resends, s.sinceSend)
+		}
+	})
+	t.Run("while a fresh ping is owed no pong answers — nothing sent so far may", func(t *testing.T) {
+		s := wakeProbeState{first: 4, owed: true}
+		if v := s.step(100*ms, 4); v != wakeProbeWait {
+			t.Errorf("pong 4 with the fresh ping still owed: verdict %d, want wait", v)
+		}
+	})
+	t.Run("a freeze ends the pause too: a ping at once", func(t *testing.T) {
+		s := wakeProbeState{first: 4, owed: true, sinceSend: 400 * ms}
+		if v := s.step(57*time.Second, 0); v != wakeProbeThawed {
+			t.Errorf("a 57-s step while a ping is owed: verdict %d, want thawed", v)
+		}
+	})
 }
 
 // The night of 2026-09-19: the process runs about two seconds per wake and is
@@ -650,19 +679,242 @@ func TestAWakeWhileARepeatedPingIsBeingWrittenRebasesTheProbe(t *testing.T) {
 	}
 }
 
-func TestATickPingIsAdoptableOnlyIfNoWakeAndNoFreezeCrossedItsWrite(t *testing.T) {
+// The review of 426 (1): wake upon wake across three writes running — the probe
+// stops pinging in a row and OWES the fresh ping. If the window ran out on the
+// next steps the rule answered DEAD instead of the promised re-send: a kill
+// with a seq that was never sent, and the path that works after the last wake
+// checked by nobody.
+func TestNoVerdictWhileTheFreshPingIsStillOwed(t *testing.T) {
+	// The three writes that a wake crosses start at ping `from`: 2 — the first re-send; 1 — the probe's very first ping.
+	run := func(t *testing.T, from uint64, pathWorksAfterTheLastWake bool) (alive bool, pings []uint64, seq uint64) {
+		shrinkWakeProbe(t)
+		wakeProbeWindow = 60 * time.Millisecond // two re-send intervals: the window runs out right behind the three crossed writes
+		clk := &fakeProbeClock{t: time.Unix(1_700_000_000, 0), tick: 10 * time.Millisecond}
+		wakeProbeClock = clk.now
+		p := probeProxy()
+		var sent sentPings
+		var lastPingAt time.Time
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		alive, _, err := p.runWakeProbe(ctx, 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
+			sent.add(s)
+			if s > 40 {
+				cancel() // the guard: a probe that never pays its debt never ends by itself
+			}
+			switch {
+			case s >= from && s <= from+2: // a ping and the two fresh ones behind it: the phone sleeps and wakes inside each write
+				p.notePongSeq(0, s) // answered, too — BEFORE the sleep: void all the same
+				clk.add(150 * time.Second)
+				p.broadcastWake()
+			case s > from+2 && pathWorksAfterTheLastWake: // whatever is sent after the last wake is answered; nothing before it ever was
+				p.notePongSeq(0, s)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("no verdict after pings %v (%v)", sent.all(), err)
+		}
+		return alive, sent.all(), seq
+	}
+	t.Run("the path works after the last wake: the owed ping is sent and answered", func(t *testing.T) {
+		alive, pings, seq := run(t, 2, true)
+		if !alive {
+			t.Fatalf("killed with sentSeq=%d after pings %v — no ping was sent after the last wake: the path that works after it was checked by nobody", seq, pings)
+		}
+		if len(pings) < 5 {
+			t.Errorf("pings %v — want the owed ping sent after the three crossed writes", pings)
+		}
+	})
+	t.Run("the control — a dead path is still killed, after the owed ping has gone out and had its second", func(t *testing.T) {
+		alive, pings, seq := run(t, 2, false)
+		if alive {
+			t.Fatalf("alive on the word of a pong heard before the last wake — nothing sent after it was ever answered (pings %v)", pings)
+		}
+		if len(pings) < 5 {
+			t.Errorf("pings %v — the verdict came before the owed ping was sent", pings)
+		}
+		if len(pings) > 0 && pings[len(pings)-1] != seq {
+			t.Errorf("the kill names sentSeq=%d, the last ping really sent is %d — a seq that never went out", seq, pings[len(pings)-1])
+		}
+	})
+	t.Run("the same at the probe's very first ping", func(t *testing.T) {
+		if alive, pings, _ := run(t, 1, true); !alive || len(pings) != 4 {
+			t.Errorf("alive %v pings %v — want 1, 2 and 3 crossed, the owed ping 4 sent after the pause and answered", alive, pings)
+		}
+		if alive, pings, _ := run(t, 1, false); alive || len(pings) < 4 {
+			t.Errorf("alive %v pings %v — want dead, and not on the word of pongs 1–3, heard before the last wake", alive, pings)
+		}
+	})
+}
+
+// The review of 426 (2): a tick ping refused for adoption left the stamp of the
+// ping BEFORE it standing, although seq had moved on. Right behind a long probe
+// — its last ping a moment old, its throttle long expired — the overdue tick
+// fires, its write is crossed by a wake, and the wake's probe then adopted the
+// REFUSED seq by the time of the previous ping.
+func TestARefusedTickPingIsNotAdoptedByThePreviousPingsTime(t *testing.T) {
+	shrinkWakeProbe(t)
+	wakeProbeAdopt = 200 * time.Millisecond
+	clk := &fakeProbeClock{t: time.Unix(1_700_000_000, 0), tick: 10 * time.Millisecond}
+	wakeProbeClock = clk.now
 	p := probeProxy()
-	epoch := p.wakeEpoch.Load()
-	start := time.Now()
-	if !p.tickPingAdoptable(epoch, start) {
-		t.Error("an ordinary tick ping must be adoptable")
+	var sent sentPings
+	var seq uint64
+	var lastPingAt time.Time
+	// A probe has just ended: its last ping is a moment old.
+	alive, _, err := p.runWakeProbe(context.Background(), 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
+		sent.add(s)
+		p.notePongSeq(0, s)
+		return nil
+	})
+	if err != nil || !alive || lastPingAt.IsZero() {
+		t.Fatalf("the fixture is wrong: alive %v err %v lastPingAt %v", alive, err, lastPingAt)
 	}
-	if p.tickPingAdoptable(epoch, start.Add(-3*time.Second)) {
-		t.Error("a write that took three seconds may hide a freeze: its ping is not the probe's first (the probe sends its own — that is all)")
+	// The overdue tick fires right behind it, and the phone sleeps and wakes while its ping is being written.
+	if err := p.tickPing(&seq, &lastPingAt, clk.now(), func(s uint64, _ time.Time) error {
+		sent.add(s)
+		p.notePongSeq(0, s) // answered — BEFORE the sleep
+		p.broadcastWake()   // the phone sleeps and wakes before the write has returned
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-	p.broadcastWake()
-	if p.tickPingAdoptable(epoch, time.Now()) {
-		t.Error("a wake was broadcast while the tick's ping was being written: that ping may have left before the sleep — not adoptable")
+	if !lastPingAt.IsZero() {
+		t.Errorf("after a tick ping refused for adoption lastPingAt still reads %s — the stamp of the ping BEFORE it, while seq has moved on to %d", lastPingAt.Format("05.000"), seq)
+	}
+	refused := seq
+	// The wake's probe. Nothing sent after that wake is ever answered.
+	before := len(sent.all())
+	alive, _, err = p.runWakeProbe(context.Background(), 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
+		sent.add(s)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sent.all(); len(got) == before {
+		t.Errorf("the probe sent nothing: it took the refused tick ping (seq %d) for its first — by the time of the ping before it", refused)
+	}
+	if alive {
+		t.Fatalf("alive on the word of the refused tick ping's pong, heard before the wake that crossed its write (pings %v)", sent.all())
+	}
+}
+
+// seq and lastPingAt belong together: the stamp is when the ping numbered seq
+// was sent — or nothing. The thresholds are literals (the freeze step is 1 s).
+func TestAPingIsStampedOnlyIfNoWakeAndNoFreezeCrossedItsWrite(t *testing.T) {
+	const ms = time.Millisecond
+	t0 := time.Unix(1_700_000_000, 0)
+	for _, c := range []struct {
+		what       string
+		wokeInside bool
+		took       time.Duration
+		stamped    bool
+	}{
+		{"an ordinary ping", false, 3 * ms, true},
+		{"a write of exactly one second — slow, no freeze", false, 1000 * ms, true},
+		{"a write that took longer than a freeze step may hide a freeze", false, 1001 * ms, false},
+		{"a wake was broadcast while the ping was being written: it may have left before the sleep", true, 3 * ms, false},
+	} {
+		got := pingStamp(c.wokeInside, t0, t0.Add(c.took))
+		if c.stamped && !got.Equal(t0.Add(c.took)) {
+			t.Errorf("%s: stamp %v, want the end of the write — a ping is sent when its write is over", c.what, got)
+		}
+		if !c.stamped && !got.IsZero() {
+			t.Errorf("%s: stamped %v, want nothing — the probe sends its own ping, that is all it costs", c.what, got)
+		}
+	}
+}
+
+// The tick's ping, one body for both session kinds: seq moves, and the stamp
+// says afterwards what pingStamp allows — never what the ping before it left.
+func TestTheTicksPingMovesSeqAndStampTogether(t *testing.T) {
+	p := probeProxy()
+	var seq uint64
+	before := time.Now().Add(-10 * time.Millisecond) // the stamp of the ping before
+	lastPingAt := before
+	var duringWrite, writeEnd time.Time
+	write := func(wake bool, fail error) func(uint64, time.Time) error {
+		return func(s uint64, _ time.Time) error {
+			duringWrite = lastPingAt
+			if wake {
+				p.broadcastWake()
+			}
+			time.Sleep(2 * time.Millisecond) // a write takes time
+			writeEnd = time.Now()
+			return fail
+		}
+	}
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(false, nil)); err != nil || seq != 1 {
+		t.Fatalf("err %v seq %d", err, seq)
+	}
+	if !duringWrite.IsZero() {
+		t.Errorf("while ping 1 was being written lastPingAt read %v — the stamp of the ping before it, under the new seq", duringWrite)
+	}
+	if lastPingAt.IsZero() || !lastPingAt.After(before) {
+		t.Errorf("an ordinary tick ping must be adoptable: lastPingAt %v", lastPingAt)
+	}
+	if lastPingAt.Before(writeEnd) {
+		t.Errorf("lastPingAt lies %s before the end of the tick's write — a ping is sent when its write is over", writeEnd.Sub(lastPingAt))
+	}
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(true, nil)); err != nil || seq != 2 {
+		t.Fatalf("err %v seq %d", err, seq)
+	}
+	if !lastPingAt.IsZero() {
+		t.Errorf("a wake crossed the write of ping 2 and lastPingAt reads %v — want nothing", lastPingAt)
+	}
+	lastPingAt = time.Now()
+	if err := p.tickPing(&seq, &lastPingAt, time.Now().Add(-3*time.Second), write(false, nil)); err != nil || seq != 3 {
+		t.Fatalf("err %v seq %d", err, seq)
+	}
+	if !lastPingAt.IsZero() {
+		t.Errorf("the write of ping 3 took three seconds and lastPingAt reads %v — want nothing", lastPingAt)
+	}
+	lastPingAt = time.Now()
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(false, context.Canceled)); err == nil {
+		t.Fatal("a failed write must be reported")
+	}
+	if !lastPingAt.IsZero() {
+		t.Errorf("ping %d was never sent and lastPingAt reads %v", seq, lastPingAt)
+	}
+}
+
+// …and the probe's own pings keep the same pair: void while a ping is being
+// written, void after a write that a wake crossed.
+func TestTheProbesOwnPingsKeepSeqAndStampTogether(t *testing.T) {
+	shrinkWakeProbe(t)
+	p := probeProxy()
+	seq := uint64(46)
+	lastPingAt := time.Now().Add(-2 * time.Second) // the stamp of ping 46 — too old to be adopted
+	var sent sentPings
+	var duringWrite []time.Time
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, err := p.runWakeProbe(ctx, 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
+		sent.add(s)
+		duringWrite = append(duringWrite, lastPingAt)
+		p.broadcastWake() // a wake crosses every write
+		if s == 49 {
+			cancel() // the third in a row: the probe owes its fresh ping and pauses — the session ends right there
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("the fixture is wrong: the probe reached a verdict while it owed its fresh ping")
+	}
+	if got := sent.all(); len(got) != 3 || got[0] != 47 || got[2] != 49 {
+		t.Fatalf("pings %v, want 47, 48 and 49 — three writes in a row at most", got)
+	}
+	for i, at := range duringWrite {
+		if !at.IsZero() {
+			t.Errorf("while ping %d was being written lastPingAt read %v — the stamp of the ping before it, under the new seq", 47+i, at)
+		}
+	}
+	if !lastPingAt.IsZero() {
+		t.Errorf("after a write that a wake crossed lastPingAt reads %v — want nothing: that ping may have left before the sleep", lastPingAt)
+	}
+	if seq != 49 {
+		t.Errorf("seq reads %d after pings 47–49: it names a ping that was never sent", seq)
 	}
 }
 
@@ -733,32 +985,31 @@ func TestBothSessionKindsRunTheOneWakeProbe(t *testing.T) {
 		}
 		rest = rest[tick+len("time.NewTicker(probeInterval)"):]
 	}
-	// The tick's ping is stamped when its write is OVER (the probe adopts a ping "sent" a moment ago).
-	stamps := 0
+	// seq and lastPingAt — the ping's number and the stamp a wake probe may adopt it by — move TOGETHER, and only
+	// in wakeprobe.go. A session kind sends its tick's ping through the one body, writes its pings in ONE place
+	// (the closure it hands to the tick and to the wake alike), and only declares the pair and passes it on.
+	for what, want := range map[string]int{"p.tickPing(&seq, &lastPingAt, now, sendPing)": 2, "&seq, &lastPingAt, sendPing)": 2, ".Write(pingPkt)": 2} {
+		if got := strings.Count(src, what); got != want {
+			t.Errorf("proxy.go holds %d × %q, want %d — one per session kind", got, what, want)
+		}
+	}
 	for at := 0; ; {
-		k := strings.Index(src[at:], "lastPingAt = ")
+		k := strings.Index(src[at:], "lastPingAt")
 		if k < 0 {
 			break
 		}
 		k += at
 		at = k + 1
-		stamps++
-		line := src[k:]
-		if nl := strings.IndexByte(line, '\n'); nl >= 0 {
-			line = line[:nl]
-		}
-		if strings.TrimSpace(strings.TrimPrefix(line, "lastPingAt = ")) == "now" {
-			t.Errorf("proxy.go: %q — the tick's ping is stamped with the time taken BEFORE its write", line)
-		}
-		if w, n := strings.LastIndex(src[:k], ".Write(pingPkt)"), strings.LastIndex(src[:k], "now := time.Now()"); w < n {
-			t.Errorf("proxy.go: %q does not follow the tick's Write", line)
+		if !strings.HasSuffix(src[:k], "&") && !strings.HasSuffix(src[:k], "var ") {
+			line := src[strings.LastIndexByte(src[:k], '\n')+1:]
+			if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+				line = line[:nl]
+			}
+			t.Errorf("proxy.go: %q — a session kind reads or writes the stamp itself; it may only declare it and pass it on", strings.TrimSpace(line))
 		}
 	}
-	if n := strings.Count(src, "if p.tickPingAdoptable(tickEpoch, now) {"); n != 2 {
-		t.Errorf("proxy.go guards the tick's stamp %d times, want 2 — a tick ping written across a wake or a freeze is not the probe's first", n)
-	}
-	if stamps != 2 {
-		t.Errorf("proxy.go stamps lastPingAt %d times, want 2 — once per session kind's tick", stamps)
+	if strings.Contains(src, "seq++") {
+		t.Error("proxy.go moves a ping's seq itself — seq and its stamp move together in wakeprobe.go alone")
 	}
 	// The wake is a level: each loop asks its watch right after it has read the channel, before its select…
 	for at, k := 0, 0; ; k++ {
@@ -806,5 +1057,32 @@ func TestBothSessionKindsRunTheOneWakeProbe(t *testing.T) {
 	}
 	if n := strings.Count(body, ".Store("); n != 3 {
 		t.Errorf("wakeprobe.go stores %d times, want 3: the two marks' reset and the probe's stamp — the pong mark is otherwise moved by CompareAndSwap alone", n)
+	}
+	// The pair in wakeprobe.go: whenever seq moves the stamp is voided in the same breath, and every other write
+	// of the stamp is pingStamp's word, given after the write has returned. Two places move seq — the tick's ping
+	// and the probe's — and each of them SENDS what it numbers (426 stepped seq once more without a write).
+	moves := 0
+	for at := 0; ; {
+		k := strings.Index(body[at:], "*seq++")
+		if k < 0 {
+			break
+		}
+		k += at
+		at = k + 1
+		moves++
+		rest := strings.TrimLeft(body[k+len("*seq++"):], " \t\n")
+		if !strings.HasPrefix(rest, "*lastPingAt = time.Time{}") {
+			t.Errorf("wakeprobe.go: seq move %d is not followed at once by the stamp's voiding — the stamp of the ping before would stand under the new seq", moves)
+		}
+		send, stamp := strings.Index(rest, "send(*seq, "), strings.Index(rest, "*lastPingAt = pingStamp(")
+		if next := strings.Index(rest, "*seq++"); send < 0 || stamp < send || (next >= 0 && next < stamp) {
+			t.Errorf("wakeprobe.go: seq move %d is not followed by its write and then by pingStamp's word (offsets send %d, stamp %d)", moves, send, stamp)
+		}
+	}
+	if moves != 2 {
+		t.Errorf("wakeprobe.go moves seq in %d places, want 2: the tick's ping and the probe's — each sends what it numbers", moves)
+	}
+	if all, void, word := strings.Count(body, "*lastPingAt = "), strings.Count(body, "*lastPingAt = time.Time{}"), strings.Count(body, "*lastPingAt = pingStamp("); all != void+word || void != 2 || word != 2 {
+		t.Errorf("wakeprobe.go writes the stamp %d times: %d voidings and %d × pingStamp's word — want nothing else, two of each", all, void, word)
 	}
 }

@@ -2528,9 +2528,26 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		var seq uint64
-		var lastPingAt time.Time // of this goroutine's latest ping, the tick's included: runWakeProbe adopts a ping sent a moment ago
+		var lastPingAt time.Time // when the ping numbered seq was sent, or zero: written by tickPing and runWakeProbe alone — wakeprobe.go
 		pingPkt := make([]byte, len(probePingMagic)+8)
 		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
+		// sendPing writes one ping — the periodic tick's and the wake probe's alike.
+		// Diagnostic bookkeeping, no per-send log (50 conns × 30/hr = 1500 lines/hr
+		// of noise): the latest seq, so that the zombie-kill log can show how many
+		// pings went out without a matching pong, and firstPingAt the very first
+		// time, so that the first-pong log can report the round trip to bootstrap.
+		sendPing := func(s uint64, now time.Time) error {
+			binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], s)
+			dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
+			if _, err := dtlsConn.Write(pingPkt); err != nil {
+				return err
+			}
+			if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
+				p.lastPingSeq[connIdx].Store(s)
+				p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
+			}
+			return nil
+		}
 		// M3 group hello. Sent IMMEDIATELY rather than waiting for the first
 		// tick: until the server sees it this conn stays on its own socket, and
 		// a probeInterval of that is a probeInterval of the old, skewed
@@ -2592,29 +2609,14 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					continue
 				}
 				lastTickAt = now
-				tickEpoch := p.wakeEpoch.Load() // a wake broadcast while this ping is written makes it unadoptable — wakeprobe.go
-				seq++
-				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
-				dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
-				if _, err := dtlsConn.Write(pingPkt); err != nil {
+				// The tick's ping is ONE body for both session kinds — seq and the stamp a
+				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
+				if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil {
 					// Write failure means the conn is already broken.
 					// Other goroutines (DTLS recv timeout, TURN reconnect
 					// loop) will handle the actual teardown — we just
 					// stop sending probes.
 					return
-				}
-				if p.tickPingAdoptable(tickEpoch, now) {
-					lastPingAt = time.Now() // a ping is sent when its write is over — wakeprobe.go
-				}
-				// Diagnostic bookkeeping (no per-send log — would be
-				// 50 conns × 30/hr = 1500 lines/hr of noise). Just record
-				// the latest seq so the zombie-kill log can show how many
-				// pings went out without a matching pong, and stamp
-				// firstPingAt the very first time so first-pong logs can
-				// report the round-trip latency to bootstrap.
-				if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
-					p.lastPingSeq[connIdx].Store(seq)
-					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
 				}
 				// Zombie check: if no pong for probeStaleThreshold (default
 				// 120s) AND the server has been observed responding to at
@@ -2683,16 +2685,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// Whether this wake is probed at all (the 30-s throttle, a connection with
 				// traffic a moment ago), the jitter and the probe itself are ONE body for
 				// both session kinds — wakeWatch.serve, wakeprobe.go (builds 422–424).
-				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "", &seq, &lastPingAt, func(s uint64, now time.Time) error {
-					binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], s)
-					dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
-					if _, err := dtlsConn.Write(pingPkt); err != nil {
-						return err
-					}
-					p.lastPingSeq[connIdx].Store(s)
-					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
-					return nil
-				})
+				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "", &seq, &lastPingAt, sendPing)
 				if err != nil {
 					return
 				}
@@ -5029,9 +5022,23 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		var seq uint64
-		var lastPingAt time.Time // of this goroutine's latest ping, the tick's included: runWakeProbe adopts a ping sent a moment ago
+		var lastPingAt time.Time // when the ping numbered seq was sent, or zero: written by tickPing and runWakeProbe alone — wakeprobe.go
 		pingPkt := make([]byte, len(probePingMagic)+8)
 		copy(pingPkt[0:len(probePingMagic)], probePingMagic)
+		// sendPing writes one ping — the periodic tick's and the wake probe's alike
+		// (the bookkeeping as in the DTLS session's).
+		sendPing := func(s uint64, now time.Time) error {
+			binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], s)
+			_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
+			if _, err := srtpConn.Write(pingPkt); err != nil {
+				return err
+			}
+			if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
+				p.lastPingSeq[connIdx].Store(s)
+				p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
+			}
+			return nil
+		}
 		// M3 group hello. Sent IMMEDIATELY rather than waiting for the first
 		// tick: until the server sees it this conn stays on its own socket, and
 		// a probeInterval of that is a probeInterval of the old, skewed
@@ -5062,19 +5069,10 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					continue
 				}
 				lastTickAt = now
-				tickEpoch := p.wakeEpoch.Load() // a wake broadcast while this ping is written makes it unadoptable — wakeprobe.go
-				seq++
-				binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], seq)
-				_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
-				if _, err := srtpConn.Write(pingPkt); err != nil {
+				// The tick's ping is ONE body for both session kinds — seq and the stamp a
+				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
+				if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil {
 					return
-				}
-				if p.tickPingAdoptable(tickEpoch, now) {
-					lastPingAt = time.Now() // a ping is sent when its write is over — wakeprobe.go
-				}
-				if connIdx >= 0 && connIdx < len(p.lastPingSeq) {
-					p.lastPingSeq[connIdx].Store(seq)
-					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
 				}
 				if p.serverProbeable.Load() && connIdx >= 0 && connIdx < len(p.lastPongTimes) {
 					lastPong := time.Unix(p.lastPongTimes[connIdx].Load(), 0)
@@ -5102,16 +5100,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				// Whether this wake is probed at all (the 30-s throttle, a connection with
 				// traffic a moment ago), the jitter and the probe itself are ONE body for
 				// both session kinds — wakeWatch.serve, wakeprobe.go (builds 422–424).
-				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "SRTP ", &seq, &lastPingAt, func(s uint64, now time.Time) error {
-					binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], s)
-					_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
-					if _, err := srtpConn.Write(pingPkt); err != nil {
-						return err
-					}
-					p.lastPingSeq[connIdx].Store(s)
-					p.firstPingAt[connIdx].CompareAndSwap(0, now.Unix())
-					return nil
-				})
+				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "SRTP ", &seq, &lastPingAt, sendPing)
 				if err != nil {
 					return
 				}

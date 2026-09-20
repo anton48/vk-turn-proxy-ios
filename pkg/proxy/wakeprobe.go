@@ -33,7 +33,10 @@ package proxy
 //   - a poll step that took far longer than its timer is a freeze: it is not
 //     listening, and it is followed by a ping at once (a thaw is a new start);
 //   - the verdict needs thirty seconds of LISTENING, comes only once the latest
-//     ping has had its second, and the mark is read — the last look — before it.
+//     ping has had its second, and the mark is read — the last look — before it;
+//   - and a fresh ping that is still OWED is a fact too (wake upon wake across
+//     three writes running — build 427): until it has gone out and had its
+//     second there is no echo to find and no verdict to reach.
 //
 // A connection that really does not answer — the process running, thirty
 // seconds listened, nothing heard — is killed exactly as before.
@@ -70,12 +73,14 @@ const (
 	wakeProbeDead                           // thirty seconds of listening, asked to the last, nothing heard
 )
 
-// wakeProbeState is the probe's whole memory. `first` is a fact; `listened`
-// and `sinceSend` are listening, added step by step where it is observed.
+// wakeProbeState is the probe's whole memory. `first` and `owed` are facts;
+// `listened` and `sinceSend` are listening, added step by step where it is
+// observed.
 type wakeProbeState struct {
 	first     uint64        // seq of the probe's first ping: a pong at or above it answers the probe
-	listened  time.Duration // awake time spent waiting since that ping
-	sinceSend time.Duration // of it, since the latest ping
+	owed      bool          // a fresh ping is OWED: nothing sent so far may answer, and the ping that may has not gone out yet
+	listened  time.Duration // awake time spent waiting for an answer
+	sinceSend time.Duration // awake time since the latest ping was written
 	resends   int
 	freezes   int
 }
@@ -97,6 +102,22 @@ func (s *wakeProbeState) step(took time.Duration, pongMark uint64) wakeProbeVerd
 		s.resends++
 		s.sinceSend = 0
 		return wakeProbeThawed
+	}
+	if s.owed {
+		// Wake upon wake crossed the last three writes (pingFresh): nothing sent
+		// so far may answer, and the ping that may has not gone out. There is no
+		// echo to find and NO VERDICT to reach — up to 426 the window could run
+		// out right here, and the rule answered dead instead of the re-send it
+		// had promised: a kill naming a seq that was never sent, the path after
+		// the last wake checked by nobody. Only the pause between writes is
+		// counted, and it is not listening: nothing that could be heard is out.
+		s.sinceSend += took
+		if s.sinceSend < wakeProbeResendEvery {
+			return wakeProbeWait
+		}
+		s.resends++
+		s.sinceSend = 0
+		return wakeProbeResend
 	}
 	if pongMark >= s.first {
 		return wakeProbeEchoed
@@ -266,13 +287,16 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 	stepStart := now
 	ping := func() (wokeInside bool, err error) {
 		*seq++
+		*lastPingAt = time.Time{} // seq names a ping that is not sent yet: the stamp of the one before says nothing about it
 		epoch := p.wakeEpoch.Load()
-		if err := send(*seq, wakeProbeClock()); err != nil {
+		started := wakeProbeClock()
+		if err := send(*seq, started); err != nil {
 			return false, err
 		}
 		stepStart = wakeProbeClock()
-		*lastPingAt = stepStart
-		return p.wakeEpoch.Load() != epoch, nil
+		wokeInside = p.wakeEpoch.Load() != epoch
+		*lastPingAt = pingStamp(wokeInside, started, stepStart)
+		return wokeInside, nil
 	}
 	// pingFresh sends a ping — and another if the phone slept and WOKE while the
 	// first was being written (the wake epoch moved across send: a freeze after
@@ -283,23 +307,28 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 	// heard before it, that ping included: a fresh one goes out at once and the
 	// caller re-bases the probe on it. An ordinary slow write moves no epoch and
 	// is still no freeze (423).
+	//
+	// Three writes in a row at most. Wake upon wake across all three, and the
+	// fresh ping is OWED (st.owed): nothing sent so far may answer, the ping that
+	// may goes out after a second's pause — and until it has gone out and had its
+	// second the rule finds no echo and reaches NO verdict (build 427; 426 stepped
+	// seq past the last ping instead and let the window run out on the debt).
 	var st wakeProbeState
 	pingFresh := func() (crossed bool, err error) {
-		for tries := 0; ; tries++ {
+		for tries := 0; tries < 3; tries++ {
 			wokeInside, err := ping()
-			if err != nil || !wokeInside {
+			if err != nil {
 				return crossed, err
+			}
+			if !wokeInside {
+				st.owed = false // a ping that may answer is out
+				return crossed, nil
 			}
 			crossed = true
 			st.freezes++
-			if tries == 2 {
-				// Wake upon wake across three writes running: stop pinging in a
-				// row. Nothing sent so far may answer — the caller re-bases on
-				// the NEXT ping, which goes out after a second of listening.
-				*seq++
-				return true, nil
-			}
 		}
+		st.owed = true
+		return true, nil
 	}
 	adopted := *seq > 0 && !lastPingAt.IsZero() && now.Sub(*lastPingAt) < wakeProbeAdopt
 	if !adopted {
@@ -333,12 +362,13 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 				connIdx, label, echoAfter(st.listened, took).Round(10*time.Millisecond), *seq, detail)
 			return true, covered, nil
 		case wakeProbeResend, wakeProbeThawed:
+			wasOwed := st.owed
 			crossed, err := pingFresh()
 			if err != nil {
 				return true, 0, err
 			}
-			if v == wakeProbeThawed || crossed {
-				st.first = *seq // what was heard before the freeze answers nothing after it
+			if v == wakeProbeThawed || crossed || wasOwed {
+				st.first = *seq // what was heard before the freeze — or sent before the debt was paid — answers nothing after it
 			}
 		case wakeProbeDead:
 			lastPongS := p.lastPongSeq[connIdx].Load()
@@ -362,12 +392,37 @@ func wakeProbeDetail(adopted bool, st *wakeProbeState) string {
 	return fmt.Sprintf(" — first ping %s (seq %d), sent again %d×, %d freeze(s) inside the wait", first, st.first, st.resends, st.freezes)
 }
 
-// tickPingAdoptable: may the periodic tick's ping, just written, serve as the
-// first ping of a wake probe that starts within the next second? Only if the
-// phone did not sleep across its write — no wake was broadcast meanwhile, and
-// the write did not take long enough to hide a freeze: such a ping may have
-// left BEFORE the sleep, and its pong says nothing about now. Not adoptable
-// costs nothing but the probe's own ping.
-func (p *Proxy) tickPingAdoptable(epochBefore uint64, started time.Time) bool {
-	return p.wakeEpoch.Load() == epochBefore && wakeProbeClock().Sub(started) <= wakeProbeFreezeStep
+// pingStamp is what a probe goroutine's lastPingAt may say about the ping just
+// written. seq and lastPingAt belong together: lastPingAt is when the ping
+// numbered seq was SENT — for a wake probe that starts within the next second to
+// adopt it as its first — or it says NOTHING, the zero time. A ping is adoptable
+// only if the phone did not sleep across its write: no wake was broadcast
+// meanwhile, and the write did not take long enough to hide a freeze; otherwise
+// it may have left BEFORE the sleep, and its pong says nothing about now. Not
+// adoptable costs nothing but the probe's own ping.
+func pingStamp(wokeInside bool, started, finished time.Time) time.Time {
+	if wokeInside || finished.Sub(started) > wakeProbeFreezeStep {
+		return time.Time{}
+	}
+	return finished
+}
+
+// tickPing is the periodic tick's ping — ONE body for both session kinds (build
+// 427). Up to 426 each kind's tick stamped lastPingAt behind a guard of its own
+// and, when the guard refused, left the stamp of the ping BEFORE standing while
+// seq had moved on. Right behind a long probe — its last ping a moment old, its
+// throttle long expired — the overdue tick fires, a wake crosses its write, and
+// the wake's probe then adopted the REFUSED seq by the previous ping's time: a
+// pong from before the sleep for an answer. Now the stamp is voided the moment
+// seq moves, and says afterwards what pingStamp allows — here and in the probe's
+// own ping alike; nobody else writes either of the two.
+func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send func(seq uint64, now time.Time) error) error {
+	*seq++
+	*lastPingAt = time.Time{} // seq names a ping that is not sent yet: the stamp of the one before says nothing about it
+	epoch := p.wakeEpoch.Load()
+	if err := send(*seq, now); err != nil {
+		return err
+	}
+	*lastPingAt = pingStamp(p.wakeEpoch.Load() != epoch, now, wakeProbeClock())
+	return nil
 }
