@@ -444,6 +444,7 @@ type Proxy struct {
 	// 50 conns × N times if the wake events come in rapid succession.
 	wakeMu            sync.RWMutex
 	wakeCh            chan struct{}
+	wakeEpoch         atomic.Uint64
 	lastActiveProbeAt []atomic.Int64
 
 	// Per-conn byte counters for diagnostic of throughput asymmetry.
@@ -1324,10 +1325,13 @@ func (p *Proxy) WakeHealthCheck() {
 // one. Per-conn probe goroutines select on wakeChannel(); closing it
 // fans the wake signal out to all of them in one operation. The
 // close-and-replace pattern (same one credPool uses for slot wakeups)
-// means a goroutine that didn't yet enter its select still picks up
-// the next wake — no missed signals.
+// wakes every goroutine PARKED in its select. One that is elsewhere at
+// that instant — in its tick branch, which at a thaw is every one of them —
+// re-reads the channel after the swap and would never see this wake: that
+// is what wakeEpoch is for (wakeWatch, wakeprobe.go).
 func (p *Proxy) broadcastWake() {
 	p.wakeMu.Lock()
+	p.wakeEpoch.Add(1) // FIRST, under the lock: whoever reads the new channel reads the new epoch too — wakeprobe.go
 	close(p.wakeCh)
 	p.wakeCh = make(chan struct{})
 	p.wakeMu.Unlock()
@@ -2561,12 +2565,19 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		// them as zombies even though it should have detected the
 		// freeze and reset lastPongTime.
 		lastTickAt := time.Now()
+		wake := p.newWakeWatch()
 		for {
 			// Capture the wake channel reference once per iteration. The
 			// channel is replaced (not just signaled) on each broadcast,
 			// so a stale capture would either fire repeatedly on a closed
 			// channel (busy-loop) or miss the next signal entirely.
 			wakeCh := p.wakeChannel()
+			if wake.pending() {
+				// A wake was broadcast while this goroutine was not parked in the select
+				// below (its tick branch, at a thaw): the channel it has just read is the
+				// NEW one and will not fire for it. The epoch remembers — wakeprobe.go.
+				wakeCh = closedWakeCh
+			}
 			select {
 			case <-ticker.C:
 				now := time.Now()
@@ -2666,70 +2677,10 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					}
 				}
 			case <-wakeCh:
-				// iOS wake() event reached us via WakeHealthCheck →
-				// broadcastWake. Fast-path data-plane check: send an
-				// out-of-schedule ping and wait briefly for the echo,
-				// killing the conn immediately if it doesn't come back.
-				// This converts the typical post-wake recovery latency
-				// from ~120s (timer-based zombie threshold) to ~5s.
-				//
-				// Server-echo gate: same logic as the timer-based killer
-				// above (line ~1821). If we've never observed a single
-				// pong on this Proxy instance, the server isn't echoing
-				// our probes — typically it's running an unpatched build
-				// without the PR #168 probe-echo capability (e.g.
-				// vk-turn-proxy add-server-wrap-layer branch ships WRAP
-				// but not probe-echo). Without an echo path, EVERY
-				// active probe will fail the 30s wait below and kill
-				// the conn unconditionally — observed in vpn.wifi.6.log
-				// 2026-05-06 21:52:21: all 50 conns killed at once
-				// after a wake burst, 0 echos received over 70 minutes
-				// (sentSeq=113-119 per conn, lastPongSeq=0 across the
-				// board). Skip the probe entirely until we see a pong.
-				if !p.serverProbeable.Load() {
-					continue
-				}
-				// Throttle: if we already did an active probe in the
-				// last 30s, skip. LTE sleep/wake storms can deliver 7+
-				// wake events in 18s (vpn.lte.1.log @ 19:48-19:49) and
-				// 50 conns × 7 active probes = 350 redundant DTLS writes
-				// — wasteful and potentially harmful (the first probe's
-				// echo might still be in flight when the second fires).
-				if connIdx < 0 || connIdx >= len(p.lastActiveProbeAt) {
-					continue
-				}
-				lastProbe := p.lastActiveProbeAt[connIdx].Load()
-				if lastProbe > 0 && time.Since(time.Unix(lastProbe, 0)) < 30*time.Second {
-					continue
-				}
-				// Skip probe if conn had data traffic within last 5s — see
-				// matching change in runSRTPSession wake-probe handler for
-				// full rationale. Defensive parity even though DTLS path is
-				// not currently in production (useSrtp=true by default since
-				// v1.0-build125).
-				if connIdx < len(p.lastTxAt) {
-					recentNs := time.Now().UnixNano() - int64(5*time.Second)
-					if p.lastTxAt[connIdx].Load() > recentNs || p.lastRxAt[connIdx].Load() > recentNs {
-						continue
-					}
-				}
-				// Stagger active-probe firing across the conn pool — see
-				// matching change in runSRTPSession wake-probe handler for
-				// the full rationale. Same pattern, same risk (transient
-				// allocation peak from simultaneous fire-all-conns probe
-				// burst), defensive fix even though current production
-				// uses SRTP path by default.
-				if jitterNs := mathrand.Int63n(int64(300 * time.Millisecond)); jitterNs > 0 {
-					select {
-					case <-time.After(time.Duration(jitterNs)):
-					case <-connCtx.Done():
-						return
-					}
-				}
-				// The probe itself — asked again while nothing answers, judged by LISTENING,
-				// answered by any pong of its own pings — is ONE body for both session
-				// kinds: wakeprobe.go (build 422).
-				alive, err := p.runWakeProbe(connCtx, connIdx, credSlot, "", &seq, &lastPingAt, func(s uint64, now time.Time) error {
+				// Whether this wake is probed at all (the 30-s throttle, a connection with
+				// traffic a moment ago), the jitter and the probe itself are ONE body for
+				// both session kinds — wakeWatch.serve, wakeprobe.go (builds 422–424).
+				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "", &seq, &lastPingAt, func(s uint64, now time.Time) error {
 					binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], s)
 					dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
 					if _, err := dtlsConn.Write(pingPkt); err != nil {
@@ -2746,7 +2697,9 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					connCancel()
 					return
 				}
-				lastTickAt = time.Now()
+				if probed {
+					lastTickAt = time.Now()
+				}
 			case <-connCtx.Done():
 				return
 			}
@@ -5083,8 +5036,15 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		// lost hello heals by repetition and a restarted server re-groups us.
 		p.sendGroupHello(srtpConn)
 		lastTickAt := time.Now()
+		wake := p.newWakeWatch()
 		for {
 			wakeCh := p.wakeChannel()
+			if wake.pending() {
+				// A wake was broadcast while this goroutine was not parked in the select
+				// below (its tick branch, at a thaw): the channel it has just read is the
+				// NEW one and will not fire for it. The epoch remembers — wakeprobe.go.
+				wakeCh = closedWakeCh
+			}
 			select {
 			case <-ticker.C:
 				now := time.Now()
@@ -5133,62 +5093,10 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					}
 				}
 			case <-wakeCh:
-				if !p.serverProbeable.Load() {
-					continue
-				}
-				if connIdx < 0 || connIdx >= len(p.lastActiveProbeAt) {
-					continue
-				}
-				lastProbe := p.lastActiveProbeAt[connIdx].Load()
-				if lastProbe > 0 && time.Since(time.Unix(lastProbe, 0)) < 30*time.Second {
-					continue
-				}
-				// Skip probe entirely if this conn had data traffic within
-				// the last 5 seconds — it's demonstrably alive, no probe
-				// needed. This is the main mechanism for reducing wake-burst
-				// peak: in the 2026-05-25 16:27:50 jetsam scenario, all 30
-				// conns had 6-19 KB/s RX in the 60s window preceding wake.
-				// Every probe in that burst was redundant. Skip-on-recent-tx
-				// eliminates probes for active conns, leaving only truly-
-				// idle conns to probe (typically a small fraction when phone
-				// is in active use). probeData TX/RX from probe Writes
-				// themselves don't update lastTxAt/lastRxAt — those updates
-				// live only in the data-path goroutines (runTURN and SRTP
-				// send/recv) — so a recent probe doesn't fake the conn into
-				// looking "active". Threshold 5s is conservative: shorter
-				// than typical idle keep-alive cycles but long enough to
-				// cover the brief sleep→wake transition where some recent
-				// traffic just stopped.
-				if connIdx < len(p.lastTxAt) {
-					recentNs := time.Now().UnixNano() - int64(5*time.Second)
-					if p.lastTxAt[connIdx].Load() > recentNs || p.lastRxAt[connIdx].Load() > recentNs {
-						continue
-					}
-				}
-				// Stagger active-probe firing across the conn pool to spread
-				// the post-wake allocation/CPU/probe-Write burst over time.
-				// Without jitter all 30 conns wake() handlers fire
-				// simultaneously and finish their probe Write+SRTP-encrypt
-				// within ~290ms (observed 2026-05-25 16:27:47 in
-				// vpn.wifi-lte-wifi.2.log of 25.05.2026 just before the
-				// 16:27:50 jetsam kill — the burst landed on already-elevated
-				// heap from preceding traffic + vkcalls bootstrap and pushed
-				// transient phys_footprint over the iOS NE per-process limit).
-				// Jittered 0-300ms sleep per-conn flattens the burst so GC
-				// can interleave between probe pulses. Worst-case freeze-
-				// detection latency increases by 300ms, which is negligible
-				// vs the 30s probe timeout.
-				if jitterNs := mathrand.Int63n(int64(300 * time.Millisecond)); jitterNs > 0 {
-					select {
-					case <-time.After(time.Duration(jitterNs)):
-					case <-connCtx.Done():
-						return
-					}
-				}
-				// The probe itself — asked again while nothing answers, judged by LISTENING,
-				// answered by any pong of its own pings — is ONE body for both session
-				// kinds: wakeprobe.go (build 422).
-				alive, err := p.runWakeProbe(connCtx, connIdx, credSlot, "SRTP ", &seq, &lastPingAt, func(s uint64, now time.Time) error {
+				// Whether this wake is probed at all (the 30-s throttle, a connection with
+				// traffic a moment ago), the jitter and the probe itself are ONE body for
+				// both session kinds — wakeWatch.serve, wakeprobe.go (builds 422–424).
+				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "SRTP ", &seq, &lastPingAt, func(s uint64, now time.Time) error {
 					binary.BigEndian.PutUint64(pingPkt[len(probePingMagic):], s)
 					_ = srtpConn.SetWriteDeadline(now.Add(5 * time.Second))
 					if _, err := srtpConn.Write(pingPkt); err != nil {
@@ -5205,7 +5113,9 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					connCancel()
 					return
 				}
-				lastTickAt = time.Now()
+				if probed {
+					lastTickAt = time.Now()
+				}
 			case <-connCtx.Done():
 				return
 			}

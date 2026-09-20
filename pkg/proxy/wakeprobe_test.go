@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	mathrand "math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -142,15 +143,16 @@ func TestANightOfShortWakesKillsNobodyWhoCouldNotHear(t *testing.T) {
 
 func shrinkWakeProbe(t *testing.T) {
 	t.Helper()
-	w, r, po, f, a, c := wakeProbeWindow, wakeProbeResendEvery, wakeProbePoll, wakeProbeFreezeStep, wakeProbeAdopt, wakeProbeClock
-	wakeProbeWindow, wakeProbeResendEvery, wakeProbePoll, wakeProbeFreezeStep, wakeProbeAdopt = 300*time.Millisecond, 30*time.Millisecond, 3*time.Millisecond, 10*time.Second, 50*time.Millisecond
+	w, r, po, f, a, c, j := wakeProbeWindow, wakeProbeResendEvery, wakeProbePoll, wakeProbeFreezeStep, wakeProbeAdopt, wakeProbeClock, wakeProbeJitter
+	wakeProbeWindow, wakeProbeResendEvery, wakeProbePoll, wakeProbeFreezeStep, wakeProbeAdopt, wakeProbeJitter = 300*time.Millisecond, 30*time.Millisecond, 3*time.Millisecond, 10*time.Second, 50*time.Millisecond, time.Millisecond
 	t.Cleanup(func() {
-		wakeProbeWindow, wakeProbeResendEvery, wakeProbePoll, wakeProbeFreezeStep, wakeProbeAdopt, wakeProbeClock = w, r, po, f, a, c
+		wakeProbeWindow, wakeProbeResendEvery, wakeProbePoll, wakeProbeFreezeStep, wakeProbeAdopt, wakeProbeClock, wakeProbeJitter = w, r, po, f, a, c, j
 	})
 }
 
 func probeProxy() *Proxy {
-	return &Proxy{credPool: &credPool{}, lastPongSeq: make([]atomic.Uint64, 1), lastPingSeq: make([]atomic.Uint64, 1), lastActiveProbeAt: make([]atomic.Int64, 1)}
+	return &Proxy{credPool: &credPool{}, lastPongSeq: make([]atomic.Uint64, 1), lastPingSeq: make([]atomic.Uint64, 1), lastActiveProbeAt: make([]atomic.Int64, 1),
+		lastTxAt: make([]atomic.Int64, 1), lastRxAt: make([]atomic.Int64, 1), wakeCh: make(chan struct{})}
 }
 
 type sentPings struct {
@@ -385,6 +387,140 @@ func TestWritesSlowerThanAFreezeStepStillEndInAVerdict(t *testing.T) {
 	}
 }
 
+// Build 424. The wake used to be an EDGE — a channel closed and replaced — and a
+// goroutine that was in its tick branch at that instant never saw it.
+func TestAWakeBroadcastDuringATickBranchIsNotLost(t *testing.T) {
+	p := probeProxy()
+	w := p.newWakeWatch()
+	if w.pending() {
+		t.Fatal("a fresh watch has nothing pending")
+	}
+	// The goroutine is in its tick branch — not parked in its select — when the wake is broadcast…
+	p.broadcastWake()
+	// …and then comes round to the top of its loop:
+	ch := p.wakeChannel()
+	select {
+	case <-ch:
+		t.Fatal("the fixture is wrong: the channel read AFTER the broadcast is the new, open one")
+	default: // the channel alone has lost this wake
+	}
+	if !w.pending() {
+		t.Fatal("the wake broadcast during the tick branch is lost: nothing pending at the top of the loop")
+	}
+	alive, probed, err := w.serve(context.Background(), 0, 0, "", new(uint64), new(time.Time), nil) // the server does not echo: no probe is due
+	if err != nil || !alive || probed {
+		t.Fatalf("alive %v probed %v err %v", alive, probed, err)
+	}
+	if w.pending() {
+		t.Error("a wake that needed no probe is still pending — the loop would spin on it")
+	}
+	// A goroutine PARKED in its select is reached by the channel, as ever.
+	ch = p.wakeChannel()
+	go p.broadcastWake()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a parked goroutine was not woken")
+	}
+	if !w.pending() {
+		t.Error("…and the watch says so too")
+	}
+}
+
+// Eight loops shaped like the probe goroutine's — a fast ticker with a busy
+// tick branch — against three hundred broadcasts at random moments: every one
+// of them must come to serve the LAST wake, wherever it was caught.
+func TestNoWakeIsLostWhereverTheGoroutineIsCaught(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		p := probeProxy()
+		var final atomic.Uint64
+		var wg sync.WaitGroup
+		stop := make(chan struct{})
+		var lost atomic.Int32
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				w := p.newWakeWatch()
+				tick := time.NewTicker(200 * time.Microsecond)
+				defer tick.Stop()
+				for {
+					if f := final.Load(); f != 0 && w.served == f {
+						return
+					}
+					ch := p.wakeChannel()
+					if w.pending() {
+						ch = closedWakeCh
+					}
+					select {
+					case <-tick.C:
+						time.Sleep(50 * time.Microsecond) // the tick branch: busy, away from the select
+					case <-ch:
+						w.served = p.wakeEpoch.Load()
+					case <-stop:
+						lost.Add(1)
+						return
+					}
+				}
+			}()
+		}
+		for i := 0; i < 300; i++ {
+			time.Sleep(time.Duration(mathrand.Intn(300)) * time.Microsecond)
+			p.broadcastWake()
+		}
+		final.Store(p.wakeEpoch.Load())
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			close(stop)
+			<-done
+		}
+		if n := lost.Load(); n != 0 {
+			t.Fatalf("round %d: %d of 8 loops never came to serve the last wake — it was broadcast while they were in their tick branch", round, n)
+		}
+	}
+}
+
+func TestServeProbesAndMarksWhatWokeThePhoneMeanwhile(t *testing.T) {
+	shrinkWakeProbe(t)
+	p := probeProxy()
+	p.serverProbeable.Store(true)
+	w := p.newWakeWatch()
+	p.broadcastWake()
+	var seq uint64
+	var lastPingAt time.Time
+	alive, probed, err := w.serve(context.Background(), 0, 0, "", &seq, &lastPingAt, func(s uint64, _ time.Time) error {
+		p.broadcastWake() // the phone sleeps and wakes again while the probe runs: the probe asks again at every thaw by itself
+		go func() { time.Sleep(time.Millisecond); p.notePongSeq(0, s) }()
+		return nil
+	})
+	if err != nil || !alive || !probed {
+		t.Fatalf("alive %v probed %v err %v", alive, probed, err)
+	}
+	if w.pending() {
+		t.Error("a wake broadcast while the probe ran is still pending: a second probe would follow the echo at once")
+	}
+	// Less than thirty seconds later the next wake needs no probe — and is served all the same.
+	p.broadcastWake()
+	if _, probed, _ = w.serve(context.Background(), 0, 0, "", &seq, &lastPingAt, nil); probed || w.pending() {
+		t.Errorf("probed %v pending %v, want a throttled wake served without a probe", probed, w.pending())
+	}
+}
+
+func TestTheEchosTimeCountsTheStepThatHeardIt(t *testing.T) {
+	for _, c := range []struct{ listened, took, want time.Duration }{
+		{0, 100 * time.Millisecond, 100 * time.Millisecond}, // an answer inside the first poll step: never "0s" — the old false echo's wording
+		{2 * time.Second, 100 * time.Millisecond, 2100 * time.Millisecond},
+		{2 * time.Second, 57 * time.Second, 2 * time.Second}, // heard right after a freeze: the frozen step is not listening
+	} {
+		if got := echoAfter(c.listened, c.took); got != c.want {
+			t.Errorf("echoAfter(%s, %s) = %s, want %s", c.listened, c.took, got, c.want)
+		}
+	}
+}
+
 // N2: the previous session's mark answers nothing in the next one.
 func TestAnOlderSessionsMarkAnswersNothing(t *testing.T) {
 	shrinkWakeProbe(t)
@@ -427,12 +563,12 @@ func TestBothSessionKindsRunTheOneWakeProbe(t *testing.T) {
 		return stripComments(string(b))
 	}
 	src := read("proxy.go")
-	for what, want := range map[string]int{"p.runWakeProbe(": 2, "p.notePongSeq(": 2, "p.resetProbeMarks(": 2, "time.NewTicker(probeInterval)": 2} {
+	for what, want := range map[string]int{"wake.serve(": 2, "p.newWakeWatch()": 2, "if wake.pending() {": 2, "p.notePongSeq(": 2, "p.resetProbeMarks(": 2, "time.NewTicker(probeInterval)": 2} {
 		if got := strings.Count(src, what); got != want {
 			t.Errorf("proxy.go holds %d × %q, want %d — one per session kind", got, what, want)
 		}
 	}
-	for _, gone := range []string{"lastPongSeq[connIdx].Store(", ">= sentSeq", "probeStart", "sentSeq :="} {
+	for _, gone := range []string{"lastPongSeq[connIdx].Store(", ">= sentSeq", "probeStart", "sentSeq :=", "lastActiveProbeAt[connIdx]", "p.runWakeProbe("} {
 		if strings.Contains(src, gone) {
 			t.Errorf("proxy.go still holds %q — a session kind keeps a probe wait or a mark write of its own", gone)
 		}
@@ -475,6 +611,32 @@ func TestBothSessionKindsRunTheOneWakeProbe(t *testing.T) {
 	}
 	if stamps != 2 {
 		t.Errorf("proxy.go stamps lastPingAt %d times, want 2 — once per session kind's tick", stamps)
+	}
+	// The wake is a level: each loop asks its watch right after it has read the channel, before its select…
+	for at, k := 0, 0; ; k++ {
+		i := strings.Index(src[at:], "wakeCh := p.wakeChannel()")
+		if i < 0 {
+			if k != 2 {
+				t.Errorf("proxy.go reads the wake channel in %d probe loops, want 2", k)
+			}
+			break
+		}
+		i += at
+		at = i + 1
+		sel := strings.Index(src[i:], "select {")
+		if sel < 0 || !strings.Contains(src[i:i+sel], "if wake.pending() {") || !strings.Contains(src[i:i+sel], "wakeCh = closedWakeCh") {
+			t.Errorf("probe loop %d: the watch is not asked between reading the wake channel and the select — a wake broadcast during the tick branch is lost", k+1)
+		}
+	}
+	// …and the epoch is bumped BEFORE the channel is swapped, under the same lock.
+	if b := strings.Index(src, "func (p *Proxy) broadcastWake() {"); b < 0 {
+		t.Error("broadcastWake not found")
+	} else {
+		fn := src[b : b+strings.Index(src[b:], "\n}\n")]
+		lock, add, cl, unlock := strings.Index(fn, "p.wakeMu.Lock()"), strings.Index(fn, "p.wakeEpoch.Add(1)"), strings.Index(fn, "close(p.wakeCh)"), strings.Index(fn, "p.wakeMu.Unlock()")
+		if !(lock >= 0 && lock < add && add < cl && cl < unlock) {
+			t.Errorf("broadcastWake: want Lock, wakeEpoch.Add(1), close, …, Unlock in that order — got offsets %d %d %d %d", lock, add, cl, unlock)
+		}
 	}
 	body := read("wakeprobe.go")
 	i := strings.Index(body, "func (p *Proxy) runWakeProbe(")

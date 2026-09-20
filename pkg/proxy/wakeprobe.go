@@ -42,6 +42,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	mathrand "math/rand"
 	"time"
 )
 
@@ -52,6 +53,7 @@ var (
 	wakeProbePoll        = 100 * time.Millisecond // how often the mark is looked at
 	wakeProbeFreezeStep  = time.Second            // a poll step longer than this was a freeze, not listening
 	wakeProbeAdopt       = time.Second            // a ping sent this recently is the probe's first ping
+	wakeProbeJitter      = 300 * time.Millisecond // the pool's probes are spread over this much
 	wakeProbeClock       = time.Now
 )
 
@@ -134,6 +136,100 @@ func (p *Proxy) notePongSeq(connIdx int, seq uint64) {
 	}
 }
 
+// closedWakeCh stands in for the wake channel of a goroutine that has a wake
+// pending: its select takes the wake case at once.
+var closedWakeCh = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+// wakeWatch is one probe goroutine's view of the wake signal (build 424).
+// broadcastWake closes the wake channel and REPLACES it: that reaches a
+// goroutine parked in its select, and no other. A goroutine in its tick branch
+// at that instant re-read the channel after the swap and never saw the wake —
+// and at a thaw the overdue tick fires on EVERY connection at once (with a
+// line to log when the gap is long), while Swift's wake() is still on its way
+// to WakeHealthCheck: on 2026-09-20 two wakes of twelve went unprobed on all
+// thirty connections, and at one of them 27 connections dead at the server
+// stood for 2 min 15 s with the phone awake, until the periodic detector.
+// So the wake is a COUNTER as well — bumped under the lock before the swap —
+// and the goroutine remembers the epoch it has served: a level, not an edge.
+type wakeWatch struct {
+	p      *Proxy
+	served uint64
+}
+
+// newWakeWatch starts from the present: a wake that came before this session
+// existed is not this session's to serve.
+func (p *Proxy) newWakeWatch() *wakeWatch {
+	return &wakeWatch{p: p, served: p.wakeEpoch.Load()}
+}
+
+// pending: a wake has been broadcast that this goroutine has not served. Asked
+// right after the goroutine has read the wake channel, at the top of EVERY
+// turn of its loop — a wake that came earlier is in the epoch, one that comes
+// later closes the channel just read.
+func (w *wakeWatch) pending() bool { return w.p.wakeEpoch.Load() != w.served }
+
+// serve is the wake case of a session's probe goroutine — one body for both
+// session kinds. probed = false when this wake needed no probe.
+func (w *wakeWatch) serve(ctx context.Context, connIdx, credSlot int, label string, seq *uint64, lastPingAt *time.Time, send func(seq uint64, now time.Time) error) (alive, probed bool, err error) {
+	epoch := w.p.wakeEpoch.Load()
+	if !w.p.wakeProbeDue(connIdx) {
+		w.served = epoch
+		return true, false, nil
+	}
+	// Spread the pool's probes over 0–300 ms: forty Write + SRTP-encrypt bursts
+	// in the same instant once pushed the extension over its memory limit
+	// (2026-05-25).
+	if jitter := mathrand.Int63n(int64(wakeProbeJitter)); jitter > 0 {
+		select {
+		case <-time.After(time.Duration(jitter)):
+		case <-ctx.Done():
+			return true, false, ctx.Err()
+		}
+	}
+	alive, err = w.p.runWakeProbe(ctx, connIdx, credSlot, label, seq, lastPingAt, send)
+	// The probe asks again at every thaw inside its wait: whatever woke the
+	// phone while it ran has been served by it.
+	w.served = w.p.wakeEpoch.Load()
+	return alive, true, err
+}
+
+// wakeProbeDue: is this wake to be probed on this connection at all?
+func (p *Proxy) wakeProbeDue(connIdx int) bool {
+	if !p.serverProbeable.Load() {
+		return false // the server does not echo: nothing to judge by
+	}
+	if connIdx < 0 || connIdx >= len(p.lastActiveProbeAt) {
+		return false
+	}
+	if last := p.lastActiveProbeAt[connIdx].Load(); last > 0 && time.Since(time.Unix(last, 0)) < 30*time.Second {
+		return false // probed less than thirty seconds ago
+	}
+	// A connection with data traffic in the last five seconds is skipped (the
+	// probes' own bytes do not count — only the data path stamps these).
+	if connIdx < len(p.lastTxAt) {
+		recent := time.Now().UnixNano() - int64(5*time.Second)
+		if p.lastTxAt[connIdx].Load() > recent || p.lastRxAt[connIdx].Load() > recent {
+			return false
+		}
+	}
+	return true
+}
+
+// echoAfter is the time an echo line reports: the listening INCLUDING the step
+// that saw the pong — up to 423 that step was left out, and an answer inside
+// the first poll step printed "in 0s", the old false echo's very wording. A
+// frozen step is not listening and is not added.
+func echoAfter(listened, took time.Duration) time.Duration {
+	if took > wakeProbeFreezeStep {
+		return listened
+	}
+	return listened + took
+}
+
 // runWakeProbe is the wake branch of a session's probe goroutine, from the
 // moment it has decided to probe. seq is the goroutine's ping counter,
 // lastPingAt the time of its latest ping (the periodic tick's included), send
@@ -186,7 +282,7 @@ func (p *Proxy) runWakeProbe(ctx context.Context, connIdx, credSlot int, label s
 				detail = wakeProbeDetail(adopted, &st)
 			}
 			log.Printf("proxy: [conn %d] %sactive probe (post-wake) echo received in %s (sentSeq=%d)%s",
-				connIdx, label, st.listened.Round(10*time.Millisecond), *seq, detail)
+				connIdx, label, echoAfter(st.listened, took).Round(10*time.Millisecond), *seq, detail)
 			return true, nil
 		case wakeProbeResend:
 			if err := ping(); err != nil {
