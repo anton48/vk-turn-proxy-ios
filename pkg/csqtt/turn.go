@@ -72,7 +72,15 @@ func closeRelayBounded(ctl net.PacketConn, relayConn io.Closer, tcClose func()) 
 // infers IPv6 from it and asks the relay for an IPv6 allocation, which VK's
 // relay answers with silence — "all retransmissions failed", nothing else.
 // (2026-09-04, the first run of tools/csqtt_client.)
-func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLevel logging.LogLevel) (*Relay, error) {
+//
+// allocated, when not nil, is called the moment the relay has ACCEPTED the
+// Allocate — BEFORE the permission, where the fact becomes true. Whatever fails
+// behind it (the permission today, any step added tomorrow), the seat WAS used
+// and is given back on the way out, and the relay keeps a deallocated seat on
+// the quota for a second more: a caller that heard of the allocation only from
+// a successful return handed that seat straight to the next taker, whose
+// Allocate was refused with 486 (the user's review of build 430).
+func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLevel logging.LogLevel, allocated func()) (*Relay, error) {
 	var ctl net.PacketConn
 	switch transport {
 	case "udp":
@@ -116,6 +124,9 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 		tc.Close()
 		_ = ctl.Close()
 		return nil, fmt.Errorf("turn allocate: %w", err)
+	}
+	if allocated != nil {
+		allocated()
 	}
 	if err := tc.CreatePermission(peer); err != nil {
 		_ = relay.Close()

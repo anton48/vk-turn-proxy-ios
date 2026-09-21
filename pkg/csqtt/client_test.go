@@ -173,7 +173,7 @@ func (s *fakeServer) seen() []getconfSeen {
 func loopbackRelay(t *testing.T, hook func(creds TURNCredentials) error) {
 	t.Helper()
 	prev := dialRelay
-	dialRelay = func(creds TURNCredentials, _ *net.UDPAddr, _ string, _ logging.LogLevel) (*Relay, error) {
+	dialRelay = func(creds TURNCredentials, _ *net.UDPAddr, _ string, _ logging.LogLevel, allocated func()) (*Relay, error) {
 		if hook != nil {
 			if err := hook(creds); err != nil {
 				return nil, err
@@ -183,6 +183,9 @@ func loopbackRelay(t *testing.T, hook func(creds TURNCredentials) error) {
 		if err != nil {
 			return nil, err
 		}
+		if allocated != nil {
+			allocated() // as DialRelay: the moment the "relay" accepts the allocation
+		}
 		return &Relay{Conn: uc, Local: uc.LocalAddr(), close: func() { uc.Close() }}, nil
 	}
 	t.Cleanup(func() { dialRelay = prev })
@@ -190,10 +193,11 @@ func loopbackRelay(t *testing.T, hook func(creds TURNCredentials) error) {
 
 // lease counts what the pool would see: acquires, releases, live leases.
 type lease struct {
-	mu       sync.Mutex
-	acquires int
-	releases int
-	delay    func(workerID int) time.Duration // optional slow mint
+	mu        sync.Mutex
+	acquires  int
+	releases  int
+	allocated int                              // Allocated calls, all leases together
+	delay     func(workerID int) time.Duration // optional slow mint
 }
 
 func (l *lease) creds(ctx context.Context, workerID int) (Credential, error) {
@@ -214,6 +218,11 @@ func (l *lease) creds(ctx context.Context, workerID int) (Credential, error) {
 		Release: func() {
 			l.mu.Lock()
 			l.releases++
+			l.mu.Unlock()
+		},
+		Allocated: func() {
+			l.mu.Lock()
+			l.allocated++
 			l.mu.Unlock()
 		},
 	}, nil
@@ -461,7 +470,7 @@ func installBlockableRelays(t *testing.T) *blockableRelays {
 	t.Helper()
 	r := &blockableRelays{}
 	prev := dialRelay
-	dialRelay = func(TURNCredentials, *net.UDPAddr, string, logging.LogLevel) (*Relay, error) {
+	dialRelay = func(_ TURNCredentials, _ *net.UDPAddr, _ string, _ logging.LogLevel, allocated func()) (*Relay, error) {
 		uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			return nil, err
@@ -470,6 +479,9 @@ func installBlockableRelays(t *testing.T) *blockableRelays {
 		r.mu.Lock()
 		r.conns = append(r.conns, bc)
 		r.mu.Unlock()
+		if allocated != nil {
+			allocated()
+		}
 		// The production close order over the fake: the deallocate write
 		// through the (blockable) control socket, then the socket.
 		return &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { closeRelayBounded(bc, deallocating{bc}, nil) }}, nil

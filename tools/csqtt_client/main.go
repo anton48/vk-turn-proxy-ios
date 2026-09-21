@@ -184,7 +184,7 @@ func main() {
 		lvl = logging.LogLevelTrace
 	}
 	t0 := time.Now()
-	relay, err := csqtt.DialRelay(csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: creds.Address}, peer, *turnTransport, lvl)
+	relay, err := csqtt.DialRelay(csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: creds.Address}, peer, *turnTransport, lvl, nil)
 	if err != nil {
 		log.Fatalf("allocate: %v", err)
 	}

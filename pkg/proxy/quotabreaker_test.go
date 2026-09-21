@@ -351,9 +351,35 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	if !strings.Contains(c, "Allocated func()") {
 		t.Error("pkg/csqtt: Credential has no Allocated callback")
 	}
-	dial := strings.Index(c, "w.c.allocRTT.Store(int64(time.Since(t0)))")
-	if dial < 0 || !strings.Contains(c[dial:dial+200], "cred.Allocated()") {
-		t.Error("pkg/csqtt: the worker does not call cred.Allocated() right after the relay dial succeeded")
+	// csqtt's mark is the allocation too: DialRelay itself reports it, between the
+	// Allocate and the permission — reported from a successful RETURN, a permission
+	// that failed behind an accepted Allocate told the pool nothing, and the seat
+	// it had used went straight to the next taker (the user's review of build 430).
+	// The worker hands the lease's callback to the dial and calls it nowhere else.
+	dialSrc, err := os.ReadFile("../csqtt/turn.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := stripComments(string(dialSrc))
+	alloc, perm := strings.Index(d, "tc.Allocate()"), strings.Index(d, "tc.CreatePermission(")
+	if alloc < 0 || perm < alloc {
+		t.Fatalf("pkg/csqtt: DialRelay's Allocate (%d) and CreatePermission (%d) not found in that order", alloc, perm)
+	}
+	if n := strings.Count(d, "allocated()"); n != 1 {
+		t.Errorf("pkg/csqtt: DialRelay reports the allocation %d time(s), want 1", n)
+	} else if at := strings.Index(d, "allocated()"); at < alloc || at > perm {
+		t.Error("pkg/csqtt: DialRelay does not report the allocation between the Allocate and the permission — a permission failure is not the relay refusing the identity, and the seat WAS used")
+	}
+	w := stripComments(c)
+	dial, gate := strings.Index(w, "dialRelay(cred.TURNCredentials"), -1
+	if dial >= 0 {
+		gate = strings.Index(w[dial:], "startDone()")
+	}
+	if dial < 0 || gate < 0 {
+		t.Fatal("pkg/csqtt: the worker's relay dial not found")
+	}
+	if n := strings.Count(w, "cred.Allocated()"); n != 1 || !strings.Contains(w[dial:dial+gate], "cred.Allocated()") {
+		t.Errorf("pkg/csqtt: the worker calls cred.Allocated() %d time(s), want once — inside the callback it hands to the relay dial, not behind the dial's return", n)
 	}
 }
 

@@ -176,9 +176,11 @@ type Client struct {
 // — when the allocation obtained with it is gone (the session ended for any
 // reason, including Close), or at once when the allocation never came up.
 // Failed is called at most once, BEFORE that Release, with DialRelay's
-// error whenever the allocation did not come up — the relay refused it,
-// never answered, or a step around it failed (the local socket, the TCP
-// dial, the permission). The POOL decides what the error means: a 486
+// error whenever the relay did not come up — the relay refused the
+// allocation, never answered, or a step around it failed (the local socket,
+// the TCP dial, the permission — and that one fails BEHIND an accepted
+// Allocate, so Allocated has been called before it: the seat was used). The
+// POOL decides what the error means: a 486
 // (quota) marks the slot so the next Creds hands out another credential,
 // a 401/403 invalidates it, anything else changes nothing. A worker that
 // only released handed the same exhausted credential back to itself on
@@ -190,9 +192,13 @@ type Credential struct {
 	Release func()
 	Failed  func(err error)
 	// Allocated, when set, is called once the relay ACCEPTED the allocation
-	// — the pool's evidence that this identity works, so a later 486 on it
-	// is its quota rather than the relay refusing everything (the pool's
-	// relay-refusal breaker keys on that). Called before READY.
+	// — at that moment, before the permission: the pool's evidence that this
+	// identity works, so a later 486 on it is its quota rather than the relay
+	// refusing everything (the pool's relay-refusal breaker keys on that), and
+	// that this lease's seat was USED — it is given back when the session
+	// ends, however early, and the relay holds it for a second more. At most
+	// once per Creds; before READY, and before Failed if the session fails
+	// behind its Allocate.
 	Allocated func()
 }
 
@@ -1305,9 +1311,21 @@ func (w *worker) session() error {
 	default:
 	}
 	t0 := time.Now()
-	relay, err := dialRelay(cred.TURNCredentials, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel)
+	// The lease hears of the allocation from DialRelay itself, the moment the
+	// relay accepts it — not from a successful return: a permission that fails
+	// behind the Allocate has still used the seat (DialRelay's doc).
+	seatUsed := false
+	relay, err := dialRelay(cred.TURNCredentials, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel, func() {
+		seatUsed = true // called on this goroutine, inside the dial
+		if cred.Allocated != nil {
+			cred.Allocated()
+		}
+	})
 	startDone()
 	if err != nil {
+		if seatUsed {
+			w.c.cfg.Logf("csqtt: worker %d: the relay ACCEPTED the allocation and a step behind it failed — the seat was used and is given back, its lease goes back behind the relay's second", w.id)
+		}
 		// The relay refused or never answered: the lease hears it BEFORE
 		// the deferred release, while the pool still counts this worker on
 		// the slot — a 486 must not come back to this worker as the same
@@ -1318,9 +1336,6 @@ func (w *worker) session() error {
 		return err
 	}
 	w.c.allocRTT.Store(int64(time.Since(t0)))
-	if cred.Allocated != nil {
-		cred.Allocated()
-	}
 	creds := cred.TURNCredentials
 	wrapper, err := NewWrapper(w.cipher, w.c.cfg.Mode)
 	if err != nil {
