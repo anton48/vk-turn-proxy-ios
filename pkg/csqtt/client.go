@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,7 +60,7 @@ type Config struct {
 	// to another credential, and a pool that only hears Release cannot.
 	Creds func(ctx context.Context, workerID int) (Credential, error)
 
-	TURNTransport string           // "udp" or "tcp"
+	TURNTransport string           // "udp", "tcp", or opt-in "auto"
 	TURNLogLevel  logging.LogLevel // pion verbosity
 
 	// StartPacing spaces worker starts (the reference client uses 100 ms).
@@ -105,9 +106,10 @@ type Client struct {
 	ctx  context.Context
 	stop context.CancelFunc
 
-	workers []*worker
-	striper *Striper
-	seq     *Sequencer
+	workers    []*worker
+	transports transportPolicy
+	striper    *Striper
+	seq        *Sequencer
 
 	reasmMu sync.Mutex
 	reasm   *Reassembler[[]byte]
@@ -205,6 +207,8 @@ type Credential struct {
 // dialRelay is DialRelay, replaceable by tests with a loopback relay.
 var dialRelay = DialRelay
 
+var dialRelayContext = DialRelayContext
+
 // identity is the pair the next GETCONF must carry.
 func (c *Client) identity() (uint64, string) {
 	c.identMu.Lock()
@@ -218,6 +222,7 @@ func (c *Client) identity() (uint64, string) {
 // session's credential is released as it ends; the new starts acquire
 // afresh, so the pool's own path-change marking spreads them.
 func (c *Client) OnPathChange() {
+	c.transports.reset()
 	c.identMu.Lock()
 	c.gen, c.salt = NewIdentity(c.gen)
 	gen := c.gen
@@ -485,6 +490,9 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 // whole client, because the server would refuse every worker the same way.
 func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	cfg.defaults()
+	if cfg.TURNTransport != "udp" && cfg.TURNTransport != "tcp" && cfg.TURNTransport != "auto" {
+		return nil, fmt.Errorf("csqtt: unknown TURN transport %q", cfg.TURNTransport)
+	}
 	if cfg.Server == nil || cfg.Password == "" || cfg.DeviceID == "" || cfg.Creds == nil {
 		return nil, errors.New("csqtt: Server, Password, DeviceID and Creds are required")
 	}
@@ -889,13 +897,14 @@ func (c *Client) repair(cmd StreamCommand) {
 
 // WorkerStats is one worker's counters.
 type WorkerStats struct {
-	ID       int
-	Ready    bool
-	Relay    string
-	TxPkts   int64
-	RxPkts   int64
-	Restarts int64
-	LastRx   time.Time
+	Transport string
+	ID        int
+	Ready     bool
+	Relay     string
+	TxPkts    int64
+	RxPkts    int64
+	Restarts  int64
+	LastRx    time.Time
 }
 
 // Stats is a snapshot of the client. The first block is what the app's
@@ -1003,6 +1012,7 @@ type worker struct {
 	probeSt   atomic.Pointer[probeState] // the probe that is out for the current silence; nil if none. Any inbound clears it
 	probing   atomic.Bool                // a READY probe is in its write (at most one goroutine behind a blocked relay)
 	relayStr  atomic.Pointer[string]
+	transport atomic.Pointer[string]
 	relayRef  atomic.Pointer[Relay] // the live allocation, for closeRelay — no mutex, a blocked send holds mu
 
 	kick chan string // restart requests with a reason
@@ -1018,6 +1028,9 @@ func newWorker(c *Client, id int, cipher *Cipher) *worker {
 
 func (w *worker) stats() WorkerStats {
 	s := WorkerStats{ID: w.id, Ready: w.ready.Load(), TxPkts: w.tx.Load(), RxPkts: w.rx.Load(), Restarts: w.restarts.Load()}
+	if p := w.transport.Load(); p != nil {
+		s.Transport = *p
+	}
 	if ns := w.heardAt.Load(); ns != 0 { // the real one: a clock reset must not make a deaf worker look heard-from
 		s.LastRx = time.Unix(0, ns)
 	}
@@ -1275,7 +1288,7 @@ func nextBackoff(prev, lived time.Duration) time.Duration {
 }
 
 // session is one allocation's lifetime. It returns why it ended.
-func (w *worker) session() error {
+func (w *worker) session() (sessionErr error) {
 	ctx := w.c.ctx
 	// The credential first, OUTSIDE the start gate: a pool may park this
 	// worker (cold-start cap, path-change settle) and a park inside the gate
@@ -1315,16 +1328,37 @@ func (w *worker) session() error {
 	// relay accepts it — not from a successful return: a permission that fails
 	// behind the Allocate has still used the seat (DialRelay's doc).
 	seatUsed := false
-	relay, err := dialRelay(cred.TURNCredentials, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel, func() {
+	allocated := func() {
 		seatUsed = true // called on this goroutine, inside the dial
 		if cred.Allocated != nil {
 			cred.Allocated()
 		}
-	})
+	}
+	transport := w.c.cfg.TURNTransport
+	auto := transport == "auto"
+	var epoch uint64
+	var relay *Relay
+	handshakeCtx := ctx
+	cancelHandshake := func() {}
+	if auto {
+		transport, epoch = w.c.transports.pick(t0)
+		handshakeCtx, cancelHandshake = context.WithTimeout(ctx, autoHandshakeBudget)
+		defer cancelHandshake()
+		relay, err = dialRelayContext(handshakeCtx, cred.TURNCredentials, w.c.cfg.Server, transport, w.c.cfg.TURNLogLevel, allocated)
+	} else {
+		relay, err = dialRelay(cred.TURNCredentials, w.c.cfg.Server, transport, w.c.cfg.TURNLogLevel, allocated)
+	}
+	w.transport.Store(&transport)
 	startDone()
 	if err != nil {
 		if seatUsed {
 			w.c.cfg.Logf("csqtt: worker %d: the relay ACCEPTED the allocation and a step behind it failed — the seat was used and is given back, its lease goes back behind the relay's second", w.id)
+		}
+		// Only connectivity failures affect transport selection. TURN auth
+		// and quota refusals belong to the credential pool, not another dial.
+		var ne net.Error
+		if auto && ctx.Err() == nil && (handshakeCtx.Err() != nil || errors.As(err, &ne)) {
+			w.c.transports.failure(epoch, transport, time.Now())
 		}
 		// The relay refused or never answered: the lease hears it BEFORE
 		// the deferred release, while the pool still counts this worker on
@@ -1334,6 +1368,27 @@ func (w *worker) session() error {
 			cred.Failed(err)
 		}
 		return err
+	}
+	// Bound GETCONF writes as well as reads; a TCP WriteTo can block. Stop
+	// this callback after a valid configuration so it never expires a live session.
+	stopHandshake := context.AfterFunc(handshakeCtx, relay.Close)
+	defer stopHandshake()
+	if auto {
+		defer func() {
+			var asked *restartRequest
+			var denied *DeniedError
+			if ctx.Err() != nil || errors.As(sessionErr, &denied) || errors.Is(sessionErr, ErrNoConfig) {
+				return
+			}
+			if errors.As(sessionErr, &asked) {
+				if !strings.Contains(asked.reason, "liveness") && !strings.Contains(asked.reason, "deaf") {
+					return
+				}
+			}
+			if sessionErr != nil {
+				w.c.transports.failure(epoch, transport, time.Now())
+			}
+		}()
 	}
 	w.c.allocRTT.Store(int64(time.Since(t0)))
 	creds := cred.TURNCredentials
@@ -1383,6 +1438,7 @@ func (w *worker) session() error {
 	// select then restarts the worker; that window is microseconds where
 	// the old one was the whole schedule.)
 	var conf ConfigResponse
+	var requestAt time.Time
 	got := false
 attempts:
 	for _, wait := range getconfSchedule {
@@ -1392,6 +1448,9 @@ attempts:
 		default:
 		}
 		gen, salt := w.c.identity()
+		if requestAt.IsZero() {
+			requestAt = time.Now()
+		}
 		req := []byte(ConfigRequest(w.c.cfg.LocalPort, w.c.cfg.DeviceID, w.c.cfg.Password,
 			gen, salt, w.id, w.c.cfg.Workers, w.c.cfg.Revision))
 		if err := w.send(req); err != nil {
@@ -1418,11 +1477,19 @@ attempts:
 				continue attempts
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-handshakeCtx.Done():
+				return handshakeCtx.Err()
 			}
 		}
 	}
 	if !got {
 		return errors.New("no TUNCONF (wrong password is silence)")
+	}
+	if !stopHandshake() || handshakeCtx.Err() != nil {
+		return handshakeCtx.Err()
+	}
+	if auto {
+		w.c.transports.success(epoch, transport, time.Since(requestAt), time.Now())
 	}
 	w.c.setConfig(conf)
 	if err := w.send([]byte(ReadyRequest)); err != nil {

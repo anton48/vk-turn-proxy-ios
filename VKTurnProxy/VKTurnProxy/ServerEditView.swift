@@ -164,7 +164,14 @@ struct ServerEditView: View {
                     }
                 }
 
-                Toggle("Use UDP transport to TURN", isOn: $draft.useUDP)
+                if mode.wrappedValue == .csqtt {
+                    Toggle("Automatic UDP / TCP", isOn: $draft.csqttAutoTURN)
+                    Text("Tests transport on new connections and falls back when a path fails. Existing connections stay up. Experimental.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                if mode.wrappedValue != .csqtt || !draft.csqttAutoTURN {
+                    Toggle("Use UDP transport to TURN", isOn: $draft.useUDP)
+                }
                 Stepper(connectionsLabel, value: $draft.numConnections, in: 1...connectionsUpperBound)
                 Stepper("Cred pool cooldown: \(draft.credPoolCooldownSeconds) s",
                         value: $draft.credPoolCooldownSeconds, in: 30...600, step: 30)

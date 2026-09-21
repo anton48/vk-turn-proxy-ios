@@ -84,6 +84,7 @@ type csqttConfig struct {
 	VKLink                  string              `json:"vk_link"`
 	NumConns                int                 `json:"num_conns"`
 	UseUDP                  bool                `json:"use_udp"`
+	AutoTURN                bool                `json:"csqtt_auto_turn"`
 	TurnServer              string              `json:"turn_server"`
 	TurnPort                string              `json:"turn_port"`
 	CredPoolCooldownSeconds int                 `json:"cred_pool_cooldown_seconds"`
@@ -502,6 +503,9 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 	transport := "tcp"
 	if cfg.UseUDP {
 		transport = "udp"
+	}
+	if cfg.AutoTURN {
+		transport = "auto"
 	}
 	gen, salt := csqttNextIdentity(dir)
 	adapter := &csqttPoolAdapter{pool: pool, fatal: e.fail}

@@ -162,6 +162,7 @@ extension TunnelConfig {
             csqttPassword: s.csqttPassword,
             csqttDeviceID: s.csqttDeviceID,
             useUDP: s.useUDP,
+            csqttAutoTURN: s.csqttAutoTURN,
             forceLegacyCaptcha: d.bool(forKey: "forceLegacyCaptcha"),
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
@@ -2908,6 +2909,7 @@ class TunnelManager: ObservableObject {
             "peer_addr": config.peerAddress,
             "use_dtls": config.useDTLS,
             "use_udp": config.useUDP,
+            "csqtt_auto_turn": config.useCsqtt && config.csqttAutoTURN,
             "force_legacy_captcha": config.forceLegacyCaptcha,
             "uplink_synth_mbit": config.uplinkSynthMbit,
             "uplink_synth_sec": config.uplinkSynthSec,
@@ -3454,6 +3456,7 @@ struct TunnelConfig {
     // Bonus: some ISP whitelists drop UDP entirely but pass TCP, so this
     // also helps for that class of restricted networks.
     var useUDP: Bool = false
+    var csqttAutoTURN: Bool = false
     // forceLegacyCaptcha: on-device captcha-test toggle (build 149) — skip the
     // captcha-free VK Calls path so the legacy captchaNotRobot.* solver runs.
     // Settings › Advanced › Diagnostics since build 212; before that it was

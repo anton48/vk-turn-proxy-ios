@@ -3,6 +3,7 @@
 package csqtt
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -81,6 +82,15 @@ func closeRelayBounded(ctl net.PacketConn, relayConn io.Closer, tcClose func()) 
 // a successful return handed that seat straight to the next taker, whose
 // Allocate was refused with 486 (the user's review of build 430).
 func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLevel logging.LogLevel, allocated func()) (*Relay, error) {
+	return DialRelayContext(context.Background(), creds, peer, transport, logLevel, allocated)
+}
+
+// DialRelayContext bounds socket creation, allocation and permission together.
+// Cancellation owns the control socket until the allocation is returned.
+func DialRelayContext(ctx context.Context, creds TURNCredentials, peer *net.UDPAddr, transport string, logLevel logging.LogLevel, allocated func()) (*Relay, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var ctl net.PacketConn
 	switch transport {
 	case "udp":
@@ -90,7 +100,7 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 		}
 		ctl = uc
 	case "tcp":
-		tcp, err := (&net.Dialer{Timeout: 5 * time.Second}).Dial("tcp4", creds.Address)
+		tcp, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp4", creds.Address)
 		if err != nil {
 			return nil, fmt.Errorf("dial tcp to relay: %w", err)
 		}
@@ -114,6 +124,21 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 		_ = ctl.Close()
 		return nil, fmt.Errorf("turn.NewClient: %w", err)
 	}
+	cancelled := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = ctl.Close()
+		tc.Close()
+		close(cancelled)
+	})
+	var finishOnce sync.Once
+	finish := func() {
+		finishOnce.Do(func() {
+			if !stopCancel() {
+				<-cancelled
+			}
+		})
+	}
+	defer finish()
 	if err := tc.Listen(); err != nil {
 		tc.Close()
 		_ = ctl.Close()
@@ -129,10 +154,13 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 		allocated()
 	}
 	if err := tc.CreatePermission(peer); err != nil {
-		_ = relay.Close()
-		tc.Close()
-		_ = ctl.Close()
+		closeRelayBounded(ctl, relay, tc.Close)
 		return nil, fmt.Errorf("turn create permission: %w", err)
+	}
+	finish()
+	if ctx.Err() != nil {
+		closeRelayBounded(ctl, relay, tc.Close)
+		return nil, ctx.Err()
 	}
 	return &Relay{
 		Conn:  relay,
