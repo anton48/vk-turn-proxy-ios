@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cacggghp/vk-turn-proxy/pkg/proxy/srtpwrap"
+	"github.com/pion/stun/v3"
 	"github.com/pion/turn/v5"
 )
 
@@ -365,25 +366,43 @@ func (f closerFunc) Close() error { return f() }
 
 // ---- end to end ------------------------------------------------------------
 
-// laggingRelay is a pion TURN server on loopback UDP that answers a deallocate
-// at once and keeps the seat on the quota for `lag` more — the VK relay's shape —
-// behind the tap, which sees the authenticated deallocates pass. It counts the
-// Allocates it refused.
+// laggingRelay is a pion TURN server on loopback — UDP, or TCP as production
+// runs — that answers a deallocate at once and keeps the seat on the quota for
+// `lag` more — the VK relay's shape, measured on both transports — behind a tap,
+// which sees the authenticated deallocates pass. A connection that is CLOSED
+// with no deallocate holds nothing: pion's server drops the allocation of a TCP
+// connection at its EOF, as the VK relay does (measured, 24 of 24). It counts
+// the Allocates it refused.
 type laggingRelay struct {
-	tap     *deallocTap
+	addr    string // where the clients dial: the tap in front of the relay
 	srv     *turn.Server
 	refused atomic.Int32
+	drop    func(n int, rst bool) int // TCP only: the relay drops n of its connections — an RST, or a FIN; how many it had to drop
+	seen    func() int                // deallocates that reached the tap, authenticated or not
 
 	mu    sync.Mutex
 	freed map[string]time.Time // client socket → when its authenticated deallocate passed
 }
 
-func newLaggingRelay(t *testing.T, quota int, lag time.Duration, known func(string) bool) *laggingRelay {
+func newLaggingRelay(t *testing.T, quota int, lag time.Duration, known func(string) bool, overUDP bool) *laggingRelay {
 	t.Helper()
 	lr := &laggingRelay{freed: map[string]time.Time{}}
-	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	var pcs []turn.PacketConnConfig
+	var lns []turn.ListenerConfig
+	var relayAddr string
+	gen := &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"}
+	if overUDP {
+		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pcs, relayAddr = []turn.PacketConnConfig{{PacketConn: pc, RelayAddressGenerator: gen}}, pc.LocalAddr().String()
+	} else {
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lns, relayAddr = []turn.ListenerConfig{{Listener: ln, RelayAddressGenerator: gen}}, ln.Addr().String()
 	}
 	var srvRef atomic.Pointer[turn.Server]
 	srv, err := turn.NewServer(turn.ServerConfig{
@@ -413,10 +432,8 @@ func newLaggingRelay(t *testing.T, quota int, lag time.Duration, known func(stri
 			lr.refused.Add(1)
 			return false
 		},
-		PacketConnConfigs: []turn.PacketConnConfig{{
-			PacketConn:            pc,
-			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"},
-		}},
+		PacketConnConfigs: pcs,
+		ListenerConfigs:   lns,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -430,8 +447,7 @@ func newLaggingRelay(t *testing.T, quota int, lag time.Duration, known func(stri
 		}
 		_ = srv.Close()
 	})
-	lr.tap = newDeallocTap(t, pc.LocalAddr().String(), 0)
-	lr.tap.onDealloc = func(from string, authenticated bool) {
+	onDealloc := func(from string, authenticated bool) {
 		if !authenticated {
 			return
 		}
@@ -441,7 +457,142 @@ func newLaggingRelay(t *testing.T, quota int, lag time.Duration, known func(stri
 		}
 		lr.mu.Unlock()
 	}
+	if overUDP {
+		tap := newDeallocTap(t, relayAddr, 0)
+		tap.onDealloc = onDealloc
+		lr.addr, lr.seen = tap.addr(), func() int { return int(tap.seen.Load()) }
+		return lr
+	}
+	tap := newTCPDeallocTap(t, relayAddr, onDealloc)
+	lr.addr, lr.drop, lr.seen = tap.addr(), tap.drop, func() int { return int(tap.seen.Load()) }
 	return lr
+}
+
+// givenBack is how many seats the relay has been given back with credentials —
+// what its second applies to.
+func (lr *laggingRelay) givenBack() int {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	return len(lr.freed)
+}
+
+// tcpDeallocTap is deallocTap's TCP counterpart: a connection of its own to the
+// relay for every client connection, the client's byte stream cut into TURN
+// frames by pion's own framing (STUN messages and ChannelData alike) and handed
+// on frame by frame, so that a deallocate is SEEN — and told, before it is
+// handed on — wherever it sits in the stream. When either side ends, both
+// connections are closed: the relay meets an EOF, as it does in the field.
+type tcpDeallocTap struct {
+	ln        net.Listener
+	relay     string
+	onDealloc func(from string, authenticated bool)
+	seen      atomic.Int32
+
+	mu    sync.Mutex
+	pairs map[net.Conn]net.Conn // client side → relay side, while both are open
+}
+
+func newTCPDeallocTap(t *testing.T, relay string, onDealloc func(string, bool)) *tcpDeallocTap {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tap := &tcpDeallocTap{ln: ln, relay: relay, onDealloc: onDealloc, pairs: map[net.Conn]net.Conn{}}
+	go tap.serve()
+	t.Cleanup(tap.close)
+	return tap
+}
+
+func (tap *tcpDeallocTap) addr() string { return tap.ln.Addr().String() }
+
+func (tap *tcpDeallocTap) serve() {
+	for {
+		c, err := tap.ln.Accept()
+		if err != nil {
+			return
+		}
+		up, err := net.Dial("tcp4", tap.relay)
+		if err != nil {
+			_ = c.Close()
+			return
+		}
+		tap.mu.Lock()
+		tap.pairs[c] = up
+		tap.mu.Unlock()
+		end := func() {
+			tap.mu.Lock()
+			delete(tap.pairs, c)
+			tap.mu.Unlock()
+			_ = c.Close()
+			_ = up.Close()
+		}
+		go func() { // client → relay, frame by frame
+			defer end()
+			frames, buf, from := turn.NewSTUNConn(c), make([]byte, 64<<10), c.RemoteAddr().String()
+			for {
+				n, _, err := frames.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				if isDeallocate(buf[:n]) {
+					tap.seen.Add(1)
+					m := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+					tap.onDealloc(from, m.Decode() == nil && m.Contains(stun.AttrMessageIntegrity))
+				}
+				if _, err := up.Write(buf[:n]); err != nil {
+					return
+				}
+			}
+		}()
+		go func() { // relay → client, as it comes
+			defer end()
+			buf := make([]byte, 64<<10)
+			for {
+				n, err := up.Read(buf)
+				if n > 0 {
+					if _, werr := c.Write(buf[:n]); werr != nil {
+						return
+					}
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+}
+
+// drop is the relay dropping n of its client connections — the hard way, an RST
+// (the client's next write fails), or with a FIN. The relay side is closed with
+// it, so the relay meets an EOF and lets the allocation go at once.
+func (tap *tcpDeallocTap) drop(n int, rst bool) int {
+	tap.mu.Lock()
+	defer tap.mu.Unlock()
+	done := 0
+	for c, up := range tap.pairs {
+		if done == n {
+			break
+		}
+		if tc, ok := c.(*net.TCPConn); ok && rst {
+			_ = tc.SetLinger(0)
+		}
+		_ = c.Close()
+		_ = up.Close()
+		delete(tap.pairs, c)
+		done++
+	}
+	return done
+}
+
+func (tap *tcpDeallocTap) close() {
+	_ = tap.ln.Close()
+	tap.mu.Lock()
+	defer tap.mu.Unlock()
+	for c, up := range tap.pairs {
+		_ = c.Close()
+		_ = up.Close()
+	}
 }
 
 // srtpPeer is the far end of the production session: the repo's own SRTP server
@@ -486,13 +637,13 @@ type tenOnOneIdentity struct {
 	kills map[int]context.CancelFunc
 }
 
-func newTenOnOneIdentity(t *testing.T, lag time.Duration) *tenOnOneIdentity {
+func newTenOnOneIdentity(t *testing.T, lag time.Duration, overUDP bool) *tenOnOneIdentity {
 	t.Helper()
 	user := fmt.Sprintf("%d:stand", time.Now().Add(8*time.Hour).Unix())
-	s := &tenOnOneIdentity{relay: newLaggingRelay(t, connsPerSlot, lag, func(u string) bool { return u == user }), kills: map[int]context.CancelFunc{}}
+	s := &tenOnOneIdentity{relay: newLaggingRelay(t, connsPerSlot, lag, func(u string) bool { return u == user }, overUDP), kills: map[int]context.CancelFunc{}}
 	peer := srtpPeer(t)
-	creds := &TURNCreds{Username: user, Password: "pw", Address: s.relay.tap.addr(), Addresses: []string{s.relay.tap.addr()}}
-	p := NewProxy(Config{UseSrtp: true, UseUDP: true, NumConns: connsPerSlot, PeerAddr: peer.String(), SeededTURN: creds})
+	creds := &TURNCreds{Username: user, Password: "pw", Address: s.relay.addr, Addresses: []string{s.relay.addr}}
+	p := NewProxy(Config{UseSrtp: true, UseUDP: overUDP, NumConns: connsPerSlot, PeerAddr: peer.String(), SeededTURN: creds})
 	p.peer = peer
 	p.credPool = newCredPool(p.ctx, poolSizeForNumConns(connsPerSlot), 0, "", func(bool, int) (string, *TURNCreds, error) {
 		return "", nil, errors.New("the stand mints nothing: one identity is all there is")
@@ -550,23 +701,38 @@ func (s *tenOnOneIdentity) kill(connIdx int) {
 // and is accepted: the relay refuses nothing.
 func TestAKilledSessionsRedialIsNotRefusedOverTheRelaysSecond(t *testing.T) {
 	shortSecond(t, 500*time.Millisecond, 1500*time.Millisecond)
-	s := newTenOnOneIdentity(t, 300*time.Millisecond)
-	s.kill(3)
-	waitUntil(t, "the killed session to be gone", 5*time.Second, func() bool { return s.relay.srv.AllocationCount() == connsPerSlot-1 })
-	back := s.backWithin(10 * time.Second)
-	if n := s.relay.refused.Load(); n != 0 {
-		t.Errorf("the relay REFUSED %d Allocate(s) — the re-dial reached it inside the second it still held the seat", n)
-	}
-	if slotSaturated(s.p.credPool, 0) {
-		t.Error("slot 0 is benched as VK-saturated over the relay's own second")
-	}
-	if refusals, _ := s.p.credPool.quotaSnapshot(); refusals != 0 {
-		t.Errorf("the pool was told of %d quota refusal(s), want none", refusals)
-	}
-	if !back {
-		t.Error("the connection was not back on the identity within 10 s")
+	for _, tr := range relayTransports {
+		t.Run(tr.name, func(t *testing.T) {
+			s := newTenOnOneIdentity(t, 300*time.Millisecond, tr.udp)
+			s.kill(3)
+			waitUntil(t, "the killed session to be gone", 5*time.Second, func() bool { return s.relay.srv.AllocationCount() == connsPerSlot-1 })
+			back := s.backWithin(10 * time.Second)
+			if n := s.relay.givenBack(); n != 1 {
+				t.Errorf("fixture: %d authenticated deallocate(s) passed the tap, want the killed session's one — without it the relay's second was never in play, and a relay that refuses nothing proves nothing", n)
+			}
+			if n := s.relay.refused.Load(); n != 0 {
+				t.Errorf("the relay REFUSED %d Allocate(s) — the re-dial reached it inside the second it still held the seat", n)
+			}
+			if slotSaturated(s.p.credPool, 0) {
+				t.Error("slot 0 is benched as VK-saturated over the relay's own second")
+			}
+			if refusals, _ := s.p.credPool.quotaSnapshot(); refusals != 0 {
+				t.Errorf("the pool was told of %d quota refusal(s), want none", refusals)
+			}
+			if !back {
+				t.Error("the connection was not back on the identity within 10 s")
+			}
+		})
 	}
 }
+
+// The relay leg's two transports: UDP, where the deallocate is confirmed (428),
+// and TCP — what production runs — where it is pion's one write and the socket
+// is closed behind it. The relay's second is the same on both (measured).
+var relayTransports = []struct {
+	name string
+	udp  bool
+}{{"UDP", true}, {"TCP — the production transport", false}}
 
 // …and when the margin IS missed — here the pool's second is shorter than the
 // relay's — the 486 that follows is read for what it is: the slot is not benched,
@@ -574,21 +740,85 @@ func TestAKilledSessionsRedialIsNotRefusedOverTheRelaysSecond(t *testing.T) {
 // slot benched there is no way back on this stand: one identity is all it has.)
 func TestA486InsideTheRelaysSecondDoesNotBenchTheSlot(t *testing.T) {
 	shortSecond(t, 50*time.Millisecond, 3*time.Second)
-	s := newTenOnOneIdentity(t, 600*time.Millisecond)
-	s.kill(6)
-	waitUntil(t, "the re-dial to be refused inside the relay's second", 5*time.Second, func() bool { return s.relay.refused.Load() >= 1 })
-	back := s.backWithin(15 * time.Second)
-	if slotSaturated(s.p.credPool, 0) {
-		t.Error("slot 0 is benched as VK-saturated over a 486 inside the relay's own second")
+	for _, tr := range relayTransports {
+		t.Run(tr.name, func(t *testing.T) {
+			s := newTenOnOneIdentity(t, 600*time.Millisecond, tr.udp)
+			s.kill(6)
+			waitUntil(t, "the re-dial to be refused inside the relay's second", 5*time.Second, func() bool { return s.relay.refused.Load() >= 1 })
+			back := s.backWithin(15 * time.Second)
+			if slotSaturated(s.p.credPool, 0) {
+				t.Error("slot 0 is benched as VK-saturated over a 486 inside the relay's own second")
+			}
+			if !back {
+				t.Error("the connection was not back on the identity within 15 s")
+			}
+			s.p.credPool.mu.Lock()
+			lag := s.p.credPool.seat.lagRefusals
+			s.p.credPool.mu.Unlock()
+			if lag < 1 {
+				t.Errorf("%d refusal(s) read as the relay's second, want at least 1", lag)
+			}
+		})
 	}
-	if !back {
-		t.Error("the connection was not back on the identity within 15 s")
-	}
-	s.p.credPool.mu.Lock()
-	lag := s.p.credPool.seat.lagRefusals
-	s.p.credPool.mu.Unlock()
-	if lag < 1 {
-		t.Errorf("%d refusal(s) read as the relay's second, want at least 1", lag)
+}
+
+// The rule's other half on the REAL teardown, over TCP: a session whose
+// connection the relay has RESET cannot even write its deallocate — and the relay
+// holds nothing for a connection it has lost (it lets the allocation go at the
+// EOF, as the VK relay does: measured, 24 of 24) — so nothing is noted and the
+// lease goes back at once. The control: the same session on a healthy connection
+// writes its deallocate — pion's ONE, the confirmed deallocate is for UDP — and
+// notes it. (A FIN instead of an RST is not pinned: whether the deallocate can
+// still be written depends on whether the RST that answers the teardown's EARLIER
+// write — the SRTP layer's close — is back yet. On loopback it is: 5 of 5, nothing
+// noted. Over a real round trip it would not be: noted, the seat cooled. This
+// side cannot tell, and either way is safe.)
+func TestOverTCPASessionTheRelayDroppedNotesNoGiveBack(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		reset bool
+		noted bool
+	}{
+		{"the control: a healthy connection — the deallocate is written, and noted", false, true},
+		{"the relay reset the connection — nothing can be written, nothing is noted", true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			user := fmt.Sprintf("%d:stand", time.Now().Add(8*time.Hour).Unix())
+			relay := newLaggingRelay(t, 1, 0, func(u string) bool { return u == user }, false)
+			peer := srtpPeer(t)
+			p := NewProxy(Config{UseSrtp: true, UseUDP: false, NumConns: 1, PeerAddr: peer.String()})
+			p.peer = peer
+			t.Cleanup(p.cancel)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			var gave gaveBack
+			conn, err := p.setupSRTPSession(ctx, relay.addr, &TURNCreds{Username: user, Password: "pw"}, 0, 0, &gave)
+			if err != nil {
+				t.Fatalf("fixture: the session did not come up over TCP: %v", err)
+			}
+			defer p.sockStats.unregister(0)
+			if c.reset {
+				if n := relay.drop(1, true); n != 1 {
+					t.Fatalf("fixture: the relay reset %d connection(s), want 1", n)
+				}
+				waitUntil(t, "the relay to let go of the connection it dropped", 3*time.Second, func() bool { return relay.srv.AllocationCount() == 0 })
+				time.Sleep(100 * time.Millisecond) // the RST is this side's by now
+			}
+			_ = conn.Close()
+			if _, noted := gave.take(); noted != c.noted {
+				t.Errorf("a give-back noted = %v, want %v", noted, c.noted)
+			}
+			if !c.reset {
+				waitUntil(t, "pion's deallocate to reach the relay", 2*time.Second, func() bool { return relay.seen() >= 1 })
+				time.Sleep(100 * time.Millisecond)
+				if n := relay.seen(); n != 1 {
+					t.Errorf("%d deallocates reached the TCP relay at the teardown, want pion's one", n)
+				}
+				if ok, not := p.dealloc.confirmed.Load(), p.dealloc.unconfirmed.Load(); ok != 0 || not != 0 {
+					t.Errorf("the confirmed deallocate ran over TCP (%d confirmed, %d not) — it is for a UDP relay leg only", ok, not)
+				}
+			}
+		})
 	}
 }
 
