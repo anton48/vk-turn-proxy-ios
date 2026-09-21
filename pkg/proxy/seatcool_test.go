@@ -270,29 +270,50 @@ func TestThePoolsSecondOutlastsTheRelays(t *testing.T) {
 // for this session: over UDP its own word (437), over TCP a deallocate that
 // could not even be written — the connection is gone.
 func TestReturnAllocationNotesWhatTheRelayStillHolds(t *testing.T) {
+	const (
+		nothing = iota // the seat is free at once
+		second         // given back: the relay's second
+		hold           // out of reach: counted until the allocation can have expired
+	)
+	heard := func(d time.Duration) func(*gaveBack) { return func(g *gaveBack) { g.life.granted(d) } }
+	disowned := func(g *gaveBack) { g.life.gone.Store(true) }
 	for _, c := range []struct {
 		what     string
 		release  func() deallocVerdict
 		closeErr error
-		noted    bool
+		before   func(*gaveBack)
+		want     int
 	}{
-		{"UDP: confirmed", func() deallocVerdict { return deallocConfirmed }, nil, true},
-		{"UDP: 437 — the relay holds nothing for this socket", func() deallocVerdict { return deallocGone }, nil, false},
-		{"UDP: unanswered — cannot tell", func() deallocVerdict { return deallocUnanswered }, errors.New("closed"), true},
-		{"UDP: refused — cannot tell", func() deallocVerdict { return deallocRefused }, nil, true},
-		{"TCP: the deallocate was written", nil, nil, true},
-		{"TCP: the write failed — the connection is gone, and its seat with it", nil, errors.New("write: broken pipe"), false},
+		{"UDP: confirmed", func() deallocVerdict { return deallocConfirmed }, nil, nil, second},
+		{"UDP: 437, a lifetime heard and not run out — the allocation may live on under another mapping", func() deallocVerdict { return deallocGone }, nil, heard(10 * time.Minute), hold},
+		{"UDP: 437, the lifetime run out BY THE CLOCK — the 437 is honest, the seat free", func() deallocVerdict { return deallocGone }, nil, heard(-time.Second), nothing},
+		{"UDP: 437, no lifetime heard — a whole assumed one", func() deallocVerdict { return deallocGone }, nil, nil, hold},
+		{"UDP: unanswered — cannot tell", func() deallocVerdict { return deallocUnanswered }, errors.New("closed"), nil, second},
+		{"UDP: unanswered on a socket the relay had already disowned (its permission refresh answered 400)", func() deallocVerdict { return deallocUnanswered }, nil, disowned, hold},
+		{"UDP: refused — cannot tell", func() deallocVerdict { return deallocRefused }, nil, nil, second},
+		{"TCP: the deallocate was written", nil, nil, nil, second},
+		{"TCP: the write failed — the connection is gone, and its seat with it", nil, errors.New("write: broken pipe"), nil, nothing},
 	} {
 		var gave gaveBack
+		if c.before != nil {
+			c.before(&gave)
+		}
 		order := ""
 		release := c.release
 		if release != nil {
 			inner := release
 			release = func() deallocVerdict { order += "release "; return inner() }
 		}
+		now := time.Now()
 		err := returnAllocation(closerFunc(func() error { order += "close"; return c.closeErr }), release, &gave)
-		if _, noted := gave.take(); noted != c.noted {
-			t.Errorf("%s: a give-back noted = %v, want %v", c.what, noted, c.noted)
+		until, held := gave.takeHold()
+		_, noted := gave.take()
+		got := map[[2]bool]int{{false, false}: nothing, {true, false}: second, {false, true}: hold, {true, true}: -1}[[2]bool{noted, held}]
+		if got != c.want {
+			t.Errorf("%s: a give-back noted = %v, a hold noted = %v — want %s", c.what, noted, held, [...]string{"nothing", "the second alone", "the hold alone"}[c.want])
+		}
+		if held && (until.Before(now.Add(9*time.Minute)) || until.After(now.Add(11*time.Minute))) {
+			t.Errorf("%s: held for %s, want the ten minutes of the lifetime", c.what, until.Sub(now).Round(time.Second))
 		}
 		if !errors.Is(err, c.closeErr) {
 			t.Errorf("%s: returned %v, want the relay conn's close error %v", c.what, err, c.closeErr)
@@ -302,6 +323,7 @@ func TestReturnAllocationNotesWhatTheRelayStillHolds(t *testing.T) {
 		}
 	}
 	returnAllocation(closerFunc(func() error { return nil }), nil, nil) // a caller with no note to take (a test's direct runTURN) must not trip it
+	returnAllocation(closerFunc(func() error { return nil }), func() deallocVerdict { return deallocGone }, nil)
 }
 
 // …at the one teardown the stands above do not pass through: the ABORT of an SRTP

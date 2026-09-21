@@ -1345,6 +1345,10 @@ type credPool struct {
 	// quota is the relay-refusal breaker — see quotabreaker.go.
 	quota quotaBreaker
 
+	// The pool's own context: what outlives a moment (a held seat's release —
+	// seatcool.go) stops with it. nil in a test's literal pool.
+	ctx context.Context
+
 	// The relay's second — seatcool.go: when a seat was last given back on
 	// (slot, credential), and what that second has cost and saved. Under cp.mu.
 	gaveBackAt map[leaseKey]time.Time
@@ -1629,6 +1633,7 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 		cooldown = 2 * time.Minute
 	}
 	cp := &credPool{
+		ctx:       ctx,
 		size:      size,
 		cooldown:  cooldown,
 		cachePath: cachePath,

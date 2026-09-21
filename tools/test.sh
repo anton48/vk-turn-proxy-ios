@@ -35,6 +35,13 @@ run() {
 goflags=(-count=1)
 [ "$RACE" = "1" ] && goflags+=(-race)
 
+# 🚨 THE GATE RUNS THE SLOW TESTS TOO. A test that waits for a library's own
+# timer (pion refreshes a permission every 120 s) skips itself unless VKTP_SLOW is
+# set, so that a bare `go test` stays quick -- and a test that only a human or a
+# sabotage runner ever switches on is a test the gate cannot see. It costs this
+# script about two minutes. VKTP_SLOW= ./tools/test.sh leaves them out.
+export VKTP_SLOW=${VKTP_SLOW-1}
+
 # 🚨 MAKE THE MACHINE READY, DO NOT ASSUME IT IS. The fork's
 # TestForkDivergesFromUpstreamExactlyHere diffs the vendored tree against
 # PRISTINE upstream, which it reads from the module cache. On a clean checkout

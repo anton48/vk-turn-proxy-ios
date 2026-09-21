@@ -2388,6 +2388,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
+	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
 	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
 
 	// Start TURN relay FIRST — DTLS handshake goes through it.
@@ -2907,6 +2908,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
+	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
 	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
 
 	// The relay leg IS this session's transport; it is JOINED before the session
@@ -3086,6 +3088,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
+	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
 	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
 
 	// TURN relay underneath (conn2 ↔ VK relay). Same pattern as
@@ -3406,24 +3409,28 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		Username:               creds.Username,
 		Password:               creds.Password,
 		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: slotIdx},
+		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: slotIdx, life: gave.lifeOf()},
 	}
 
 	client, err := turn.NewClient(cfg)
 	if err != nil {
 		return fmt.Errorf("TURN client: %w", err)
 	}
-	defer client.Close()
+	// Whatever asks the relay on this allocation's behalf (outofreach.go) is
+	// joined behind the client's Close, which ends a pending question.
+	defer func() { client.Close(); gave.lifeOf().wait() }()
 
 	if err = client.Listen(); err != nil {
 		return fmt.Errorf("TURN listen: %w", err)
 	}
 
 	allocStart := time.Now()
+	gave.lifeOf().fresh()
 	relayConn, err := client.Allocate()
 	if err != nil {
 		return fmt.Errorf("TURN allocate: %w", err)
 	}
+	gave.lifeOf().askMappingAtAllocate(client)
 	// The relay accepted this identity: mark it NOW, before anything
 	// downstream — the permission, a handshake, the session above — can be
 	// delayed or fail. The mark means the allocation, not the session, and it
@@ -4537,21 +4544,27 @@ type turnLoggerFactory struct {
 	// runDirectSession path). Loggers inherit it so per-slot auth-error
 	// attribution works when pion logs a 401/403 — see turnLogger.maybeFlagAuthError.
 	slot int
+	// life is what the SESSION whose client this factory logs for keeps of its
+	// allocation's life at the relay — pion's lines are the only place a
+	// refresh's outcome is heard (outofreach.go). nil = no bookkeeping.
+	life *allocLife
 }
 
 func (f *turnLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
-	return &turnLogger{scope: scope, proxy: f.proxy, slot: f.slot}
+	return &turnLogger{scope: scope, proxy: f.proxy, slot: f.slot, life: f.life}
 }
 
 type turnLogger struct {
 	scope string
 	proxy *Proxy
 	slot  int
+	life  *allocLife
 }
 
 func (l *turnLogger) Trace(msg string)                          {}
 func (l *turnLogger) Tracef(format string, args ...interface{}) {}
 func (l *turnLogger) Debug(msg string) {
+	l.life.heardDebug(msg)
 	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") ||
 		strings.Contains(msg, "Failed to read") || strings.Contains(msg, "Failed to handle") || strings.Contains(msg, "Exiting loop") {
 		log.Printf("pion/%s: %s", l.scope, msg)
@@ -4559,6 +4572,7 @@ func (l *turnLogger) Debug(msg string) {
 }
 func (l *turnLogger) Debugf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
+	l.life.heardDebug(msg)
 	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") || strings.Contains(msg, "ifetime") ||
 		strings.Contains(msg, "Failed to read") || strings.Contains(msg, "Failed to handle") || strings.Contains(msg, "Exiting loop") {
 		log.Printf("pion/%s: %s", l.scope, msg)
@@ -4570,23 +4584,27 @@ func (l *turnLogger) Warn(msg string) {
 	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
+	l.life.heardError(msg)
 }
 func (l *turnLogger) Warnf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
+	l.life.heardError(msg)
 }
 func (l *turnLogger) Error(msg string) {
 	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
+	l.life.heardError(msg)
 }
 func (l *turnLogger) Errorf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
+	l.life.heardError(msg)
 }
 
 // maybeCountTransientError bumps the per-Proxy silent-degradation counter when
@@ -4942,6 +4960,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	// abort of its setup — the lease is released behind the relay's second
 	// (seatcool.go).
 	var gave gaveBack
+	gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
 	defer func() { p.releaseLease(currentSlot, currentCreds, &gave) }()
 
 	// Set up TURN allocation and DTLS-SRTP handshake to the peer.
@@ -5332,7 +5351,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		Realm:          "okcdn.ru",
 		Software:       "vk-turn-srtp",
 		// Custom factory (not pion's default LogLevelError) so SRTP-path TURN refresh/auth failures feed the silent-degradation watchdog + get sanitized, matching runTURN.
-		LoggerFactory: &turnLoggerFactory{proxy: p, slot: credSlot},
+		LoggerFactory: &turnLoggerFactory{proxy: p, slot: credSlot, life: gave.lifeOf()},
 		// Match the relay family to the peer (see addrFamilyFor) — was
 		// hardcoded IPv4, which 443'd ("Peer Address Family Mismatch") on an
 		// IPv6 peer (e.g. a DNS name resolving to AAAA) — issue #39.
@@ -5349,12 +5368,14 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	}
 
 	allocStart := time.Now()
+	gave.lifeOf().fresh()
 	relayConn, err := tc.Allocate()
 	if err != nil {
 		tc.Close()
 		_ = ctlConn.Close()
 		return nil, fmt.Errorf("turn allocate: %w", err)
 	}
+	gave.lifeOf().askMappingAtAllocate(tc) // how the relay sees this socket while the allocation is fresh — outofreach.go
 	// The relay accepted this identity: mark it NOW, before the permission
 	// and the SRTP handshake — the mark means the allocation, not the
 	// session, and names the credential, not the slot (quotabreaker.go; see
@@ -5417,6 +5438,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		_ = ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget)) // the deallocate goes out under a budget, hook or no hook
 		_ = returnAllocation(relayConn, release, gave)                      // confirmed over UDP, and NOTED for the pool — seatcool.go
 		tc.Close()
+		gave.lifeOf().wait() // nothing of this allocation's is left asking the relay — outofreach.go
 		_ = ctlConn.Close()
 	}
 	if err := tc.CreatePermission(p.peer); err != nil {
@@ -5505,6 +5527,7 @@ func (s *srtpSessionConn) Close() error {
 			firstErr = err
 		}
 		s.tc.Close()
+		s.gave.lifeOf().wait() // nothing of this allocation's is left asking the relay — outofreach.go
 		if err := s.ctlConn.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
