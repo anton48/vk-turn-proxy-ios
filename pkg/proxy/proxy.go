@@ -282,6 +282,10 @@ type Proxy struct {
 	// the retry floor asks about (retryfloor.go).
 	ups sessionUps
 
+	// dealloc counts what became of the confirmed deallocates over a UDP relay
+	// leg (dealloc.go).
+	dealloc deallocStats
+
 	// sessionHook, when set, stands in for the transport's session function —
 	// the first arm of runConnection's dispatch: the seam the retry-floor herd
 	// test drives. Nil in production.
@@ -3429,6 +3433,14 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		p.noteSessionUp(connIdx)
 	}
 	defer relayConn.Close()
+	if p.config.UseUDP {
+		// Over a UDP relay leg the allocation is given back by a deallocate the
+		// relay CONFIRMS, before the relay conn is closed: this function — and
+		// with it the session above, and its restart — returns after the relay's
+		// answer, not ahead of a datagram (dealloc.go). Registered between the two
+		// defers around it: LIFO runs the budget first, then this, then Close.
+		defer p.releaseAllocation(client, creds, connIdx)
+	}
 	// Registered AFTER relayConn.Close's defer, so LIFO runs it FIRST: the
 	// deallocate that Close writes goes out under relayCloseWriteBudget on
 	// the control socket, instead of holding this goroutine (and the socket
@@ -5379,9 +5391,19 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		})
 	}
 	defer quiesce()
+	// Over a UDP relay leg the allocation is given back by a deallocate the
+	// relay CONFIRMS, before the relay conn is closed — here and in the live
+	// session's Close alike (dealloc.go). Nil over TCP.
+	var release func()
+	if p.config.UseUDP {
+		release = func() { p.releaseAllocation(tc, creds, connIdx) }
+	}
 	abortSetup := func() {
 		quiesce()
 		_ = ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget)) // the deallocate goes out under a budget, hook or no hook
+		if release != nil {
+			release()
+		}
 		_ = relayConn.Close()
 		tc.Close()
 		_ = ctlConn.Close()
@@ -5406,6 +5428,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		relayConn: relayConn,
 		tc:        tc,
 		ctlConn:   ctlConn,
+		release:   release,
 	}, nil
 }
 
@@ -5417,6 +5440,7 @@ type srtpSessionConn struct {
 	relayConn net.PacketConn
 	tc        turnSessionClient // *turn.Client; an interface so a test can close without a server
 	ctlConn   net.PacketConn
+	release   func() // the confirmed deallocate, run before relayConn is closed — over a UDP relay leg only, nil otherwise (dealloc.go)
 
 	closeOnce sync.Once
 }
@@ -5458,6 +5482,12 @@ func (s *srtpSessionConn) Close() error {
 		_ = s.ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
 		if err := s.Conn.Close(); err != nil {
 			firstErr = err
+		}
+		if s.release != nil {
+			// Over UDP: the relay's ANSWER to the deallocate, before anything
+			// below closes — Close returns after it, and so does the session,
+			// and only then does its connection re-dial (dealloc.go).
+			s.release()
 		}
 		if err := s.relayConn.Close(); err != nil && firstErr == nil {
 			firstErr = err
