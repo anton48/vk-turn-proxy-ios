@@ -29,17 +29,24 @@ import (
 // it holds `quota` allocations.
 func udpQuotaTURN(t *testing.T, quota int) (string, *turn.Server) {
 	t.Helper()
+	return udpQuotaTURNFor(t, quota, func(username string) bool { return username == "u" })
+}
+
+// udpQuotaTURNFor is udpQuotaTURN with the usernames it knows a parameter (the
+// password is pw for each): a session that takes its credential from the POOL
+// needs a username of the pool's shape, an expiry in front.
+func udpQuotaTURNFor(t *testing.T, quota int, known func(username string) bool) (string, *turn.Server) {
+	t.Helper()
 	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := turn.GenerateAuthKey("u", "okcdn.ru", "pw")
 	var srvRef atomic.Pointer[turn.Server]
 	srv, err := turn.NewServer(turn.ServerConfig{
 		Realm: "okcdn.ru",
 		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
-			if ra.Username == "u" {
-				return "u", key, true
+			if known(ra.Username) {
+				return ra.Username, turn.GenerateAuthKey(ra.Username, "okcdn.ru", "pw"), true
 			}
 			return "", nil, false
 		},
@@ -79,6 +86,7 @@ type deallocTap struct {
 	mute     atomic.Bool
 	seen     atomic.Int32 // deallocates that reached the tap
 	passed   atomic.Int32 // … and were handed on to the relay
+	onPass   func()       // called right before a deallocate is handed on; set before the stand runs
 
 	mu  sync.Mutex
 	ups map[string]*net.UDPConn
@@ -152,8 +160,18 @@ func (tap *deallocTap) serve() {
 		case tap.dropNext.Load() > 0:
 			tap.dropNext.Add(-1)
 		case tap.delay > 0:
-			go func() { time.Sleep(tap.delay); tap.passed.Add(1); _, _ = up.Write(pkt) }()
+			go func() {
+				time.Sleep(tap.delay)
+				if tap.onPass != nil {
+					tap.onPass()
+				}
+				tap.passed.Add(1)
+				_, _ = up.Write(pkt)
+			}()
 		default:
+			if tap.onPass != nil {
+				tap.onPass()
+			}
 			tap.passed.Add(1)
 			_, _ = up.Write(pkt)
 		}
@@ -174,12 +192,17 @@ func (tap *deallocTap) close() {
 // It reports whether the relay ACCEPTED it, and gives the allocation back.
 func allocateNow(t *testing.T, tap *deallocTap) (accepted bool, err error) {
 	t.Helper()
+	return allocateNowAs(t, tap, "u")
+}
+
+func allocateNowAs(t *testing.T, tap *deallocTap, username string) (accepted bool, err error) {
+	t.Helper()
 	ctl, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ctl.Close()
-	tc, err := turn.NewClient(&turn.ClientConfig{TURNServerAddr: tap.addr(), Conn: ctl, Username: "u", Password: "pw", Realm: "okcdn.ru"})
+	tc, err := turn.NewClient(&turn.ClientConfig{TURNServerAddr: tap.addr(), Conn: ctl, Username: username, Password: "pw", Realm: "okcdn.ru"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +221,7 @@ func allocateNow(t *testing.T, tap *deallocTap) (accepted bool, err error) {
 			return nil, err
 		}
 		return res.Msg, nil
-	}, tc.Close, "u", "pw", 2*time.Second)
+	}, tc.Close, username, "pw", 2*time.Second)
 	_ = relayConn.Close()
 	return true, nil
 }

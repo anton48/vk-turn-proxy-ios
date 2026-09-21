@@ -26,8 +26,11 @@ package proxy
 // retransmits it (RTO 200 ms) — and WAITS for the answer, under a budget. The
 // session's teardown returns only then, and the restart, which begins once the
 // session function has returned, FOLLOWS the relay's answer instead of racing a
-// datagram. pion's own fire-and-forget deallocate still goes out afterwards
-// (the relay answers it with 437; nobody is listening by then).
+// datagram — for the SRTP session because its Close is this teardown, for the
+// sessions whose relay leg is runTURN in a goroutine of its own because they
+// JOIN it before they return (relayjoin.go). pion's own fire-and-forget
+// deallocate still goes out afterwards (the relay answers it with 437; nobody
+// is listening by then).
 //
 // Bounded: on a dead path nothing answers and a stop must not hang — after
 // deallocConfirmBudget the pending transaction is closed and the teardown goes
@@ -147,6 +150,7 @@ func boundedDeallocate(do stunRoundTrip, abort func(), username, password string
 type deallocStats struct {
 	confirmed, unconfirmed atomic.Int64
 	lastSummaryAt          atomic.Int64 // unix nanoseconds
+	legsLeft               atomic.Int64 // sessions that returned without their relay leg — relayjoin.go
 }
 
 // releaseAllocation is the confirmed deallocate of a session over a UDP relay

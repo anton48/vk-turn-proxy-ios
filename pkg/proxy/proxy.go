@@ -2348,8 +2348,8 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// Create AsyncPacketPipe: conn1 = DTLS transport, conn2 = TURN transport.
 	// One pipe per runDTLSSession invocation — the conns get torn down
 	// together when TURN or DTLS fails, and the outer runConnection loop
-	// re-enters runDTLSSession to build a fresh pair. See spawnTURN comment
-	// below for why we do NOT reuse pipes across TURN reconnects.
+	// re-enters runDTLSSession to build a fresh pair. See the comment at the
+	// relay leg's start below for why we do NOT reuse pipes across TURN reconnects.
 	conn1, conn2 := connutil.AsyncPacketPipe()
 	defer conn1.Close()
 	defer conn2.Close()
@@ -2409,18 +2409,17 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// it). See vpn.lte-wifi.0.log conn 27 around 00:50:18 — first TURN
 	// allocate succeeds but DTLS handshake never completes; conn 27's second
 	// allocate via the outer loop goes through DTLS in 57 ms.
-	spawnTURN := func(addr string, c *TURNCreds) chan error {
-		ch := make(chan error, 1)
-		go func() {
-			err := p.runTURN(connCtx, addr, c, conn2, connIdx, credSlot)
-			ch <- err
-			// Always cancel on TURN exit. Without TURN there's no DTLS
-			// transport, so the conn is dead either way.
-			connCancel()
-		}()
-		return ch
-	}
-	turnDone := spawnTURN(turnAddr, creds)
+	//
+	// The relay leg runs in a goroutine of its own and is JOINED before this
+	// session returns (relayjoin.go). On its exit it always cancels the session:
+	// without TURN there's no DTLS transport, so the conn is dead either way.
+	var leg relayLeg
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
+	// Registered BEHIND the credential's release above, so it runs BEFORE it, and
+	// ahead of every return below — the early ones too: the session gives its
+	// credential back, and its connection re-dials, only after the relay leg's
+	// teardown (over UDP: the relay's answer to the deallocate).
+	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
 	// DTLS handshake — packets go through conn1 → conn2 → TURN relay → peer
 	dtlsStart := time.Now()
@@ -2903,10 +2902,13 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	currentSlot, currentCreds := credSlot, creds
 	defer func() { p.credPool.release(currentSlot, currentCreds) }()
 
-	turnDone := make(chan error, 1)
-	go func() {
-		turnDone <- p.runTURN(connCtx, turnAddr, creds, conn2, connIdx, credSlot)
-	}()
+	// The relay leg IS this session's transport; it is JOINED before the session
+	// returns — behind the credential's release above, so ahead of it
+	// (relayjoin.go). The reconnect loop below starts the next one through the
+	// same leg.
+	var leg relayLeg
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, nil)
+	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
 	if readyCh != nil && !*signaled {
 		*signaled = true
@@ -2966,11 +2968,12 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				}
 				credSlot = newSlot
 				currentSlot, currentCreds = newSlot, newCreds
+				next, started := p.goRunTURN(connCtx, &leg, newAddr, newCreds, conn2, connIdx, newSlot, nil)
+				if !started {
+					return // the session is ending: nothing is started behind its join
+				}
 				log.Printf("proxy: [conn %d, cred %d] starting new direct TURN session", connIdx, credSlot)
-				turnDone = make(chan error, 1)
-				go func() {
-					turnDone <- p.runTURN(connCtx, newAddr, newCreds, conn2, connIdx, newSlot)
-				}()
+				turnDone = next
 				break
 			}
 			if retries >= 5 {
@@ -3075,19 +3078,14 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	currentSlot, currentCreds := credSlot, creds
 	defer func() { p.credPool.release(currentSlot, currentCreds) }()
 
-	// TURN relay underneath (conn2 ↔ VK relay). Same spawn pattern as
+	// TURN relay underneath (conn2 ↔ VK relay). Same pattern as
 	// runDTLSSession: any TURN exit cancels the conn so the outer loop
-	// rebuilds it.
-	spawnTURN := func(addr string, c *TURNCreds) chan error {
-		ch := make(chan error, 1)
-		go func() {
-			terr := p.runTURN(connCtx, addr, c, conn2, connIdx, credSlot)
-			ch <- terr
-			connCancel()
-		}()
-		return ch
-	}
-	turnDone := spawnTURN(turnAddr, creds)
+	// rebuilds it, and the relay leg is JOINED before this session returns —
+	// behind the credential's release above, so ahead of it, and ahead of every
+	// return below, the early ones too (relayjoin.go).
+	var leg relayLeg
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
+	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
 	// WRAP-A obfuscation around the DTLS-transport end of the pipe, then a
 	// plain DTLS client with amurcanov's exact config.
@@ -3435,10 +3433,12 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	defer relayConn.Close()
 	if p.config.UseUDP {
 		// Over a UDP relay leg the allocation is given back by a deallocate the
-		// relay CONFIRMS, before the relay conn is closed: this function — and
-		// with it the session above, and its restart — returns after the relay's
-		// answer, not ahead of a datagram (dealloc.go). Registered between the two
-		// defers around it: LIFO runs the budget first, then this, then Close.
+		// relay CONFIRMS, before the relay conn is closed: this function returns
+		// after the relay's answer, not ahead of a datagram (dealloc.go) — and so
+		// does the session above, which JOINS this goroutine before it returns
+		// and gives its credential back (relayjoin.go), and only then its restart.
+		// Registered between the two defers around it: LIFO runs the budget
+		// first, then this, then Close.
 		defer p.releaseAllocation(client, creds, connIdx)
 	}
 	// Registered AFTER relayConn.Close's defer, so LIFO runs it FIRST: the
