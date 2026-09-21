@@ -30,6 +30,7 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     var turnServerOverride: String = ""
     var useUDP: Bool = false
     var csqttAutoTURN: Bool = false
+    var csqttQualityScheduling: Bool = false
     // No UI toggle since build 127; effectively a constant (true).
     var useDTLS: Bool = true
 
@@ -95,6 +96,7 @@ struct ServerProfile: Codable, Identifiable, Equatable {
         case dnsServers, numConnections, credPoolCooldownSeconds, turnServerOverride
         case useUDP, useDTLS
         case csqttAutoTURN
+        case csqttQualityScheduling
         case useSrtp, useWrap, useWrapA, useWrapS
         case wrapKeyHex, obfProfile, clientID
         case wrapAPassword, deviceID
@@ -129,6 +131,7 @@ extension ServerProfile {
         if let v = try c.decodeIfPresent(String.self, forKey: .turnServerOverride) { turnServerOverride = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useUDP) { useUDP = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .csqttAutoTURN) { csqttAutoTURN = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .csqttQualityScheduling) { csqttQualityScheduling = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useDTLS) { useDTLS = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useSrtp) { useSrtp = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useWrap) { useWrap = v }
@@ -224,6 +227,7 @@ struct ServerSettings: Codable {
     var turnServerOverride: String? = nil
     var useUDP: Bool? = nil
     var csqttAutoTURN: Bool? = nil
+    var csqttQualityScheduling: Bool? = nil
     var useDTLS: Bool? = nil
     var useSrtp: Bool? = nil
     var useWrap: Bool? = nil
@@ -256,6 +260,7 @@ struct ServerSettings: Codable {
         turnServerOverride = p.turnServerOverride
         useUDP = p.useUDP
         csqttAutoTURN = p.csqttAutoTURN
+        csqttQualityScheduling = p.csqttQualityScheduling
         useDTLS = p.useDTLS
         useSrtp = p.useSrtp
         useWrap = p.useWrap
@@ -287,6 +292,7 @@ struct ServerSettings: Codable {
         if let v = turnServerOverride { p.turnServerOverride = v }
         if let v = useUDP { p.useUDP = v }
         if let v = csqttAutoTURN { p.csqttAutoTURN = v }
+        if let v = csqttQualityScheduling { p.csqttQualityScheduling = v }
         if let v = useDTLS { p.useDTLS = v }
         if let v = useSrtp { p.useSrtp = v }
         if let v = useWrap { p.useWrap = v }

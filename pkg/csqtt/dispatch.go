@@ -132,6 +132,13 @@ func (s *Striper) Resize(n int) {
 // for which alive returns false. It returns -1 when none is alive. A dead
 // worker mid-chunk hands the rest of the chunk to the next live one.
 func (s *Striper) Pick(c PacketClass, alive func(int) bool) int {
+	return s.PickWeighted(c, alive, nil)
+}
+
+// PickWeighted preserves contiguous chunks and their existing maximum size.
+// Slow workers get shorter chunks (at least one packet), so they can recover
+// without being starved. A nil cost keeps the original schedule exactly.
+func (s *Striper) PickWeighted(c PacketClass, alive func(int) bool, cost func(int) int64) int {
 	cur := &s.cursor[c]
 	if cur.remaining == 0 || !alive(cur.worker) {
 		start := cur.worker
@@ -140,6 +147,27 @@ func (s *Striper) Pick(c PacketClass, alive func(int) bool) int {
 			if alive(w) {
 				cur.worker = w
 				cur.remaining = s.chunk[c]
+				if cost != nil {
+					own := cost(w)
+					best := own
+					for j := 0; j < s.n; j++ {
+						if alive(j) {
+							if v := cost(j); v > 0 && v < best {
+								best = v
+							}
+						}
+					}
+					if best > 0 && own > best {
+						ratio := own / best
+						if ratio > 8 {
+							ratio = 8
+						}
+						cur.remaining /= int(ratio)
+						if cur.remaining < 1 {
+							cur.remaining = 1
+						}
+					}
+				}
 				break
 			}
 			if i == s.n {

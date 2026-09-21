@@ -128,3 +128,35 @@ func TestManualTransportDoesNotUseAutoDial(t *testing.T) {
 		c.Close()
 	}
 }
+
+func TestAutoTransportQuotaDoesNotTriggerFallback(t *testing.T) {
+	srv := newFakeServer(t)
+	prev := dialRelayContext
+	var mu sync.Mutex
+	var names []string
+	dialRelayContext = func(_ context.Context, _ TURNCredentials, _ *net.UDPAddr, name string, _ logging.LogLevel) (*Relay, error) {
+		mu.Lock()
+		names = append(names, name)
+		mu.Unlock()
+		return nil, errors.New("turn allocate: error 486 Allocation Quota Reached")
+	}
+	t.Cleanup(func() { dialRelayContext = prev })
+	cfg := testConfig(srv, 1, (&lease{}).creds)
+	cfg.TURNTransport = "auto"
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	if c, err := Dial(ctx, cfg); err == nil {
+		c.Close()
+		t.Fatal("quota refusal connected")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(names) < 2 {
+		t.Fatal("retry was not exercised", names)
+	}
+	for _, n := range names {
+		if n != "udp" {
+			t.Fatal("quota refusal switched transport", names)
+		}
+	}
+}

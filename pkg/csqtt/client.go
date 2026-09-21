@@ -33,8 +33,9 @@ type Config struct {
 	Generation uint64
 	Salt       string
 
-	Workers int    // 1..MaxWorkers
-	Chunks  [3]int // per-class striping chunks; zero keeps DefaultChunks
+	Workers           int    // 1..MaxWorkers
+	QualityScheduling bool   // opt-in bounded per-worker writes and weighted chunks
+	Chunks            [3]int // per-class striping chunks; zero keeps DefaultChunks
 
 	// DuplicateTCP (EXPERIMENT) sends a second copy of every CQF1-framed
 	// packet through a different worker. The server keys reassembly on
@@ -108,6 +109,7 @@ type Client struct {
 
 	workers    []*worker
 	transports transportPolicy
+	queueDrops atomic.Int64
 	striper    *Striper
 	seq        *Sequencer
 
@@ -521,6 +523,10 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	c.workers = make([]*worker, cfg.Workers)
 	for i := range c.workers {
 		c.workers[i] = newWorker(c, i+1, cipher)
+		if cfg.QualityScheduling {
+			c.wg.Add(1)
+			go c.workers[i].writeQueued()
+		}
 	}
 
 	// Worker 1 first, alone: its TUNCONF is what the caller waits for, and
@@ -573,7 +579,11 @@ func (c *Client) WritePacket(pkt []byte) error {
 	if len(pkt) == 0 {
 		return nil
 	}
-	w := c.striper.Pick(Classify(pkt), c.alive)
+	var cost func(int) int64
+	if c.cfg.QualityScheduling {
+		cost = c.workerCost
+	}
+	w := c.striper.PickWeighted(Classify(pkt), c.alive, cost)
 	if w < 0 {
 		c.noWorker.Add(1)
 		return errNoWorker
@@ -582,10 +592,16 @@ func (c *Client) WritePacket(pkt []byte) error {
 	if c.Config().FramesData() {
 		if framed, ok := c.seq.Frame(wk.frameBuf, pkt); ok {
 			c.framedTx.Add(1)
-			err := wk.send(framed)
+			err := c.dispatchPacket(w, framed)
 			if c.cfg.DuplicateTCP {
 				if w2 := c.secondWorker(w); w2 >= 0 {
-					if c.workers[w2].send(framed) == nil {
+					var dupErr error
+					if c.cfg.QualityScheduling {
+						dupErr = c.workers[w2].queuePacket(framed)
+					} else {
+						dupErr = c.workers[w2].send(framed)
+					}
+					if dupErr == nil {
 						c.dupTx.Add(1)
 					}
 				}
@@ -593,7 +609,7 @@ func (c *Client) WritePacket(pkt []byte) error {
 			return err
 		}
 	}
-	return wk.send(pkt)
+	return c.dispatchPacket(w, pkt)
 }
 
 var errNoWorker = errors.New("csqtt: no worker is ready")
@@ -897,19 +913,22 @@ func (c *Client) repair(cmd StreamCommand) {
 
 // WorkerStats is one worker's counters.
 type WorkerStats struct {
-	Transport string
-	ID        int
-	Ready     bool
-	Relay     string
-	TxPkts    int64
-	RxPkts    int64
-	Restarts  int64
-	LastRx    time.Time
+	QueuedBytes int64
+	WriteCost   time.Duration
+	Transport   string
+	ID          int
+	Ready       bool
+	Relay       string
+	TxPkts      int64
+	RxPkts      int64
+	Restarts    int64
+	LastRx      time.Time
 }
 
 // Stats is a snapshot of the client. The first block is what the app's
 // Stats carries (bytes, connections, RTT, reconnects); the rest is csqtt's own.
 type Stats struct {
+	QueueDrops  int64         // outbound queue saturation, stale session or failed writes
 	TxBytes     int64         // plaintext bytes sent through the relays (IP packets + control)
 	RxBytes     int64         // plaintext bytes received
 	Ready       int           // workers with a session — READY_OK once, not restarted since
@@ -939,6 +958,7 @@ type Stats struct {
 // Stats snapshots the counters.
 func (c *Client) Stats() Stats {
 	s := Stats{
+		QueueDrops:  c.queueDrops.Load(),
 		Dropped:     c.dropped.Load(),
 		NoWorker:    c.noWorker.Load(),
 		FramedTx:    c.framedTx.Load(),
@@ -989,9 +1009,14 @@ var keepaliveEvery = 10 * time.Second
 var getconfSchedule = []time.Duration{750 * time.Millisecond, 1500 * time.Millisecond, 3 * time.Second}
 
 type worker struct {
-	c      *Client
-	id     int
-	cipher *Cipher
+	quality      qualityState
+	queue        chan queuedPacket
+	queueMu      sync.Mutex
+	queueClosed  bool
+	sessionEpoch atomic.Uint64
+	c            *Client
+	id           int
+	cipher       *Cipher
 
 	mu       sync.Mutex // guards wrapper, relay and wireBuf
 	wrapper  *Wrapper
@@ -1021,6 +1046,7 @@ type worker struct {
 func newWorker(c *Client, id int, cipher *Cipher) *worker {
 	return &worker{
 		c: c, id: id, cipher: cipher,
+		queue:   make(chan queuedPacket, workerQueuePackets),
 		wireBuf: make([]byte, 0, 2048), frameBuf: make([]byte, 0, 2048),
 		kick: make(chan string, 1),
 	}
@@ -1028,6 +1054,8 @@ func newWorker(c *Client, id int, cipher *Cipher) *worker {
 
 func (w *worker) stats() WorkerStats {
 	s := WorkerStats{ID: w.id, Ready: w.ready.Load(), TxPkts: w.tx.Load(), RxPkts: w.rx.Load(), Restarts: w.restarts.Load()}
+	s.QueuedBytes = w.quality.pending.Load()
+	s.WriteCost = time.Duration(w.quality.writeCost.Load())
 	if p := w.transport.Load(); p != nil {
 		s.Transport = *p
 	}
@@ -1381,7 +1409,7 @@ func (w *worker) session() (sessionErr error) {
 				return
 			}
 			if errors.As(sessionErr, &asked) {
-				if !strings.Contains(asked.reason, "liveness") && !strings.Contains(asked.reason, "deaf") {
+				if !strings.Contains(asked.reason, "liveness") && !strings.Contains(asked.reason, "deaf") && asked.reason != "write error" {
 					return
 				}
 			}
@@ -1399,6 +1427,9 @@ func (w *worker) session() (sessionErr error) {
 	}
 	w.blackhole.Store(false) // a fresh allocation is a fresh path; an injected fault does not follow it
 	w.mu.Lock()
+	w.sessionEpoch.Add(1)
+	w.quality.writeCost.Store(0)
+	w.quality.failedUntil.Store(0)
 	w.relay, w.wrapper = relay, wrapper
 	w.mu.Unlock()
 	w.relayRef.Store(relay)
@@ -1545,8 +1576,15 @@ func (w *worker) handleControl(p []byte) {
 
 // send wraps and writes one plaintext. Safe for concurrent callers.
 func (w *worker) send(plain []byte) error {
+	return w.sendEpoch(plain, 0)
+}
+
+func (w *worker) sendEpoch(plain []byte, epoch uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if epoch != 0 && (epoch != w.sessionEpoch.Load() || !w.ready.Load()) {
+		return errNoWorker
+	}
 	if w.relay == nil || w.wrapper == nil {
 		return errNoWorker
 	}

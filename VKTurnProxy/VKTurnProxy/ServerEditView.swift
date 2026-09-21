@@ -168,6 +168,9 @@ struct ServerEditView: View {
                     Toggle("Automatic UDP / TCP", isOn: $draft.csqttAutoTURN)
                     Text("Tests transport on new connections and falls back when a path fails. Existing connections stay up. Experimental.")
                         .font(.caption).foregroundColor(.secondary)
+                    Toggle("Adaptive connection scheduling", isOn: $draft.csqttQualityScheduling)
+                    Text("Keeps slow writes from blocking other connections and reduces their share of traffic. Experimental.")
+                        .font(.caption).foregroundColor(.secondary)
                 }
                 if mode.wrappedValue != .csqtt || !draft.csqttAutoTURN {
                     Toggle("Use UDP transport to TURN", isOn: $draft.useUDP)

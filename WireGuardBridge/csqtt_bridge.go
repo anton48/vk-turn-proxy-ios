@@ -85,6 +85,7 @@ type csqttConfig struct {
 	NumConns                int                 `json:"num_conns"`
 	UseUDP                  bool                `json:"use_udp"`
 	AutoTURN                bool                `json:"csqtt_auto_turn"`
+	QualityScheduling       bool                `json:"csqtt_quality_scheduling"`
 	TurnServer              string              `json:"turn_server"`
 	TurnPort                string              `json:"turn_port"`
 	CredPoolCooldownSeconds int                 `json:"cred_pool_cooldown_seconds"`
@@ -531,7 +532,8 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 			Server: server, Password: cfg.Password, DeviceID: cfg.DeviceID,
 			Generation: gen, Salt: salt, Workers: cfg.NumConns,
 			Creds: adapter.creds, TURNTransport: transport, TURNLogLevel: logging.LogLevelWarn,
-			Logf: log.Printf,
+			QualityScheduling: cfg.QualityScheduling,
+			Logf:              log.Printf,
 		})
 		if err != nil {
 			e.fail(fmt.Errorf("csqtt: %w", err))
@@ -917,8 +919,21 @@ func csqttLogPathSnapshotImpl(handle int32, label string) {
 // whichever of them a log has is read by the same eye and the same grep — and a
 // counter added here reaches all three.
 func csqttStatsLine(s csqtt.Stats, tunIn, tunOut int64) string {
-	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d",
-		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut)
+	udp, tcp := 0, 0
+	var queued int64
+	for _, w := range s.Workers {
+		queued += w.QueuedBytes
+		if w.Ready {
+			if w.Transport == "udp" {
+				udp++
+			}
+			if w.Transport == "tcp" {
+				tcp++
+			}
+		}
+	}
+	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d; udp=%d tcp=%d queued=%d queue drops=%d",
+		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut, udp, tcp, queued, s.QueueDrops)
 }
 
 // Stats in the app's shape — the same struct the WireGuard path marshals,

@@ -29,6 +29,32 @@ Worker stats include the selected transport. A silent server, including a
 wrong password, can still prevent both transports from connecting. Switching
 transport cannot bypass a server refusal or the provider's allocation quota.
 
+## Adaptive connection scheduling
+
+Enable **Adaptive connection scheduling** in the CSQTT server editor. Each
+worker gets a bounded asynchronous write queue (32 packets and 64 KiB,
+including its in-flight write). A blocked relay no longer blocks the TUN
+writer from handing packets to other relays. Queue-full fallback happens
+only before acceptance; a failed write is never replayed speculatively.
+Packets are copied into owned buffers and tagged with the allocation epoch;
+queued packets from an old allocation cannot leak into its replacement.
+
+Chunk scheduling weights local write time per KiB (EWMA), queued bytes and
+recent write errors. Slow workers receive up to eight times shorter chunks,
+with at least one packet per turn for recovery. The original maximum chunk
+size is unchanged, avoiding larger bursts into the relay's policer. Small,
+medium and bulk classes retain separate cursors. Stale write measurements
+expire after 30 seconds. Worker stats expose queue bytes and write cost;
+QueueDrops counts outbound queue saturation, stale packets and write errors.
+
+These are **local backpressure signals**, not end-to-end RTT, delivery rate
+or a packet-loss estimate. An uncongested UDP socket can look fast even when
+the remote relay drops traffic. Existing liveness detection still handles
+unresponsive workers. No extra measurement packets or new wire messages are
+introduced. On a congested pool, bounded queues intentionally drop packets
+instead of allowing unlimited memory growth. Async acceptance does not mean
+the server has received the packet.
+
 ## Device acceptance checks
 
 Before making this default, compare manual UDP, manual TCP and automatic mode

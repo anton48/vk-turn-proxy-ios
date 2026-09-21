@@ -37,6 +37,8 @@ final class ServerStore: ObservableObject {
     ]
     private static let boolKeyPaths: [(String, WritableKeyPath<ServerProfile, Bool>, Bool)] = [
         ("useUDP", \.useUDP, false), ("useDTLS", \.useDTLS, true),
+        ("csqttAutoTURN", \.csqttAutoTURN, false),
+        ("csqttQualityScheduling", \.csqttQualityScheduling, false),
         ("useSrtp", \.useSrtp, true), ("useWrap", \.useWrap, false),
         ("useWrapA", \.useWrapA, false), ("useWrapS", \.useWrapS, false),
         ("useCsqtt", \.useCsqtt, false),

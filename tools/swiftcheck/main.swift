@@ -4432,6 +4432,27 @@ do {
     }
 }
 
+// Adaptive settings must cross every persistence/config boundary. The full
+// app build type-checks these files; these checks pin the wiring names.
+do {
+    let profile = source("VKTurnProxy/VKTurnProxy/ServerProfile.swift")
+    let store = source("VKTurnProxy/VKTurnProxy/ServerStore.swift")
+    let manager = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    let editor = source("VKTurnProxy/VKTurnProxy/ServerEditView.swift")
+    for (key, wire) in [("csqttAutoTURN", "csqtt_auto_turn"),
+                        ("csqttQualityScheduling", "csqtt_quality_scheduling")] {
+        check(profile.contains("var \(key): Bool = false"), "\(key) defaults to off")
+        check(profile.contains("case \(key)") && profile.contains("forKey: .\(key)"),
+              "\(key) persists and decodes old profiles")
+        check(profile.contains("\(key) = p.\(key)") && profile.contains("if let v = \(key) { p.\(key) = v }"),
+              "\(key) survives backup and restore")
+        check(store.contains("(\"\(key)\", \\.\(key), false)"), "\(key) projects to flat settings")
+        check(manager.contains("\(key): s.\(key)") && manager.contains("\"\(wire)\": config.useCsqtt && config.\(key)"),
+              "\(key) reaches only the CSQTT backend")
+        check(editor.contains("isOn: $draft.\(key)"), "\(key) is editable")
+    }
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

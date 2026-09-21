@@ -280,6 +280,36 @@ func startCsqtt(t *testing.T, extra string) int32 {
 
 // ─── the checks ───────────────────────────────────────────────────────────
 
+func TestCsqttAdaptiveOptionsReachClient(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra, transport string
+		quality                bool
+	}{
+		{"legacy", "", "tcp", false},
+		{"manualUDP", `,"use_udp":true`, "udp", false},
+		{"automatic", `,"use_udp":true,"csqtt_auto_turn":true,"csqtt_quality_scheduling":true`, "auto", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mints atomic.Int32
+			installFakePool(t, mintingFetch(&mints))
+			fc := newFakeClient()
+			captured := make(chan csqtt.Config, 1)
+			prev := csqttDial
+			csqttDial = func(_ context.Context, cfg csqtt.Config) (csqttClient, error) { captured <- cfg; return fc, nil }
+			t.Cleanup(func() { csqttDial = prev })
+			_ = startCsqtt(t, tc.extra)
+			select {
+			case cfg := <-captured:
+				if cfg.TURNTransport != tc.transport || cfg.QualityScheduling != tc.quality {
+					t.Fatalf("transport=%s quality=%v", cfg.TURNTransport, cfg.QualityScheduling)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("bridge did not dial")
+			}
+		})
+	}
+}
+
 // installGatedDial makes csqttDial block until `release` is closed, then
 // return `c` ALIVE whatever the ctx says — the shape of a dial that
 // finished after the stop (a stop in .connecting, or Dial's select picking
