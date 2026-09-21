@@ -49,7 +49,7 @@ func TestTheSlotIsMarkedAtTheTURNAllocationNotAtSessionReadiness(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		done := make(chan error, 1)
-		go func() { done <- p.runTURN(ctx, addr, creds, conn2, 0, 0) }()
+		go func() { done <- p.runTURN(ctx, addr, creds, conn2, 0, 0, nil) }()
 		waitUntil(t, "the slot to be marked allocated", 5*time.Second, func() bool { return allocated(cp) == 1 })
 		select {
 		case err := <-done:
@@ -69,7 +69,7 @@ func TestTheSlotIsMarkedAtTheTURNAllocationNotAtSessionReadiness(t *testing.T) {
 		defer cancel()
 		done := make(chan error, 1)
 		go func() {
-			c, err := p.setupSRTPSession(ctx, addr, creds, 0, 0)
+			c, err := p.setupSRTPSession(ctx, addr, creds, 0, 0, nil)
 			if c != nil {
 				_ = c.Close()
 			}

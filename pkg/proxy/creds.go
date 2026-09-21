@@ -1344,6 +1344,11 @@ type credPool struct {
 
 	// quota is the relay-refusal breaker — see quotabreaker.go.
 	quota quotaBreaker
+
+	// The relay's second — seatcool.go: when a seat was last given back on
+	// (slot, credential), and what that second has cost and saved. Under cp.mu.
+	gaveBackAt map[leaseKey]time.Time
+	seat       seatStats
 }
 
 // leaseKey names what a lease was taken on: the slot and the credential
@@ -2545,6 +2550,16 @@ func (cp *credPool) markSaturated(slot int, creds *TURNCreds) time.Duration {
 		return 0
 	}
 
+	// A 486 right behind a seat this side gave back on this very credential
+	// is the relay's second — it keeps a deallocated seat on the quota for one
+	// second more — and not saturation: nothing is marked, the breaker's
+	// freshness test does not see it, a zero cooldown tells the caller so
+	// (seatcool.go).
+	if over, ok := cp.relaysSecondLocked(slot, creds, time.Now()); ok {
+		cp.noteRelaysSecondLocked(slot, over, time.Now())
+		return 0
+	}
+
 	entry := cp.pool[slot]
 	// The relay-refusal breaker hears of every 486 here, native and csqtt
 	// alike, before the slot's own cooldown is chosen — quotabreaker.go.
@@ -2601,11 +2616,14 @@ func (cp *credPool) applySaturationLocked(slot int, cooldown time.Duration, reas
 // in both cases VK has no allocations against them. Marking them would
 // waste 11 minutes of an otherwise-fine slot.
 //
-// Empirically confirmed VK-side timing: build 69's wgForceReconnect test
-// showed 486 firing ~0.4-0.8s after Refresh(0) closes — VK quota release
-// is timer-driven (600s lifetime), not client-driven. So the lastUsedAt
-// + 600s window is a reliable predictor of when a slot is safe to reuse.
-// See evaluated_alternatives_pre_emptive_refresh.md.
+// Why the lifetime is the window: at a path change the dying sessions'
+// deallocates leave through the interface that has just gone — they do not
+// reach the relay, and an allocation that was not given back holds its seat
+// until it expires (600 s). So lastUsedAt + 600 s predicts when such a slot
+// is safe to reuse. 🚫 Not because the relay ignores a deallocate: one that
+// REACHES it frees the seat — one second later (measured 2026-09-21,
+// seatcool.go; the 486s that build 69's wgForceReconnect test drew 0.4–0.8 s
+// behind its Refresh(0) were that second).
 func (cp *credPool) MarkInUseSlotsForPathChange() {
 	const vkAllocLifetime = 600 * time.Second
 	// Safety buffer: clock skew + jitter in VK's quota-release task.

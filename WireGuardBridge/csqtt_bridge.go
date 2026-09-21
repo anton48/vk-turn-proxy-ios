@@ -325,11 +325,25 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 		addr, creds, slot, err := a.pool.Acquire(idx)
 		if err == nil {
 			var once sync.Once
+			var allocated atomic.Bool
 			return csqtt.Credential{
 				TURNCredentials: csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: addr},
-				Release:         func() { once.Do(func() { a.pool.Release(slot, creds) }) },
-				Failed:          func(err error) { a.refused(workerID, slot, creds, err) },
-				Allocated:       func() { a.pool.NoteAllocated(slot, creds) },
+				// A worker releases its lease right behind closing its relay — the
+				// deallocate written. The VK relay keeps such a seat on the quota for
+				// a second more, so a lease that HELD an allocation is released
+				// behind that second (the pool goes on counting the seat); one whose
+				// allocation never came about is released at once (seatcool.go).
+				Release: func() {
+					once.Do(func() {
+						if allocated.Load() {
+							a.pool.ReleaseGivenBack(slot, creds, time.Now())
+							return
+						}
+						a.pool.Release(slot, creds)
+					})
+				},
+				Failed:    func(err error) { a.refused(workerID, slot, creds, err) },
+				Allocated: func() { allocated.Store(true); a.pool.NoteAllocated(slot, creds) },
 			}, nil
 		}
 		if terminal := csqttTerminalCredError(err); terminal != nil {

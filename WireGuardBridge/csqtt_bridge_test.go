@@ -511,6 +511,73 @@ func TestCsqttCredentialAdapterMapsWorkersAndLeasesSlots(t *testing.T) {
 	}
 }
 
+// The relay's second (build 430; pkg/proxy/seatcool.go): the VK relay keeps a
+// deallocated seat on the identity's quota for a second more, so a worker's lease
+// that HELD an allocation goes back to the pool behind that second — the next
+// worker parks instead of drawing a 486 — and one whose allocation never came
+// about goes back at once. Sabotages seen red: the cooled release dropped from
+// the adapter (the parked worker is seated at once); every lease cooled (the
+// worker behind a lease that held nothing waits out a second nobody holds).
+func TestCsqttLeaseGoesBackBehindTheRelaysSecondOnlyIfItHeldAnAllocation(t *testing.T) {
+	fetch := func(_ bool, slot int) (string, *proxy.TURNCreds, error) {
+		addr := "95.163.34.180:19302"
+		return addr, &proxy.TURNCreds{Username: freshUsername("second"), Password: "p", Address: addr, Addresses: []string{addr}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := proxy.NewCredPool(ctx, proxy.CredPoolConfig{VKLink: "abc", NumConns: 10, Fetch: fetch})
+	defer pool.Close()
+	a := &csqttPoolAdapter{pool: pool, fatal: func(err error) { t.Errorf("fatal: %v", err) }}
+	prevBackstop := csqttAcquireBackstop
+	csqttAcquireBackstop, csqttAcquireBackstopMax = time.Hour, time.Hour
+	defer func() { csqttAcquireBackstop, csqttAcquireBackstopMax = prevBackstop, 5*time.Second }()
+	var leases []csqtt.Credential
+	for k := 1; k <= 10; k++ {
+		c, err := a.creds(ctx, k)
+		if err != nil {
+			t.Fatalf("worker %d: %v", k, err)
+		}
+		leases = append(leases, c)
+	}
+	seated := func(worker int) (<-chan error, time.Time) {
+		done := make(chan error, 1)
+		go func() { _, err := a.creds(ctx, worker); done <- err }()
+		return done, time.Now()
+	}
+	// A lease whose allocation never came about: the seat is free at once.
+	done, t0 := seated(11)
+	time.Sleep(100 * time.Millisecond) // parked
+	leases[0].Release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("worker 11: %v", err)
+		}
+		if took := time.Since(t0); took > 700*time.Millisecond {
+			t.Errorf("worker 11 was seated %s after a lease that held NO allocation was released — a second nobody holds was waited out", took)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker 11 still parked")
+	}
+	// A lease that held an allocation: the relay keeps its seat for a second.
+	leases[1].Allocated()
+	done, _ = seated(12)
+	time.Sleep(100 * time.Millisecond)
+	released := time.Now()
+	leases[1].Release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("worker 12: %v", err)
+		}
+		if took := time.Since(released); took < time.Second {
+			t.Errorf("worker 12 was seated %s after the release of a lease that HELD an allocation — inside the relay's second: its Allocate would be refused with 486", took)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker 12 still parked five seconds after the release")
+	}
+}
+
 // A captcha is TERMINAL for a csqtt tunnel — there is no WebView on this
 // path — so the start must fail at once with the reason, not spin through
 // the whole bootstrap budget. Sabotage seen red: the terminal test dropped

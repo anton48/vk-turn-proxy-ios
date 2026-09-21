@@ -2384,7 +2384,11 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// refilled under us, and the pool counts a release only against the
 	// credential it names (credPool.release).
 	currentSlot, currentCreds := credSlot, creds
-	defer func() { p.credPool.release(currentSlot, currentCreds) }()
+	// The relay leg this session starts below. It also carries the note of the
+	// allocation given back, by which the lease is released behind the relay's
+	// second (relayjoin.go, seatcool.go).
+	var leg relayLeg
+	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
 
 	// Start TURN relay FIRST — DTLS handshake goes through it.
 	// TURN runs until it fails naturally (no forced lifetime).
@@ -2413,7 +2417,6 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// The relay leg runs in a goroutine of its own and is JOINED before this
 	// session returns (relayjoin.go). On its exit it always cancels the session:
 	// without TURN there's no DTLS transport, so the conn is dead either way.
-	var leg relayLeg
 	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
 	// Registered BEHIND the credential's release above, so it runs BEFORE it, and
 	// ahead of every return below — the early ones too: the session gives its
@@ -2900,13 +2903,16 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	}
 	// The lease is the pair (slot, credential) — see runDTLSSession.
 	currentSlot, currentCreds := credSlot, creds
-	defer func() { p.credPool.release(currentSlot, currentCreds) }()
+	// The relay leg this session starts below. It also carries the note of the
+	// allocation given back, by which the lease is released behind the relay's
+	// second (relayjoin.go, seatcool.go).
+	var leg relayLeg
+	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
 
 	// The relay leg IS this session's transport; it is JOINED before the session
 	// returns — behind the credential's release above, so ahead of it
 	// (relayjoin.go). The reconnect loop below starts the next one through the
 	// same leg.
-	var leg relayLeg
 	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, nil)
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
@@ -2947,7 +2953,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			// Release before retry loop — see runDTLSSession for full
 			// rationale. Same pattern: avoid stale active counts during
 			// reconnect storm.
-			p.credPool.release(credSlot, currentCreds)
+			p.releaseLease(credSlot, currentCreds, &leg.gave) // behind the relay's second, if the leg that ended gave its allocation back
 			credSlot = -1
 			currentSlot, currentCreds = -1, nil
 			retries := 0
@@ -3076,14 +3082,17 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	}
 	// The lease is the pair (slot, credential) — see runDTLSSession.
 	currentSlot, currentCreds := credSlot, creds
-	defer func() { p.credPool.release(currentSlot, currentCreds) }()
+	// The relay leg this session starts below. It also carries the note of the
+	// allocation given back, by which the lease is released behind the relay's
+	// second (relayjoin.go, seatcool.go).
+	var leg relayLeg
+	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
 
 	// TURN relay underneath (conn2 ↔ VK relay). Same pattern as
 	// runDTLSSession: any TURN exit cancels the conn so the outer loop
 	// rebuilds it, and the relay leg is JOINED before this session returns —
 	// behind the credential's release above, so ahead of it, and ahead of every
 	// return below, the early ones too (relayjoin.go).
-	var leg relayLeg
 	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
@@ -3356,7 +3365,7 @@ func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
 // Runs until the relay fails or ctx is cancelled. No forced lifetime —
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
-func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int) error {
+func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, gave *gaveBack) error {
 	turnUDPAddr, err := net.ResolveUDPAddr("udp", turnAddr)
 	if err != nil {
 		return fmt.Errorf("resolve TURN: %w", err)
@@ -3430,21 +3439,22 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		// handshake over the relay has completed.
 		p.noteSessionUp(connIdx)
 	}
-	defer relayConn.Close()
+	// The allocation is given back by ONE body (returnAllocation, seatcool.go).
+	// Over a UDP relay leg first the deallocate the relay CONFIRMS: this function
+	// returns after the relay's answer, not ahead of a datagram (dealloc.go) — and
+	// so does the session above, which JOINS this goroutine before it returns and
+	// gives its credential back (relayjoin.go), and only then its restart. Then
+	// the relay conn's own Close; and the moment is NOTED for the pool, which
+	// keeps counting the seat for the relay's second.
+	var release func() deallocVerdict
 	if p.config.UseUDP {
-		// Over a UDP relay leg the allocation is given back by a deallocate the
-		// relay CONFIRMS, before the relay conn is closed: this function returns
-		// after the relay's answer, not ahead of a datagram (dealloc.go) — and so
-		// does the session above, which JOINS this goroutine before it returns
-		// and gives its credential back (relayjoin.go), and only then its restart.
-		// Registered between the two defers around it: LIFO runs the budget
-		// first, then this, then Close.
-		defer p.releaseAllocation(client, creds, connIdx)
+		release = func() deallocVerdict { return p.releaseAllocation(client, creds, connIdx) }
 	}
-	// Registered AFTER relayConn.Close's defer, so LIFO runs it FIRST: the
-	// deallocate that Close writes goes out under relayCloseWriteBudget on
-	// the control socket, instead of holding this goroutine (and the socket
-	// below it) for ever on a TCP relay that stopped taking bytes.
+	defer func() { _ = returnAllocation(relayConn, release, gave) }()
+	// Registered AFTER it, so LIFO runs it FIRST: what returnAllocation writes
+	// goes out under relayCloseWriteBudget on the control socket, instead of
+	// holding this goroutine (and the socket below it) for ever on a TCP relay
+	// that stopped taking bytes.
 	defer func() { _ = turnConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget)) }()
 	p.turnRTTns.Store(int64(time.Since(allocStart)))
 
@@ -4928,11 +4938,15 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	}
 	// The lease is the pair (slot, credential) — see runDTLSSession.
 	currentSlot, currentCreds := credSlot, creds
-	defer func() { p.credPool.release(currentSlot, currentCreds) }()
+	// When this session's allocation is given back — by its live Close or by the
+	// abort of its setup — the lease is released behind the relay's second
+	// (seatcool.go).
+	var gave gaveBack
+	defer func() { p.releaseLease(currentSlot, currentCreds, &gave) }()
 
 	// Set up TURN allocation and DTLS-SRTP handshake to the peer.
 	sessStart := time.Now()
-	srtpConn, err := p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx)
+	srtpConn, err := p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx, &gave)
 	if err != nil {
 		// Mirror runDTLSSession's error attribution so quota / auth
 		// failures land on the correct slot.
@@ -5282,7 +5296,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 // (srtpSessionConn wrapper) whose Read/Write framing is RTP+SRTP and
 // whose Close tears down the SRTP wrapper, the relay allocation, the
 // TURN client, and the underlying control conn together.
-func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TURNCreds, credSlot, connIdx int) (net.Conn, error) {
+func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TURNCreds, credSlot, connIdx int, gave *gaveBack) (net.Conn, error) {
 	// Local control conn: UDP socket (UDP-control) or TCP dial wrapped
 	// in turn.NewSTUNConn (TCP-control). Mirrors tools/turn_srtp_test
 	// transport plumbing.
@@ -5394,17 +5408,14 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	// Over a UDP relay leg the allocation is given back by a deallocate the
 	// relay CONFIRMS, before the relay conn is closed — here and in the live
 	// session's Close alike (dealloc.go). Nil over TCP.
-	var release func()
+	var release func() deallocVerdict
 	if p.config.UseUDP {
-		release = func() { p.releaseAllocation(tc, creds, connIdx) }
+		release = func() deallocVerdict { return p.releaseAllocation(tc, creds, connIdx) }
 	}
 	abortSetup := func() {
 		quiesce()
 		_ = ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget)) // the deallocate goes out under a budget, hook or no hook
-		if release != nil {
-			release()
-		}
-		_ = relayConn.Close()
+		_ = returnAllocation(relayConn, release, gave)                      // confirmed over UDP, and NOTED for the pool — seatcool.go
 		tc.Close()
 		_ = ctlConn.Close()
 	}
@@ -5429,6 +5440,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		tc:        tc,
 		ctlConn:   ctlConn,
 		release:   release,
+		gave:      gave,
 	}, nil
 }
 
@@ -5440,7 +5452,8 @@ type srtpSessionConn struct {
 	relayConn net.PacketConn
 	tc        turnSessionClient // *turn.Client; an interface so a test can close without a server
 	ctlConn   net.PacketConn
-	release   func() // the confirmed deallocate, run before relayConn is closed — over a UDP relay leg only, nil otherwise (dealloc.go)
+	release   func() deallocVerdict // the confirmed deallocate, run before relayConn is closed — over a UDP relay leg only, nil otherwise (dealloc.go)
+	gave      *gaveBack             // the session's note of when its allocation was given back — seatcool.go
 
 	closeOnce sync.Once
 }
@@ -5483,13 +5496,12 @@ func (s *srtpSessionConn) Close() error {
 		if err := s.Conn.Close(); err != nil {
 			firstErr = err
 		}
-		if s.release != nil {
-			// Over UDP: the relay's ANSWER to the deallocate, before anything
-			// below closes — Close returns after it, and so does the session,
-			// and only then does its connection re-dial (dealloc.go).
-			s.release()
-		}
-		if err := s.relayConn.Close(); err != nil && firstErr == nil {
+		// The allocation is given back by ONE body (returnAllocation,
+		// seatcool.go). Over UDP first the relay's ANSWER to the deallocate,
+		// before anything below closes — Close returns after it, and so does
+		// the session, and only then does its connection re-dial (dealloc.go);
+		// then the relay conn's own Close; and the moment is NOTED for the pool.
+		if err := returnAllocation(s.relayConn, s.release, s.gave); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		s.tc.Close()

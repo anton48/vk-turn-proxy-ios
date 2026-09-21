@@ -164,12 +164,16 @@ func (s *relayJoinStand) verdict(t *testing.T, what string, returned time.Durati
 			t.Errorf("%s: %d lease(s) out while deallocate %d was on its way to the relay, want 1: the credential was given back before the relay had answered", what, n, i+1)
 		}
 	}
-	if n := s.leases(); n != 0 {
-		t.Errorf("%s: %d lease(s) still out after the session has returned, want 0", what, n)
+	// Since build 430 the seat stays COUNTED through the relay's second behind the
+	// give-back (seatcool.go) — and not a moment longer.
+	if n := s.leases(); n != 1 {
+		t.Errorf("%s: %d lease(s) out right behind the session's return, want 1 — the seat the relay still holds for a second", what, n)
 	}
+	waitUntil(t, what+": the seat to be let go after the relay's second", 3*time.Second, func() bool { return s.leases() == 0 })
 }
 
 func TestASessionReturnsOnlyAfterItsRelayLegIsTornDown(t *testing.T) {
+	shortSecond(t, 700*time.Millisecond, 2*time.Second) // long enough to be seen standing behind the verdict's own waits
 	t.Run("runDTLSSession — an established session is ended (a kill, a restart by request)", func(t *testing.T) {
 		s, allocations := newRelayJoinStand(t, Config{UseDTLS: true}, dtlsPeer(t))
 		ctx, cancel := context.WithCancel(context.Background())
@@ -322,6 +326,11 @@ func TestASessionsWaitForItsRelayLegIsBounded(t *testing.T) {
 		}
 		if u := s.p.dealloc.unconfirmed.Load(); u != 0 {
 			t.Errorf("fixture: the leg's teardown had ended (%d reported) when the session returned", u)
+		}
+		// The leg left behind is giving its allocation back about now: the seat stays
+		// counted through the relay's second all the same (seatcool.go).
+		if n := s.leases(); n != 1 {
+			t.Errorf("%d lease(s) out right behind a session that returned without its relay leg, want 1 — the seat is handed out while the relay still holds it", n)
 		}
 		waitUntil(t, "the relay leg to end by itself", 3*time.Second, func() bool { return s.p.dealloc.unconfirmed.Load() == 1 })
 	})
@@ -501,7 +510,7 @@ func TestEverySessionJoinsItsRelayLegBeforeItGivesItsCredentialBack(t *testing.T
 		sessions++
 		first := strings.Index(b, "p.goRunTURN(")
 		joinAt := strings.Index(b, "defer p.joinRelayLeg(&leg, connCancel, connIdx)")
-		release := strings.Index(b, "p.credPool.release(currentSlot, currentCreds)")
+		release := strings.Index(b, "p.releaseLease(currentSlot, currentCreds, &leg.gave)") // the lease's release — behind the relay's second since 430, seatcool.go
 		switch {
 		case strings.Count(b, "defer p.joinRelayLeg(") != 1 || joinAt < 0:
 			t.Errorf("%s starts a relay leg and does not defer joinRelayLeg(&leg, connCancel, connIdx) exactly once", fn)
@@ -512,8 +521,8 @@ func TestEverySessionJoinsItsRelayLegBeforeItGivesItsCredentialBack(t *testing.T
 		case regexp.MustCompile(`\breturn\b`).MatchString(b[first:joinAt]):
 			t.Errorf("%s: a return stands between the relay leg's start and its join — that way out leaves the leg behind", fn)
 		}
-		if strings.Count(b, "&leg") != starts+1 {
-			t.Errorf("%s: %d use(s) of &leg for %d start(s) and one join — every start and the join go through the session's ONE leg", fn, strings.Count(b, "&leg"), starts)
+		if n := strings.Count(b, "p.goRunTURN(connCtx, &leg, "); n != starts || strings.Count(b, "var leg relayLeg") != 1 {
+			t.Errorf("%s: %d of its %d start(s) go through &leg, %d leg(s) declared — every start and the join go through the session's ONE leg", fn, n, starts, strings.Count(b, "var leg relayLeg"))
 		}
 	}
 	if sessions != 3 {

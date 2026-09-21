@@ -277,15 +277,24 @@ func TestEveryLeaseHolderNamesItsCredential(t *testing.T) {
 			t.Errorf("%s: %q tells the pool a slot number alone — a lease names its credential", name, m)
 		}
 	}
-	// The sessions release the PAIR they hold, the probe what it was handed.
-	if n := strings.Count(proxySrc, "p.credPool.release(currentSlot, currentCreds)"); n != 4 {
+	// The sessions release the PAIR they hold — through releaseLease since build
+	// 430 (behind the relay's second when their allocation was given back:
+	// seatcool.go), which hands the pair on to the pool — the probe what it was
+	// handed.
+	if n := strings.Count(proxySrc, "p.releaseLease(currentSlot, currentCreds, "); n != 4 {
 		t.Errorf("proxy.go: %d deferred releases of (currentSlot, currentCreds), want 4 — one per session function", n)
+	}
+	seatCool := code("seatcool.go")
+	for _, call := range []string{"p.credPool.releaseGivenBack(slot, creds, at)", "p.credPool.release(slot, creds)", "cp.release(slot, creds)"} {
+		if !strings.Contains(seatCool, call) {
+			t.Errorf("seatcool.go lacks %q — releaseLease and the cooled release hand the PAIR on", call)
+		}
 	}
 	for _, call := range []string{
 		"p.credPool.release(probeSlot, probeCreds)",
-		"p.credPool.release(credSlot, currentCreds)",    // the direct session's re-lease
-		"currentSlot, currentCreds = newSlot, newCreds", // … which takes a new pair
-		"currentSlot, currentCreds = -1, nil",           // … after giving the old one back
+		"p.releaseLease(credSlot, currentCreds, &leg.gave)", // the direct session's re-lease
+		"currentSlot, currentCreds = newSlot, newCreds",     // … which takes a new pair
+		"currentSlot, currentCreds = -1, nil",               // … after giving the old one back
 	} {
 		if !strings.Contains(proxySrc, call) {
 			t.Errorf("proxy.go lacks %q", call)

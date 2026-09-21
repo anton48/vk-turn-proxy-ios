@@ -163,7 +163,7 @@ func TestRunTURNReturnsWhenTheRelayGoesSilentAtCreatePermission(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return p.turnRTTns.Load() != 0 })
 
@@ -201,7 +201,7 @@ func TestSetupSRTPSessionReturnsWhenTheRelayGoesSilentAtCreatePermission(t *test
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0)
+		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil)
 		if c != nil {
 			_ = c.Close()
 		}
@@ -246,7 +246,7 @@ func TestSetupSRTPSessionReturnsWhenTheCancelPrecedesThePermission(t *testing.T)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0)
+		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil)
 		if c != nil {
 			_ = c.Close()
 		}
@@ -310,7 +310,7 @@ func TestTheCancelHooksSetThePastDeadlineBeforeTheClose(t *testing.T) {
 		}
 	}
 	abort := hook("abortSetup := func() {")
-	b, r := strings.Index(abort, "SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))"), strings.Index(abort, "relayConn.Close()")
+	b, r := strings.Index(abort, "SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))"), strings.Index(abort, "returnAllocation(relayConn, release, gave)") // the ONE body that gives the allocation back — seatcool.go
 	if b < 0 || r < 0 || b > r {
 		t.Error("setupSRTPSession's abortSetup does not re-arm a live write budget before the deallocate — after a cancel the hook's past deadline would fail it")
 	}
@@ -339,7 +339,7 @@ func TestRunTURNDeallocatesAfterACancelOnAHealthyRelay(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return p.turnRTTns.Load() != 0 })
 	_, _ = conn1.WriteTo(make([]byte, 100), peer)
@@ -364,7 +364,7 @@ func TestSetupSRTPSessionDeallocatesAfterACancelOnAHealthyRelay(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0)
+		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil)
 		if c != nil {
 			_ = c.Close()
 		}

@@ -87,6 +87,10 @@ type deallocTap struct {
 	seen     atomic.Int32 // deallocates that reached the tap
 	passed   atomic.Int32 // … and were handed on to the relay
 	onPass   func()       // called right before a deallocate is handed on; set before the stand runs
+	// onDealloc is told of every deallocate handed on: the client socket it came from
+	// and whether it carries credentials (the first of a confirmed pair does not, and
+	// the relay answers it with a 401 — it frees nothing). Set before the stand runs.
+	onDealloc func(from string, authenticated bool)
 
 	mu  sync.Mutex
 	ups map[string]*net.UDPConn
@@ -162,20 +166,24 @@ func (tap *deallocTap) serve() {
 		case tap.delay > 0:
 			go func() {
 				time.Sleep(tap.delay)
-				if tap.onPass != nil {
-					tap.onPass()
-				}
-				tap.passed.Add(1)
-				_, _ = up.Write(pkt)
+				tap.handOn(up, pkt, from.String())
 			}()
 		default:
-			if tap.onPass != nil {
-				tap.onPass()
-			}
-			tap.passed.Add(1)
-			_, _ = up.Write(pkt)
+			tap.handOn(up, pkt, from.String())
 		}
 	}
+}
+
+func (tap *deallocTap) handOn(up *net.UDPConn, pkt []byte, from string) {
+	if tap.onPass != nil {
+		tap.onPass()
+	}
+	if tap.onDealloc != nil {
+		m := &stun.Message{Raw: append([]byte(nil), pkt...)}
+		tap.onDealloc(from, m.Decode() == nil && m.Contains(stun.AttrMessageIntegrity))
+	}
+	tap.passed.Add(1)
+	_, _ = up.Write(pkt)
 }
 
 func (tap *deallocTap) close() {
@@ -248,7 +256,9 @@ func TestARestartDoesNotOutrunItsOwnDeallocate(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		done := make(chan error, 1)
-		go func() { done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0) }()
+		go func() {
+			done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+		}()
 		waitUntil(t, "the allocation", 5*time.Second, func() bool { return srv.AllocationCount() == 1 })
 		if ok, err := allocateNow(t, tap); ok || err == nil {
 			t.Fatalf("fixture: a second Allocate was accepted while the first allocation stands — the quota of 1 is not enforced")
@@ -271,7 +281,7 @@ func TestARestartDoesNotOutrunItsOwnDeallocate(t *testing.T) {
 		defer cancel()
 		done := make(chan error, 1)
 		go func() {
-			c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0)
+			c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil)
 			if c != nil {
 				_ = c.Close()
 			}
@@ -314,7 +324,7 @@ func TestARestartDoesNotOutrunItsOwnDeallocate(t *testing.T) {
 		waitUntil(t, "the allocation", 5*time.Second, func() bool { return srv.AllocationCount() == 1 })
 		above, _ := net.Pipe() // stands in for the SRTP wrapper above the relay conn
 		creds := &TURNCreds{Username: "u", Password: "pw"}
-		sess := &srtpSessionConn{Conn: above, relayConn: relayConn, tc: tc, ctlConn: ctl, release: func() { p.releaseAllocation(tc, creds, 0) }}
+		sess := &srtpSessionConn{Conn: above, relayConn: relayConn, tc: tc, ctlConn: ctl, release: func() deallocVerdict { return p.releaseAllocation(tc, creds, 0) }}
 		_ = sess.Close()
 		if ok, err := allocateNow(t, tap); !ok {
 			t.Fatalf("the re-dial right behind Close was REFUSED (%v): Close returned before the relay had answered the deallocate", err)
@@ -339,7 +349,9 @@ func TestALostDeallocateIsSentAgain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0) }()
+	go func() {
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return srv.AllocationCount() == 1 })
 	tap.dropNext.Store(1) // the first deallocate datagram never reaches the relay
 	cancel()
@@ -372,7 +384,9 @@ func TestAnUnansweredDeallocateIsBoundedAndCounted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0) }()
+	go func() {
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return srv.AllocationCount() == 1 })
 	tap.mute.Store(true) // no deallocate gets through from here on
 	t0 := time.Now()
@@ -562,8 +576,8 @@ func TestEveryTeardownConfirmsItsDeallocateOverUDPOnly(t *testing.T) {
 		t.Errorf("proxy.go calls p.releaseAllocation %d times, want 2: runTURN's defer and setupSRTPSession's closure", n)
 	}
 	for _, guarded := range []string{
-		`if p\.config\.UseUDP \{\s*defer p\.releaseAllocation\(client, creds, connIdx\)\s*\}`,
-		`if p\.config\.UseUDP \{\s*release = func\(\) \{ p\.releaseAllocation\(tc, creds, connIdx\) \}\s*\}`,
+		`if p\.config\.UseUDP \{\s*release = func\(\) deallocVerdict \{ return p\.releaseAllocation\(client, creds, connIdx\) \}\s*\}`,
+		`if p\.config\.UseUDP \{\s*release = func\(\) deallocVerdict \{ return p\.releaseAllocation\(tc, creds, connIdx\) \}\s*\}`,
 	} {
 		if !regexp.MustCompile(guarded).MatchString(src) {
 			t.Errorf("proxy.go lacks /%s/ — the confirmed deallocate is for a UDP relay leg only", guarded)
@@ -584,22 +598,35 @@ func TestEveryTeardownConfirmsItsDeallocateOverUDPOnly(t *testing.T) {
 			at = i
 		}
 	}
-	// runTURN: defers run last-in first-out — the budget, then the confirmed deallocate, then relayConn.Close.
+	// Since build 430 the two steps — the confirmed deallocate, then the relay
+	// conn's own Close — are ONE body at all three sites (returnAllocation,
+	// seatcool.go), which also notes the moment for the pool.
+	seat, err := os.ReadFile("seatcool.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i := strings.Index(string(seat), "func returnAllocation("); i < 0 {
+		t.Fatal("returnAllocation not found")
+	} else {
+		body := stripComments(string(seat)[i:])
+		order("returnAllocation", body[:strings.Index(body, "\n}\n")], "release()", "relayConn.Close()")
+	}
+	// runTURN: defers run last-in first-out — the budget, then the allocation given back.
 	if i := strings.Index(src, "func (p *Proxy) runTURN("); i < 0 {
 		t.Fatal("runTURN not found")
 	} else {
-		order("runTURN's defers", src[i:], "defer relayConn.Close()", "defer p.releaseAllocation(client, creds, connIdx)", "turnConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))")
+		order("runTURN's defers", src[i:], "defer func() { _ = returnAllocation(relayConn, release, gave) }()", "turnConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))")
 	}
 	a := strings.Index(src, "abortSetup := func() {")
 	if a < 0 {
 		t.Fatal("abortSetup not found")
 	}
-	order("abortSetup", src[a:a+strings.Index(src[a:], "\n\t}\n")], "quiesce()", "SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))", "release()", "relayConn.Close()", "tc.Close()", "ctlConn.Close()")
+	order("abortSetup", src[a:a+strings.Index(src[a:], "\n\t}\n")], "quiesce()", "SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))", "returnAllocation(relayConn, release, gave)", "tc.Close()", "ctlConn.Close()")
 	c := strings.Index(src, "func (s *srtpSessionConn) Close() error {")
 	if c < 0 {
 		t.Fatal("srtpSessionConn.Close not found")
 	}
-	order("srtpSessionConn.Close", src[c:c+strings.Index(src[c:], "\n}\n")], "s.ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))", "s.Conn.Close()", "s.release()", "s.relayConn.Close()", "s.tc.Close()", "s.ctlConn.Close()")
+	order("srtpSessionConn.Close", src[c:c+strings.Index(src[c:], "\n}\n")], "s.ctlConn.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))", "s.Conn.Close()", "returnAllocation(s.relayConn, s.release, s.gave)", "s.tc.Close()", "s.ctlConn.Close()")
 	if !strings.Contains(src, "release:   release,") {
 		t.Error("setupSRTPSession does not hand its release to the session it returns — the live session's Close would give the allocation back unconfirmed")
 	}
@@ -616,7 +643,9 @@ func TestOverTCPTheTeardownSendsNoRequestOfItsOwn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0) }()
+	go func() {
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return p.turnRTTns.Load() != 0 })
 	cancel()
 	select {

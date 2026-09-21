@@ -157,7 +157,7 @@ type deallocStats struct {
 // leg — ONE body for every teardown that gives an allocation back (the SRTP
 // session's Close, its setup's abort, runTURN's defers). Called BEFORE the
 // relay conn is closed, with a live write budget already on the socket.
-func (p *Proxy) releaseAllocation(tc *turn.Client, creds *TURNCreds, connIdx int) {
+func (p *Proxy) releaseAllocation(tc *turn.Client, creds *TURNCreds, connIdx int) deallocVerdict {
 	start := time.Now()
 	do := func(req *stun.Message) (*stun.Message, error) {
 		res, err := tc.PerformTransaction(req, tc.TURNServerAddr(), false)
@@ -168,6 +168,7 @@ func (p *Proxy) releaseAllocation(tc *turn.Client, creds *TURNCreds, connIdx int
 	}
 	v, code, err := boundedDeallocate(do, tc.Close, creds.Username, creds.Password, deallocConfirmBudget)
 	p.noteDeallocate(connIdx, v, code, err, time.Since(start))
+	return v // what the relay said — returnAllocation reads it for the pool (seatcool.go)
 }
 
 // noteDeallocate counts the outcome and says it: every deallocate that was NOT

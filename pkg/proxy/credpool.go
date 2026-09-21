@@ -230,9 +230,21 @@ func (p *CredPool) Acquire(connIdx int) (addr string, creds *TURNCreds, slot int
 // credential it names (credPool.release).
 func (p *CredPool) Release(slot int, creds *TURNCreds) { p.cp.release(slot, creds) }
 
+// ReleaseGivenBack is Release for a lease whose ALLOCATION was given back to the
+// relay at `at` (the deallocate written, as far as the caller can tell): the VK
+// relay keeps a deallocated seat on the identity's quota for a second more, and
+// the pool keeps counting it that long — a re-dial is seated elsewhere, or
+// parks, instead of being refused with 486 (seatcool.go). A lease that never
+// held an allocation goes through Release.
+func (p *CredPool) ReleaseGivenBack(slot int, creds *TURNCreds, at time.Time) {
+	p.cp.releaseGivenBack(slot, creds, at)
+}
+
 // MarkSaturated records a 486 (allocation quota reached) on creds, the
 // credential the caller leased from slot, and returns the cooldown applied —
-// zero when the slot no longer holds that credential (nothing is marked).
+// zero when the slot no longer holds that credential, or when the refusal is
+// the relay's second behind a seat this side has just given back (nothing is
+// marked either way — seatcool.go).
 func (p *CredPool) MarkSaturated(slot int, creds *TURNCreds) time.Duration {
 	return p.cp.markSaturated(slot, creds)
 }

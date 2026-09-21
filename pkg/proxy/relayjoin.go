@@ -60,6 +60,8 @@ type relayLeg struct {
 	running int           // started and not yet ended, teardown included
 	joined  bool          // the session is ending: nothing is started behind a join
 	idle    chan struct{} // made by a join that found a leg running; closed by the last one's end
+
+	gave gaveBack // when the leg gave its allocation back — what the session releases its lease by (seatcool.go)
 }
 
 // start registers one more run; false once the session is ending.
@@ -119,7 +121,7 @@ func (p *Proxy) goRunTURN(ctx context.Context, leg *relayLeg, turnAddr string, c
 	ch := make(chan error, 1)
 	go func() {
 		defer leg.done()
-		ch <- p.runTURN(ctx, turnAddr, creds, conn2, connIdx, slotIdx)
+		ch <- p.runTURN(ctx, turnAddr, creds, conn2, connIdx, slotIdx, &leg.gave)
 		if after != nil {
 			after()
 		}
@@ -137,6 +139,9 @@ func (p *Proxy) joinRelayLeg(leg *relayLeg, cancel context.CancelFunc, connIdx i
 	if leg.join(relayJoinBudget) {
 		return
 	}
+	// The leg left behind is still giving its allocation back — about now, for all
+	// this side can tell: the pool keeps the seat counted for the relay's second.
+	leg.gave.note(time.Now())
 	n := p.dealloc.legsLeft.Add(1)
 	waited := time.Since(start)
 	frozen := ""
