@@ -25,10 +25,17 @@ package proxy
 // So a session keeps what it learns of its allocation's LIFE at the relay
 // (allocLife — hung on the note its lease is released by, gaveBack):
 //
-//   - WHEN IT EXPIRES: pion says the lifetime the relay granted, at the Allocate
-//     and at every refresh that succeeded — the only place a refresh's outcome
-//     is heard — and the session stamps it on the WALL clock: the relay's runs
-//     in real time, which a freeze of this process does not stop;
+//   - WHEN IT CAN HAVE EXPIRED, at the latest: pion says the lifetime the relay
+//     granted, at the Allocate and at every refresh that succeeded — the only
+//     place a refresh's outcome is heard — and the session stamps it on the WALL
+//     clock: the relay's runs in real time, which a freeze of this process does
+//     not stop. 🚫 The last lifetime HEARD is not that bound (the review of 432):
+//     a refresh can reach the relay and be GRANTED while its answer is lost — the
+//     mapping changes right behind the request — and the copies retransmitted
+//     from the new mapping are refused, of which pion says nothing. So a refresh
+//     that was SENT and not heard granted counts as granted, from the last moment
+//     a copy of it can have left (lifeHeard, refreshAsked) — unless the
+//     allocation had certainly expired before it was sent: nothing revives that;
 //   - a seat whose deallocate was answered 437 stays COUNTED until then
 //     (returnAllocation → gaveBack.noteOutOfReach → credPool.holdSeatUntil).
 //     EXPIRED BY THE CLOCK — a sleep that outlasted the lifetime — the 437 is
@@ -72,13 +79,13 @@ var mappingAskBudget = 300 * time.Millisecond
 // allocLife is what ONE session knows of its allocation's life at the relay. The
 // zero value knows nothing; a nil *allocLife is no bookkeeping.
 type allocLife struct {
-	expires atomic.Int64                // wall clock, unix ns: when the relay lets the allocation go if nothing refreshes it; 0 = not heard
-	mapped  atomic.Pointer[net.UDPAddr] // how the relay saw this socket at the Allocate (UDP; nil = not asked, or not answered)
-	gone    atomic.Bool                 // the relay has answered for this socket as for one that has no allocation
-	said    atomic.Bool                 // the mapping has been said: once per session
-	client  atomic.Pointer[turn.Client] // whom to ask
+	mapped atomic.Pointer[net.UDPAddr] // how the relay saw this socket at the Allocate (UDP; nil = not asked, or not answered)
+	gone   atomic.Bool                 // the relay has answered for this socket as for one that has no allocation
+	said   atomic.Bool                 // the mapping has been said: once per session
+	client atomic.Pointer[turn.Client] // whom to ask
 
 	mu     sync.Mutex
+	heard  lifeHeard      // what pion has said of the allocation's life
 	ending bool           // wait has been called: nothing is begun behind it
 	asks   sync.WaitGroup // the goroutines that ask the relay: joined behind the client's Close (wait)
 
@@ -87,6 +94,20 @@ type allocLife struct {
 	connIdx int
 	udp     bool
 }
+
+// lifeHeard is what a session has HEARD of its allocation's life — read and
+// written together, under allocLife.mu. Every moment in it is a WALL-clock one.
+type lifeHeard struct {
+	until   time.Time     // by its last GRANT the relay lets the allocation go here at the latest; zero = none heard
+	granted time.Duration // that grant's lifetime — what pion asks for at the next refresh
+	asked   time.Time     // a refresh SENT and not heard granted — a copy of it may have been granted all the same; zero = none
+	ended   time.Time     // when that refresh's transaction was heard to end: no copy of it left later; zero = not heard
+}
+
+// lifeSlack is added to every bound of the allocation's life: a copy of a
+// request still on its way when the answer was read sets the relay's clock a path
+// delay later than this side's. A var for tests.
+var lifeSlack = 2 * time.Second
 
 // fresh forgets the allocation before: called right BEFORE an Allocate — pion
 // says the lifetime it was granted from inside that call. (The direct session
@@ -97,8 +118,8 @@ func (l *allocLife) fresh() {
 	}
 	l.mu.Lock()
 	l.ending = false // the asks of the allocation before were joined behind its client's Close
+	l.heard = lifeHeard{}
 	l.mu.Unlock()
-	l.expires.Store(0)
 	l.mapped.Store(nil)
 	l.client.Store(nil)
 	l.gone.Store(false)
@@ -108,22 +129,83 @@ func (l *allocLife) fresh() {
 // isGone: the relay has answered for this socket as for one with no allocation.
 func (l *allocLife) isGone() bool { return l != nil && l.gone.Load() }
 
-// granted stamps the lifetime the relay has just granted.
+// granted stamps the lifetime the relay has just been HEARD to grant. The grant
+// settles whatever was sent before it: the relay's clock was set by the copy it
+// answered, and that copy left before now.
 func (l *allocLife) granted(d time.Duration) {
-	if l != nil {
-		l.expires.Store(time.Now().Add(d).UnixNano())
+	if l == nil {
+		return
 	}
+	l.mu.Lock()
+	l.heard = lifeHeard{until: wallClock().Add(d + lifeSlack), granted: d}
+	l.mu.Unlock()
 }
 
-// expiry is when the allocation can have expired at the latest: the stamp, or
-// — nothing heard — a whole assumed lifetime from now.
-func (l *allocLife) expiry(now time.Time) time.Time {
-	if l != nil {
-		if ns := l.expires.Load(); ns != 0 {
-			return time.Unix(0, ns)
+// refreshAsked: pion is about to send a refresh. Until it is heard GRANTED it may
+// have been granted unheard. 🚫 Except when the allocation has certainly expired
+// already — a refresh cannot bring a dead allocation back: the overdue refreshes
+// of a wake behind a long sleep must not turn forty honest 437s into forty seats
+// held for a lifetime.
+func (l *allocLife) refreshAsked() {
+	if l == nil {
+		return
+	}
+	now := wallClock()
+	l.mu.Lock()
+	if now.Before(l.boundLocked(now)) {
+		l.heard.asked, l.heard.ended = now, time.Time{}
+	}
+	l.mu.Unlock()
+}
+
+// refreshEnded: the transaction of the refresh last sent has come back — with an
+// answer that may be no grant, or with none. No copy of it leaves after this.
+func (l *allocLife) refreshEnded() {
+	if l == nil {
+		return
+	}
+	now := wallClock()
+	l.mu.Lock()
+	if !l.heard.asked.IsZero() && l.heard.ended.IsZero() {
+		l.heard.ended = now
+	}
+	l.mu.Unlock()
+}
+
+// boundLocked is when the allocation can have expired at the LATEST: the last
+// grant heard — nothing heard: a whole assumed lifetime from now — or, later
+// than that, a lifetime behind the last moment a copy of a refresh that was not
+// heard granted can have left. Caller holds l.mu.
+func (l *allocLife) boundLocked(now time.Time) time.Time {
+	h := l.heard
+	until := h.until
+	if until.IsZero() {
+		until = now.Add(assumedAllocLifetime)
+	}
+	if !h.asked.IsZero() {
+		last := h.ended
+		if last.IsZero() {
+			last = now // its transaction is still running: a copy may be leaving now
+		}
+		lifetime := h.granted
+		if lifetime <= 0 {
+			lifetime = assumedAllocLifetime
+		}
+		if u := last.Add(lifetime + lifeSlack); u.After(until) {
+			until = u
 		}
 	}
-	return now.Add(assumedAllocLifetime).Round(0)
+	return until.Round(0)
+}
+
+// expiry is when the allocation can have expired at the latest — boundLocked.
+func (l *allocLife) expiry(now time.Time) time.Time {
+	if l == nil {
+		return now.Add(assumedAllocLifetime).Round(0)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.boundLocked(now.Round(0))
 }
 
 // begin registers one more goroutine that asks the relay; false once the session
@@ -157,11 +239,28 @@ var pionLifetimeLine = regexp.MustCompile(`^(?:Initial|Updated) lifetime: (\d+) 
 const (
 	pionPermissionRefreshFailed = "Fail to refresh permissions: "
 	relayAnswered400            = "error response (error 400:"
+	// An allocation refresh, as pion says it (allocation.go, refreshAllocation):
+	// the first line BEFORE the transaction — the first copy is about to leave;
+	// the second when the transaction has come back WITH an answer, whatever it
+	// says (a refusal other than a stale nonce is then swallowed without a
+	// word); the third, from the timer, when it came back with none.
+	pionRefreshSent     = "Send refresh request (dontWait=false)"
+	pionRefreshAnswered = "Refresh request sent, and waiting response"
+	pionRefreshFailed   = "Failed to refresh allocation: "
 )
 
-// heardDebug is pion's Debug line: a lifetime the relay granted.
+// heardDebug is pion's Debug line: a lifetime the relay granted, or a refresh on
+// its way out and back.
 func (l *allocLife) heardDebug(msg string) {
 	if l == nil {
+		return
+	}
+	switch msg {
+	case pionRefreshSent:
+		l.refreshAsked()
+		return
+	case pionRefreshAnswered:
+		l.refreshEnded()
 		return
 	}
 	if m := pionLifetimeLine.FindStringSubmatch(msg); m != nil {
@@ -177,7 +276,14 @@ func (l *allocLife) heardDebug(msg string) {
 // Anchored on pion's prefix and on the error-code form — a bare "400" is a
 // port number as often as not.
 func (l *allocLife) heardError(msg string) {
-	if l == nil || !strings.HasPrefix(msg, pionPermissionRefreshFailed) || !strings.Contains(msg, relayAnswered400) {
+	if l == nil {
+		return
+	}
+	if strings.HasPrefix(msg, pionRefreshFailed) {
+		l.refreshEnded() // no answer at all: whether a copy was granted stays unknown — but none leaves later
+		return
+	}
+	if !strings.HasPrefix(msg, pionPermissionRefreshFailed) || !strings.Contains(msg, relayAnswered400) {
 		return
 	}
 	l.outOfReach("its permission refresh was answered 400")

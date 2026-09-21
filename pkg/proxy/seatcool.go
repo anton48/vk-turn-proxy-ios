@@ -165,7 +165,7 @@ func returnAllocation(relayConn io.Closer, release func() deallocVerdict, gave *
 	}
 	switch {
 	case !inReach:
-		gave.noteOutOfReach(time.Now())
+		gave.noteOutOfReach(wallClock()) // the clock the allocation's life is stamped by
 	case held:
 		gave.note(time.Now())
 	}

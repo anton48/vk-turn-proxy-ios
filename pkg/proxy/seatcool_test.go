@@ -286,7 +286,7 @@ func TestReturnAllocationNotesWhatTheRelayStillHolds(t *testing.T) {
 	}{
 		{"UDP: confirmed", func() deallocVerdict { return deallocConfirmed }, nil, nil, second},
 		{"UDP: 437, a lifetime heard and not run out — the allocation may live on under another mapping", func() deallocVerdict { return deallocGone }, nil, heard(10 * time.Minute), hold},
-		{"UDP: 437, the lifetime run out BY THE CLOCK — the 437 is honest, the seat free", func() deallocVerdict { return deallocGone }, nil, heard(-time.Second), nothing},
+		{"UDP: 437, the lifetime run out BY THE CLOCK — the 437 is honest, the seat free", func() deallocVerdict { return deallocGone }, nil, heard(-time.Minute), nothing},
 		{"UDP: 437, no lifetime heard — a whole assumed one", func() deallocVerdict { return deallocGone }, nil, nil, hold},
 		{"UDP: unanswered — cannot tell", func() deallocVerdict { return deallocUnanswered }, errors.New("closed"), nil, second},
 		{"UDP: unanswered on a socket the relay had already disowned (its permission refresh answered 400)", func() deallocVerdict { return deallocUnanswered }, nil, disowned, hold},

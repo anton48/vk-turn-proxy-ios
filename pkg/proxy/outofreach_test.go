@@ -11,6 +11,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -202,21 +203,22 @@ func TestAllocLifeHearsWhatPionSays(t *testing.T) {
 			t.Errorf("nothing heard: expiry %s from now, want the assumed lifetime %s", got.Sub(now), assumedAllocLifetime)
 		}
 		l.heardDebug("Initial lifetime: 600 seconds")
-		if d := time.Until(l.expiry(now)); d < 599*time.Second || d > 601*time.Second {
+		if d := time.Until(l.expiry(now)); d < 599*time.Second || d > 601*time.Second+lifeSlack {
 			t.Errorf("Initial lifetime: 600 seconds → expires in %s", d)
 		}
 		l.heardDebug("Updated lifetime: 3600 seconds")
-		if d := time.Until(l.expiry(now)); d < 3599*time.Second || d > 3601*time.Second {
+		if d := time.Until(l.expiry(now)); d < 3599*time.Second || d > 3601*time.Second+lifeSlack {
 			t.Errorf("Updated lifetime: 3600 seconds → expires in %s", d)
 		}
-		for _, other := range []string{"Refresh timer 1 expired", "lifetime: 5 seconds", "Updated lifetime: 0 seconds", "Updated lifetime: x seconds"} {
-			before := l.expires.Load()
+		for _, other := range []string{"Refresh timer 1 expired", "lifetime: 5 seconds", "Updated lifetime: 0 seconds", "Updated lifetime: x seconds",
+			"Send refresh request (dontWait=true)", "Refresh request sent", "No permission to refresh"} {
+			before := l.expiry(now)
 			l.heardDebug(other)
-			if l.expires.Load() != before {
-				t.Errorf("%q moved the expiry", other)
+			if got := l.expiry(now); !got.Equal(before) {
+				t.Errorf("%q moved the expiry by %s", other, got.Sub(before))
 			}
 		}
-		if at := time.Unix(0, l.expires.Load()); at != at.Round(0) {
+		if at := l.expiry(now); at != at.Round(0) {
 			t.Error("the expiry carries a monotonic reading: the relay's lifetime runs in real time")
 		}
 	})
@@ -227,7 +229,7 @@ func TestAllocLifeHearsWhatPionSays(t *testing.T) {
 		gave.watch(func() { kills.Add(1) }, 7, false)
 		lg := (&turnLoggerFactory{slot: 0, life: gave.lifeOf()}).NewLogger("turnc")
 		lg.Debugf("Initial lifetime: %d seconds", 1200) // pion's own call, udp_conn.go
-		if d := time.Until(gave.lifeOf().expiry(time.Now())); d < 1199*time.Second || d > 1201*time.Second {
+		if d := time.Until(gave.lifeOf().expiry(time.Now())); d < 1199*time.Second || d > 1201*time.Second+lifeSlack {
 			t.Errorf("the lifetime pion said through its logger was not stamped: expires in %s, want 20m", d.Round(time.Second))
 		}
 		lg.Errorf("Fail to refresh permissions: %s", "CreatePermission error response (error 400: Bad Request)") // pion's own call, allocation.go
@@ -316,10 +318,24 @@ func TestPionStillSaysWhatThisBuildListensFor(t *testing.T) {
 		{alloc, `a.log.Debugf("Updated lifetime: %d seconds"`, "the expiry is stamped from it at every refresh"},
 		{conn, `conn.log.Debugf("Initial lifetime: %d seconds"`, "the expiry is stamped from it at the Allocate"},
 		{alloc, `a.log.Errorf("Fail to refresh permissions: %s", err)`, "a permission refresh answered 400 ends the session"},
+		{alloc, `a.log.Debugf("Send refresh request (dontWait=%v)", dontWait)`, "a refresh sent and not heard granted may have been granted: the bound of the allocation's life counts it"},
+		{alloc, `a.log.Debug("` + pionRefreshAnswered + `")`, "the last moment a copy of that refresh can have left"},
+		{alloc, `a.log.Warnf("` + pionRefreshFailed + `%s", err)`, "the same, for a refresh that came back with no answer"},
 	} {
 		if !strings.Contains(want.src, want.lit) {
 			t.Errorf("pion no longer says %s — %s (outofreach.go)", want.lit, want.why)
 		}
+	}
+	// …and WHERE pion says them is what they mean: the first before the transaction
+	// goes out, the second behind its return — never the other way round.
+	body := alloc[strings.Index(alloc, "func (a *allocation) refreshAllocation("):]
+	body = body[:strings.Index(body, "\nfunc (a *allocation) refreshPermissions(")]
+	sentAt, txAt, backAt := strings.Index(body, `"Send refresh request (dontWait=%v)"`), strings.Index(body, "a.client.PerformTransaction("), strings.Index(body, `"Refresh request sent, and waiting response"`)
+	if sentAt < 0 || txAt < 0 || backAt < 0 || !(sentAt < txAt && txAt < backAt) {
+		t.Errorf("pion's refresh no longer says \"Send refresh request\" BEFORE its transaction and \"…waiting response\" BEHIND it (at %d, %d, %d) — the moments outofreach.go takes from them mean something else now", sentAt, txAt, backAt)
+	}
+	if fmt.Sprintf("Send refresh request (dontWait=%v)", false) != pionRefreshSent || !strings.HasPrefix(fmt.Sprintf("Failed to refresh allocation: %s", "x"), pionRefreshFailed) {
+		t.Error("the refresh lines listened for are not pion's")
 	}
 	for _, line := range []string{"Initial lifetime: 600 seconds", "Updated lifetime: 600 seconds"} {
 		if !pionLifetimeLine.MatchString(line) {
@@ -420,6 +436,11 @@ type vkLikeTap struct {
 	ghosts   []*net.UDPConn // the mappings left behind: open, so that their allocations live on
 	refusals atomic.Int32   // 400s and 437s the tap answered
 	firstAt  atomic.Int64   // when it answered the first of them, unix ns
+
+	loseFor     string // the client socket whose next refresh is GRANTED by the relay — and the answer lost, the mapping changed behind the request
+	refreshes   map[string]int
+	lostAt      atomic.Int64 // when that refresh passed, unix ns
+	lostAnswers atomic.Int32 // what the relay sent to a mapping left behind: it reaches nobody
 }
 
 func newVKLikeTap(t *testing.T, relay string) *vkLikeTap {
@@ -432,7 +453,7 @@ func newVKLikeTap(t *testing.T, relay string) *vkLikeTap {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tap := &vkLikeTap{ln: ln, relay: ra, ups: map[string]*net.UDPConn{}, disowned: map[string]bool{}}
+	tap := &vkLikeTap{ln: ln, relay: ra, ups: map[string]*net.UDPConn{}, disowned: map[string]bool{}, refreshes: map[string]int{}}
 	go tap.serve()
 	t.Cleanup(tap.close)
 	return tap
@@ -447,12 +468,19 @@ func (tap *vkLikeTap) upstream(client *net.UDPAddr) (*net.UDPConn, error) {
 		return nil, err
 	}
 	tap.ups[client.String()] = up
-	go func() { // the relay's answers, back to that client
+	go func() { // the relay's answers, back to that client — while this IS its mapping
 		b := make([]byte, 2048)
 		for {
 			n, err := up.Read(b)
 			if err != nil {
 				return
+			}
+			tap.mu.Lock()
+			current := tap.ups[client.String()] == up
+			tap.mu.Unlock()
+			if !current { // a translator that has forgotten the flow lets nothing back in
+				tap.lostAnswers.Add(1)
+				continue
 			}
 			_, _ = tap.ln.WriteToUDP(b[:n], client)
 		}
@@ -468,13 +496,37 @@ func (tap *vkLikeTap) remap(t *testing.T, n int) {
 	if n >= len(tap.order) {
 		t.Fatalf("fixture: the tap has seen %d client socket(s), no #%d", len(tap.order), n)
 	}
-	client := tap.order[n]
+	if err := tap.remapLocked(tap.order[n]); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// remapLocked leaves the client's mapping behind — open, so that its allocation
+// lives on — and gives it another. Caller holds tap.mu.
+func (tap *vkLikeTap) remapLocked(client string) error {
 	tap.ghosts = append(tap.ghosts, tap.ups[client])
 	addr, _ := net.ResolveUDPAddr("udp4", client)
 	if _, err := tap.upstream(addr); err != nil {
-		t.Fatal(err)
+		return err
 	}
 	tap.disowned[client] = true
+	return nil
+}
+
+// loseNextRefreshAnswer arms what a review of build 432 described: the n-th
+// client's NEXT allocation refresh reaches the relay and is GRANTED — and the
+// mapping changes right behind the request, so that the answer reaches nobody and
+// the retransmitted copies arrive from a 5-tuple with no allocation (437). It
+// says how many refreshes of that client had passed before it was armed.
+func (tap *vkLikeTap) loseNextRefreshAnswer(t *testing.T, n int) int {
+	t.Helper()
+	tap.mu.Lock()
+	defer tap.mu.Unlock()
+	if n >= len(tap.order) {
+		t.Fatalf("fixture: the tap has seen %d client socket(s), no #%d", len(tap.order), n)
+	}
+	tap.loseFor = tap.order[n]
+	return tap.refreshes[tap.loseFor]
 }
 
 func (tap *vkLikeTap) clients() int {
@@ -501,6 +553,23 @@ func (tap *vkLikeTap) serve() {
 			tap.order = append(tap.order, from.String())
 		}
 		disowned := tap.disowned[from.String()]
+		if !disowned && stun.IsMessage(pkt) {
+			r := &stun.Message{Raw: pkt}
+			if lt, err := refreshLifetime(r); err == nil && lt > 0 {
+				tap.refreshes[from.String()]++
+				if tap.loseFor == from.String() {
+					tap.loseFor = ""
+					_, _ = up.Write(pkt) // the relay gets it, and grants it …
+					tap.lostAt.Store(time.Now().UnixNano())
+					if err := tap.remapLocked(from.String()); err != nil { // … and its answer finds the mapping gone
+						tap.mu.Unlock()
+						return
+					}
+					tap.mu.Unlock()
+					continue
+				}
+			}
+		}
 		tap.mu.Unlock()
 		if !disowned {
 			_, _ = up.Write(pkt)
@@ -528,6 +597,22 @@ func (tap *vkLikeTap) serve() {
 			_, _ = up.Write(pkt)
 		}
 	}
+}
+
+// refreshLifetime is the LIFETIME a Refresh REQUEST asks for, in seconds (a
+// deallocate asks for 0); an error for anything else.
+func refreshLifetime(m *stun.Message) (uint32, error) {
+	if err := m.Decode(); err != nil {
+		return 0, err
+	}
+	if m.Type != stun.NewType(stun.MethodRefresh, stun.ClassRequest) {
+		return 0, errors.New("not a Refresh request")
+	}
+	v, err := m.Get(stun.AttrLifetime)
+	if err != nil || len(v) != 4 {
+		return 0, errors.New("no LIFETIME")
+	}
+	return binary.BigEndian.Uint32(v), nil
 }
 
 func (tap *vkLikeTap) close() {
@@ -605,7 +690,11 @@ func srtpEchoPeer(t *testing.T) *net.UDPAddr {
 	return srv.Addr().(*net.UDPAddr)
 }
 
-func newOutOfReachStand(t *testing.T) *outOfReachStand {
+func newOutOfReachStand(t *testing.T) *outOfReachStand { return newOutOfReachStandFor(t, 0) }
+
+// newOutOfReachStandFor: the relay grants `lifetime` to an allocation and to
+// every refresh of it (0: pion's ten minutes) — a client refreshes at half of it.
+func newOutOfReachStandFor(t *testing.T, lifetime time.Duration) *outOfReachStand {
 	t.Helper()
 	const lag = 300 * time.Millisecond
 	s := &outOfReachStand{live: map[string]int{}, freed: map[string][]time.Time{}, kills: map[int]context.CancelFunc{}, starts: map[int]int{}}
@@ -616,7 +705,8 @@ func newOutOfReachStand(t *testing.T) *outOfReachStand {
 		t.Fatal(err)
 	}
 	srv, err := turn.NewServer(turn.ServerConfig{
-		Realm: "okcdn.ru",
+		Realm:              "okcdn.ru",
+		AllocationLifetime: lifetime,
 		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
 			return ra.Username, turn.GenerateAuthKey(ra.Username, "okcdn.ru", "pw"), true
 		},
@@ -768,8 +858,66 @@ func TestASeatWhoseDeallocateWasAnswered437StaysCounted(t *testing.T) {
 	if n := strings.Count(out, "the relay has NO allocation for this socket"); n != 1 {
 		t.Errorf("the mapping was said %d time(s), want once", n)
 	}
-	if !regexp.MustCompile(`credpool: slot 0 keeps a seat counted for (9m5\ds|10m0s) more — its deallocate was answered 437`).MatchString(out) {
+	if !regexp.MustCompile(`credpool: slot 0 keeps a seat counted for (9m5\ds|10m[0-2]s) more — its deallocate was answered 437`).MatchString(out) {
 		t.Errorf("the pool did not say that it keeps the seat for the allocation's ten minutes:\n%s", grepLines(out, "keeps a seat"))
+	}
+}
+
+// THE REVIEW OF 432: the lifetime the relay was last HEARD to grant is not the
+// upper bound of the allocation's life. A refresh can reach the relay and be
+// GRANTED while its answer is lost — the mapping changes right behind the request
+// — and the retransmitted copies are then refused (437) and pion says nothing of
+// it. Build 432 let such a seat go the moment the last CONFIRMED lifetime had run
+// out by the clock, although the relay held the allocation for the refresh's
+// lifetime more: the re-dial was seated on it, refused with 486, and the identity
+// benched for eleven minutes. The reviewer's stand, on the production session: a
+// relay that grants eight seconds, the refresh at four granted and its answer
+// lost, the session ended behind the confirmed eight and ahead of the relay's
+// twelve.
+func TestARefreshGrantedWithItsAnswerLostStillHoldsTheSeat(t *testing.T) {
+	const lifetime = 8 * time.Second
+	slack := lifeSlack
+	lifeSlack = 200 * time.Millisecond // the stand's window is seconds wide
+	t.Cleanup(func() { lifeSlack = slack })
+	say := captureLog(t)
+	s := newOutOfReachStandFor(t, lifetime)
+	if n := s.tap.loseNextRefreshAnswer(t, 0); n != 0 {
+		t.Fatalf("fixture: %d refresh(es) of conn 0 had passed before the tap was armed — the stand came up too slowly for a lifetime of %s", n, lifetime)
+	}
+	waitUntil(t, "conn 0's refresh to reach the relay, its answer lost", lifetime, func() bool { return s.tap.lostAt.Load() != 0 })
+	lost := time.Unix(0, s.tap.lostAt.Load())
+	// The lifetime conn 0 last HEARD of is the Allocate's: it runs out half a
+	// lifetime behind the refresh; the relay's runs a whole one from it.
+	time.Sleep(time.Until(lost.Add(lifetime/2 + lifeSlack + 500*time.Millisecond)))
+	if n := s.tap.lostAnswers.Load(); n < 1 {
+		t.Fatalf("fixture: the tap dropped %d answer(s) — the refresh's answer reached conn 0, and its confirmed lifetime has not run out", n)
+	}
+	if n := s.liveOn(s.userA); n != connsPerSlot {
+		t.Fatalf("fixture: the relay holds %d allocation(s) of identity A before the session is ended, want %d", n, connsPerSlot)
+	}
+	refusedBefore := s.tap.refusals.Load() // the retransmitted copies of the refresh, and the refresh after it
+	if left := time.Until(lost.Add(lifetime)); left < 1500*time.Millisecond {
+		t.Fatalf("fixture: the session is ended only %s ahead of the relay's own expiry — too late to tell a held seat from an expired one", left.Round(time.Millisecond))
+	}
+	s.kill(0) // its lease is settled, and its re-dial seated, within milliseconds of this
+	waitUntil(t, "the tap to answer conn 0's deallocate like the VK relay", 5*time.Second, func() bool { return s.tap.refusals.Load() > refusedBefore })
+	waitUntil(t, "conn 0 to be back", 10*time.Second, func() bool {
+		return s.p.activeConns.Load() == int32(connsPerSlot) && s.begun(0) >= 2 && (s.liveOn(s.userB) == 1 || s.refused.Load() > 0)
+	})
+	if n := s.refused.Load(); n != 0 {
+		t.Errorf("the relay REFUSED %d Allocate(s) on identity A — the seat was let go by the last CONFIRMED lifetime, and the refresh whose answer was lost had been granted", n)
+	}
+	if slotSaturated(s.p.credPool, 0) {
+		t.Error("slot 0 is benched as VK-saturated — a good identity lost for eleven minutes over an allocation of our own")
+	}
+	if active, _, _ := leaseCounts(s.p.credPool, 0); active != connsPerSlot {
+		t.Errorf("slot 0: active %d, want %d — the seat out of reach stays counted while a refresh that may have been granted keeps its allocation alive", active, connsPerSlot)
+	}
+	if n := s.liveOn(s.userB); n != 1 {
+		t.Errorf("identity B carries %d allocation(s), want 1 — conn 0 is not back on the reserve identity", n)
+	}
+	if out := say(); !strings.Contains(out, "credpool: slot 0 keeps a seat counted for ") {
+		t.Errorf("the pool did not say that it keeps the seat:\n%s", grepLines(out, "keeps a seat|NO allocation"))
 	}
 }
 
