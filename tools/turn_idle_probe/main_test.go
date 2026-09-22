@@ -108,3 +108,20 @@ func TestParseDatagramTakesTheFrameAsItComes(t *testing.T) {
 		}()
 	}
 }
+
+// The arms' TCP sockets send no keepalive of their own unless asked: Go's dialer would probe every 15 s and the
+// far side, never idle, would never show its own keepalive — the measurement of 2026-09-23 saw exactly that.
+func TestTheArmsSendNoKeepaliveOfTheirOwnUnlessAsked(t *testing.T) {
+	if d := dialerFor("tcp", true); d.KeepAlive >= 0 {
+		t.Fatalf("the TCP dialer keeps Go's default keepalive (KeepAlive %v): the far side is never idle", d.KeepAlive)
+	}
+	if d := dialerFor("tcp", false); d.KeepAlive != 0 {
+		t.Fatal("-os-keepalive must leave the dialer at Go's default")
+	}
+	if d := dialerFor("udp", true); d.KeepAlive != 0 {
+		t.Fatal("a UDP dialer has no keepalive to disable")
+	}
+	if osKeepalive {
+		t.Fatal("the OS keepalive must be OFF by default")
+	}
+}

@@ -70,6 +70,21 @@ import (
 	"github.com/pion/stun/v3"
 )
 
+// osKeepalive: whether the arms' TCP sockets keep Go's default keepalive (-os-keepalive). Off, so that a
+// silence is a silence on the wire and whatever zero-length segment arrives during it is the far side's.
+var osKeepalive bool
+
+// dialerFor builds the arms' dialer: over TCP with the OS keepalive DISABLED unless asked for — Go's net.Dialer
+// enables it with a 15-s period by default, and a probe every 15 s from this host is exactly what a measurement of
+// the far side's keepalive must not send.
+func dialerFor(transport string, noKeepalive bool) *net.Dialer {
+	d := &net.Dialer{Timeout: requestTimeout}
+	if transport == "tcp" && noKeepalive {
+		d.KeepAlive = -1
+	}
+	return d
+}
+
 const (
 	requestTimeout = 5 * time.Second
 	firstRTO       = 500 * time.Millisecond // UDP only: a lost request is sent again
@@ -549,7 +564,7 @@ func (s *session) after() (verdict, detail string) {
 func runArm(a arm, relay string, creds *proxy.TURNCreds, peer *net.UDPAddr, ask askFunc, whyNoAsk string, rtp bool) result {
 	res := result{name: a.name, transport: a.transport, silence: a.silence, control: a.control}
 	fail := func(err error) result { res.verdict, res.detail = "NOT RUN", err.Error(); return res }
-	conn, err := (&net.Dialer{Timeout: requestTimeout}).Dial(a.transport+"4", relay)
+	conn, err := dialerFor(a.transport, !osKeepalive).Dial(a.transport+"4", relay)
 	if err != nil {
 		return fail(fmt.Errorf("dial: %w", err))
 	}
@@ -642,6 +657,7 @@ func main() {
 	flag.DurationVar(&permissionLifetime, "permission-lifetime", permissionLifetime, "how old a permission may be for a missing inbound datagram to still count against the mapping (RFC: 5m; the VK relay was seen to honour one 6m40s old)")
 	peerShape := flag.String("peer-shape", "rtp", "rtp or plain: what travels through the relay to and from the peer — the VK relay forwards nothing that is not shaped as media, so plain is the arm that must fail")
 	noControl := flag.Bool("no-control", false, "skip the control arm (a Refresh + CreatePermission every 25 s for the longest silence)")
+	flag.BoolVar(&osKeepalive, "os-keepalive", false, "leave Go's default TCP keepalive on the arms' sockets (a probe from THIS host every 15 s of idleness). Off by default: with it on, the far side is never idle and a measurement of ITS keepalive sees only our own probes and its answers — seen on the wire 2026-09-23")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
