@@ -30,8 +30,13 @@ func TestPathUpRotatesTheGroupHello(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	p.sendGroupHello(&buf)
-	if !bytes.Equal(buf.Bytes(), after) {
-		t.Fatal("sendGroupHello does not send the CURRENT hello")
+	if !bytes.HasPrefix(buf.Bytes(), after) {
+		t.Fatal("sendGroupHello does not send the CURRENT hello first")
+	}
+	// Behind it, since build 434, the sentinel naming the group just left
+	// (supersede_test.go has the whole contract).
+	if rest := buf.Bytes()[len(after):]; len(rest) != groupHelloLen || !bytes.HasPrefix(rest, groupSupersedeMagic) {
+		t.Fatalf("the sentinel does not follow the rotated hello: %d byte(s)", len(rest))
 	}
 	third := &Proxy{}
 	third.initGroupHello(Config{UseWrapA: true})

@@ -140,8 +140,17 @@ func (p *Proxy) rotateGroupHello() {
 	hello := make([]byte, 0, groupHelloLen)
 	hello = append(hello, groupHelloMagic...)
 	hello = append(hello, id[:]...)
+	// The group being left is named to the server behind every new session's
+	// hello (sendGroupHello): it reaps that group at once instead of at its
+	// backstop, and repeats its keepalive into nothing that was released.
+	if old := p.groupHello.Load(); old != nil && len(*old) == groupHelloLen {
+		sup := make([]byte, 0, groupHelloLen)
+		sup = append(sup, groupSupersedeMagic...)
+		sup = append(sup, (*old)[len(groupHelloMagic):]...)
+		p.groupSupersede.Store(&sup)
+	}
 	p.groupHello.Store(&hello)
-	log.Printf("proxy: group hello rotated to %s — the server's old group keeps only the dead sessions", id)
+	log.Printf("proxy: group hello rotated to %s — the server's old group keeps only the dead sessions, and is told so", id)
 }
 
 // beginConnSession stamps a starting session with the current epoch and

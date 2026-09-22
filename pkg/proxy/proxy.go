@@ -470,6 +470,16 @@ type Proxy struct {
 	// is not our server (WRAP-A / WRAP-S) — see groupHelloMagic. Built once in
 	// NewProxy and ROTATED on a path-up (pathrestart.go), hence the atomic.
 	groupHello atomic.Pointer[[]byte]
+	// groupSupersede is the sentinel that names the group the LAST rotation left
+	// behind (0xff 'S' 'U' 'P' + that group's 16-byte id), sent right behind the
+	// hello so the server reaps the old group at once instead of at its 150-s
+	// backstop — and never repeats its keepalive into released allocations. nil
+	// until the first rotation. See sendGroupHello.
+	groupSupersede atomic.Pointer[[]byte]
+	// pongRepeats counts the pongs that arrived at or below the mark — the
+	// server's keepalive is a repeat of the last echo, and each one lands here.
+	// A field-analysis number: it says the server's repeats reach this phone.
+	pongRepeats atomic.Int64
 
 	// Per-conn last-activity timestamps (UnixNano) for skip-on-recent-tx
 	// wake-probe optimization. Updated alongside connTxBytes/connRxBytes
@@ -2842,6 +2852,9 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					if n >= len(probePingMagic)+8 {
 						pongSeq = binary.BigEndian.Uint64(buf[len(probePingMagic) : len(probePingMagic)+8])
 						p.notePongSeq(connIdx, pongSeq) // forward only — wakeprobe.go
+						if pongIsRepeat(prevPongSeq, pongSeq) {
+							p.pongRepeats.Add(1) // the server's keepalive: a repeat of the last echo
+						}
 					}
 					// One-shot first-pong log: shows when end-to-end
 					// probing actually started working for this conn,
@@ -2862,8 +2875,8 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 						// row trigger it) but well below the 120s zombie
 						// threshold (so it can't fire after a kill).
 						if gap > 300 {
-							log.Printf("proxy: [conn %d] pong gap %ds resolved (prev pongSeq=%d, this pongSeq=%d, missed=%d)",
-								connIdx, gap, prevPongSeq, pongSeq, pongSeq-prevPongSeq-1)
+							log.Printf("proxy: [conn %d] pong gap %ds resolved (prev pongSeq=%d, this pongSeq=%d, %s)",
+								connIdx, gap, prevPongSeq, pongSeq, pongGapTail(prevPongSeq, pongSeq))
 						}
 					}
 				}
@@ -3866,10 +3879,11 @@ func (p *Proxy) dumpConnStats(prevTx, prevRx []int64, prevTime time.Time, label 
 			humanBytes(int64(float64(r.rx)/dur)),
 			humanBytes(r.rxCum))
 	}
-	log.Printf("  summary: %d idle (combined <1KB in interval), top TX %s/s, top RX %s/s",
+	log.Printf("  summary: %d idle (combined <1KB in interval), top TX %s/s, top RX %s/s, pong repeats %d (the server's keepalive, since start)",
 		idle,
 		humanBytes(int64(float64(rows[0].tx)/dur)),
-		humanBytes(int64(float64(rows[0].rx)/dur)))
+		humanBytes(int64(float64(rows[0].rx)/dur)),
+		p.pongRepeats.Load())
 }
 
 // TaskVMInfo carries the iOS-side process memory accounting fields
@@ -4762,6 +4776,22 @@ var groupHelloMagic = []byte{0xff, 'G', 'R', 'P'}
 // groupHelloLen is magic + a 16-byte session id.
 const groupHelloLen = 4 + 16
 
+// groupSupersedeMagic opens the sentinel that names a group this client has
+// LEFT: 0xff 'S' 'U' 'P' + the old 16-byte id — the hello's construction and
+// its length, so a server that predates it forwards it to WireGuard, which
+// drops it as malformed (one 20-byte packet per session, nothing else). A
+// server that knows it reaps the old group at the next tick.
+var groupSupersedeMagic = []byte{0xff, 'S', 'U', 'P'}
+
+// supersedeBytes is the sentinel for the group the last rotation left behind,
+// or nil before any rotation (and always nil when grouping is off).
+func (p *Proxy) supersedeBytes() []byte {
+	if s := p.groupSupersede.Load(); s != nil {
+		return *s
+	}
+	return nil
+}
+
 // initGroupHello builds this tunnel's group hello: one session id per tunnel
 // start, shared by every conn, so the server can put this client's connections
 // on one socket toward WireGuard.
@@ -4798,13 +4828,46 @@ func (p *Proxy) groupHelloBytes() []byte {
 }
 
 // sendGroupHello writes this tunnel's group hello to one conn, if the peer is
-// our own server. Errors are ignored on purpose: the hello is an optimisation,
-// it is repeated every probe interval, and a server that never sees one simply
-// keeps the connection on its own socket.
+// our own server — and, behind it, the sentinel naming the group the last
+// rotation left behind, so that the server does not wait its 150-s backstop
+// to reap the old group (and does not repeat its keepalive into it). Once per
+// session, at its start; a session that starts long after the rotation names
+// a group the server has already reaped, which is a no-op there. Errors are
+// ignored on purpose: both are optimisations, and a server that never sees
+// them simply keeps the connection on its own socket, or reaps at the backstop.
 func (p *Proxy) sendGroupHello(w io.Writer) {
-	if h := p.groupHelloBytes(); h != nil {
-		_, _ = w.Write(h)
+	h := p.groupHelloBytes()
+	if h == nil {
+		return
 	}
+	_, _ = w.Write(h)
+	if s := p.supersedeBytes(); s != nil {
+		_, _ = w.Write(s)
+	}
+}
+
+// pongIsRepeat says whether a pong is a REPEAT of one already heard — its seq
+// at or below the mark it found — which is what the server's keepalive sends
+// into a silence. A mark of 0 is a session that has heard nothing yet: its
+// first pong is never a repeat.
+func pongIsRepeat(prevSeq, seq uint64) bool {
+	return prevSeq > 0 && seq <= prevSeq
+}
+
+// pongGapTail is the end of a "pong gap resolved" line: how many echoes the
+// gap swallowed — or, when the pong that ended it carries a seq at or below
+// the one before, that it is a REPEAT (the server's keepalive resends the last
+// echo into a silence), which is not a gap in the sequence at all. The count
+// is unsigned; without the branch a repeat printed a number near 2^64.
+func pongGapTail(prevSeq, seq uint64) string {
+	if pongIsRepeat(prevSeq, seq) {
+		return fmt.Sprintf("a repeat of seq %d — the server's keepalive, no echo missed", seq)
+	}
+	missed := uint64(0)
+	if seq > prevSeq {
+		missed = seq - prevSeq - 1
+	}
+	return fmt.Sprintf("missed=%d", missed)
 }
 
 // recvPktPool recycles []byte slices used to hand off freshly-read packets
@@ -5260,6 +5323,9 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					if n >= len(probePingMagic)+8 {
 						pongSeq = binary.BigEndian.Uint64(buf[len(probePingMagic) : len(probePingMagic)+8])
 						p.notePongSeq(connIdx, pongSeq) // forward only — wakeprobe.go
+						if pongIsRepeat(prevPongSeq, pongSeq) {
+							p.pongRepeats.Add(1) // the server's keepalive: a repeat of the last echo
+						}
 					}
 					if p.firstPongAt[connIdx].CompareAndSwap(0, nowUnix) {
 						firstPing := p.firstPingAt[connIdx].Load()
@@ -5272,8 +5338,8 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 					} else if prevPongAt > 0 {
 						gap := nowUnix - prevPongAt
 						if gap > 300 {
-							log.Printf("proxy: [conn %d] SRTP pong gap %ds resolved (prev pongSeq=%d, this pongSeq=%d, missed=%d)",
-								connIdx, gap, prevPongSeq, pongSeq, pongSeq-prevPongSeq-1)
+							log.Printf("proxy: [conn %d] SRTP pong gap %ds resolved (prev pongSeq=%d, this pongSeq=%d, %s)",
+								connIdx, gap, prevPongSeq, pongSeq, pongGapTail(prevPongSeq, pongSeq))
 						}
 					}
 				}
