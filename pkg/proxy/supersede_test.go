@@ -5,6 +5,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -270,6 +271,238 @@ func TestTheGroupsLeftAreBounded(t *testing.T) {
 	p.groupsLeftMu.Unlock()
 	if n != groupsLeftCap {
 		t.Fatalf("%d groups kept, want the cap %d", n, groupsLeftCap)
+	}
+}
+
+// hookedRecorder runs hook from inside the FIRST write — the hello's — the way
+// events landing between a session's load of the hello and the write's return
+// do; a rotation, another session's whole hello, whatever the case needs.
+type hookedRecorder struct {
+	hook func()
+	pkts [][]byte
+}
+
+func (r *hookedRecorder) Write(b []byte) (int, error) {
+	r.pkts = append(r.pkts, append([]byte(nil), b...))
+	if len(r.pkts) == 1 && r.hook != nil {
+		r.hook()
+	}
+	return len(b), nil
+}
+
+// THE REVIEW'S FIRST CASE (the review of 435). A hello of A is on its way out
+// when the tunnel rotates to B; a session of B announces B; THEN the late
+// hello of A completes. 435 kept one "last announced" pointer per tunnel, the
+// late write overwrote it with A, and at the next rotation B looked
+// unannounced and was never named — the server kept B to its backstop. The
+// fact of an announcement belongs to the GENERATION: a late hello of A
+// announces A and says nothing about B.
+func TestALateHelloOfAnOldGroupDoesNotUnannounceTheNewOne(t *testing.T) {
+	p := &Proxy{}
+	p.initGroupHello(Config{})
+	a := append([]byte(nil), p.groupHelloBytes()...)
+	var b []byte
+	w := &hookedRecorder{hook: func() {
+		p.rotateGroupHello() // A → B while A's hello is in flight
+		b = append([]byte(nil), p.groupHelloBytes()...)
+		p.sendGroupHello(&recorder{}) // a session of B announces B, whole
+	}}
+	p.sendGroupHello(w) // A's hello completes last
+	if bytes.Equal(b, a) || len(b) == 0 {
+		t.Fatal("fixture: the rotation inside the write did not happen")
+	}
+	p.rotateGroupHello() // B → C: B was announced and must be named
+	c := append([]byte(nil), p.groupHelloBytes()...)
+	w2 := &recorder{}
+	p.sendGroupHello(w2)
+	ids := sentinels(t, w2.pkts)
+	if !containsID(ids, helloID(b)) {
+		t.Fatal("B — announced by a session of its own — is not named after the rotation away from it: the late hello of A un-announced it, and the server keeps B to its backstop")
+	}
+	if !containsID(ids, helloID(a)) {
+		t.Fatal("A — announced by the late hello — is not named")
+	}
+	if containsID(ids, helloID(c)) {
+		t.Fatal("the sentinel names the group the client is in")
+	}
+}
+
+// The other direction of the same binding: a late hello of A announces A
+// ALONE. With no session of B ever up, the rotation away from B names nothing
+// — the server never had B — and A, which the late hello did announce, is
+// named. Sabotage seen red: the flag set on the CURRENT generation instead of
+// the one the hello belongs to.
+func TestALateHelloAnnouncesItsOwnGroupOnly(t *testing.T) {
+	p := &Proxy{}
+	p.initGroupHello(Config{})
+	a := append([]byte(nil), p.groupHelloBytes()...)
+	var b []byte
+	w := &hookedRecorder{hook: func() {
+		p.rotateGroupHello() // A → B while A's hello is in flight; nobody announces B
+		b = append([]byte(nil), p.groupHelloBytes()...)
+	}}
+	p.sendGroupHello(w)
+	p.rotateGroupHello() // B → C
+	w2 := &recorder{}
+	p.sendGroupHello(w2)
+	ids := sentinels(t, w2.pkts)
+	if containsID(ids, helloID(b)) {
+		t.Fatal("B named although no session ever announced it: the late hello of A announced the CURRENT group instead of its own")
+	}
+	if !containsID(ids, helloID(a)) {
+		t.Fatal("A — announced by the late hello — is not named")
+	}
+	if len(ids) != 1 {
+		t.Fatalf("%d sentinel(s), want exactly the one naming A", len(ids))
+	}
+}
+
+// gatedRecorder holds the FIRST write — the hello's — until gate is closed,
+// telling entered that the session is inside it: the hello it will write is
+// the one it loaded before the gate, whatever the tunnel does meanwhile.
+type gatedRecorder struct {
+	gate    <-chan struct{}
+	entered *sync.WaitGroup
+	held    bool
+	pkts    [][]byte
+}
+
+func (g *gatedRecorder) Write(b []byte) (int, error) {
+	if !g.held {
+		g.held = true
+		g.entered.Done()
+		<-g.gate
+	}
+	g.pkts = append(g.pkts, append([]byte(nil), b...))
+	return len(b), nil
+}
+
+// THE REVIEW'S SECOND CASE. Three sessions loaded the hello of A before the
+// rotation to B, and their writes complete after it. 435 excluded the tunnel's
+// CURRENT group (B) from the sentinels, so each of the three wrote hello A +
+// supersede A — a no-op at the server, where a group cannot supersede itself
+// (old == by) — and counted it: A's three copies were spent on nothing, and
+// the first real session of B no longer named A. A sentinel never names the
+// group of the hello it rides behind, and such a self-supersede spends no
+// copy.
+func TestASelfSupersedeIsNeverWrittenAndSpendsNothing(t *testing.T) {
+	p := &Proxy{}
+	p.initGroupHello(Config{})
+	a := append([]byte(nil), p.groupHelloBytes()...)
+	p.sendGroupHello(&recorder{}) // A announced
+
+	gate := make(chan struct{})
+	var entered, done sync.WaitGroup
+	ws := make([]*gatedRecorder, supersedeSends)
+	for i := range ws {
+		ws[i] = &gatedRecorder{gate: gate, entered: &entered}
+		entered.Add(1)
+		done.Add(1)
+		go func(w *gatedRecorder) {
+			defer done.Done()
+			p.sendGroupHello(w)
+		}(ws[i])
+	}
+	entered.Wait()       // the three are inside their hello's write: each loaded A
+	p.rotateGroupHello() // → B
+	b := append([]byte(nil), p.groupHelloBytes()...)
+	close(gate) // the three hellos of A complete after the rotation
+	done.Wait()
+	for i, w := range ws {
+		if len(w.pkts) < 1 || !bytes.Equal(w.pkts[0], a) {
+			t.Fatalf("fixture: old session %d did not write the hello of A", i)
+		}
+		if ids := sentinels(t, w.pkts); len(ids) != 0 {
+			t.Fatalf("old session %d wrote a sentinel behind its hello of A, naming %x — a group cannot supersede itself at the server", i, ids[0])
+		}
+	}
+	// The sessions of B name A — all supersedeSends of them — and not one more.
+	for i := 0; i < supersedeSends; i++ {
+		w := &recorder{}
+		p.sendGroupHello(w)
+		if len(w.pkts) < 1 || !bytes.Equal(w.pkts[0], b) {
+			t.Fatalf("fixture: session %d of B did not write the hello of B", i+1)
+		}
+		if !containsID(sentinels(t, w.pkts), helloID(a)) {
+			t.Fatalf("session %d of B does not name A: the self-supersedes of the old sessions spent A's copies", i+1)
+		}
+	}
+	w := &recorder{}
+	p.sendGroupHello(w)
+	if len(sentinels(t, w.pkts)) != 0 {
+		t.Fatal("A is still named after its sends")
+	}
+}
+
+// failEvery fails every write: a hello that never left.
+type failEvery struct{}
+
+func (failEvery) Write(b []byte) (int, error) { return 0, os.ErrClosed }
+
+// A hello whose write failed announced nothing: the server never saw it, and
+// the rotation away from that group names nothing.
+func TestAFailedHelloAnnouncesNothing(t *testing.T) {
+	p := &Proxy{}
+	p.initGroupHello(Config{})
+	p.sendGroupHello(failEvery{})
+	p.rotateGroupHello()
+	w := &recorder{}
+	p.sendGroupHello(w)
+	if len(sentinels(t, w.pkts)) != 0 {
+		t.Fatal("a group whose hello never left is named — the server never had it")
+	}
+}
+
+// The announcement and the rotation go under ONE lock — the announced flag
+// set and the "has the tunnel rotated away from me" check on one side, the old
+// generation's flag read and the replacement on the other — so that neither
+// can slip between the other's two steps (a hello marked announced after the
+// rotation read the flag and before it stored the new generation would be a
+// group the server has and nobody names). A race test cannot pin that; the
+// source can.
+func TestTheAnnouncementAndTheRotationShareOneLock(t *testing.T) {
+	body := func(file, fn string) string {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(src)
+		i := strings.Index(s, "func (p *Proxy) "+fn+"(")
+		if i < 0 {
+			t.Fatalf("%s: no %s", file, fn)
+		}
+		j := strings.Index(s[i:], "\n}\n")
+		return s[i : i+j]
+	}
+	underLock := func(fn, body string, stmts ...string) {
+		lock := strings.Index(body, "p.groupsLeftMu.Lock()")
+		if lock < 0 {
+			t.Fatalf("%s does not take groupsLeftMu", fn)
+		}
+		unlock := strings.Index(body, "\tp.groupsLeftMu.Unlock()")
+		if unlock < 0 {
+			unlock = len(body) // deferred: held to the end
+		}
+		for _, s := range stmts {
+			i := strings.Index(body, s)
+			if i < 0 {
+				t.Fatalf("%s: %q not found", fn, s)
+			}
+			if i < lock || i > unlock {
+				t.Fatalf("%s: %q is outside the lock", fn, s)
+			}
+		}
+	}
+	underLock("rotateGroupHello", body("pathrestart.go", "rotateGroupHello"),
+		"old := p.groupHello.Load()", "p.groupHello.Store(next)", "old.announced")
+	underLock("announced", body("proxy.go", "announced"),
+		"g.announced = true", "p.groupHello.Load() != g")
+	send := body("proxy.go", "sendGroupHello")
+	if strings.Contains(send, "announced = true") {
+		t.Fatal("sendGroupHello sets the flag itself, outside announced's lock")
+	}
+	if i, j := strings.Index(send, "w.Write(g.hello)"), strings.Index(send, "p.announced(g)"); i < 0 || j < 0 || j < i {
+		t.Fatal("the generation must be announced by the write of its hello, after it")
 	}
 }
 

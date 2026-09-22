@@ -465,23 +465,24 @@ type Proxy struct {
 	connTxBytes []atomic.Int64
 	connRxBytes []atomic.Int64
 
-	// groupHello is this tunnel's M3 group hello (0xff 'G' 'R' 'P' + a 16-byte
-	// session id), sent verbatim on every conn so the server can group this
-	// client's connections onto one socket toward WireGuard. nil when the peer
-	// is not our server (WRAP-A / WRAP-S) — see groupHelloMagic. Built once in
-	// NewProxy and ROTATED on a path-up (pathrestart.go), hence the atomic.
-	groupHello atomic.Pointer[[]byte]
-	// groupAnnounced is the hello a session last WROTE — the group the server
-	// can know of; compared to groupHello by POINTER. A rotation that leaves a
-	// group no session ever announced leaves nothing the server has (a cascade
-	// of path-ups inside the debounce mints ids that never reach a connection),
-	// and the sentinel must name the group the server HAS — see groupsLeft.
-	groupAnnounced atomic.Pointer[[]byte]
+	// groupHello is this tunnel's CURRENT group generation (groupGen): the M3
+	// group hello (0xff 'G' 'R' 'P' + a 16-byte session id), sent verbatim on
+	// every conn so the server can group this client's connections onto one
+	// socket toward WireGuard, and whether a session has ANNOUNCED it. nil when
+	// the peer is not our server (WRAP-A / WRAP-S) — see groupHelloMagic. Built
+	// once in NewProxy and ROTATED on a path-up (pathrestart.go), hence the
+	// atomic; the generation's announced flag and the rotation's read-and-
+	// replace go under groupsLeftMu, so that a hello whose write completes
+	// across a rotation and the rotation itself cannot miss each other.
+	groupHello atomic.Pointer[groupGen]
 	// groupsLeft holds the announced groups this client has rotated away from,
 	// each still to be named to the server by supersedeSends more hellos (the
 	// sentinel 0xff 'S' 'U' 'P' + that group's id, behind the hello): the server
 	// reaps a named group at once instead of at its 150-s backstop, and never
-	// repeats its keepalive into released allocations. Under groupsLeftMu.
+	// repeats its keepalive into released allocations. Under groupsLeftMu — the
+	// ONE lock for this list, for a generation's announced flag and for the
+	// rotation (only a group some session announced can be at the server, and
+	// which groups those are is decided here).
 	groupsLeftMu sync.Mutex
 	groupsLeft   []groupLeft
 	// pongRepeats counts the pongs that arrived at or below the mark — the
@@ -4791,6 +4792,23 @@ const groupHelloLen = 4 + 16
 // server that knows it reaps the old group at the next tick.
 var groupSupersedeMagic = []byte{0xff, 'S', 'U', 'P'}
 
+// groupGen is one generation of this tunnel's group: its hello, and whether a
+// session has ANNOUNCED it — written the hello to the server, which makes the
+// group one the server can have. The fact belongs to the GENERATION, never to
+// the tunnel: a hello of an older generation whose write completes late
+// announces its own group and says nothing about the current one (build 435
+// kept one "last announced" pointer per tunnel; such a late hello overwrote
+// it, the current group then looked unannounced at its rotation and was never
+// named — the server kept it to its backstop). announced is written and read
+// under groupsLeftMu.
+type groupGen struct {
+	hello     []byte
+	announced bool
+}
+
+// id is the 16-byte group id inside the generation's hello.
+func (g *groupGen) id() []byte { return g.hello[len(groupHelloMagic):] }
+
 // groupLeft is one announced group this client has left: the sentinel that
 // names it, and how many hellos have carried that sentinel so far.
 type groupLeft struct {
@@ -4815,16 +4833,21 @@ const (
 // noteGroupLeft records that the group with this id was announced to the
 // server and has now been left: the next supersedeSends hellos name it. An id
 // already on the list is not added twice (the rotation and the announcing
-// session can both find the same group left — see sendGroupHello).
+// session can both find the same group left — see announced).
 func (p *Proxy) noteGroupLeft(id []byte) {
+	p.groupsLeftMu.Lock()
+	defer p.groupsLeftMu.Unlock()
+	p.noteGroupLeftLocked(id)
+}
+
+// noteGroupLeftLocked is noteGroupLeft under groupsLeftMu.
+func (p *Proxy) noteGroupLeftLocked(id []byte) {
 	if len(id) != groupHelloLen-len(groupHelloMagic) {
 		return
 	}
 	sup := make([]byte, 0, groupHelloLen)
 	sup = append(sup, groupSupersedeMagic...)
 	sup = append(sup, id...)
-	p.groupsLeftMu.Lock()
-	defer p.groupsLeftMu.Unlock()
 	for _, g := range p.groupsLeft {
 		if bytes.Equal(g.sup, sup) {
 			return
@@ -4836,15 +4859,25 @@ func (p *Proxy) noteGroupLeft(id []byte) {
 	p.groupsLeft = append(p.groupsLeft, groupLeft{sup: sup})
 }
 
-// supersedesDue returns the sentinels the next hello carries: every left group
-// still short of its sends — never the group the client is in.
-func (p *Proxy) supersedesDue() [][]byte {
-	cur := p.groupHelloBytes()
+// supersedesDue returns the sentinels a hello carries behind it: every left
+// group still short of its sends — never the group of the hello it rides
+// behind (sent, that hello's id). A sentinel naming the group it rides behind
+// is a no-op at the server (a group cannot supersede itself), and counting it
+// as a send would spend the group's copies on nothing: three hellos of the old
+// group that complete after the rotation would name their own group three
+// times and the first hello of the new group would name nothing (build 435
+// excluded the tunnel's CURRENT group instead, which those hellos were not).
+func (p *Proxy) supersedesDue(sent []byte) [][]byte {
 	p.groupsLeftMu.Lock()
 	defer p.groupsLeftMu.Unlock()
+	return p.supersedesDueLocked(sent)
+}
+
+// supersedesDueLocked is supersedesDue under groupsLeftMu.
+func (p *Proxy) supersedesDueLocked(sent []byte) [][]byte {
 	var due [][]byte
 	for _, g := range p.groupsLeft {
-		if g.sends >= supersedeSends || (cur != nil && bytes.Equal(g.sup[len(groupSupersedeMagic):], cur[len(groupHelloMagic):])) {
+		if g.sends >= supersedeSends || bytes.Equal(g.sup[len(groupSupersedeMagic):], sent) {
 			continue
 		}
 		due = append(due, g.sup)
@@ -4868,11 +4901,15 @@ func (p *Proxy) noteSupersedeSent(sup []byte) {
 	}
 }
 
-// supersedeBytes is the FIRST sentinel due, or nil when none is — the whole
-// list is supersedesDue; this is the one-line view the older tests and callers
-// used for "is there a group to name".
+// supersedeBytes is the FIRST sentinel a hello of the CURRENT group would
+// carry, or nil when none is — the whole list is supersedesDue; this is the
+// one-line view the older tests used for "is there a group to name".
 func (p *Proxy) supersedeBytes() []byte {
-	if due := p.supersedesDue(); len(due) > 0 {
+	var cur []byte
+	if g := p.groupHello.Load(); g != nil {
+		cur = g.id()
+	}
+	if due := p.supersedesDue(cur); len(due) > 0 {
 		return due[0]
 	}
 	return nil
@@ -4900,15 +4937,15 @@ func (p *Proxy) initGroupHello(cfg Config) {
 	hello := make([]byte, 0, groupHelloLen)
 	hello = append(hello, groupHelloMagic...)
 	hello = append(hello, id[:]...)
-	p.groupHello.Store(&hello)
+	p.groupHello.Store(&groupGen{hello: hello})
 	log.Printf("proxy: group hello %s (sent on every conn so the server can "+
 		"schedule this client's downlink as one group)", id)
 }
 
 // groupHelloBytes is the CURRENT hello, or nil when grouping is off.
 func (p *Proxy) groupHelloBytes() []byte {
-	if h := p.groupHello.Load(); h != nil {
-		return *h
+	if g := p.groupHello.Load(); g != nil {
+		return g.hello
 	}
 	return nil
 }
@@ -4918,30 +4955,45 @@ func (p *Proxy) groupHelloBytes() []byte {
 // client has left and not yet named enough times, so that the server does not
 // wait its 150-s backstop to reap those groups (and does not repeat its
 // keepalive into them). Once per session, at its start. The hello written
-// makes its group ANNOUNCED — the one a later rotation has to name; and if the
-// group rotated away while this hello was on its way out, that group was
-// announced by this very write and is noted as left here (the rotation saw it
-// unannounced). Errors are ignored on purpose: both are optimisations, and a
-// server that never sees them simply keeps the connection on its own socket,
-// or reaps at the backstop.
+// makes ITS generation announced (announced, below) — the group a later
+// rotation has to name. Errors are ignored on purpose: both are
+// optimisations, and a server that never sees them simply keeps the
+// connection on its own socket, or reaps at the backstop; a hello that never
+// left announces nothing.
 func (p *Proxy) sendGroupHello(w io.Writer) {
-	h := p.groupHello.Load()
-	if h == nil {
+	g := p.groupHello.Load()
+	if g == nil {
 		return
 	}
-	if _, err := w.Write(*h); err != nil {
+	if _, err := w.Write(g.hello); err != nil {
 		return
 	}
-	p.groupAnnounced.Store(h)
-	if p.groupHello.Load() != h {
-		p.noteGroupLeft((*h)[len(groupHelloMagic):])
-	}
-	for _, s := range p.supersedesDue() {
+	for _, s := range p.announced(g) {
 		if _, err := w.Write(s); err != nil {
 			return
 		}
 		p.noteSupersedeSent(s)
 	}
+}
+
+// announced records that a session has written the hello of generation g —
+// the server can have that group now — and returns the sentinels the same
+// session writes behind it. Under the one lock with the rotation
+// (rotateGroupHello), so that neither can miss the other: if the tunnel has
+// rotated away from g meanwhile, the rotation found g unannounced and dropped
+// it, so g is noted as left HERE; a rotation that runs after this finds g
+// announced and notes it itself (the note is idempotent). The fact goes onto g
+// alone — a late hello of an older generation says nothing about the current
+// one. The sentinels never name g itself: a group cannot supersede itself at
+// the server, and g's copies are not spent on such a write.
+func (p *Proxy) announced(g *groupGen) [][]byte {
+	p.groupsLeftMu.Lock()
+	defer p.groupsLeftMu.Unlock()
+	g.announced = true
+	if p.groupHello.Load() != g {
+		p.noteGroupLeftLocked(g.id())
+	}
+	return p.supersedesDueLocked(g.id())
 }
 
 // pongIsRepeat says whether a pong is a REPEAT of one already heard — its seq
