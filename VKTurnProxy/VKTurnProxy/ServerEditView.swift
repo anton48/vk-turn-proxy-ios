@@ -164,7 +164,14 @@ struct ServerEditView: View {
                     }
                 }
 
-                Toggle("Use UDP transport to TURN", isOn: $draft.useUDP)
+                if mode.wrappedValue == .srtpWrapA {
+                    Toggle("Automatic UDP / TCP", isOn: $draft.wrapAAutoTURN)
+                    Text("Compares the complete TURN, DTLS and GETCONF startup on new connections. A network change starts a fresh comparison. Experimental.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                if mode.wrappedValue != .srtpWrapA || !draft.wrapAAutoTURN {
+                    Toggle("Use UDP transport to TURN", isOn: $draft.useUDP)
+                }
                 Stepper(connectionsLabel, value: $draft.numConnections, in: 1...connectionsUpperBound)
                 Stepper("Cred pool cooldown: \(draft.credPoolCooldownSeconds) s",
                         value: $draft.credPoolCooldownSeconds, in: 30...600, step: 30)

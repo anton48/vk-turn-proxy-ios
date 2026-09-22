@@ -117,6 +117,10 @@ type Config struct {
 	// Mutually exclusive with UseSrtp/UseDTLS; selected first in the
 	// runConnection dispatch.
 	UseWrapA bool
+	// WrapAAutoTURN chooses UDP or TCP for each new WRAP-A session from the
+	// measured TURN+DTLS+GETCONF bootstrap. Manual UseUDP remains unchanged
+	// when this opt-in setting is false.
+	WrapAAutoTURN bool
 	// WrapAPassword is the shared secret for WRAP-A. Dual-purpose: HKDF input
 	// for the obfuscation key (deriveWrapAKey) AND GETCONF authentication.
 	// One UI field. Required when UseWrapA is true.
@@ -507,7 +511,8 @@ type Proxy struct {
 	// firstSessionUp is set when the first session ever carried traffic
 	// (signalBootstrapDone(nil)). Until then a path-up has nothing to
 	// restart — see OnPathUp.
-	firstSessionUp atomic.Bool
+	firstSessionUp  atomic.Bool
+	wrapATransports *wrapATransportPolicy
 }
 
 // NewProxy creates a new proxy instance.
@@ -567,6 +572,7 @@ func NewProxy(cfg Config) *Proxy {
 		sessCancel:        sessCancel,
 		captchaCh:         make(chan string, 1),
 		bootstrapDoneCh:   make(chan error, 1),
+		wrapATransports:   newWrapATransportPolicy(cfg.UseUDP),
 		lastPongTimes:     make([]atomic.Int64, cfg.NumConns),
 		lastPingSeq:       make([]atomic.Uint64, cfg.NumConns),
 		lastPongSeq:       make([]atomic.Uint64, cfg.NumConns),
@@ -3069,10 +3075,28 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 // sender / zombie watchdog (amurcanov's server has no probe-echo); self-
 // healing rides the global no-RX watchdog + the per-conn read-deadline
 // staleness check below.
-func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool, connIdx int) error {
+func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh chan<- struct{}, signaled *bool, connIdx int) (retErr error) {
 	_ = linkID // reserved for per-link logging parity with the DTLS path
 	connCtx, connCancel := context.WithCancel(sessCtx)
 	defer connCancel()
+	bootstrapStarted := time.Now()
+	transport := "tcp"
+	if p.config.UseUDP {
+		transport = "udp"
+	}
+	var transportEpoch uint64
+	if p.config.WrapAAutoTURN {
+		transport, transportEpoch = p.wrapATransports.pick(connIdx, p.config.NumConns, bootstrapStarted)
+	}
+	bootstrapOK := false
+	bootstrapTimer := time.AfterFunc(wrapABootstrapBudget, connCancel)
+	defer bootstrapTimer.Stop()
+	defer func() {
+		if p.config.WrapAAutoTURN && !bootstrapOK && sessCtx.Err() == nil && isWrapATransportFailure(retErr) {
+			p.wrapATransports.failure(transportEpoch, transport, time.Now())
+			log.Printf("proxy: [conn %d] WRAP-A auto transport %s failed during bootstrap: %v", connIdx, transport, retErr)
+		}
+	}()
 
 	conn1, conn2 := connutil.AsyncPacketPipe()
 	defer conn1.Close()
@@ -3088,7 +3112,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
-	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
+	leg.gave.watch(connCancel, connIdx, transport == "udp") // a session dead at the relay is ended at once — outofreach.go
 	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
 
 	// TURN relay underneath (conn2 ↔ VK relay). Same pattern as
@@ -3096,6 +3120,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	// rebuilds it, and the relay leg is JOINED before this session returns —
 	// behind the credential's release above, so ahead of it, and ahead of every
 	// return below, the early ones too (relayjoin.go).
+	connCtx = context.WithValue(connCtx, turnTransportContextKey{}, transport)
 	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
@@ -3140,6 +3165,11 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 		return fmt.Errorf("WRAP-A getconf: %w", err)
 	}
 	p.storeWrapAProvision(prov)
+	bootstrapOK = true
+	bootstrapTimer.Stop()
+	if p.config.WrapAAutoTURN {
+		p.wrapATransports.success(transportEpoch, transport, time.Since(bootstrapStarted), time.Now())
+	}
 
 	p.dtlsHSns.Store(int64(time.Since(dtlsStart)))
 	p.activeConns.Add(1)
@@ -3156,7 +3186,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	p.signalBootstrapDone(nil)
 
 	p.noteSessionUp(connIdx) // the retry floor's evidence that the network works — retryfloor.go
-	log.Printf("proxy: [conn %d, cred %d] WRAP-A+TURN session established (getconf ok)", connIdx, credSlot)
+	log.Printf("proxy: [conn %d, cred %d] WRAP-A+TURN session established via %s (getconf ok)", connIdx, credSlot, transport)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
 		p.lastPongTimes[connIdx].Store(time.Now().Unix())
@@ -3183,6 +3213,8 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 			case <-ticker.C:
 				dtlsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if _, werr := dtlsConn.Write(ka); werr != nil {
+					log.Printf("proxy: [conn %d] WRAP-A keepalive failed: %v", connIdx, werr)
+					connCancel()
 					return
 				}
 			}
@@ -3210,8 +3242,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 				return
 			case item := <-p.sendCh:
 				p.paceSettle(ticket, len(item.buf))
-				// -1: no per-conn TX accounting at this site today.
-				if err := p.writePacket(item, -1, writeOne); err != nil {
+				if err := p.writePacket(item, connIdx, writeOne); err != nil {
 					log.Printf("proxy: [conn %d] WRAP-A send: write error: %v", connIdx, err)
 					return
 				}
@@ -3368,7 +3399,16 @@ func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
 // Runs until the relay fails or ctx is cancelled. No forced lifetime —
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
+type turnTransportContextKey struct{}
+
 func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, gave *gaveBack) error {
+	transport := "tcp"
+	if p.config.UseUDP {
+		transport = "udp"
+	}
+	if selected, ok := ctx.Value(turnTransportContextKey{}).(string); ok {
+		transport = selected
+	}
 	turnUDPAddr, err := net.ResolveUDPAddr("udp", turnAddr)
 	if err != nil {
 		return fmt.Errorf("resolve TURN: %w", err)
@@ -3376,14 +3416,14 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 
 	// Connect to TURN server
 	var turnConn net.PacketConn
-	if p.config.UseUDP {
+	if transport == "udp" {
 		udpConn, err := net.DialUDP("udp", nil, turnUDPAddr)
 		if err != nil {
 			return fmt.Errorf("dial TURN UDP: %w", err)
 		}
 		defer udpConn.Close()
 		turnConn = &connectedUDPConn{udpConn}
-	} else {
+	} else if transport == "tcp" {
 		tcpCtx, tcpCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer tcpCancel()
 		var d net.Dialer
@@ -3397,6 +3437,8 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		p.sockStats.register(connIdx, tcpConn)
 		defer p.sockStats.unregister(connIdx)
 		turnConn = turn.NewSTUNConn(tcpConn)
+	} else {
+		return fmt.Errorf("unknown TURN transport %q", transport)
 	}
 
 	// Determine the relay address family from the peer (see addrFamilyFor).
@@ -4367,6 +4409,9 @@ func pathSnapshotOSDefault() string {
 // as pre-emptively saturated. See credPool.MarkInUseSlotsForPathChange
 // for the full rationale.
 func (p *Proxy) OnPathChange() {
+	if p.wrapATransports != nil {
+		p.wrapATransports.reset()
+	}
 	// The VK client's pooled connections may be bound to the interface this
 	// event took away — replace the client before anything mints.
 	RotateVKSessionClient()

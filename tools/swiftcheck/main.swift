@@ -4432,6 +4432,24 @@ do {
     }
 }
 
+do {
+    let profile = source("VKTurnProxy/VKTurnProxy/ServerProfile.swift")
+    let store = source("VKTurnProxy/VKTurnProxy/ServerStore.swift")
+    let manager = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    let editor = source("VKTurnProxy/VKTurnProxy/ServerEditView.swift")
+    check(profile.contains("var wrapAAutoTURN: Bool = false"), "WRAP-A automatic transport defaults to off")
+    check(profile.contains("case wrapAAutoTURN") && profile.contains("forKey: .wrapAAutoTURN"),
+          "WRAP-A automatic transport survives profile decoding")
+    check(profile.contains("wrapAAutoTURN = p.wrapAAutoTURN") && profile.contains("if let v = wrapAAutoTURN { p.wrapAAutoTURN = v }"),
+          "WRAP-A automatic transport survives backup and restore")
+    check(store.contains("(\"wrapAAutoTURN\", \\.wrapAAutoTURN, false)"),
+          "WRAP-A automatic transport projects to flat settings")
+    check(manager.contains("wrapAAutoTURN: s.wrapAAutoTURN") &&
+          manager.contains("\"wrap_a_auto_turn\": config.useWrapA && config.wrapAAutoTURN"),
+          "WRAP-A automatic transport reaches only WRAP-A")
+    check(editor.contains("isOn: $draft.wrapAAutoTURN"), "WRAP-A automatic transport is editable")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

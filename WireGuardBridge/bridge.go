@@ -153,12 +153,13 @@ func decodeWrapKey(useWrap bool, hexStr string) ([]byte, error) {
 
 // ProxyConfig is the JSON config passed from Swift.
 type ProxyConfig struct {
-	VKLink     string `json:"vk_link"`
-	PeerAddr   string `json:"peer_addr"`
-	TurnServer string `json:"turn_server,omitempty"`
-	TurnPort   string `json:"turn_port,omitempty"`
-	UseDTLS    bool   `json:"use_dtls"`
-	UseUDP     bool   `json:"use_udp"`
+	VKLink        string `json:"vk_link"`
+	PeerAddr      string `json:"peer_addr"`
+	TurnServer    string `json:"turn_server,omitempty"`
+	TurnPort      string `json:"turn_port,omitempty"`
+	UseDTLS       bool   `json:"use_dtls"`
+	UseUDP        bool   `json:"use_udp"`
+	WrapAAutoTURN bool   `json:"wrap_a_auto_turn,omitempty"`
 	// UseWrap enables the WRAP layer between DTLS and TURN ChannelData
 	// (see proxy.Config.UseWrap and pkg/proxy/wrap.go). Requires the
 	// peer server to be running cacggghp/vk-turn-proxy with matching
@@ -384,6 +385,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 		VKLink:           pcfg.VKLink,
 		UseDTLS:          pcfg.UseDTLS,
 		UseUDP:           pcfg.UseUDP,
+		WrapAAutoTURN:    pcfg.WrapAAutoTURN,
 		UseWrap:          pcfg.UseWrap,
 		WrapKey:          wrapKey,
 		UseWrapS:         pcfg.UseWrapS,

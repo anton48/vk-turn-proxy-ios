@@ -153,6 +153,7 @@ extension TunnelConfig {
             wrapKeyHex: s.wrapKeyHex,
             useSrtp: s.useSrtp,
             useWrapA: s.useWrapA,
+            wrapAAutoTURN: s.wrapAAutoTURN,
             wrapAPassword: s.wrapAPassword,
             deviceID: s.deviceID,
             useWrapS: s.useWrapS,
@@ -2908,6 +2909,7 @@ class TunnelManager: ObservableObject {
             "peer_addr": config.peerAddress,
             "use_dtls": config.useDTLS,
             "use_udp": config.useUDP,
+            "wrap_a_auto_turn": config.useWrapA && config.wrapAAutoTURN,
             "force_legacy_captcha": config.forceLegacyCaptcha,
             "uplink_synth_mbit": config.uplinkSynthMbit,
             "uplink_synth_sec": config.uplinkSynthSec,
@@ -3420,6 +3422,7 @@ struct TunnelConfig {
     // grouping. See pkg/proxy/wrapa.go + getconf.go; the extension fetches the
     // minted config via wgWaitWrapAProvision after bootstrap.
     var useWrapA: Bool = false
+    var wrapAAutoTURN: Bool = false
     // Shared secret for WRAP-A: HKDF input for the obfuscation key AND GETCONF
     // authentication. One field. Required when useWrapA=true.
     var wrapAPassword: String = ""

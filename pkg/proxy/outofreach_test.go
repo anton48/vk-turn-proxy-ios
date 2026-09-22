@@ -375,7 +375,11 @@ func TestEverySessionsAllocationLifeIsWiredAndJoined(t *testing.T) {
 		"func (p *Proxy) runSRTPSession(":   "gave",
 	} {
 		bd := body(fn)
-		w := strings.Index(bd, note+".watch(connCancel, connIdx, p.config.UseUDP)")
+		transport := "p.config.UseUDP"
+		if fn == "func (p *Proxy) runWrapASession(" {
+			transport = `transport == "udp"`
+		}
+		w := strings.Index(bd, note+".watch(connCancel, connIdx, "+transport+")")
 		if w < 0 {
 			t.Errorf("%s does not tell its note who it is — a session dead at the relay could not be ended, and its mapping would be asked about as over TCP", fn)
 			continue

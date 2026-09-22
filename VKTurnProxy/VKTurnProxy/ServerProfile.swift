@@ -29,6 +29,7 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     var credPoolCooldownSeconds: Int = 150
     var turnServerOverride: String = ""
     var useUDP: Bool = false
+    var wrapAAutoTURN: Bool = false
     // No UI toggle since build 127; effectively a constant (true).
     var useDTLS: Bool = true
 
@@ -93,6 +94,7 @@ struct ServerProfile: Codable, Identifiable, Equatable {
         case privateKey, peerPublicKey, presharedKey, tunnelAddress, peerAddress
         case dnsServers, numConnections, credPoolCooldownSeconds, turnServerOverride
         case useUDP, useDTLS
+        case wrapAAutoTURN
         case useSrtp, useWrap, useWrapA, useWrapS
         case wrapKeyHex, obfProfile, clientID
         case wrapAPassword, deviceID
@@ -126,6 +128,7 @@ extension ServerProfile {
         if let v = try c.decodeIfPresent(Int.self, forKey: .credPoolCooldownSeconds) { credPoolCooldownSeconds = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .turnServerOverride) { turnServerOverride = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useUDP) { useUDP = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .wrapAAutoTURN) { wrapAAutoTURN = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useDTLS) { useDTLS = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useSrtp) { useSrtp = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useWrap) { useWrap = v }
@@ -220,6 +223,7 @@ struct ServerSettings: Codable {
     var credPoolCooldownSeconds: Int? = nil
     var turnServerOverride: String? = nil
     var useUDP: Bool? = nil
+    var wrapAAutoTURN: Bool? = nil
     var useDTLS: Bool? = nil
     var useSrtp: Bool? = nil
     var useWrap: Bool? = nil
@@ -251,6 +255,7 @@ struct ServerSettings: Codable {
         credPoolCooldownSeconds = p.credPoolCooldownSeconds
         turnServerOverride = p.turnServerOverride
         useUDP = p.useUDP
+        wrapAAutoTURN = p.wrapAAutoTURN
         useDTLS = p.useDTLS
         useSrtp = p.useSrtp
         useWrap = p.useWrap
@@ -281,6 +286,7 @@ struct ServerSettings: Codable {
         if let v = credPoolCooldownSeconds { p.credPoolCooldownSeconds = v }
         if let v = turnServerOverride { p.turnServerOverride = v }
         if let v = useUDP { p.useUDP = v }
+        if let v = wrapAAutoTURN { p.wrapAAutoTURN = v }
         if let v = useDTLS { p.useDTLS = v }
         if let v = useSrtp { p.useSrtp = v }
         if let v = useWrap { p.useWrap = v }
