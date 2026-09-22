@@ -20,6 +20,7 @@ func TestPathUpRotatesTheGroupHello(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	before := append([]byte(nil), p.groupHelloBytes()...)
+	p.sendGroupHello(&bytes.Buffer{}) // announced: a group the server can have is the one a rotation names
 	p.rotateGroupHello()
 	after := p.groupHelloBytes()
 	if bytes.Equal(before, after) {

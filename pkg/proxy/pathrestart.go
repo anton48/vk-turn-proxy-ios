@@ -140,14 +140,17 @@ func (p *Proxy) rotateGroupHello() {
 	hello := make([]byte, 0, groupHelloLen)
 	hello = append(hello, groupHelloMagic...)
 	hello = append(hello, id[:]...)
-	// The group being left is named to the server behind every new session's
-	// hello (sendGroupHello): it reaps that group at once instead of at its
-	// backstop, and repeats its keepalive into nothing that was released.
-	if old := p.groupHello.Load(); old != nil && len(*old) == groupHelloLen {
-		sup := make([]byte, 0, groupHelloLen)
-		sup = append(sup, groupSupersedeMagic...)
-		sup = append(sup, (*old)[len(groupHelloMagic):]...)
-		p.groupSupersede.Store(&sup)
+	// The group being left is named to the server behind the next sessions'
+	// hellos (sendGroupHello): it reaps that group at once instead of at its
+	// backstop, and repeats its keepalive into nothing that was released. Only
+	// a group some session ANNOUNCED can be at the server: a cascade of
+	// path-ups inside the debounce rotates through ids no connection ever
+	// carried, and naming those would leave the group the server HAS to its
+	// backstop. An unannounced group is simply dropped; the announced one
+	// before it is still on the list.
+	old := p.groupHello.Load()
+	if old != nil && p.groupAnnounced.Load() == old {
+		p.noteGroupLeft((*old)[len(groupHelloMagic):])
 	}
 	p.groupHello.Store(&hello)
 	log.Printf("proxy: group hello rotated to %s — the server's old group keeps only the dead sessions, and is told so", id)
