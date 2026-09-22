@@ -134,7 +134,7 @@ func TestAutoTransportQuotaDoesNotTriggerFallback(t *testing.T) {
 	prev := dialRelayContext
 	var mu sync.Mutex
 	var names []string
-	dialRelayContext = func(_ context.Context, _ TURNCredentials, _ *net.UDPAddr, name string, _ logging.LogLevel) (*Relay, error) {
+	dialRelayContext = func(_ context.Context, _ TURNCredentials, _ *net.UDPAddr, name string, _ logging.LogLevel, _ func()) (*Relay, error) {
 		mu.Lock()
 		names = append(names, name)
 		mu.Unlock()

@@ -135,7 +135,7 @@ func TestQualitySchedulingBlockedWriterDoesNotBlockHealthyRelay(t *testing.T) {
 	prev := dialRelay
 	var calls atomic.Int32
 	var slow atomic.Pointer[gatedWriteConn]
-	dialRelay = func(TURNCredentials, *net.UDPAddr, string, logging.LogLevel) (*Relay, error) {
+	dialRelay = func(TURNCredentials, *net.UDPAddr, string, logging.LogLevel, func()) (*Relay, error) {
 		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
 		if err != nil {
 			return nil, err

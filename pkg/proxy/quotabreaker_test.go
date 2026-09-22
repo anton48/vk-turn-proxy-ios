@@ -371,15 +371,19 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 		t.Error("pkg/csqtt: DialRelay does not report the allocation between the Allocate and the permission — a permission failure is not the relay refusing the identity, and the seat WAS used")
 	}
 	w := stripComments(c)
-	dial, gate := strings.Index(w, "dialRelay(cred.TURNCredentials"), -1
-	if dial >= 0 {
-		gate = strings.Index(w[dial:], "startDone()")
+	callback, gate := strings.Index(w, "allocated := func()"), -1
+	if callback >= 0 {
+		gate = strings.Index(w[callback:], "startDone()")
 	}
-	if dial < 0 || gate < 0 {
-		t.Fatal("pkg/csqtt: the worker's relay dial not found")
+	if callback < 0 || gate < 0 {
+		t.Fatal("pkg/csqtt: the worker's allocation callback or relay dial not found")
 	}
-	if n := strings.Count(w, "cred.Allocated()"); n != 1 || !strings.Contains(w[dial:dial+gate], "cred.Allocated()") {
+	setup := w[callback : callback+gate]
+	if n := strings.Count(w, "cred.Allocated()"); n != 1 || !strings.Contains(setup, "cred.Allocated()") {
 		t.Errorf("pkg/csqtt: the worker calls cred.Allocated() %d time(s), want once — inside the callback it hands to the relay dial, not behind the dial's return", n)
+	}
+	if !strings.Contains(setup, "dialRelayContext(") || !strings.Contains(setup, "dialRelay(") || strings.Count(setup, ", allocated)") != 2 {
+		t.Error("pkg/csqtt: both automatic and manual relay dials must receive the same allocation callback")
 	}
 }
 
