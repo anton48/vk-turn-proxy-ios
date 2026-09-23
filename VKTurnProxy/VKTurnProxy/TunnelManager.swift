@@ -161,6 +161,7 @@ extension TunnelConfig {
             useCsqtt: s.useCsqtt,
             csqttPassword: s.csqttPassword,
             csqttDeviceID: s.csqttDeviceID,
+            csqttBoundedQueues: s.csqttBoundedQueues,
             useUDP: s.useUDP,
             forceLegacyCaptcha: d.bool(forKey: "forceLegacyCaptcha"),
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
@@ -2952,6 +2953,8 @@ class TunnelManager: ObservableObject {
             // server binds the password to whatever id connects first.
             let devID = config.csqttDeviceID.trimmingCharacters(in: .whitespacesAndNewlines)
             dict["csqtt_device_id"] = devID.isEmpty ? csqttFallbackDeviceID() : devID
+            // Build 437: the bounded write queues (pkg/csqtt/queue.go); absent = off.
+            dict["csqtt_bounded_queues"] = config.csqttBoundedQueues
         }
         // SRTP-WRAP-S (samosvalishe/free-turn-proxy): obf profile + Client-ID on
         // the SRTP+WRAP data path. wrap_key_hex is already set above.
@@ -3442,6 +3445,8 @@ struct TunnelConfig {
     var useCsqtt: Bool = false
     var csqttPassword: String = ""
     var csqttDeviceID: String = ""
+    // csqtt, build 437: one bounded write queue per connection — see ServerProfile.
+    var csqttBoundedQueues: Bool = true
     // 2026-05-18 empirical: VK's new per-cred TURN allocation-rate
     // throttle (introduced ~16:00 MSK that day) applies ONLY to UDP-
     // transport allocations. 11×10 = 110 TCP-control allocations on a

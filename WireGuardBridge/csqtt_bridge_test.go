@@ -56,7 +56,7 @@ func newFakeClient() *fakeClient {
 	return &fakeClient{
 		up: make(chan []byte, 64), down: make(chan []byte, 64), done: make(chan struct{}),
 		conf:  csqtt.ConfigResponse{TunnelIP: "10.66.67.3", DNS: "77.88.8.8,77.88.8.1", StreamRevision: "stream-v2", Raw: "TUNCONF:10.66.67.3:77.88.8.8,77.88.8.1:9000:stream-v2"},
-		stats: csqtt.Stats{TxBytes: 1234, RxBytes: 5678, Ready: 9, Live: 7, Total: 30, Restarts: 3, AllocateRTT: 131 * time.Millisecond},
+		stats: csqtt.Stats{TxBytes: 1234, RxBytes: 5678, Ready: 9, Live: 7, Total: 30, Restarts: 3, AllocateRTT: 131 * time.Millisecond, QueueFull: 6, QueueStale: 2, WriteErrs: 1, Queued: 3},
 	}
 }
 
@@ -279,6 +279,39 @@ func startCsqtt(t *testing.T, extra string) int32 {
 }
 
 // ─── the checks ───────────────────────────────────────────────────────────
+
+// The profile's switch for the bounded write queues reaches csqtt.Config as
+// the queue's depth: on → DefaultWriteQueue, off or absent (an older config) →
+// 0, the synchronous write. Sabotage seen red: the bridge passing 0 always.
+func TestCsqttBoundedQueuesReachTheClient(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra string
+		want        int
+	}{
+		{"absent", "", 0},
+		{"off", `,"csqtt_bounded_queues":false`, 0},
+		{"on", `,"csqtt_bounded_queues":true`, csqtt.DefaultWriteQueue},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mints atomic.Int32
+			installFakePool(t, mintingFetch(&mints))
+			fc := newFakeClient()
+			captured := make(chan csqtt.Config, 1)
+			prev := csqttDial
+			csqttDial = func(_ context.Context, cfg csqtt.Config) (csqttClient, error) { captured <- cfg; return fc, nil }
+			t.Cleanup(func() { csqttDial = prev })
+			_ = startCsqtt(t, tc.extra)
+			select {
+			case cfg := <-captured:
+				if cfg.WriteQueue != tc.want {
+					t.Fatalf("WriteQueue = %d, want %d", cfg.WriteQueue, tc.want)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the bridge did not dial")
+			}
+		})
+	}
+}
 
 // installGatedDial makes csqttDial block until `release` is closed, then
 // return `c` ALIVE whatever the ctx says — the shape of a dial that
@@ -735,7 +768,7 @@ func TestCsqttStopLeavesTheClientsCountersInTheLog(t *testing.T) {
 	if atStop == "" {
 		t.Fatalf("the stop left no counters in the log — a run without a path event carries none at all:\n%s", strings.Join(out.lines(), "\n"))
 	}
-	for _, want := range []string{"workers 9/30 ready (7 heard from lately)", "restarts 3, repairs 4", "probes 41 (+7 sent again, 9 witnesses)", "rounds asked again 5", "lost 2, deaf restart-alls 1"} {
+	for _, want := range []string{"workers 9/30 ready (7 heard from lately)", "restarts 3, repairs 4", "probes 41 (+7 sent again, 9 witnesses)", "rounds asked again 5", "lost 2, deaf restart-alls 1", "queue: full 6, stale 2, write errors 1, queued 3"} {
 		if !strings.Contains(atStop, want) {
 			t.Fatalf("the stop's counters lack %q — they are the client's as it RAN (a closed client has nobody ready): %q", want, atStop)
 		}

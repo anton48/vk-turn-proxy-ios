@@ -84,6 +84,7 @@ type csqttConfig struct {
 	VKLink                  string              `json:"vk_link"`
 	NumConns                int                 `json:"num_conns"`
 	UseUDP                  bool                `json:"use_udp"`
+	BoundedQueues           bool                `json:"csqtt_bounded_queues"` // pkg/csqtt/queue.go; absent = the synchronous write
 	TurnServer              string              `json:"turn_server"`
 	TurnPort                string              `json:"turn_port"`
 	CredPoolCooldownSeconds int                 `json:"cred_pool_cooldown_seconds"`
@@ -503,11 +504,19 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 	if cfg.UseUDP {
 		transport = "udp"
 	}
+	// The bounded write queues (pkg/csqtt/queue.go): a relay that stops taking
+	// bytes then holds its own queue, not the whole uplink. The profile's switch;
+	// off — or absent from an older config — is the synchronous write of every
+	// build before 437.
+	queue := 0
+	if cfg.BoundedQueues {
+		queue = csqtt.DefaultWriteQueue
+	}
 	gen, salt := csqttNextIdentity(dir)
 	adapter := &csqttPoolAdapter{pool: pool, fatal: e.fail}
 	// Never the password: the config line Swift logs is the redacted one.
-	log.Printf("csqttStart: tunnel %d: server=%s device=%s workers=%d transport=%s gen=%d cache=%v seeded=%v",
-		e.id, cfg.Server, cfg.DeviceID, cfg.NumConns, transport, gen, cachePath != "", seed != nil)
+	log.Printf("csqttStart: tunnel %d: server=%s device=%s workers=%d transport=%s queue=%d gen=%d cache=%v seeded=%v",
+		e.id, cfg.Server, cfg.DeviceID, cfg.NumConns, transport, queue, gen, cachePath != "", seed != nil)
 
 	go func() {
 		defer close(e.dialed)
@@ -527,7 +536,8 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 			Server: server, Password: cfg.Password, DeviceID: cfg.DeviceID,
 			Generation: gen, Salt: salt, Workers: cfg.NumConns,
 			Creds: adapter.creds, TURNTransport: transport, TURNLogLevel: logging.LogLevelWarn,
-			Logf: log.Printf,
+			WriteQueue: queue,
+			Logf:       log.Printf,
 		})
 		if err != nil {
 			e.fail(fmt.Errorf("csqtt: %w", err))
@@ -913,8 +923,8 @@ func csqttLogPathSnapshotImpl(handle int32, label string) {
 // whichever of them a log has is read by the same eye and the same grep — and a
 // counter added here reaches all three.
 func csqttStatsLine(s csqtt.Stats, tunIn, tunOut int64) string {
-	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d",
-		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut)
+	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d; queue: full %d, stale %d, write errors %d, queued %d",
+		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut, s.QueueFull, s.QueueStale, s.WriteErrs, s.Queued)
 }
 
 // Stats in the app's shape — the same struct the WireGuard path marshals,

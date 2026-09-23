@@ -4432,6 +4432,42 @@ do {
     }
 }
 
+// csqtt's bounded write queues (build 437): a per-server Bool, ON by default,
+// wired through every boundary a per-server Bool crosses — the profile (persisted
+// and decoded), the backup, the flat settings, the tunnel config, proxy_config
+// under the csqtt block, and the editor's csqtt section. A missing link is a
+// switch that shows but does nothing, or one that is not saved.
+do {
+    let profile = source("VKTurnProxy/VKTurnProxy/ServerProfile.swift")
+    let store = source("VKTurnProxy/VKTurnProxy/ServerStore.swift")
+    let manager = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    let editor = source("VKTurnProxy/VKTurnProxy/ServerEditView.swift")
+    check(profile.contains("var csqttBoundedQueues: Bool = true"), "csqttBoundedQueues defaults to ON")
+    check(profile.contains("case csqttBoundedQueues")
+          && profile.contains("if let v = try c.decodeIfPresent(Bool.self, forKey: .csqttBoundedQueues) { csqttBoundedQueues = v }"),
+          "csqttBoundedQueues is in CodingKeys AND the hand-written init(from:) (the Codable trap)")
+    check(profile.contains("var csqttBoundedQueues: Bool? = nil") && profile.contains("csqttBoundedQueues = p.csqttBoundedQueues")
+          && profile.contains("if let v = csqttBoundedQueues { p.csqttBoundedQueues = v }"),
+          "csqttBoundedQueues survives a backup and a restore")
+    check(store.contains("(\"csqttBoundedQueues\", \\.csqttBoundedQueues, true)"),
+          "csqttBoundedQueues projects to the flat settings with the same default")
+    check(manager.contains("csqttBoundedQueues: s.csqttBoundedQueues,"), "TunnelConfig takes csqttBoundedQueues from the profile")
+    if let a = manager.range(of: "dict[\"use_csqtt\"] = true"), let b = manager.range(of: "dict[\"csqtt_bounded_queues\"] = config.csqttBoundedQueues"),
+       let c = manager.range(of: "if config.useWrapS {") {
+        check(a.lowerBound < b.lowerBound && b.lowerBound < c.lowerBound, "csqtt_bounded_queues rides proxy_config inside the csqtt block only")
+    } else {
+        check(false, "csqtt_bounded_queues is not written into proxy_config")
+    }
+    if let a = editor.range(of: "if mode.wrappedValue == .csqtt {"), let b = editor.range(of: "isOn: $draft.csqttBoundedQueues"),
+       let c = editor.range(of: "if mode.wrappedValue == .srtpWrapS {") {
+        check(a.lowerBound < b.lowerBound && b.lowerBound < c.lowerBound, "the queue switch sits inside the editor's csqtt section")
+    } else {
+        check(false, "the queue switch is not in the editor's csqtt section")
+    }
+    check(!source("VKTurnProxy/VKTurnProxy/ContentView.swift").contains("csqttBoundedQueues"),
+          "ContentView does not read csqttBoundedQueues (the NavigationView host must not re-render on it)")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

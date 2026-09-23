@@ -149,6 +149,12 @@ struct ServerEditView: View {
                         Text("csqtt has no key exchange: the password is the tunnel's only key, so traffic recorded today can be decrypted by anyone who learns it later (no forward secrecy). The other modes do not have this property.")
                             .font(.caption)
                             .foregroundColor(.orange)
+                        // Build 437: a bounded write queue per connection (pkg/csqtt/queue.go).
+                        // Off is the write path of every build before it.
+                        Toggle("Bounded per-connection write queues", isOn: $draft.csqttBoundedQueues)
+                        Text("A relay that stops taking bytes then holds only its own queue, not every connection. Off: one stuck connection stalls the whole uplink until it is restarted (the behaviour before build 437).")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                     if mode.wrappedValue == .srtpWrapS {
                         SecureField("WRAP key (64 hex chars)", text: $draft.wrapKeyHex)

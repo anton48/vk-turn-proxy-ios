@@ -128,16 +128,29 @@ func (s *Striper) Resize(n int) {
 	}
 }
 
+// Chunk is the chunk length of class c.
+func (s *Striper) Chunk(c PacketClass) int { return s.chunk[c] }
+
 // Pick returns the worker for the next packet of class c, skipping workers
 // for which alive returns false. It returns -1 when none is alive. A dead
 // worker mid-chunk hands the rest of the chunk to the next live one.
 func (s *Striper) Pick(c PacketClass, alive func(int) bool) int {
+	return s.PickRoom(c, alive, nil)
+}
+
+// PickRoom is Pick with a second predicate, asked where a NEW chunk begins
+// and only there: a worker for which room says no is passed over at the
+// boundary, as a dead one is. Inside a chunk only alive is asked, so a
+// worker whose write queue fills mid-chunk keeps the rest of that chunk —
+// the queue drops what it cannot take (queue.go), the schedule does not move
+// a flow's packets onto another allocation. A nil room is Pick.
+func (s *Striper) PickRoom(c PacketClass, alive, room func(int) bool) int {
 	cur := &s.cursor[c]
 	if cur.remaining == 0 || !alive(cur.worker) {
 		start := cur.worker
 		for i := 1; i <= s.n; i++ {
 			w := (start + i) % s.n
-			if alive(w) {
+			if alive(w) && (room == nil || room(w)) {
 				cur.worker = w
 				cur.remaining = s.chunk[c]
 				break

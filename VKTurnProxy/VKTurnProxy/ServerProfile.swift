@@ -72,6 +72,10 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     /// server like WRAP-A's deviceID; a `csqtt://connect?…&device=<id>` link
     /// may carry it (the server binds the password to ONE id) — parseCsqttLink.
     var csqttDeviceID: String = ""
+    /// csqtt (build 437): one bounded write queue per connection, so a relay
+    /// that stops taking bytes holds only its own queue, not the whole uplink.
+    /// ON by default; off is the synchronous write of the builds before 437.
+    var csqttBoundedQueues: Bool = true
 
     /// Human-readable transport mode, matching the ServerMode picker labels.
     /// Used in log lines and import confirmations.
@@ -97,6 +101,7 @@ struct ServerProfile: Codable, Identifiable, Equatable {
         case wrapKeyHex, obfProfile, clientID
         case wrapAPassword, deviceID
         case useCsqtt, csqttPassword, csqttDeviceID
+        case csqttBoundedQueues
     }
 }
 
@@ -139,6 +144,7 @@ extension ServerProfile {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useCsqtt) { useCsqtt = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .csqttPassword) { csqttPassword = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .csqttDeviceID) { csqttDeviceID = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .csqttBoundedQueues) { csqttBoundedQueues = v }
     }
 }
 
@@ -238,6 +244,7 @@ struct ServerSettings: Codable {
     var useCsqtt: Bool? = nil
     var csqttPassword: String? = nil
     var csqttDeviceID: String? = nil
+    var csqttBoundedQueues: Bool? = nil
 
     init(_ p: ServerProfile) {
         serverName = p.serverName
@@ -264,6 +271,7 @@ struct ServerSettings: Codable {
         useCsqtt = p.useCsqtt
         csqttPassword = p.csqttPassword
         csqttDeviceID = p.csqttDeviceID
+        csqttBoundedQueues = p.csqttBoundedQueues
     }
 
     /// Rebuild a profile, filling every absent field with the ServerProfile
@@ -294,6 +302,7 @@ struct ServerSettings: Codable {
         if let v = useCsqtt { p.useCsqtt = v }
         if let v = csqttPassword { p.csqttPassword = v }
         if let v = csqttDeviceID { p.csqttDeviceID = v }
+        if let v = csqttBoundedQueues { p.csqttBoundedQueues = v }
         return p
     }
 }

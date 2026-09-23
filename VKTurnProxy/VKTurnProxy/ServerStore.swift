@@ -40,6 +40,7 @@ final class ServerStore: ObservableObject {
         ("useSrtp", \.useSrtp, true), ("useWrap", \.useWrap, false),
         ("useWrapA", \.useWrapA, false), ("useWrapS", \.useWrapS, false),
         ("useCsqtt", \.useCsqtt, false),
+        ("csqttBoundedQueues", \.csqttBoundedQueues, true),
     ]
     private static let intKeyPaths: [(String, WritableKeyPath<ServerProfile, Int>, Int)] = [
         ("numConnections", \.numConnections, 30),
