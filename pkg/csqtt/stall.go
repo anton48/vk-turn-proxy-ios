@@ -57,6 +57,17 @@ package csqtt
 // bound's own timeout (a stall) are not the connection gone; the relay's own
 // close (the teardown's, Client.Close's) fails a write with "closed" and is
 // not counted either — it is the close.
+//
+// THE SOCKET'S WORD (build 440, 2026-09-23 — the user's review of 439). The
+// bound re-labels one error and one only: the deadline's own expiry,
+// os.ErrDeadlineExceeded, becomes the stall, and the socket's error stays
+// inside it. net.Error's Timeout() is not that word — a syscall.Errno answers
+// it for ETIMEDOUT and EAGAIN too — and 439 had taken it for one: under the
+// bound the kernel's own give-up on a connection was a stall (an asked
+// restart at once, no failure backoff) and a moment's refusal restarted a
+// worker with nothing wrong with it. The verdicts in writeLocked read the
+// error's identity, whatever the bound: the stall, the connection gone, or
+// nothing.
 
 import (
 	"errors"

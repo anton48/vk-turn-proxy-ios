@@ -980,3 +980,146 @@ func TestAStaleDeadSignalDoesNotEndTheNextSession(t *testing.T) {
 		t.Fatalf("the stale signal ended the fresh session: restarts %d, ready %d, dials %d", st.Restarts, st.Ready, relays.dials())
 	}
 }
+
+// THE SOCKET'S WORD (the user's review of 439, 2026-09-23). Under the bound
+// Relay.write re-labels the socket's error: the deadline's own expiry becomes
+// errWriteStalled. net.Error's Timeout() is NOT the deadline's own word — a
+// syscall.Errno answers it for ETIMEDOUT (the kernel's own give-up on the
+// connection: a dead write) and for EAGAIN (a moment's refusal: nothing) as
+// well — and 439 took it for one: under the bound ETIMEDOUT was a STALL (an
+// asked restart at once, no failure backoff — a fresh allocation ≈4.5 ms
+// after the error on the reviewer's stand; DeadWrites 0, WriteStalls 1) and
+// EAGAIN restarted a worker that had nothing wrong with it; and the errno was
+// formatted away (%v), so nothing downstream could tell. The isolated
+// connGone table cannot see any of this: the error is re-labelled before it
+// gets there. The tests below go through WritePacket with the bound ON, and
+// through Relay.write row by row.
+
+// The kernel's own give-up under the bound is a dead write — the caller hears
+// ETIMEDOUT itself, the worker is not ready at once, the session ends with a
+// failure and the re-dial waits the failure backoff — not a stall. Sabotages
+// seen red: the deadline's word taken from net.Error's Timeout() again (439's
+// isTimeout); the word looked for at the top level only.
+func TestAKernelTimeoutUnderTheBoundIsADeadWriteNotAStall(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installStallRelays(t)
+	cfg := testConfig(srv, 2, (&lease{}).creds)
+	cfg.WriteStall = DefaultWriteStall
+	c := dialReady(t, cfg)
+	defer c.Close()
+	gone := relays.nth(1) // worker 2, the striper's first pick
+	gone.failErr = opErr("write", syscall.ETIMEDOUT)
+	gone.failNext.Store(true)
+
+	t0 := time.Now()
+	err := writeWithin(t, c, tcpPacket(1200, 1), 3*time.Second)
+	if err == nil || errors.Is(err, errWriteStalled) || !errors.Is(err, syscall.ETIMEDOUT) {
+		t.Fatalf("WritePacket returned %v, want the kernel's own ETIMEDOUT and not the stall", err)
+	}
+	if c.workers[1].ready.Load() {
+		t.Fatal("the worker whose connection timed out still reads ready: the striper would feed the dead socket on")
+	}
+	t1 := time.Now()
+	if err := writeWithin(t, c, tcpPacket(1200, 2), 3*time.Second); err != nil {
+		t.Fatalf("the packet after the dead write: %v", err)
+	}
+	if d := time.Since(t1); d > 200*time.Millisecond {
+		t.Fatalf("the packet after the dead write took %s", d)
+	}
+	waitFor(t, "the worker on a fresh allocation", func() bool {
+		st := c.Stats()
+		return relays.dials() == 3 && st.Restarts == 1 && st.Ready == 2
+	})
+	if took := time.Since(t0); took < restartBackoff {
+		t.Fatalf("the worker re-dialled %s after the kernel's timeout: an asked restart — a stall's — not a failure under its backoff", took)
+	}
+	st := c.Stats()
+	if st.DeadWrites != 1 || st.Workers[1].DeadWrites != 1 || st.WriteStalls != 0 || st.Workers[1].Stalls != 0 {
+		t.Fatalf("dead writes %d (worker 2: %d), stalls %d (worker 2: %d) — want 1, 1, 0, 0", st.DeadWrites, st.Workers[1].DeadWrites, st.WriteStalls, st.Workers[1].Stalls)
+	}
+}
+
+// A moment's refusal under the bound is neither a stall nor a dead write: the
+// packet is dropped, the caller hears the socket's own EAGAIN, the worker
+// stays ready and nothing restarts.
+func TestAMomentsRefusalUnderTheBoundIsNeitherAStallNorADeadWrite(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installStallRelays(t)
+	cfg := testConfig(srv, 1, (&lease{}).creds)
+	cfg.WriteStall = DefaultWriteStall
+	c := dialReady(t, cfg)
+	defer c.Close()
+	sc := relays.nth(0)
+	sc.failErr = opErr("write", syscall.EAGAIN)
+	sc.failNext.Store(true)
+	err := writeWithin(t, c, tcpPacket(1200, 1), 3*time.Second)
+	if err == nil || errors.Is(err, errWriteStalled) || !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("the refused write returned %v, want the socket's own EAGAIN and not the stall", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	st := c.Stats()
+	if st.DeadWrites != 0 || st.WriteStalls != 0 || st.Ready != 1 || st.Restarts != 0 || relays.dials() != 1 || !c.workers[0].ready.Load() {
+		t.Fatalf("after a moment's refusal under the bound: dead writes %d, stalls %d, ready %d, restarts %d, dials %d", st.DeadWrites, st.WriteStalls, st.Ready, st.Restarts, relays.dials())
+	}
+}
+
+// Relay.write's re-labelling, row by row: the stall is the deadline's own
+// word — os.ErrDeadlineExceeded, bare or as the net package wraps it — and no
+// other, and the stall KEEPS the socket's error inside (errors.Is sees it);
+// the kernel's ETIMEDOUT, EAGAIN, EPIPE, ECONNRESET and a plain error come
+// back as they are, whatever the bound; with the bound off nothing is
+// re-labelled at all. Sabotages seen red: Timeout() as the word; the word at
+// the top level only; the socket's error formatted away (%v) or dropped.
+func TestTheStallIsTheDeadlinesOwnWordAndKeepsIt(t *testing.T) {
+	deadlineWrapped := &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}
+	plain := errors.New("stall fixture: a plain write error")
+	rows := []struct {
+		name      string
+		fail      error // what the socket answers; nil with block = the deadline passes
+		block     bool
+		bound     time.Duration
+		wantStall bool
+		wantIs    error // the socket's own error, still inside
+		wantGone  bool
+	}{
+		{"the deadline passes on a blocked write", nil, true, 50 * time.Millisecond, true, os.ErrDeadlineExceeded, false},
+		{"the deadline's own word, bare", os.ErrDeadlineExceeded, false, time.Second, true, os.ErrDeadlineExceeded, false},
+		{"the deadline's own word as the net package wraps it", deadlineWrapped, false, time.Second, true, os.ErrDeadlineExceeded, false},
+		{"ETIMEDOUT, the kernel's own give-up", opErr("write", syscall.ETIMEDOUT), false, time.Second, false, syscall.ETIMEDOUT, true},
+		{"EAGAIN, a moment's refusal", opErr("write", syscall.EAGAIN), false, time.Second, false, syscall.EAGAIN, false},
+		{"EPIPE", opErr("write", syscall.EPIPE), false, time.Second, false, syscall.EPIPE, true},
+		{"ECONNRESET", opErr("write", syscall.ECONNRESET), false, time.Second, false, syscall.ECONNRESET, true},
+		{"a plain error", plain, false, time.Second, false, plain, false},
+		{"ETIMEDOUT with the bound off", opErr("write", syscall.ETIMEDOUT), false, 0, false, syscall.ETIMEDOUT, true},
+		{"the deadline's word with the bound off", deadlineWrapped, false, 0, false, os.ErrDeadlineExceeded, false},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sc := newStallConn(uc, 0, &writeRecord{})
+			defer sc.Close()
+			r := &Relay{Conn: sc, Local: sc.LocalAddr(), ctl: sc}
+			if row.fail != nil {
+				sc.failErr = row.fail
+				sc.failNext.Store(true)
+			}
+			sc.block.Store(row.block)
+			err = r.write([]byte("x"), uc.LocalAddr(), row.bound)
+			if err == nil {
+				t.Fatal("the write returned no error")
+			}
+			if got := errors.Is(err, errWriteStalled); got != row.wantStall {
+				t.Fatalf("a stall: %v, want %v (%v)", got, row.wantStall, err)
+			}
+			if !errors.Is(err, row.wantIs) {
+				t.Fatalf("the socket's own word is gone: %v does not carry %v", err, row.wantIs)
+			}
+			if got := connGone(err); got != row.wantGone {
+				t.Fatalf("connGone: %v, want %v (%v)", got, row.wantGone, err)
+			}
+		})
+	}
+}

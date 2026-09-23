@@ -74,20 +74,27 @@ func (r *Relay) write(p []byte, to net.Addr, d time.Duration) error {
 	if r.closing.Load() {
 		_ = dl.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
 	}
-	if err != nil && isTimeout(err) {
-		return fmt.Errorf("%w (%v after %s)", errWriteStalled, err, d)
+	if err != nil && isDeadlineExceeded(err) {
+		// The socket's own error stays inside (%w): the verdicts in
+		// writeLocked and a log that names the cause read it through the
+		// stall's label.
+		return fmt.Errorf("%w (%w after %s)", errWriteStalled, err, d)
 	}
 	return err
 }
 
-// isTimeout is the socket's own word that the deadline passed, through
-// whatever wrapping pion's write path adds.
-func isTimeout(err error) bool {
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
-	}
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
+// isDeadlineExceeded is the socket's own word that the WRITE'S deadline
+// passed — os.ErrDeadlineExceeded, through the wrapping the net package adds
+// (pion's write path adds none) — and nothing else. net.Error's Timeout() is
+// NOT that word: a syscall.Errno answers it for ETIMEDOUT (the kernel's own
+// give-up on the connection — a dead write) and for EAGAIN (a moment's
+// refusal — nothing) as well, and read as the bound's own timeout both were a
+// STALL under the bound: an asked restart at once instead of the failure
+// backoff, and a restart where none was due, with the errno formatted away
+// so that nothing downstream could tell (the user's review of 439,
+// 2026-09-23).
+func isDeadlineExceeded(err error) bool {
+	return errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 // relayCloseWriteBudget bounds the ONE write pion makes on Close — the
