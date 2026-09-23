@@ -135,6 +135,7 @@ type Client struct {
 	// counters
 	dropped     atomic.Int64 // out queue full
 	writeStalls atomic.Int64 // writes a relay did not take within WriteStall (stall.go)
+	deadWrites  atomic.Int64 // writes that found the connection gone (stall.go)
 	noWorker    atomic.Int64 // WritePacket with nothing alive
 	framedTx    atomic.Int64
 	dupTx       atomic.Int64 // second copies sent (DuplicateTCP)
@@ -905,14 +906,15 @@ func (c *Client) repair(cmd StreamCommand) {
 
 // WorkerStats is one worker's counters.
 type WorkerStats struct {
-	ID       int
-	Ready    bool
-	Relay    string
-	TxPkts   int64
-	RxPkts   int64
-	Restarts int64
-	LastRx   time.Time
-	Stalls   int64 // writes this worker's relay did not take within the bound, since start — which relay stalls is what a log has to say
+	ID         int
+	Ready      bool
+	Relay      string
+	TxPkts     int64
+	RxPkts     int64
+	Restarts   int64
+	LastRx     time.Time
+	Stalls     int64 // writes this worker's relay did not take within the bound, since start — which relay stalls is what a log has to say
+	DeadWrites int64 // writes that found this worker's connection gone, since start
 }
 
 // Stats is a snapshot of the client. The first block is what the app's
@@ -931,6 +933,7 @@ type Stats struct {
 	Workers     []WorkerStats
 	Dropped     int64 // inbound packets the TUN side did not take in time
 	WriteStalls int64 // writes a relay did not take within WriteStall (stall.go; 0 with the bound off)
+	DeadWrites  int64 // writes that found the connection gone — a reset, a broken pipe, a closed socket (stall.go)
 	NoWorker    int64 // outbound packets with no ready worker
 	FramedTx    int64
 	DupTx       int64
@@ -950,6 +953,7 @@ func (c *Client) Stats() Stats {
 	s := Stats{
 		Dropped:     c.dropped.Load(),
 		WriteStalls: c.writeStalls.Load(),
+		DeadWrites:  c.deadWrites.Load(),
 		NoWorker:    c.noWorker.Load(),
 		FramedTx:    c.framedTx.Load(),
 		DupTx:       c.dupTx.Load(),
@@ -1009,21 +1013,23 @@ type worker struct {
 	wireBuf  []byte
 	frameBuf []byte
 
-	ready     atomic.Bool
-	tx, rx    atomic.Int64
-	txBytes   atomic.Int64
-	rxBytes   atomic.Int64
-	restarts  atomic.Int64
-	lastRx    atomic.Int64 // the liveness CLOCK, unix nanos: last inbound OR the last clock reset (a wake, a late tick)
-	heardAt   atomic.Int64 // the last REAL inbound, unix nanos — no reset touches it; what the stats report
-	lastTx    atomic.Int64
-	readyAt   atomic.Int64               // unix nanos; 0 while not ready
-	blackhole atomic.Bool                // FAULT INJECTION: drop every inbound datagram of the current session
-	probeSt   atomic.Pointer[probeState] // the probe that is out for the current silence; nil if none. Any inbound clears it
-	probing   atomic.Bool                // a READY probe is in its write (at most one goroutine behind a blocked relay)
-	relayStr  atomic.Pointer[string]
-	relayRef  atomic.Pointer[Relay] // the live allocation, for closeRelay — no mutex, a blocked send holds mu
-	stalls    atomic.Int64          // writes this worker's relay did not take within the bound (stall.go)
+	ready      atomic.Bool
+	tx, rx     atomic.Int64
+	txBytes    atomic.Int64
+	rxBytes    atomic.Int64
+	restarts   atomic.Int64
+	lastRx     atomic.Int64 // the liveness CLOCK, unix nanos: last inbound OR the last clock reset (a wake, a late tick)
+	heardAt    atomic.Int64 // the last REAL inbound, unix nanos — no reset touches it; what the stats report
+	lastTx     atomic.Int64
+	readyAt    atomic.Int64               // unix nanos; 0 while not ready
+	blackhole  atomic.Bool                // FAULT INJECTION: drop every inbound datagram of the current session
+	probeSt    atomic.Pointer[probeState] // the probe that is out for the current silence; nil if none. Any inbound clears it
+	probing    atomic.Bool                // a READY probe is in its write (at most one goroutine behind a blocked relay)
+	relayStr   atomic.Pointer[string]
+	relayRef   atomic.Pointer[Relay] // the live allocation, for closeRelay — no mutex, a blocked send holds mu
+	stalls     atomic.Int64          // writes this worker's relay did not take within the bound (stall.go)
+	deadWrites atomic.Int64          // writes that found this worker's connection gone (stall.go)
+	dead       chan error            // a write found the connection gone: the serve loop ends the session with a failure (stall.go)
 
 	kick chan string // restart requests with a reason
 }
@@ -1033,11 +1039,12 @@ func newWorker(c *Client, id int, cipher *Cipher) *worker {
 		c: c, id: id, cipher: cipher,
 		wireBuf: make([]byte, 0, 2048), frameBuf: make([]byte, 0, 2048),
 		kick: make(chan string, 1),
+		dead: make(chan error, 1),
 	}
 }
 
 func (w *worker) stats() WorkerStats {
-	s := WorkerStats{ID: w.id, Ready: w.ready.Load(), TxPkts: w.tx.Load(), RxPkts: w.rx.Load(), Restarts: w.restarts.Load(), Stalls: w.stalls.Load()}
+	s := WorkerStats{ID: w.id, Ready: w.ready.Load(), TxPkts: w.tx.Load(), RxPkts: w.rx.Load(), Restarts: w.restarts.Load(), Stalls: w.stalls.Load(), DeadWrites: w.deadWrites.Load()}
 	if ns := w.heardAt.Load(); ns != 0 { // the real one: a clock reset must not make a deaf worker look heard-from
 		s.LastRx = time.Unix(0, ns)
 	}
@@ -1326,8 +1333,15 @@ func (w *worker) session() error {
 	// while the pool parked us in Creds) wanted a fresh GETCONF, and this is
 	// one under the current identity. From here on a kick names THIS
 	// allocation and is honoured — in the GETCONF wait and the serve loop.
+	// A dead-write signal older than this allocation the same: it was about
+	// a connection that is gone already (a probe's write racing the
+	// teardown), never about this one.
 	select {
 	case <-w.kick:
+	default:
+	}
+	select {
+	case <-w.dead:
 	default:
 	}
 	t0 := time.Now()
@@ -1460,6 +1474,11 @@ attempts:
 			return ctx.Err()
 		case reason := <-w.kick:
 			return &restartRequest{reason: reason}
+		case err := <-w.dead:
+			// A write — the pump's, a probe's — found the connection gone
+			// (stall.go): a FAILURE of the relay path, restarted under the
+			// failure backoff like any other.
+			return fmt.Errorf("%w: %v", errConnGone, causeOf(err))
 		case err := <-readErr:
 			return fmt.Errorf("relay read: %w", err)
 		case p := <-control:
@@ -1518,8 +1537,13 @@ func (w *worker) writeLocked(plain []byte) error {
 	}
 	bound := w.c.cfg.WriteStall
 	if err := w.relay.write(wire, w.c.cfg.Server, bound); err != nil {
-		if errors.Is(err, errWriteStalled) {
+		switch {
+		case errors.Is(err, errWriteStalled):
 			w.stalled(bound)
+		case connGone(err) && !w.relay.closing.Load():
+			// The relay's own close fails a write under way with "closed":
+			// that is the close, not a dead connection found by this write.
+			w.deadWrite(err)
 		}
 		return err
 	}

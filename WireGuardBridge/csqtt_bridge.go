@@ -924,8 +924,8 @@ func csqttLogPathSnapshotImpl(handle int32, label string) {
 // whichever of them a log has is read by the same eye and the same grep — and a
 // counter added here reaches all three.
 func csqttStatsLine(s csqtt.Stats, tunIn, tunOut int64) string {
-	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d; write stalls %d",
-		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut, s.WriteStalls)
+	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d; write stalls %d, dead writes %d",
+		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut, s.WriteStalls, s.DeadWrites)
 }
 
 // Stats in the app's shape — the same struct the WireGuard path marshals,

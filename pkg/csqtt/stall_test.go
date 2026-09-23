@@ -23,6 +23,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -104,6 +105,7 @@ type stallConn struct {
 	firstDone  atomic.Bool
 	block      atomic.Bool
 	failNext   atomic.Bool
+	failErr    error         // what the next failed write returns; nil = a plain error
 	entered    chan struct{} // a write that blocked announces itself
 	release    chan struct{}
 	closed     chan struct{}
@@ -174,6 +176,9 @@ func (s *stallConn) WriteTo(p []byte, to net.Addr) (int, error) {
 	defer s.wmu.Unlock()
 	start := time.Now()
 	if s.failNext.CompareAndSwap(true, false) {
+		if s.failErr != nil {
+			return 0, s.failErr
+		}
 		return 0, errors.New("stall fixture: a plain write error")
 	}
 	if d := s.delayEach; d > 0 {
@@ -768,5 +773,210 @@ func TestAStallReachesThroughPionOnTheTCPTransport(t *testing.T) {
 	relay.Close()
 	if took := time.Since(t0); took > relayCloseWriteBudget+bound+2*time.Second {
 		t.Fatalf("Relay.Close took %s behind the stalled write", took)
+	}
+}
+
+// ─── the dead write (build 439) ────────────────────────────────────────────
+
+// opErr wraps an errno the way the net package reports a socket's error:
+// OpError → SyscallError → Errno.
+func opErr(op string, errno syscall.Errno) error {
+	return &net.OpError{Op: op, Net: "tcp", Err: &os.SyscallError{Syscall: op, Err: errno}}
+}
+
+// What ends a session and what does not: a reset, a broken pipe, the
+// kernel's give-up and a closed socket are the connection gone; a moment's
+// refusal (ENOBUFS, EAGAIN), a route that is away for now (the path-change
+// hook's business), the bound's own timeout (a stall) and a plain error are
+// not.
+func TestConnGoneTellsADeadConnectionFromAMomentsRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		gone bool
+	}{
+		{"EPIPE", opErr("write", syscall.EPIPE), true},
+		{"ECONNRESET", opErr("write", syscall.ECONNRESET), true},
+		{"ECONNABORTED", opErr("write", syscall.ECONNABORTED), true},
+		{"ENOTCONN", opErr("write", syscall.ENOTCONN), true},
+		{"ETIMEDOUT", opErr("write", syscall.ETIMEDOUT), true},
+		{"a closed socket", &net.OpError{Op: "write", Net: "tcp", Err: net.ErrClosed}, true},
+		{"a closed pipe", io.ErrClosedPipe, true},
+		{"ENOBUFS", opErr("sendto", syscall.ENOBUFS), false},
+		{"EAGAIN", opErr("write", syscall.EAGAIN), false},
+		{"EHOSTUNREACH", opErr("write", syscall.EHOSTUNREACH), false},
+		{"ENETUNREACH", opErr("write", syscall.ENETUNREACH), false},
+		{"ENETDOWN", opErr("write", syscall.ENETDOWN), false},
+		{"the bound's timeout", &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded}, false},
+		{"a plain error", errors.New("stall fixture: a plain write error"), false},
+		{"nil", nil, false},
+	} {
+		if got := connGone(tc.err); got != tc.gone {
+			t.Errorf("connGone(%s) = %v, want %v", tc.name, got, tc.gone)
+		}
+	}
+}
+
+// A write that finds the connection gone — a broken pipe, a reset — ENDS THE
+// SESSION: the caller hears the write's own error (not a stall), the worker
+// is not ready at once (the next packet goes to its neighbour without a
+// wait), the write is counted, and the session ends with a FAILURE — the
+// re-dial comes after the failure backoff, never at once. Before 439 the
+// error went back to the bridge as a count and nothing else: the worker
+// stayed ready and the striper fed the dead socket until the keepalive
+// noticed, up to ten seconds later. Sabotages seen red: the verdict not
+// consulted; the worker left ready; the session not ended; the counters
+// dropped; the restart asked at once instead of failed.
+func TestAWriteThatFindsTheConnectionGoneEndsTheSession(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installStallRelays(t)
+	cfg := testConfig(srv, 2, (&lease{}).creds)
+	cfg.WriteStall = DefaultWriteStall
+	c := dialReady(t, cfg)
+	defer c.Close()
+	gone := relays.nth(1) // worker 2, the striper's first pick
+	gone.failErr = opErr("write", syscall.EPIPE)
+	gone.failNext.Store(true)
+
+	t0 := time.Now()
+	err := writeWithin(t, c, tcpPacket(1200, 1), 3*time.Second)
+	if err == nil || errors.Is(err, errWriteStalled) {
+		t.Fatalf("WritePacket returned %v, want the write's own error", err)
+	}
+	if c.workers[1].ready.Load() {
+		t.Fatal("the worker whose connection is gone still reads ready: the striper would feed the dead socket on")
+	}
+	t1 := time.Now()
+	if err := writeWithin(t, c, tcpPacket(1200, 2), 3*time.Second); err != nil {
+		t.Fatalf("the packet after the dead write: %v", err)
+	}
+	if d := time.Since(t1); d > 200*time.Millisecond {
+		t.Fatalf("the packet after the dead write took %s", d)
+	}
+	waitFor(t, "the worker on a fresh allocation", func() bool {
+		st := c.Stats()
+		return relays.dials() == 3 && st.Restarts == 1 && st.Ready == 2
+	})
+	if took := time.Since(t0); took < restartBackoff {
+		t.Fatalf("the worker re-dialled %s after the dead write: an asked restart, not a failure under its backoff", took)
+	}
+	st := c.Stats()
+	if st.DeadWrites != 1 || st.Workers[1].DeadWrites != 1 || st.Workers[0].DeadWrites != 0 || st.WriteStalls != 0 {
+		t.Fatalf("dead writes: client %d, worker 2 %d, worker 1 %d; stalls %d — want 1, 1, 0, 0", st.DeadWrites, st.Workers[1].DeadWrites, st.Workers[0].DeadWrites, st.WriteStalls)
+	}
+}
+
+// A moment's refusal — ENOBUFS on a UDP socket, EAGAIN — is neither a stall
+// nor the connection gone: the error goes back to the caller, the worker
+// stays ready, nothing is counted, nothing restarts. Sabotage seen red: every
+// errno read as the connection gone.
+func TestAMomentsRefusalDoesNotEndTheSession(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installStallRelays(t)
+	cfg := testConfig(srv, 1, (&lease{}).creds)
+	cfg.WriteStall = DefaultWriteStall
+	c := dialReady(t, cfg)
+	defer c.Close()
+	sc := relays.nth(0)
+	sc.failErr = opErr("sendto", syscall.ENOBUFS)
+	sc.failNext.Store(true)
+	if err := writeWithin(t, c, tcpPacket(1200, 1), 3*time.Second); err == nil {
+		t.Fatal("the refused write returned no error")
+	}
+	time.Sleep(300 * time.Millisecond)
+	st := c.Stats()
+	if st.DeadWrites != 0 || st.WriteStalls != 0 || st.Ready != 1 || st.Restarts != 0 || relays.dials() != 1 || !c.workers[0].ready.Load() {
+		t.Fatalf("after a moment's refusal: dead writes %d, stalls %d, ready %d, restarts %d, dials %d", st.DeadWrites, st.WriteStalls, st.Ready, st.Restarts, relays.dials())
+	}
+}
+
+// The relay's OWN close — the teardown's, Client.Close's, the liveness
+// restart's — fails a write under way with "closed": that is the close
+// itself, not a dead connection found by the write; nothing is counted and
+// no second ending is asked for. Sabotage seen red: the closing check dropped.
+func TestTheRelaysOwnCloseIsNotADeadWrite(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installStallRelays(t)
+	cfg := testConfig(srv, 1, (&lease{}).creds)
+	cfg.WriteStall = DefaultWriteStall
+	c := dialReady(t, cfg)
+	defer c.Close()
+	sc := relays.nth(0)
+	relay := c.workers[0].relayRef.Load()
+	relay.closing.Store(true) // a Close under way, as Relay.Close marks it before anything else
+	sc.failErr = &net.OpError{Op: "write", Net: "tcp", Err: net.ErrClosed}
+	sc.failNext.Store(true)
+	if err := writeWithin(t, c, tcpPacket(1200, 1), 3*time.Second); err == nil {
+		t.Fatal("the write on the closing relay returned no error")
+	}
+	if st := c.Stats(); st.DeadWrites != 0 || st.Workers[0].DeadWrites != 0 {
+		t.Fatalf("the relay's own close was counted as a dead write: %d", st.DeadWrites)
+	}
+	select {
+	case err := <-c.workers[0].dead:
+		t.Fatalf("the relay's own close asked the session to end: %v", err)
+	default:
+	}
+}
+
+// A PROBE's write that finds the connection gone ends the session too: the
+// probe's error is otherwise dropped on the floor, and on the TCP transport a
+// reset is noticed by a write and by nothing else. Sabotage seen red: the
+// verdict reached from the pump's path alone.
+func TestAProbesWriteThatFindsTheConnectionGoneEndsTheSession(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installStallRelays(t)
+	cfg := testConfig(srv, 1, (&lease{}).creds)
+	cfg.WriteStall = DefaultWriteStall
+	c := dialReady(t, cfg)
+	defer c.Close()
+	sc := relays.nth(0)
+	sc.failErr = opErr("write", syscall.ECONNRESET)
+	sc.failNext.Store(true)
+	c.WakeHealthCheck() // the probe's write, on its own goroutine
+	waitFor(t, "the worker on a fresh allocation after the probe's dead write", func() bool {
+		st := c.Stats()
+		return relays.dials() == 2 && st.Restarts == 1 && st.Ready == 1
+	})
+	if st := c.Stats(); st.DeadWrites != 1 {
+		t.Fatalf("dead writes %d, want 1", st.DeadWrites)
+	}
+}
+
+// A dead-write signal left over from a session that has ended — a probe's
+// write racing the teardown — must not end the NEXT session at its first
+// step: the session drains the signal when it starts, as it drains an old
+// kick. Sabotage seen red: the drain dropped (the fresh session ends at once).
+func TestAStaleDeadSignalDoesNotEndTheNextSession(t *testing.T) {
+	srv := newFakeServer(t)
+	relays := installStallRelays(t)
+	// The next session waits 300 ms in Creds — before its drain — so that the
+	// stale signal lands in the window it is meant for: after the old serve
+	// loop's exit and before the new session looks.
+	var acquires atomic.Int32
+	l := &lease{delay: func(int) time.Duration {
+		if acquires.Add(1) >= 2 {
+			return 300 * time.Millisecond
+		}
+		return 0
+	}}
+	cfg := testConfig(srv, 1, l.creds)
+	c := dialReady(t, cfg)
+	defer c.Close()
+	w := c.workers[0]
+	w.restart("test: an asked restart")
+	waitFor(t, "the old session's teardown", func() bool { return !w.ready.Load() })
+	select {
+	case w.dead <- errors.New("stale: from the session that has ended"):
+	default:
+		t.Fatal("fixture: the dead channel was not empty")
+	}
+	waitFor(t, "the worker on a fresh allocation", func() bool {
+		st := c.Stats()
+		return relays.dials() == 2 && st.Restarts == 1 && st.Ready == 1
+	})
+	time.Sleep(1500 * time.Millisecond)
+	if st := c.Stats(); st.Restarts != 1 || st.Ready != 1 || relays.dials() != 2 {
+		t.Fatalf("the stale signal ended the fresh session: restarts %d, ready %d, dials %d", st.Restarts, st.Ready, relays.dials())
 	}
 }

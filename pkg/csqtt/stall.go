@@ -39,9 +39,30 @@ package csqtt
 // liveness rule's thirty seconds. Several relays stuck at once cost one bound
 // each, in turn. With Config.WriteStall = 0 no deadline is set: the write
 // waits as long as the relay makes it, as every build before 438 did.
+//
+// THE DEAD WRITE (build 439, 2026-09-23). A write's error that says the
+// CONNECTION is gone — a broken pipe, a reset, the kernel's own give-up, a
+// closed socket — ends the session at once, whoever wrote: the pump, a probe,
+// a keepalive. On the TCP transport a reset is noticed by the next write on
+// the socket and by nothing else (pion's relayed conn hands the read loop no
+// transport error); before 439 the pump's error went back to the bridge as a
+// count and the worker stayed READY — the striper kept handing it chunks,
+// each packet failing at once, until the session's own keepalive noticed, up
+// to ten seconds later (≈290 packets to a dead socket in the field, Sep 23
+// §316). Now the worker is not ready at once and the session ends with a
+// FAILURE — the re-dial under the failure backoff, never at once: a network
+// that resets every connection right after its setup must not be re-dialled
+// as fast as the start gate allows. A moment's refusal (ENOBUFS, EAGAIN), a
+// route that is away for now (the path-change hook's business) and the
+// bound's own timeout (a stall) are not the connection gone; the relay's own
+// close (the teardown's, Client.Close's) fails a write with "closed" and is
+// not counted either — it is the close.
 
 import (
 	"errors"
+	"io"
+	"net"
+	"syscall"
 	"time"
 )
 
@@ -64,6 +85,71 @@ func (w *worker) stalled(bound time.Duration) {
 	w.markNotReady()
 	w.c.cfg.Logf("csqtt: worker %d: the relay took no bytes for %s — a stalled write; the packet is dropped and the worker restarted", w.id, bound)
 	w.restart("write stalled: the relay took no bytes for " + bound.String())
+}
+
+// errConnGone is what a session ends with when a write — the pump's, a
+// probe's, a keepalive's — found the connection gone (deadWrite).
+var errConnGone = errors.New("csqtt: the write found the connection gone")
+
+// connGone says whether a write's error means the CONNECTION is gone — a
+// reset, a broken pipe, the kernel's own give-up, a closed socket — as
+// opposed to a moment's refusal (ENOBUFS on a UDP socket, EAGAIN), a route
+// that is away for now (unreachable — the path-change hook's business) or
+// the bound's timeout (a stall, judged apart). On the TCP transport a reset
+// is noticed by the next WRITE on the socket and by nothing else: pion's
+// relayed conn hands the read loop no transport error.
+func connGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNABORTED, syscall.ENOTCONN, syscall.ETIMEDOUT:
+			return true
+		}
+	}
+	return false
+}
+
+// causeOf is the innermost error — the errno's own words when there is one
+// — for a log line that names the cause and not the addresses.
+func causeOf(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno.Error()
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return net.ErrClosed.Error()
+	}
+	return err.Error()
+}
+
+// deadWrite is the verdict on a write that found the connection gone, under
+// w.mu from writeLocked: counted (the client's total and this worker's own),
+// the worker not ready at once — the striper hands the rest of its chunk to
+// the next live worker and begins no chunk on it — and the session told to
+// END WITH A FAILURE (w.dead, read by the serve loop): the restart then runs
+// under the failure backoff, as after any other failure of the relay path —
+// never as an asked restart, which re-dials at once: a network that resets
+// every connection right after its setup would otherwise re-dial as fast as
+// the start gate lets it, an allocation each time. Before 439 the pump's
+// error went back to the bridge as a count and nothing else: the worker
+// stayed ready, the striper fed the dead socket for up to ten seconds, until
+// the session's own keepalive noticed (≈290 packets in the field, Sep 23
+// §316).
+func (w *worker) deadWrite(err error) {
+	w.deadWrites.Add(1)
+	w.c.deadWrites.Add(1)
+	w.markNotReady()
+	w.c.cfg.Logf("csqtt: worker %d: the write found the connection gone (%s) — the session ends", w.id, causeOf(err))
+	select {
+	case w.dead <- err:
+	default:
+	}
 }
 
 // markNotReady is the ONE place a worker stops being ready — the session's

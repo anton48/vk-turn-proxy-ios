@@ -56,7 +56,7 @@ func newFakeClient() *fakeClient {
 	return &fakeClient{
 		up: make(chan []byte, 64), down: make(chan []byte, 64), done: make(chan struct{}),
 		conf:  csqtt.ConfigResponse{TunnelIP: "10.66.67.3", DNS: "77.88.8.8,77.88.8.1", StreamRevision: "stream-v2", Raw: "TUNCONF:10.66.67.3:77.88.8.8,77.88.8.1:9000:stream-v2"},
-		stats: csqtt.Stats{TxBytes: 1234, RxBytes: 5678, Ready: 9, Live: 7, Total: 30, Restarts: 3, AllocateRTT: 131 * time.Millisecond, WriteStalls: 6},
+		stats: csqtt.Stats{TxBytes: 1234, RxBytes: 5678, Ready: 9, Live: 7, Total: 30, Restarts: 3, AllocateRTT: 131 * time.Millisecond, WriteStalls: 6, DeadWrites: 4},
 	}
 }
 
@@ -768,7 +768,7 @@ func TestCsqttStopLeavesTheClientsCountersInTheLog(t *testing.T) {
 	if atStop == "" {
 		t.Fatalf("the stop left no counters in the log — a run without a path event carries none at all:\n%s", strings.Join(out.lines(), "\n"))
 	}
-	for _, want := range []string{"workers 9/30 ready (7 heard from lately)", "restarts 3, repairs 4", "probes 41 (+7 sent again, 9 witnesses)", "rounds asked again 5", "lost 2, deaf restart-alls 1", "write stalls 6"} {
+	for _, want := range []string{"workers 9/30 ready (7 heard from lately)", "restarts 3, repairs 4", "probes 41 (+7 sent again, 9 witnesses)", "rounds asked again 5", "lost 2, deaf restart-alls 1", "write stalls 6, dead writes 4"} {
 		if !strings.Contains(atStop, want) {
 			t.Fatalf("the stop's counters lack %q — they are the client's as it RAN (a closed client has nobody ready): %q", want, atStop)
 		}
