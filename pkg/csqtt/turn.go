@@ -3,10 +3,13 @@
 package csqtt
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/logging"
@@ -27,14 +30,65 @@ type TURNCredentials struct {
 type Relay struct {
 	Conn  net.PacketConn
 	Local net.Addr
-	close func()
-	once  sync.Once
+	// ctl is the control socket the allocation rides on — where a write
+	// deadline goes: pion's relay conn forwards none (its SetWriteDeadline is
+	// a stub), the STUNConn hands it to the TCP conn and a UDP socket honours
+	// it itself. nil in a fixture that is its own control socket (write then
+	// uses Conn).
+	ctl     net.PacketConn
+	closing atomic.Bool // Close under way: a write ending now puts the close's own deadline back (write)
+	close   func()
+	once    sync.Once
 }
 
 // Close tears down the relayed conn, the TURN client and the control socket.
 // Close ends the allocation; idempotent, so the session's deferred close and
 // Client.Close's forced close do not collide. Bounded: see closeRelayBounded.
-func (r *Relay) Close() { r.once.Do(r.close) }
+func (r *Relay) Close() {
+	r.closing.Store(true) // before the close sets its deadline: a write that ends under it must know (write)
+	r.once.Do(r.close)
+}
+
+// write sends one datagram through the allocation — under a deadline of d
+// when d > 0: the relay has d to take the bytes, and a write it has not taken
+// by then returns errWriteStalled (the worker's verdict follows in
+// writeLocked). The deadline goes on the control socket and is cleared behind
+// the write — pion's own writes on that socket, the refreshes and the
+// deallocate, must never meet a deadline that has passed — unless the relay's
+// Close is under way, whose deadline (relayCloseWriteBudget, set before the
+// deallocate is written) is then put back: a close that began while this
+// write was blocked set it first, and a clear that wiped it would leave the
+// deallocate's write unbounded on the very socket that is stuck.
+func (r *Relay) write(p []byte, to net.Addr, d time.Duration) error {
+	if d <= 0 {
+		_, err := r.Conn.WriteTo(p, to)
+		return err
+	}
+	dl := r.ctl
+	if dl == nil {
+		dl = r.Conn
+	}
+	_ = dl.SetWriteDeadline(time.Now().Add(d))
+	_, err := r.Conn.WriteTo(p, to)
+	_ = dl.SetWriteDeadline(time.Time{})
+	if r.closing.Load() {
+		_ = dl.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
+	}
+	if err != nil && isTimeout(err) {
+		return fmt.Errorf("%w (%v after %s)", errWriteStalled, err, d)
+	}
+	return err
+}
+
+// isTimeout is the socket's own word that the deadline passed, through
+// whatever wrapping pion's write path adds.
+func isTimeout(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
 
 // relayCloseWriteBudget bounds the ONE write pion makes on Close — the
 // deallocate (Refresh with lifetime 0, sent without waiting for the answer;
@@ -137,6 +191,7 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 	return &Relay{
 		Conn:  relay,
 		Local: ctl.LocalAddr(),
+		ctl:   ctl,
 		close: func() { closeRelayBounded(ctl, relay, tc.Close) },
 	}, nil
 }

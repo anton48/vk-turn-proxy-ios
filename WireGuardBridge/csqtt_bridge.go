@@ -84,7 +84,7 @@ type csqttConfig struct {
 	VKLink                  string              `json:"vk_link"`
 	NumConns                int                 `json:"num_conns"`
 	UseUDP                  bool                `json:"use_udp"`
-	BoundedQueues           bool                `json:"csqtt_bounded_queues"` // pkg/csqtt/queue.go; absent = the synchronous write
+	BoundedWrites           bool                `json:"csqtt_bounded_writes"` // pkg/csqtt/stall.go; absent = the unbounded write
 	TurnServer              string              `json:"turn_server"`
 	TurnPort                string              `json:"turn_port"`
 	CredPoolCooldownSeconds int                 `json:"cred_pool_cooldown_seconds"`
@@ -504,19 +504,20 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 	if cfg.UseUDP {
 		transport = "udp"
 	}
-	// The bounded write queues (pkg/csqtt/queue.go): a relay that stops taking
-	// bytes then holds its own queue, not the whole uplink. The profile's switch;
-	// off — or absent from an older config — is the synchronous write of every
-	// build before 437.
-	queue := 0
-	if cfg.BoundedQueues {
-		queue = csqtt.DefaultWriteQueue
+	// The bounded relay write (pkg/csqtt/stall.go): a relay that stops taking
+	// bytes is judged after DefaultWriteStall and restarted, instead of holding
+	// the whole uplink until the liveness rule does. The profile's switch; off —
+	// or absent from an older config — is the unbounded write of every build
+	// before 438.
+	stall := time.Duration(0)
+	if cfg.BoundedWrites {
+		stall = csqtt.DefaultWriteStall
 	}
 	gen, salt := csqttNextIdentity(dir)
 	adapter := &csqttPoolAdapter{pool: pool, fatal: e.fail}
 	// Never the password: the config line Swift logs is the redacted one.
-	log.Printf("csqttStart: tunnel %d: server=%s device=%s workers=%d transport=%s queue=%d gen=%d cache=%v seeded=%v",
-		e.id, cfg.Server, cfg.DeviceID, cfg.NumConns, transport, queue, gen, cachePath != "", seed != nil)
+	log.Printf("csqttStart: tunnel %d: server=%s device=%s workers=%d transport=%s write-bound=%s gen=%d cache=%v seeded=%v",
+		e.id, cfg.Server, cfg.DeviceID, cfg.NumConns, transport, stall, gen, cachePath != "", seed != nil)
 
 	go func() {
 		defer close(e.dialed)
@@ -536,7 +537,7 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 			Server: server, Password: cfg.Password, DeviceID: cfg.DeviceID,
 			Generation: gen, Salt: salt, Workers: cfg.NumConns,
 			Creds: adapter.creds, TURNTransport: transport, TURNLogLevel: logging.LogLevelWarn,
-			WriteQueue: queue,
+			WriteStall: stall,
 			Logf:       log.Printf,
 		})
 		if err != nil {
@@ -923,8 +924,8 @@ func csqttLogPathSnapshotImpl(handle int32, label string) {
 // whichever of them a log has is read by the same eye and the same grep — and a
 // counter added here reaches all three.
 func csqttStatsLine(s csqtt.Stats, tunIn, tunOut int64) string {
-	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d; queue: full %d, stale %d, write errors %d, queued %d",
-		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut, s.QueueFull, s.QueueStale, s.WriteErrs, s.Queued)
+	return fmt.Sprintf("workers %d/%d ready (%d heard from lately), restarts %d, repairs %d, probes %d (+%d sent again, %d witnesses), rounds asked again %d, lost %d, deaf restart-alls %d; tun in=%d out=%d; write stalls %d",
+		s.Ready, s.Total, s.Live, s.Restarts, s.Repairs, s.Probes, s.Reprobes, s.Witnesses, s.RoundAsks, s.LostWorkers, s.DeafAll, tunIn, tunOut, s.WriteStalls)
 }
 
 // Stats in the app's shape — the same struct the WireGuard path marshals,

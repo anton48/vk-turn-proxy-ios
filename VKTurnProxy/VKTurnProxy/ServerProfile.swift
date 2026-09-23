@@ -72,10 +72,11 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     /// server like WRAP-A's deviceID; a `csqtt://connect?…&device=<id>` link
     /// may carry it (the server binds the password to ONE id) — parseCsqttLink.
     var csqttDeviceID: String = ""
-    /// csqtt (build 437): one bounded write queue per connection, so a relay
-    /// that stops taking bytes holds only its own queue, not the whole uplink.
-    /// ON by default; off is the synchronous write of the builds before 437.
-    var csqttBoundedQueues: Bool = true
+    /// csqtt (build 438): every relay write is bounded — a relay that stops
+    /// taking bytes is restarted after a second instead of holding the whole
+    /// uplink until the liveness rule does. ON by default; off is the
+    /// unbounded write of the builds before 438.
+    var csqttBoundedWrites: Bool = true
 
     /// Human-readable transport mode, matching the ServerMode picker labels.
     /// Used in log lines and import confirmations.
@@ -101,7 +102,7 @@ struct ServerProfile: Codable, Identifiable, Equatable {
         case wrapKeyHex, obfProfile, clientID
         case wrapAPassword, deviceID
         case useCsqtt, csqttPassword, csqttDeviceID
-        case csqttBoundedQueues
+        case csqttBoundedWrites
     }
 }
 
@@ -144,7 +145,7 @@ extension ServerProfile {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useCsqtt) { useCsqtt = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .csqttPassword) { csqttPassword = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .csqttDeviceID) { csqttDeviceID = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .csqttBoundedQueues) { csqttBoundedQueues = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .csqttBoundedWrites) { csqttBoundedWrites = v }
     }
 }
 
@@ -244,7 +245,7 @@ struct ServerSettings: Codable {
     var useCsqtt: Bool? = nil
     var csqttPassword: String? = nil
     var csqttDeviceID: String? = nil
-    var csqttBoundedQueues: Bool? = nil
+    var csqttBoundedWrites: Bool? = nil
 
     init(_ p: ServerProfile) {
         serverName = p.serverName
@@ -271,7 +272,7 @@ struct ServerSettings: Codable {
         useCsqtt = p.useCsqtt
         csqttPassword = p.csqttPassword
         csqttDeviceID = p.csqttDeviceID
-        csqttBoundedQueues = p.csqttBoundedQueues
+        csqttBoundedWrites = p.csqttBoundedWrites
     }
 
     /// Rebuild a profile, filling every absent field with the ServerProfile
@@ -302,7 +303,7 @@ struct ServerSettings: Codable {
         if let v = useCsqtt { p.useCsqtt = v }
         if let v = csqttPassword { p.csqttPassword = v }
         if let v = csqttDeviceID { p.csqttDeviceID = v }
-        if let v = csqttBoundedQueues { p.csqttBoundedQueues = v }
+        if let v = csqttBoundedWrites { p.csqttBoundedWrites = v }
         return p
     }
 }

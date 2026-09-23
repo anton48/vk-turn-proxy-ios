@@ -34,13 +34,15 @@ type Config struct {
 
 	Workers int    // 1..MaxWorkers
 	Chunks  [3]int // per-class striping chunks; zero keeps DefaultChunks
-	// WriteQueue is the depth of each worker's write queue, in packets. 0 — the
-	// default — writes synchronously: WritePacket returns when the relay's
-	// socket took the packet, so a relay that stops taking bytes holds the
-	// caller, and every other worker behind it. DefaultWriteQueue puts a
-	// bounded queue and a writer goroutine between the caller and every relay:
-	// a stuck relay then holds its own queue and nothing else (queue.go).
-	WriteQueue int
+	// WriteStall bounds every write to a relay: a write the relay has not
+	// taken within it is a STALL — the packet is dropped and counted, the
+	// worker is not ready at once and restarted (stall.go). 0 — the default —
+	// sets no bound: the write waits as long as the relay makes it, and a
+	// relay that stops taking bytes holds the caller, and every other worker
+	// behind it, until the liveness rule restarts that worker. The write is
+	// synchronous either way, and IN ORDER across the workers: that order is
+	// what the server's CQF1 reassembly lives on (stall.go).
+	WriteStall time.Duration
 
 	// DuplicateTCP (EXPERIMENT) sends a second copy of every CQF1-framed
 	// packet through a different worker. The server keys reassembly on
@@ -132,9 +134,7 @@ type Client struct {
 
 	// counters
 	dropped     atomic.Int64 // out queue full
-	queueFull   atomic.Int64 // outbound packets refused by a full write queue (queue.go)
-	queueStale  atomic.Int64 // queued packets dropped because their session had ended
-	writeErrs   atomic.Int64 // queued packets whose write failed
+	writeStalls atomic.Int64 // writes a relay did not take within WriteStall (stall.go)
 	noWorker    atomic.Int64 // WritePacket with nothing alive
 	framedTx    atomic.Int64
 	dupTx       atomic.Int64 // second copies sent (DuplicateTCP)
@@ -523,13 +523,6 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	c.workers = make([]*worker, cfg.Workers)
 	for i := range c.workers {
 		c.workers[i] = newWorker(c, i+1, cipher)
-		if cfg.WriteQueue > 0 {
-			// The bounded write queue and its writer, for the worker's whole life
-			// (queue.go); with WriteQueue = 0 the worker writes synchronously.
-			c.workers[i].outQ = make(chan outItem, cfg.WriteQueue)
-			c.wg.Add(1)
-			go c.workers[i].writeLoop()
-		}
 	}
 
 	// Worker 1 first, alone: its TUNCONF is what the caller waits for, and
@@ -582,21 +575,14 @@ func (c *Client) WritePacket(pkt []byte) error {
 	if len(pkt) == 0 {
 		return nil
 	}
-	class := Classify(pkt)
-	// The worker: the striper's schedule, unchanged — and with the write queue
-	// on, a worker whose queue has no room is passed over where a new chunk
-	// begins, never inside one (queue.go).
-	var w int
-	if c.cfg.WriteQueue > 0 {
-		w = c.striper.PickRoom(class, c.alive, func(i int) bool { return c.roomFor(i, class) })
-	} else {
-		w = c.striper.Pick(class, c.alive)
-	}
+	// The write is synchronous and this is its ONE caller: the packets leave
+	// in the order they arrive here, across the workers — chunk k+1 begins on
+	// its worker only after chunk k's last packet has entered its relay's
+	// socket. The csqtt server's CQF1 reassembly lives on that order; what
+	// keeps a stuck relay from holding this caller for good is the bound on
+	// the write, never a queue in front of it (stall.go).
+	w := c.striper.Pick(Classify(pkt), c.alive)
 	if w < 0 {
-		if c.cfg.WriteQueue > 0 && c.anyReady() {
-			c.queueFull.Add(1) // somebody is ready: it is the queues that have no room
-			return errQueueFull
-		}
 		c.noWorker.Add(1)
 		return errNoWorker
 	}
@@ -604,10 +590,10 @@ func (c *Client) WritePacket(pkt []byte) error {
 	if c.Config().FramesData() {
 		if framed, ok := c.seq.Frame(wk.frameBuf, pkt); ok {
 			c.framedTx.Add(1)
-			err := c.dispatch(wk, framed)
+			err := wk.send(framed)
 			if c.cfg.DuplicateTCP {
 				if w2 := c.secondWorker(w); w2 >= 0 {
-					if c.dispatch(c.workers[w2], framed) == nil {
+					if c.workers[w2].send(framed) == nil {
 						c.dupTx.Add(1)
 					}
 				}
@@ -615,7 +601,7 @@ func (c *Client) WritePacket(pkt []byte) error {
 			return err
 		}
 	}
-	return c.dispatch(wk, pkt)
+	return wk.send(pkt)
 }
 
 var errNoWorker = errors.New("csqtt: no worker is ready")
@@ -919,15 +905,14 @@ func (c *Client) repair(cmd StreamCommand) {
 
 // WorkerStats is one worker's counters.
 type WorkerStats struct {
-	ID        int
-	Ready     bool
-	Relay     string
-	TxPkts    int64
-	RxPkts    int64
-	Restarts  int64
-	LastRx    time.Time
-	Queued    int   // packets in the worker's write queue now (0 with the queue off)
-	QueueFull int64 // packets this worker's queue refused, since start
+	ID       int
+	Ready    bool
+	Relay    string
+	TxPkts   int64
+	RxPkts   int64
+	Restarts int64
+	LastRx   time.Time
+	Stalls   int64 // writes this worker's relay did not take within the bound, since start — which relay stalls is what a log has to say
 }
 
 // Stats is a snapshot of the client. The first block is what the app's
@@ -945,10 +930,7 @@ type Stats struct {
 
 	Workers     []WorkerStats
 	Dropped     int64 // inbound packets the TUN side did not take in time
-	QueueFull   int64 // outbound packets refused by a full write queue (queue.go; 0 with the queue off)
-	QueueStale  int64 // queued packets dropped because their session had ended
-	WriteErrs   int64 // queued packets whose write failed
-	Queued      int   // packets in the write queues now
+	WriteStalls int64 // writes a relay did not take within WriteStall (stall.go; 0 with the bound off)
 	NoWorker    int64 // outbound packets with no ready worker
 	FramedTx    int64
 	DupTx       int64
@@ -967,9 +949,7 @@ type Stats struct {
 func (c *Client) Stats() Stats {
 	s := Stats{
 		Dropped:     c.dropped.Load(),
-		QueueFull:   c.queueFull.Load(), // every refusal: the queue's inside a chunk (the workers' own counts) and the striper's where a chunk found no room
-		QueueStale:  c.queueStale.Load(),
-		WriteErrs:   c.writeErrs.Load(),
+		WriteStalls: c.writeStalls.Load(),
 		NoWorker:    c.noWorker.Load(),
 		FramedTx:    c.framedTx.Load(),
 		DupTx:       c.dupTx.Load(),
@@ -994,7 +974,6 @@ func (c *Client) Stats() Stats {
 		s.TxBytes += w.txBytes.Load()
 		s.RxBytes += w.rxBytes.Load()
 		s.Restarts += ws.Restarts
-		s.Queued += ws.Queued
 		if ws.Ready {
 			s.Ready++
 			if !ws.LastRx.IsZero() && now.Sub(ws.LastRx) <= liveWindow {
@@ -1044,9 +1023,7 @@ type worker struct {
 	probing   atomic.Bool                // a READY probe is in its write (at most one goroutine behind a blocked relay)
 	relayStr  atomic.Pointer[string]
 	relayRef  atomic.Pointer[Relay] // the live allocation, for closeRelay — no mutex, a blocked send holds mu
-	outQ      chan outItem          // the bounded write queue; nil with the queue off (queue.go)
-	queueFull atomic.Int64          // packets this worker's queue refused — which relay drops is what the field analysis asks
-	epoch     atomic.Uint64         // the session epoch, moved with every relay installed: a queued packet carries the one it was queued under
+	stalls    atomic.Int64          // writes this worker's relay did not take within the bound (stall.go)
 
 	kick chan string // restart requests with a reason
 }
@@ -1060,7 +1037,7 @@ func newWorker(c *Client, id int, cipher *Cipher) *worker {
 }
 
 func (w *worker) stats() WorkerStats {
-	s := WorkerStats{ID: w.id, Ready: w.ready.Load(), TxPkts: w.tx.Load(), RxPkts: w.rx.Load(), Restarts: w.restarts.Load(), Queued: w.queued(), QueueFull: w.queueFull.Load()}
+	s := WorkerStats{ID: w.id, Ready: w.ready.Load(), TxPkts: w.tx.Load(), RxPkts: w.rx.Load(), Restarts: w.restarts.Load(), Stalls: w.stalls.Load()}
 	if ns := w.heardAt.Load(); ns != 0 { // the real one: a clock reset must not make a deaf worker look heard-from
 		s.LastRx = time.Unix(0, ns)
 	}
@@ -1388,15 +1365,12 @@ func (w *worker) session() error {
 	w.blackhole.Store(false) // a fresh allocation is a fresh path; an injected fault does not follow it
 	w.mu.Lock()
 	w.relay, w.wrapper = relay, wrapper
-	w.epoch.Add(1) // a new session: whatever was queued under the old one is stale from here (queue.go)
 	w.mu.Unlock()
 	w.relayRef.Store(relay)
 	rs := relay.Conn.LocalAddr().String()
 	w.relayStr.Store(&rs)
 	defer func() {
-		w.ready.Store(false)
-		w.readyAt.Store(0)
-		w.clearProbe()
+		w.markNotReady()
 		// The relay FIRST: a writer blocked in WriteTo (a probe, the TUN
 		// pump) holds w.mu, and the close is what frees it — a restart of a
 		// worker whose relay stopped taking bytes must not wait behind the
@@ -1520,11 +1494,11 @@ func (w *worker) handleControl(p []byte) {
 	}
 }
 
-// send wraps and writes one plaintext. Safe for concurrent callers. The
-// control plane's path (GETCONF, READY, the probes, keepalives, DISCONNECT),
-// and the data path's with the write queue off; the queue's writer goes
-// through sendData (queue.go), which adds the session check to the same lock
-// and the same write.
+// send wraps and writes one plaintext. Safe for concurrent callers: ONE path
+// for the control plane (GETCONF, READY, the probes, keepalives, DISCONNECT)
+// and the data plane (WritePacket) — synchronous, under the worker's lock, so
+// that what leaves through this worker leaves in the order it was handed in,
+// and bounded by Config.WriteStall (stall.go).
 func (w *worker) send(plain []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1535,14 +1509,18 @@ func (w *worker) send(plain []byte) error {
 }
 
 // writeLocked wraps and writes one plaintext under w.mu, the relay known to
-// be there. ONE body for every writer: the counters and the keepalive's clock
-// are stamped here and nowhere else.
+// be there. ONE body for every writer: the bound, the stall's verdict, the
+// counters and the keepalive's clock are here and nowhere else.
 func (w *worker) writeLocked(plain []byte) error {
 	wire, err := w.wrapper.Wrap(w.wireBuf, plain)
 	if err != nil {
 		return err
 	}
-	if _, err := w.relay.Conn.WriteTo(wire, w.c.cfg.Server); err != nil {
+	bound := w.c.cfg.WriteStall
+	if err := w.relay.write(wire, w.c.cfg.Server, bound); err != nil {
+		if errors.Is(err, errWriteStalled) {
+			w.stalled(bound)
+		}
 		return err
 	}
 	w.tx.Add(1)
