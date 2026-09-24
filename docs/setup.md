@@ -16,7 +16,7 @@
 
 - выделенный или VPS сервер, на котором будет работать серверное приложение vk-turn-proxy. К нему будет подключаться TURN relay, поэтому сервер должен иметь публичный IP адрес, достижимый из Интернет и на firewall (если он есть) должен быть открыт доступ к паре IP:порт.
 
-- на сервере должен быть установлен, настроен и запущен [WireGuard сервер](https://www.wireguard.com)  (или какая-то другая реализация WireGuard протокола).
+- на сервере должен быть установлен, настроен и запущен [WireGuard сервер](https://www.wireguard.com) или какая-то другая реализация WireGuard протокола. Этот пункт не нужен для серверов wdtt (WireGuard встроенный) и csqtt (WireGuard отсутствует).
 
 - в общем случае, на сервере должна быть настроена маршрутизация между интерфейсами (например, net.ipv4.ip_forward=1 в linux или net.inet.ip.forwarding=1 в FreeBSD).
 
@@ -24,9 +24,9 @@
 
 ## Режимы работы
 
-Клиентское приложение поддерживает 5 режимов работы:
+Клиентское приложение поддерживает 6 режимов работы:
 
-<img width="750" height="802" alt="image" src="https://github.com/user-attachments/assets/2f20bc32-1548-4b50-b5c9-c734f52dee3b" />
+<img width="750" height="620" alt="image" src="https://github.com/user-attachments/assets/a71e53a6-4ba9-4c42-9d43-285b85a1fc63" />
 
 ### Legacy
 
@@ -68,13 +68,15 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 
 режим совместимости с сервером [FreeTurn](https://github.com/samosvalishe/free-turn-proxy/releases).
 
+### csqtt
+
+режим совместимости с сервером [csqtt](https://github.com/amurcanov/csqtt/releases). В протоколе этого сервера WireGuard не используется, поэтому отдельно запускать и настраивать его на сервере не надо.
+
 ## Настройки клиентского приложения
 
 Начальный экран настроек выглядит так:
 
-
 <img width="750" height="1334" alt="image" src="https://github.com/user-attachments/assets/7ec11202-c3a9-4674-8412-ab72df22458a" />
-
 
 В поле VK Call Link необходимо добавить URL звонка из VK (https://vk.ru/call/join/xxxxxxxxxxxxxxxxxxxxxx). URL может быть несколько, каждый на отдельной строке. 
 
@@ -84,17 +86,13 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 
 При первом включении будет открыт WebView для ручной аутентификации на vk.ru. Если она будет успешна, то приложение сохранит cookies в Keychain и в дальнейшем будет их использовать для получения credentials. Приложение будет показывать дату, до которой действуют сохраненные cookies. Их можно удалить или перелогиниться:
 
-
 <img width="750" height="1074" alt="image" src="https://github.com/user-attachments/assets/0bbbda7e-218c-4bbc-8331-56e69b1232b2" />
-
 
 В этом режиме каждый URL звонка дает возможность открыть 20 соединений/аллокаций. Если нужно больше 20, то нужно два URL, больше 40 - три URL (максимальное количество соединений в приложении ограничено 60, поэтому больше трех URL добавлять нет необходимости).
 
 ### Legacy или SRTP режим
 
-
 <img width="750" height="1334" alt="image" src="https://github.com/user-attachments/assets/c7a2c808-b545-41a7-a4a5-00b25dc0ba94" />
-
 
 Имя сервера можно изменить.
 
@@ -119,9 +117,7 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 
 Далее можно создать новый сервер с настройками по умолчанию, скопировать настройки этого сервера в новый сервер или удалить сервер:
 
-
 <img width="750" height="539" alt="image" src="https://github.com/user-attachments/assets/2112653e-f9a3-460d-bf00-f75c305a593f" />
-
 
 ### SRTP-WRAP режим
 
@@ -160,6 +156,18 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 
 Раздела WireGuard в этом режиме нет, так как WDTT сервер присылает эти настройки клиенту после установления соединения в автоматическом режиме.
 
+### csqtt режим
+
+В этом режиме в разделе Transport появляются обязательные дополнительные поля для ввода пароля csqtt и Device ID:
+
+<img width="750" height="1304" alt="image" src="https://github.com/user-attachments/assets/fdfc20c6-0a31-4242-aeff-069dcc370a4c" />
+
+Так же есть дополнительный параметр уникальный для csqtt - "Bounded relay writes":
+
+<img width="750" height="1199" alt="image" src="https://github.com/user-attachments/assets/b02fb60a-67a3-45db-9680-f767a1f7e455" />
+
+Если он выключен, то один relay (allocation) может тормозить работу остальных в случае каких-то сетевых проблем с ним.
+
 ## Автоматические ссылки
 
 Приложение регистрирует ссылки вида vkturnproxy:// на себя, то есть при нажатии на такую ссылку iOS должен передать ее в приложение vk-turn-proxy-ios. Альтернативно можно в самом приложении нажать Settings - Import from conection link. 
@@ -189,7 +197,7 @@ PublicKey = M8UkE3Twc0wj72z8wgizMoBVneEd0cN4IDHBlGiRyyw=
 
 Копируем ссылку клиенту. Раздел Peer добавляем в существующий конфиг WireGuard.
 
-Дополнительно через Settings - Import from conection link можно импортировать ссылки из WDTT и FreeTurn.
+Дополнительно через Settings - Import from conection link можно импортировать ссылки из WDTT, csqtt и FreeTurn.
 
 ## Backup/restore
 
