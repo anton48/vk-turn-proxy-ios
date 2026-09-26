@@ -162,6 +162,9 @@ https://github.com/samosvalishe/vk-turn-proxy/releases
 
 <img width="750" height="1304" alt="image" src="https://github.com/user-attachments/assets/fdfc20c6-0a31-4242-aeff-069dcc370a4c" />
 
+- в поле Server Password пароль для конкретного клиента
+- в поле Device ID идентификатор устройства, который передается серверу csqtt. Поле заполняется автоматически, но может быть изменено
+
 Так же есть дополнительный параметр уникальный для csqtt - "Bounded relay writes":
 
 <img width="750" height="1199" alt="image" src="https://github.com/user-attachments/assets/b02fb60a-67a3-45db-9680-f767a1f7e455" />
