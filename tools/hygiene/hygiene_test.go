@@ -35,7 +35,8 @@ package hygiene
 // upstream's fixtures are upstream's.
 //
 // Seen red on the tree of 2026-09-28 before the addresses were replaced, and
-// red again under a sabotage that puts one public address back into a comment.
+// red again under a sabotage that puts one public address back into a comment —
+// with a full stop behind it, since the user's finding of the same evening.
 
 import (
 	"bytes"
@@ -114,6 +115,12 @@ func TestTheRuleTellsARealAddressFromWhatTheTreeMayCarry(t *testing.T) {
 		"a relay at " + bench + ":19302":                                    false,
 		"a fixture minting " + prefix + "%d:19302 per slot":                 false,
 		"a doc fixture minting 203.0.113.%d:19302 per slot":                 true,
+		"the server address is " + host + ".":                               false,
+		"in parentheses (" + host + "), then a comma " + host + ",":         false,
+		"an IPv6 at the end of a sentence: " + v6 + ".":                     false,
+		"an IPv6 before the colon of a sentence " + v6 + ": and on":         false,
+		"a fifth component 1.2.3.4.5 and 5.1.2.3.4 are no addresses":        true,
+		"a documentation address at the end of a sentence: 203.0.113.10.":   true,
 		"a server at [" + v6 + "]:443":                                      false,
 	} {
 		got := true
@@ -154,8 +161,8 @@ var (
 func addressLiterals(line string) []literal {
 	var out []literal
 	for _, m := range v4Pattern.FindAllStringIndex(line, -1) {
-		if wordish(line, m[0]-1) || wordish(line, m[1]) {
-			continue // v1.2.3.4, 1.2.3.4.5, an identifier's tail
+		if joinedBefore(line, m[0]) || joinedAfter(line, m[1]) {
+			continue // v1.2.3.4, 1.2.3.4.5, an identifier's tail — never the full stop of a sentence
 		}
 		ip := net.ParseIP(line[m[0]:m[1]])
 		if ip == nil {
@@ -164,7 +171,7 @@ func addressLiterals(line string) []literal {
 		out = append(out, literal{ip: ip, text: line[m[0]:m[1]], before: line[:m[0]]})
 	}
 	for _, m := range v4Format.FindAllStringIndex(line, -1) {
-		if wordish(line, m[0]-1) {
+		if joinedBefore(line, m[0]) {
 			continue
 		}
 		ip := net.ParseIP(strings.TrimSuffix(line[m[0]:m[1]], "%d") + "0")
@@ -174,24 +181,60 @@ func addressLiterals(line string) []literal {
 		out = append(out, literal{ip: ip, text: line[m[0]:m[1]], before: line[:m[0]]})
 	}
 	for _, m := range v6Pattern.FindAllStringIndex(line, -1) {
-		if wordish(line, m[0]-1) || wordish(line, m[1]) {
+		if joinedBefore(line, m[0]) || joinedAfter(line, m[1]) {
 			continue
 		}
-		ip := net.ParseIP(line[m[0]:m[1]])
+		text := line[m[0]:m[1]]
+		ip := net.ParseIP(text)
+		if ip == nil && strings.HasSuffix(text, ":") {
+			// "2001:db8::1: and then" — the pattern takes the sentence's colon for an
+			// empty group; the address is what stands before it.
+			text = strings.TrimSuffix(text, ":")
+			ip = net.ParseIP(text)
+		}
 		if ip == nil || ip.To4() != nil || ip[0]&0xe0 != 0x20 {
 			continue // not an address, or not global unicast (fe80::, ::1, ff02::)
 		}
-		out = append(out, literal{ip: ip, text: line[m[0]:m[1]], before: line[:m[0]]})
+		out = append(out, literal{ip: ip, text: text, before: line[:m[0]]})
 	}
 	return out
 }
 
-func wordish(s string, i int) bool {
-	if i < 0 || i >= len(s) {
+// joinedBefore / joinedAfter: is the literal part of a longer token? A letter,
+// a digit or an underscore joins it (v1.2.3.4, an identifier's tail); a DOT
+// joins it only with a digit on its other side — the fifth component of
+// 1.2.3.4.5 — and is otherwise punctuation: an address before the full stop of
+// a sentence («… lives at 203.0.113.10.») is an address. The first cut took
+// every dot for a continuation and let exactly that through — the user's
+// finding of 2026-09-28, shown on a temporary copy of the tree: a Markdown
+// line with a public address and a full stop passed, the same line without
+// the full stop did not.
+func joinedBefore(s string, start int) bool {
+	if start == 0 {
 		return false
 	}
-	c := s[i]
-	return c == '.' || c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	c := s[start-1]
+	if c == '.' {
+		return start >= 2 && isDigit(s[start-2])
+	}
+	return isWordChar(c)
+}
+
+func joinedAfter(s string, end int) bool {
+	if end >= len(s) {
+		return false
+	}
+	c := s[end]
+	if c == '.' {
+		return end+1 < len(s) && isDigit(s[end+1])
+	}
+	return isWordChar(c)
+}
+
+func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+func isWordChar(c byte) bool {
+	return c == '_' || isDigit(c) || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 func allowedAddress(l literal) bool {
