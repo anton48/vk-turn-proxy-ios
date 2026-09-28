@@ -79,7 +79,7 @@ func TestAParkCarriesTheChannelTheNextBroadcastCloses(t *testing.T) {
 func TestEveryParkCarriesTheChannel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	full := func(slot int) credPoolEntry {
 		return credPoolEntry{addr: relay, ts: time.Now(), active: 10,
 			creds: &TURNCreds{Username: fmt.Sprintf("%d:s%d", time.Now().Add(8*time.Hour).Unix(), slot), Password: "p", Address: relay, Addresses: []string{relay}}}

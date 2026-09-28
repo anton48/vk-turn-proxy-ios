@@ -35,7 +35,7 @@ func (m *fakeMinter) fetch(allowCaptchaBlock bool, slot int) (string, *TURNCreds
 			return "", nil, err
 		}
 	}
-	addr := "95.163.34.180:19302"
+	addr := "203.0.113.11:19302"
 	return addr, &TURNCreds{
 		Username:  fmt.Sprintf("%d:test-slot-%d-mint-%d", time.Now().Add(8*time.Hour).Unix(), slot, n),
 		Password:  "pw",
@@ -79,7 +79,7 @@ func TestCredPoolTenConnectionsShareOneMint(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Acquire(%d): %v", i, err)
 		}
-		if slot != 0 || addr != "95.163.34.180:19302" || creds == nil {
+		if slot != 0 || addr != "203.0.113.11:19302" || creds == nil {
 			t.Fatalf("Acquire(%d): slot %d addr %q creds %v, want slot 0 on the relay", i, slot, addr, creds != nil)
 		}
 	}
@@ -133,11 +133,11 @@ func TestCredPoolRelayHostsSurviveAWarmCache(t *testing.T) {
 	cold := &fakeMinter{fail: func(int) error { return fmt.Errorf("the warm-cache pool must not mint") }}
 	b := NewCredPool(context.Background(), CredPoolConfig{NumConns: 30, CachePath: cache, Fetch: cold.fetch})
 	defer b.Close()
-	if hosts := b.RelayHosts(); len(hosts) != 1 || hosts[0] != "95.163.34.180" {
-		t.Fatalf("RelayHosts from the cache = %v, want [95.163.34.180]", hosts)
+	if hosts := b.RelayHosts(); len(hosts) != 1 || hosts[0] != "203.0.113.11" {
+		t.Fatalf("RelayHosts from the cache = %v, want [203.0.113.11]", hosts)
 	}
-	if ip := b.RelayIP(); ip != "95.163.34.180" {
-		t.Fatalf("RelayIP from the cache = %q, want 95.163.34.180", ip)
+	if ip := b.RelayIP(); ip != "203.0.113.11" {
+		t.Fatalf("RelayIP from the cache = %q, want 203.0.113.11", ip)
 	}
 	if cold.count() != 0 {
 		t.Fatalf("the warm-cache pool minted %d times reading its relay", cold.count())
@@ -212,9 +212,9 @@ func TestCredPoolGrowPaceIsPinned(t *testing.T) {
 // The TURN override rewrites every address (the fresh-fetch path only) and
 // the primary follows. Sabotage seen red: skipping the port override.
 func TestApplyTURNOverride(t *testing.T) {
-	c := &TURNCreds{Addresses: []string{"95.163.34.180:19302", "91.231.135.146:19302"}}
+	c := &TURNCreds{Addresses: []string{"203.0.113.11:19302", "203.0.113.12:19302"}}
 	addr, err := applyTURNOverride(c, "", "3478")
-	if err != nil || addr != "95.163.34.180:3478" || c.Address != addr || c.Addresses[1] != "91.231.135.146:3478" {
+	if err != nil || addr != "203.0.113.11:3478" || c.Address != addr || c.Addresses[1] != "203.0.113.12:3478" {
 		t.Fatalf("port override: addr %q err %v creds %+v", addr, err, c)
 	}
 	addr, err = applyTURNOverride(c, "10.0.0.1", "")
@@ -260,12 +260,12 @@ func TestCredPoolSeedServesTheFirstAcquireWithoutAMint(t *testing.T) {
 	seed := &TURNCreds{
 		Username:  fmt.Sprintf("%d:seed", time.Now().Add(8*time.Hour).Unix()),
 		Password:  "pw",
-		Address:   "95.163.34.181:19302",
-		Addresses: []string{"95.163.34.181:19302"},
+		Address:   "203.0.113.13:19302",
+		Addresses: []string{"203.0.113.13:19302"},
 	}
 	p := NewCredPool(context.Background(), CredPoolConfig{NumConns: 30, SeededTURN: seed, TurnPort: "3478", Fetch: m.fetch})
 	defer p.Close()
-	if ip := p.RelayIP(); ip != "95.163.34.181" {
+	if ip := p.RelayIP(); ip != "203.0.113.13" {
 		t.Fatalf("RelayIP before any acquire = %q, want the seed's host", ip)
 	}
 	addr, creds, slot, err := p.Acquire(0)
@@ -274,7 +274,7 @@ func TestCredPoolSeedServesTheFirstAcquireWithoutAMint(t *testing.T) {
 	}
 	// Verbatim: the port override must NOT touch the seed (a cached cred keeps
 	// its stored address, as in NewProxy).
-	if slot != 0 || addr != "95.163.34.181:19302" || creds == nil || creds.Username != seed.Username {
+	if slot != 0 || addr != "203.0.113.13:19302" || creds == nil || creds.Username != seed.Username {
 		t.Fatalf("Acquire(0) = slot %d addr %q creds %+v, want the seed in slot 0 untouched", slot, addr, creds)
 	}
 	if m.count() != 0 {

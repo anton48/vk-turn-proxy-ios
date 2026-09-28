@@ -171,8 +171,8 @@ func (e *CallUnavailableError) Error() string {
 //
 // Address vs Addresses: VK's vchat.joinConversationByLink response includes
 // a turn_server.urls array — typically 2 endpoints on different /24 subnets
-// (e.g. 91.231.135.146:19302 and 95.163.34.164:19302), confirmed by build
-// 53 logging. Until then we took only urls[0]. We now parse all of them
+// (confirmed by build
+// 53 logging). Until then we took only urls[0]. We now parse all of them
 // into Addresses for diagnostics and possible future failover. We do NOT
 // rotate per-conn: iOS includeAllNetworks=true allows only one exempt
 // host (NEVPNProtocol.serverAddress), and routing the second TURN

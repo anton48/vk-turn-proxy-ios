@@ -346,9 +346,9 @@ func TestIsNetworkClassError(t *testing.T) {
 	for text, want := range map[string]bool{
 		`Post "https://api.vk.me/x": context deadline exceeded`:                                                   true,
 		`Post "https://api.vk.me/x": net/http: request canceled (Client.Timeout exceeded while awaiting headers)`: true,
-		`read tcp 192.168.4.37:59321->87.240.137.208:443: read: can't assign requested address`:                   true,
+		`read tcp 192.168.0.7:59321->203.0.113.15:443: read: can't assign requested address`:                      true,
 		`dial tcp: lookup api.vk.me: no such host`:                                                                true,
-		`write tcp 10.0.0.2:1->1.2.3.4:443: write: broken pipe`:                                                   true,
+		`write tcp 10.0.0.2:1->203.0.113.16:443: write: broken pipe`:                                              true,
 		`unmarshal: invalid character '<', body: <html>`:                                                          false,
 		`vkcalls step2 (calls.start): VK error 14: Captcha need`:                                                  false,
 		`vkcalls: no session client`:                                                                              false,
@@ -364,8 +364,8 @@ func TestIsNetworkClassError(t *testing.T) {
 	// source address (retry and legacy-wave transient) and the dial on an
 	// IPv6-only Wi-Fi without an IPv4 source (fails in 30–200 ms every time —
 	// a fresh client may retry it once, the legacy loop must NOT wait 12 waves).
-	readShape := errors.New(`read tcp 192.168.4.37:59321->87.240.137.208:443: read: can't assign requested address`)
-	connectShape := errors.New(`dial tcp 87.240.137.208:443: connect: can't assign requested address`)
+	readShape := errors.New(`read tcp 192.168.0.7:59321->203.0.113.15:443: read: can't assign requested address`)
+	connectShape := errors.New(`dial tcp 203.0.113.15:443: connect: can't assign requested address`)
 	if !isTransientNetworkError(readShape) || isTransientNetworkError(connectShape) {
 		t.Errorf("isTransientNetworkError: read shape %v, connect shape %v — want true, false", isTransientNetworkError(readShape), isTransientNetworkError(connectShape))
 	}

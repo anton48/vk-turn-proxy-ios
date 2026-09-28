@@ -88,7 +88,7 @@ func TestALateSuccessOfTheOldCredentialDoesNotCertifyTheNew(t *testing.T) {
 	// the same credential per slot, and the relay's acceptance of that
 	// identity holds for the copy that is in the slot now.
 	t.Run("the same identity fetched into the slot again IS the credential the relay accepted", func(t *testing.T) {
-		const relay = "95.163.34.180:19302"
+		const relay = "203.0.113.11:19302"
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 		cp := newCredPool(ctx, 12, 2*time.Minute, "", func(_ bool, _ int) (string, *TURNCreds, error) {

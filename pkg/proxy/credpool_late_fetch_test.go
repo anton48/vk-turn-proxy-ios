@@ -18,7 +18,7 @@ import (
 // lived on, unaccounted, and every later release, quota check and
 // path-change marking worked on a wrong count.
 
-const lateRelay = "95.163.34.180:19302"
+const lateRelay = "203.0.113.11:19302"
 
 func lateCreds(tag string) *TURNCreds {
 	return &TURNCreds{Username: fmt.Sprintf("%d:%s", time.Now().Add(8*time.Hour).Unix(), tag),

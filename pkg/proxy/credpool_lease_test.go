@@ -23,7 +23,7 @@ import (
 // production refill (pickSlotToFill → tryFill), invalidate() and
 // invalidateEntry on a bare pool.
 
-const leaseTestRelay = "95.163.34.180:19302"
+const leaseTestRelay = "203.0.113.11:19302"
 
 // leasePool is a 12-slot pool whose fetcher mints a fresh identity per call.
 func leasePool(t *testing.T, mints *atomic.Int32) *credPool {
@@ -394,7 +394,7 @@ func sameCredentialPool(t *testing.T) *credPool {
 	t.Cleanup(cancel)
 	username := fmt.Sprintf("%d:the-calls-mint", time.Now().Add(8*time.Hour).Unix())
 	cp := newCredPool(ctx, 12, 2*time.Minute, "", func(_ bool, slot int) (string, *TURNCreds, error) {
-		relay := fmt.Sprintf("95.163.34.%d:19302", 180+slot)
+		relay := fmt.Sprintf("203.0.113.%d:19302", 180+slot)
 		return relay, &TURNCreds{Username: username, Password: "p", Address: relay, Addresses: []string{relay}}, nil
 	})
 	cp.mu.Lock()

@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const cascadeTestRelay = "95.163.34.180:19302"
+const cascadeTestRelay = "203.0.113.11:19302"
 
 // seatHolders puts n holders on slot the way get() seats them — through the
 // pool's own seatLocked, so the entry's count and the record of leases still

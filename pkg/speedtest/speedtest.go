@@ -279,8 +279,8 @@ type Progress struct {
 
 	// What OOKLA believes this device's address is — NOT necessarily its address.
 	// Measured 2026-08-20: four independent services (ipify, ifconfig.me,
-	// icanhazip, checkip.amazonaws) all reported 176.78.47.118 while Ookla's own
-	// speedtest-config.php reported 85.246.4.193. The library faithfully repeats
+	// icanhazip, checkip.amazonaws) all reported one address while Ookla's own
+	// speedtest-config.php reported another. The library faithfully repeats
 	// what that endpoint says, so the discrepancy is Ookla's, not the library's.
 	//
 	// ⇒ label it "as seen by Ookla" in any UI. That framing is not a hedge: this

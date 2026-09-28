@@ -18,7 +18,7 @@ func breakerPool(t *testing.T, mints *atomic.Int32) *credPool {
 	prevBase, prevMax := quotaPauseBase, quotaPauseMax
 	quotaPauseBase, quotaPauseMax = 60*time.Millisecond, 200*time.Millisecond
 	t.Cleanup(func() { quotaPauseBase, quotaPauseMax = prevBase, prevMax })
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	cp := newCredPool(ctx, 12, 2*time.Minute, "", func(_ bool, slot int) (string, *TURNCreds, error) {
@@ -122,7 +122,7 @@ func TestTwoFreshRefusalsPauseMinting(t *testing.T) {
 func TestARefusalOnAnOldCredentialIsNotFresh(t *testing.T) {
 	var mints atomic.Int32
 	cp := breakerPool(t, &mints)
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	cp.mu.Lock()
 	for i := 0; i < 2; i++ {
 		cp.pool[i] = credPoolEntry{addr: relay, ts: time.Now().Add(-2 * quotaFreshCredWindow), active: 1,
@@ -152,7 +152,7 @@ func TestARefusalOnAnOldCredentialIsNotFresh(t *testing.T) {
 func TestARefusalOnACredentialWithASuccessIsItsQuotaNotARefusal(t *testing.T) {
 	var mints atomic.Int32
 	cp := breakerPool(t, &mints)
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	full := make([]*TURNCreds, 2)
 	cp.mu.Lock()
 	for i := 0; i < 2; i++ {
@@ -188,7 +188,7 @@ func TestARefusalOnACredentialWithASuccessIsItsQuotaNotARefusal(t *testing.T) {
 func TestOverlappingHerdFailuresWithoutASuccessTripTheBreaker(t *testing.T) {
 	var mints atomic.Int32
 	cp := breakerPool(t, &mints)
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	cp.mu.Lock()
 	cp.pool[0] = credPoolEntry{addr: relay, ts: time.Now(), active: 10, // ten leases, all still held
 		creds: &TURNCreds{Username: fmt.Sprintf("%d:herd", time.Now().Add(8*time.Hour).Unix()), Password: "p", Address: relay, Addresses: []string{relay}}}

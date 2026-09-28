@@ -150,7 +150,7 @@ func freshUsername(tag string) string {
 func mintingFetch(counter *atomic.Int32) func(bool, int) (string, *proxy.TURNCreds, error) {
 	return func(_ bool, slot int) (string, *proxy.TURNCreds, error) {
 		counter.Add(1)
-		addr := fmt.Sprintf("95.163.34.%d:19302", 100+slot)
+		addr := fmt.Sprintf("203.0.113.%d:19302", 100+slot)
 		return addr, &proxy.TURNCreds{Username: freshUsername(fmt.Sprintf("slot-%d", slot)), Password: "p", Address: addr, Addresses: []string{addr}}, nil
 	}
 }
@@ -409,7 +409,7 @@ func TestCsqttLifecycleOwnsItsDescriptorAndCleansUp(t *testing.T) {
 	if err := json.Unmarshal([]byte(prov), &pv); err != nil || pv.Address != "10.66.67.3/24" || pv.DNS != "77.88.8.8,77.88.8.1" || pv.MTU != 1300 {
 		t.Fatalf("provision %q → %+v (%v): want the TUNCONF address as /24, its DNS, MTU 1300", prov, pv, err)
 	}
-	if ip := csqttGetRelayIPImpl(h); ip != "95.163.34.100" {
+	if ip := csqttGetRelayIPImpl(h); ip != "203.0.113.100" {
 		t.Fatalf("relay IP %q, want the minted relay's host", ip)
 	}
 
@@ -494,7 +494,7 @@ func TestCsqttCredentialAdapterMapsWorkersAndLeasesSlots(t *testing.T) {
 		mu.Lock()
 		slots = append(slots, slot)
 		mu.Unlock()
-		addr := "95.163.34.180:19302"
+		addr := "203.0.113.11:19302"
 		return addr, &proxy.TURNCreds{Username: freshUsername("shared"), Password: "p", Address: addr, Addresses: []string{addr}}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -553,7 +553,7 @@ func TestCsqttCredentialAdapterMapsWorkersAndLeasesSlots(t *testing.T) {
 // worker behind a lease that held nothing waits out a second nobody holds).
 func TestCsqttLeaseGoesBackBehindTheRelaysSecondOnlyIfItHeldAnAllocation(t *testing.T) {
 	fetch := func(_ bool, slot int) (string, *proxy.TURNCreds, error) {
-		addr := "95.163.34.180:19302"
+		addr := "203.0.113.11:19302"
 		return addr, &proxy.TURNCreds{Username: freshUsername("second"), Password: "p", Address: addr, Addresses: []string{addr}}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())

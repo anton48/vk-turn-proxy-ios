@@ -256,7 +256,7 @@ func TestAllocLifeHearsWhatPionSays(t *testing.T) {
 			"Fail to refresh permissions: all retransmissions failed for ZZZZ",
 			"Fail to refresh permissions: transaction closed",
 			"Fail to refresh permissions: CreatePermission error response (error 401: Unauthorized)",
-			"Fail to refresh permissions: write udp [::]:64000->1.2.3.4:40000: use of closed network connection", // a bare 400 is a port number as often as not
+			"Fail to refresh permissions: write udp [::]:64000->203.0.113.16:40000: use of closed network connection", // a bare 400 is a port number as often as not
 			"Failed to bind channel 16384: unexpected response type ChannelBind error response",
 			"Failed to refresh allocation: error response (error 400: Bad Request)",
 			"x Fail to refresh permissions: CreatePermission error response (error 400: Bad Request)",

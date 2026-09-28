@@ -27,7 +27,7 @@ func pathChangedPool(t *testing.T, slot3Empty bool) (*credPool, *atomic.Int32) {
 	var mints atomic.Int32
 	fetch := func(_ bool, slot int) (string, *TURNCreds, error) {
 		mints.Add(1)
-		addr := "95.163.34.180:19302"
+		addr := "203.0.113.11:19302"
 		return addr, &TURNCreds{Username: fmt.Sprintf("%d:minted-%d", time.Now().Add(8*time.Hour).Unix(), slot),
 			Password: "p", Address: addr, Addresses: []string{addr}}, nil
 	}
@@ -41,7 +41,7 @@ func pathChangedPool(t *testing.T, slot3Empty bool) (*credPool, *atomic.Int32) {
 	now := time.Now()
 	for i := range cp.pool {
 		creds := &TURNCreds{Username: fmt.Sprintf("%d:loaded-%d", now.Add(8*time.Hour).Unix(), i), Password: "p",
-			Address: "95.163.34.180:19302", Addresses: []string{"95.163.34.180:19302"}}
+			Address: "203.0.113.11:19302", Addresses: []string{"203.0.113.11:19302"}}
 		switch i {
 		case 0, 4, 5:
 			cp.pool[i] = credPoolEntry{addr: creds.Address, creds: creds, ts: now.Add(-3 * time.Minute), saturatedUntil: now.Add(10 * time.Minute)}

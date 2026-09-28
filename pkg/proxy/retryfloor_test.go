@@ -78,9 +78,9 @@ func TestNetworkClassIsDecidedByWhatAnswered(t *testing.T) {
 		{fmt.Errorf("SRTP setup: %w", errors.New("TURN allocate: Allocate error response (error 486: Allocation Quota Reached)")), false},
 		{errors.New("DTLS failed: x (TURN error: TURN allocate: Allocate error response (error 401: Unauthorized))"), false},
 		{errors.New("TURN allocate: Allocate error response (error 403: Forbidden)"), false},
-		{errors.New("SRTP setup: TURN dial: dial tcp 95.163.34.180:19302: connect: no route to host"), true},
-		{errors.New("SRTP setup: TURN dial: dial tcp 95.163.34.180:19302: connect: connection refused"), true},
-		{errors.New("SRTP setup: TURN dial: dial tcp 95.163.34.180:19302: i/o timeout"), true},
+		{errors.New("SRTP setup: TURN dial: dial tcp 203.0.113.11:19302: connect: no route to host"), true},
+		{errors.New("SRTP setup: TURN dial: dial tcp 203.0.113.11:19302: connect: connection refused"), true},
+		{errors.New("SRTP setup: TURN dial: dial tcp 203.0.113.11:19302: i/o timeout"), true},
 		{errors.New("vk: step2 request failed: EOF"), true},
 	} {
 		if got := isNetworkClassFailure(c.err); got != c.want {
@@ -196,7 +196,7 @@ func TestAHerdOfInstantFailuresIsBoundedByTheFloor(t *testing.T) {
 		dials.Add(1)
 		time.Sleep(time.Millisecond) // the seat is held for the length of a failing connect()
 		p.credPool.release(slot, creds)
-		return errors.New("SRTP setup: TURN dial: dial tcp 95.163.34.180:19302: connect: no route to host")
+		return errors.New("SRTP setup: TURN dial: dial tcp 203.0.113.11:19302: connect: no route to host")
 	}
 
 	var wg sync.WaitGroup
@@ -261,7 +261,7 @@ func TestASessionThatCameUpEndsTheStreakWhateverItReturned(t *testing.T) {
 				mu.Unlock()
 				switch n {
 				case 1, 2, 4:
-					return errors.New("SRTP setup: TURN dial: dial tcp 95.163.34.180:19302: connect: no route to host")
+					return errors.New("SRTP setup: TURN dial: dial tcp 203.0.113.11:19302: connect: no route to host")
 				case 3:
 					p.noteSessionUp(connIdx) // the session came up …
 					return c.after           // … and ended

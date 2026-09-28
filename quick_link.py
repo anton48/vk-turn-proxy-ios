@@ -52,7 +52,7 @@ missing or empty):
     peerPublicKey    — WG server public key  (base64)
     tunnelAddress    — e.g. "192.168.102.3/24"
     vkLink           — https://vk.me/join/<token>
-    peerAddress      — e.g. "1.2.3.4:51820" (the WG server, not the TURN)
+    peerAddress      — e.g. "203.0.113.16:51820" (the WG server, not the TURN)
 
 allowedIPs is NOT emitted (removed 2026-06-11). The iOS app pins the
 WireGuard peer allowed_ip to 0.0.0.0/0 — under includeAllNetworks=true that
@@ -233,7 +233,7 @@ CONFIG = {
     # Force fresh conns onto a specific TURN relay instead of whatever VK
     # returns (disk-cached creds keep their stored address). Uncomment + set
     # to IP:port. Omitted / empty = use VK's relays.
-    # "turnServerOverride": "1.2.3.4:19302",
+    # "turnServerOverride": "203.0.113.16:19302",
 }
 
 REQUIRED = (

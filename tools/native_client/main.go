@@ -11,7 +11,7 @@
 // The stand:
 //
 //	go build -o /root/native_client ./tools/native_client
-//	/root/native_client -server 161.104.59.236:56000 \
+//	/root/native_client -server <server-ip>:<port> \
 //	    -vk-link https://vk.ru/call/join/<id> \
 //	    -wg-key-file /root/wg_client.key -wg-peer-key <server pubkey> \
 //	    -conns 30 -route 77.88.8.8

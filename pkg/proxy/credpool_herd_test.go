@@ -25,7 +25,7 @@ import (
 func TestColdStartHerdMintsTwoAndParksTheRest(t *testing.T) {
 	gate := make(chan struct{})
 	var entered, mints atomic.Int32
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	fetch := func(_ bool, slot int) (string, *TURNCreds, error) {
 		entered.Add(1)
 		<-gate

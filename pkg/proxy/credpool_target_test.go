@@ -35,7 +35,7 @@ func TestColdStartTargetIsCeilConnsOverTenBoundedByThePool(t *testing.T) {
 // (6 slots, 30 conns) with two full slots and nothing in flight, a third
 // connection must MINT its third bucket — the old ceil(6/4) = 2 parked it.
 func TestColdStartCapOnACookieShapedPoolMintsTheThirdBucket(t *testing.T) {
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	mk := func(tag string) *TURNCreds {
 		return &TURNCreds{Username: fmt.Sprintf("%d:%s", time.Now().Add(8*time.Hour).Unix(), tag),
 			Password: "p", Address: relay, Addresses: []string{relay}}

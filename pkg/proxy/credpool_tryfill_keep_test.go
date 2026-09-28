@@ -18,7 +18,7 @@ import (
 // >= abortIfAvailableGTE` after the fetch) — the slot stays empty and tryFill
 // answers false.
 func TestTryFillKeepsACredentialThatLandsAfterTheTargetIsMet(t *testing.T) {
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	mk := func(tag string) *TURNCreds {
 		return &TURNCreds{Username: fmt.Sprintf("%d:%s", time.Now().Add(8*time.Hour).Unix(), tag),
 			Password: "p", Address: relay, Addresses: []string{relay}}
@@ -91,7 +91,7 @@ func TestTryFillKeepsACredentialThatLandsAfterTheTargetIsMet(t *testing.T) {
 // The pre-fetch checkpoint stays: a mint the conn-driven fetches have already
 // made redundant is not STARTED (no VK call, no `fetching` flag).
 func TestTryFillStillSkipsAMintTheTargetHasMadeRedundant(t *testing.T) {
-	const relay = "95.163.34.180:19302"
+	const relay = "203.0.113.11:19302"
 	mk := func(tag string) *TURNCreds {
 		return &TURNCreds{Username: fmt.Sprintf("%d:%s", time.Now().Add(8*time.Hour).Unix(), tag),
 			Password: "p", Address: relay, Addresses: []string{relay}}

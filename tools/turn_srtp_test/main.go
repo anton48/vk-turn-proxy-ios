@@ -13,12 +13,12 @@
 //
 // Usage (single allocation, baseline):
 //   go run ./tools/turn_srtp_test -creds=backup.json -slot=0 \
-//       -dst-ip=217.168.246.242 -dst-port=9998 \
+//       -dst-ip=<sink-ip> -dst-port=9998 \
 //       -duration=30s
 //
 // Usage (parallel across distinct creds):
 //   go run ./tools/turn_srtp_test -creds=backup.json -parallel=10 \
-//       -dst-ip=217.168.246.242 -dst-port=9998 -duration=30s
+//       -dst-ip=<sink-ip> -dst-port=9998 -duration=30s
 //
 // Usage (production-like — many allocations per cred, matching iOS
 // app's connsPerSlot=10 pattern). With -allocs-per-cred=K each cred
@@ -28,7 +28,7 @@
 // NumConns=30 production layout.
 //   go run ./tools/turn_srtp_test -creds=backup.json -parallel=3 \
 //       -allocs-per-cred=10 -spacing=5ms \
-//       -dst-ip=217.168.246.242 -dst-port=9998 -duration=60s
+//       -dst-ip=<sink-ip> -dst-port=9998 -duration=60s
 
 package main
 

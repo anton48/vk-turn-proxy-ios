@@ -497,10 +497,10 @@ func TestThePeerSendsOncePerAskFromItsListeningSocketAndAnswersNoStranger(t *tes
 // unprivileged port. Sabotage seen red: private networks let through.
 func TestTheDefaultDestinationRuleIsPublicUnicastOnly(t *testing.T) {
 	for addr, want := range map[string]bool{
-		"95.163.34.180:50000": true, "8.8.8.8:1024": true,
+		"203.0.113.11:50000": true, "8.8.8.8:1024": true,
 		"8.8.8.8:1023": false, "8.8.8.8:53": false,
 		"10.129.0.27:50000": false, "172.16.0.1:50000": false, "192.168.1.1:50000": false, "127.0.0.1:50000": false,
-		"169.254.1.1:50000": false, "100.64.0.1:50000": false, "100.127.255.255:50000": false, "100.128.0.1:50000": true,
+		"169.254.1.1:50000": false, "100.64.0.1:50000": false, "100.127.255.255:50000": false, "203.0.113.20:50000": true,
 		"224.0.0.1:50000": false, "240.0.0.1:50000": false, "255.255.255.255:50000": false, "0.0.0.0:50000": false,
 	} {
 		a, err := net.ResolveUDPAddr("udp4", addr)
@@ -514,11 +514,11 @@ func TestTheDefaultDestinationRuleIsPublicUnicastOnly(t *testing.T) {
 	if publicUnicast(net.ParseIP("2001:db8::1"), 50000) {
 		t.Fatal("an IPv6 destination passed a rule written for IPv4")
 	}
-	rule, err := allowRule("95.163.0.0/16, 90.156.0.0/16")
+	rule, err := allowRule("198.51.100.0/24, 203.0.113.0/24")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rule(net.IPv4(90, 156, 1, 1), 50000) || rule(net.IPv4(8, 8, 8, 8), 50000) {
+	if !rule(net.IPv4(203, 0, 113, 77), 50000) || rule(net.IPv4(8, 8, 8, 8), 50000) {
 		t.Fatal("-peer-allow does not bound the destinations to its networks")
 	}
 	if _, err := allowRule("not-a-network"); err == nil {

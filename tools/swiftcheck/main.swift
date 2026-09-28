@@ -3914,8 +3914,8 @@ do {
     //    them live in BackupManager (scan-only, see above). Reviewed by three
     //    agents before landing; every fixture below is a case one of them raised.
     do {
-        let (body, frag) = ConnectionLinkFragment.split("wdtt://1.2.3.4:443:51820:0:pw:AbC#🇩🇪 Germany-1")
-        check(body == "wdtt://1.2.3.4:443:51820:0:pw:AbC" && frag == "🇩🇪 Germany-1",
+        let (body, frag) = ConnectionLinkFragment.split("wdtt://203.0.113.16:443:51820:0:pw:AbC#🇩🇪 Germany-1")
+        check(body == "wdtt://203.0.113.16:443:51820:0:pw:AbC" && frag == "🇩🇪 Germany-1",
               "the fragment is cut at the FIRST '#'; everything after it is the name")
         check(ConnectionLinkFragment.split("no-fragment").1 == nil, "no '#' → no fragment")
         check(ConnectionLinkFragment.split("a#b#c").1 == "b#c", "a '#' inside the name is kept")
@@ -4361,7 +4361,7 @@ do {
         return String(data: data, encoding: .utf8)!
     }
     let marker = "SECRET_AFTER_QUOTE"
-    let base: [String: Any] = ["use_csqtt": true, "peer_addr": "1.2.3.4:46000",
+    let base: [String: Any] = ["use_csqtt": true, "peer_addr": "203.0.113.16:46000",
                                "csqtt_device_id": "iphoneSE3", "num_conns": 30]
 
     // The user's case: a password that starts with a double quote.
@@ -4373,7 +4373,7 @@ do {
     let line = ProxyConfigRedaction.redacted(encoded)
     check(!line.contains(marker), "🚨 a csqtt password containing a quote leaks past the redaction")
     check(line.contains("\"csqtt_password\":\"…\""), "the password field stays on the line, masked")
-    check(line.contains("\"peer_addr\":\"1.2.3.4:46000\"") && line.contains("\"num_conns\":30")
+    check(line.contains("\"peer_addr\":\"203.0.113.16:46000\"") && line.contains("\"num_conns\":30")
               && line.contains("\"csqtt_device_id\":\"iphoneSE3\"") && line.contains("\"use_csqtt\":true"),
           "the non-secret fields keep their values — the line stays a diagnostic")
 
@@ -4392,7 +4392,7 @@ do {
 
     // The other secrets that ride the same config, the nested one included.
     let native: [String: Any] = [
-        "use_srtp": true, "use_wrap_a": true, "peer_addr": "5.6.7.8:443",
+        "use_srtp": true, "use_wrap_a": true, "peer_addr": "203.0.113.19:443",
         "wrap_a_password": "A" + marker, "wrap_key_hex": "B" + marker,
         "seeded_turn": ["address": "9.9.9.9:3478", "username": "1700000000:u1", "password": "C" + marker],
         "vk_host_ips": ["login.vk.ru": ["1.1.1.1"]]]
