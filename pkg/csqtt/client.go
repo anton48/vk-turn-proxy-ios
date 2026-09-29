@@ -400,7 +400,12 @@ func (c *Client) dropRoundBefore(mark time.Time) {
 // deafVerdictReached is a test's window between a verdict and its execution:
 // the wake hook is not serialized with judgeDeaf, and what it publishes in that
 // window decides whether the verdict may still be carried out. nil in production.
-var deafVerdictReached func(deafAction)
+// An atomic like its siblings (probeSnapshotTaken, livenessVerdictReached): the
+// monitor of every client still up reads it at each of its ticks, and a test
+// that binds it again for a second client shares no lock with the first
+// client's monitor — as a plain variable it was a data race the moment that
+// monitor's tick landed inside the test.
+var deafVerdictReached atomic.Pointer[func(deafAction)]
 
 // judgeDeaf applies deafVerdict. prevTick is the monitor's previous tick, zero
 // from a wake round's watcher (which notices a freeze by its own steps).
@@ -433,8 +438,8 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 		}
 	}
 	action := deafVerdict(in)
-	if deafVerdictReached != nil && action != deafNone {
-		deafVerdictReached(action)
+	if hook := deafVerdictReached.Load(); hook != nil && action != deafNone {
+		(*hook)(action)
 	}
 	switch action {
 	case deafProbeAll:
