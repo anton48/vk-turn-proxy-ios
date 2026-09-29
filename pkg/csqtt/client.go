@@ -313,10 +313,11 @@ var wakeListenSleep = func(ctx context.Context, d time.Duration) time.Duration {
 // listenTo is a wake round's watcher: it counts the round's LISTENING in short
 // steps and asks for the verdict once there is wakeDeafAfter of it. It ends
 // with the round — answered, replaced by a newer one, dropped, or judged. A
-// step that took far longer than it should means the process was frozen in it:
-// the round then predates a freeze and is dropped — never judged on what it
-// did not hear while nobody was listening; the next wake, or the monitor's
-// thirty seconds of silence, asks again.
+// step that ran more than wakeStepSlack late means the process was frozen in
+// it: the round then predates a freeze and is dropped — never judged on what
+// it did not hear while nobody was listening; the next wake, or the monitor's
+// thirty seconds of silence, asks again. A step late by no more than the slack
+// is a running process's lateness, and listening whole.
 func (c *Client) listenTo(r *probeRound) {
 	nextAsk := wakeAskAgainEvery
 	for {
@@ -324,7 +325,7 @@ func (c *Client) listenTo(r *probeRound) {
 		if c.ctx.Err() != nil || c.round.Load() != r || c.rxSeq.Load() != r.rxSeq {
 			return
 		}
-		if took > 2*wakeListenStep {
+		if took > wakeListenStep+wakeStepSlack {
 			c.round.CompareAndSwap(r, nil)
 			return
 		}

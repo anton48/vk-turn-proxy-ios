@@ -888,7 +888,12 @@ func longReady(c *Client) {
 	}
 }
 
-// quickWake shortens the wake round's wait and its watcher's step.
+// quickWake shortens the wake round's wait, its watcher's step and its asking
+// again — and NOT the step's slack, which stays at its full length: a step of
+// twenty milliseconds runs late by the same tens of milliseconds a step of 250
+// does (the scheduler's lateness, the race detector's pauses), and a freeze
+// threshold that shrank with the step took such a step for a freeze now and
+// then — the fresh round dropped, nobody asking again inside a test's wait.
 func quickWake(t *testing.T) {
 	t.Helper()
 	oldAfter, oldStep, oldAsk := wakeDeafAfter, wakeListenStep, wakeAskAgainEvery
@@ -2173,6 +2178,54 @@ func TestAFreezeInsideTheWakeWindowDropsTheRound(t *testing.T) {
 	}
 	c.WakeHealthCheck() // the next wake asks again; no step of this round is frozen
 	waitFor(t, "the restart-all after the fresh wake round went unanswered", func() bool { return c.Stats().DeafAll == 1 })
+}
+
+// What makes a late step a freeze is a length of its own, wakeStepSlack, and
+// not a multiple of the step: a step late by the slack and no more is
+// listening, counted whole — the scheduler's and the collector's lateness under
+// the race detector runs to tens of milliseconds whatever the step — and a
+// step later than that is a freeze: the round is dropped, never judged. Pinned
+// at the boundary with the fixture's short step, where "twice the step" had put
+// the threshold at 40 ms and a hiccup of thirty dropped a fresh round that
+// nobody would ask again for thirty seconds (1 in 60 unloaded runs of
+// TestAVerdictOnAReplacedRoundIsNotCarriedOut under -race, at will under a CPU
+// quota that parks the process for 30 ms at a time). Sabotage seen red: the
+// threshold twice the step (a step late by the slack read as a freeze).
+func TestAStepLateByItsSlackIsListeningAndLaterIsAFreeze(t *testing.T) {
+	quickWake(t)
+	realSleep := wakeListenSleep
+	var late atomic.Int64 // exactly how late every step reports itself
+	wakeListenSleep = func(ctx context.Context, d time.Duration) time.Duration {
+		realSleep(ctx, d)
+		return d + time.Duration(late.Load())
+	}
+	defer func() { wakeListenSleep = realSleep }()
+
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
+	defer c.Close()
+	longReady(c)
+	deafen(c)
+
+	late.Store(int64(wakeStepSlack + time.Millisecond)) // later than the slack: the process was frozen in the step
+	c.WakeHealthCheck()
+	waitFor(t, "the watcher to drop the round whose step ran later than the slack", func() bool { return c.round.Load() == nil })
+	time.Sleep(3 * wakeDeafAfter)
+	if st := c.Stats(); st.DeafAll != 0 {
+		t.Fatalf("restart-alls on a round frozen through: %d, want 0", st.DeafAll)
+	}
+
+	late.Store(int64(wakeStepSlack)) // late by the slack and no more: the process ran, and listened
+	c.WakeHealthCheck()
+	r := c.round.Load()
+	if r == nil {
+		t.Fatal("the wake hook published no round")
+	}
+	waitFor(t, "the verdict on a round whose step ran late by the slack", func() bool { return c.Stats().DeafAll == 1 })
+	if got := time.Duration(r.listened.Load()); got != wakeListenStep+wakeStepSlack {
+		t.Fatalf("the round's listening at its verdict: %s — want the one late step counted whole, %s", got, wakeListenStep+wakeStepSlack)
+	}
 }
 
 // A round is dropped, replaced by the monitor's, or cleared by a verdict ONLY
