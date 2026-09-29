@@ -21,7 +21,10 @@ package hygiene
 //   - a public resolver everyone knows (1.1.1.1, 8.8.8.8, 9.9.9.9, Yandex's
 //     77.88.8.8 and their kin), which the tools and the app's defaults point at;
 //   - a browser version that merely LOOKS like an address (Chrome/146.0.0.0 in a
-//     User-Agent — four numbers behind a "Name/").
+//     User-Agent — four numbers behind a "Name/");
+//   - a NETWORK of /8 or wider — 0.0.0.0/1 and 128.0.0.0/1, the two halves of
+//     the address space a tunnel's routes take (the console client, 09-29): a
+//     prefix that wide names no host. A /24 or a /32 still does.
 //
 // A literal is a dotted quad, or three octets and a format verb — "203.0.113.%d"
 // in a fixture that mints one host per slot names the /24 as surely as a quad
@@ -122,6 +125,10 @@ func TestTheRuleTellsARealAddressFromWhatTheTreeMayCarry(t *testing.T) {
 		"a fifth component 1.2.3.4.5 and 5.1.2.3.4 are no addresses":        true,
 		"a documentation address at the end of a sentence: 203.0.113.10.":   true,
 		"a server at [" + v6 + "]:443":                                      false,
+		"the halves 0.0.0.0/1 and 128.0.0.0/1 into the tunnel":              true,
+		"a real network named by a narrow prefix " + host + "/24":           false,
+		"a real host named as a /32: " + host + "/32":                       false,
+		"a real host with a port-like slash " + host + "/16bits":            false,
 	} {
 		got := true
 		for _, lit := range addressLiterals(text) {
@@ -139,6 +146,7 @@ type literal struct {
 	ip     net.IP
 	text   string
 	before string // the line up to the literal
+	after  string // the line after it
 }
 
 var (
@@ -148,8 +156,10 @@ var (
 	v6Pattern = regexp.MustCompile(`[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{0,4}){2,7}`)
 	// Chrome/146.0.0.0, Version/17.4.1.2 — a product's version, not a host.
 	versionPrefix = regexp.MustCompile(`[A-Za-z]+/$`)
-	docV4         = []string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"}
-	resolvers     = map[string]bool{
+	// "/1" … "/8" right behind the literal: a network that wide names no host.
+	widePrefix = regexp.MustCompile(`^/[0-8]\b`)
+	docV4      = []string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"}
+	resolvers  = map[string]bool{
 		"1.1.1.1": true, "1.0.0.1": true, "8.8.8.8": true, "8.8.4.4": true, "9.9.9.9": true, "149.112.112.112": true,
 		"77.88.8.8": true, "77.88.8.1": true, "77.88.8.88": true, "77.88.8.2": true,
 		"208.67.222.222": true, "208.67.220.220": true,
@@ -168,7 +178,7 @@ func addressLiterals(line string) []literal {
 		if ip == nil {
 			continue // an octet above 255: a version like 146.0.7680.116
 		}
-		out = append(out, literal{ip: ip, text: line[m[0]:m[1]], before: line[:m[0]]})
+		out = append(out, literal{ip: ip, text: line[m[0]:m[1]], before: line[:m[0]], after: line[m[1]:]})
 	}
 	for _, m := range v4Format.FindAllStringIndex(line, -1) {
 		if joinedBefore(line, m[0]) {
@@ -251,7 +261,7 @@ func allowedAddress(l literal) bool {
 				return true
 			}
 		}
-		return versionPrefix.MatchString(l.before)
+		return versionPrefix.MatchString(l.before) || widePrefix.MatchString(l.after)
 	}
 	_, doc6, _ := net.ParseCIDR("2001:db8::/32")
 	return doc6.Contains(l.ip)

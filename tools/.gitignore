@@ -37,7 +37,7 @@ wrapa_test/
 # Bare-name binaries of the stand tools whose SOURCE is tracked (2026-09-07:
 # `go build ./...` inside tools/h3get wrote one beside its main.go).
 csqtt_client/csqtt_client
-native_client/native_client
+vk-turn-proxy-console/vk-turn-proxy-console
 h3get/h3get
 udpreorder/udpreorder
 speedtest_cli/speedtest_cli

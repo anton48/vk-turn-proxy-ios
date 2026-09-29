@@ -86,6 +86,23 @@ run "vendored fork — separate module, not reached by the root ./..." \
 run "WireGuardBridge — separate module, the csqtt bridge lifecycle" \
     env -C WireGuardBridge GODEBUG=asyncpreemptoff=1 go test "${goflags[@]}" -tags ios .
 
+# The console client ships as five binaries that GitHub builds for the release
+# (.github/workflows/vk-turn-proxy-console.yml). A build or vet failure on one
+# of them would first show there — after the tag is pushed. The gate builds and
+# vets every target here; its tests ran with the root module above.
+console_targets() {
+    local ok=0 t
+    for t in darwin/amd64 darwin/arm64 freebsd/amd64 linux/amd64 linux/arm64; do
+        CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build -trimpath -o /dev/null ./tools/vk-turn-proxy-console \
+            || { echo "   build $t failed"; ok=1; }
+        CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go vet ./tools/vk-turn-proxy-console \
+            || { echo "   vet $t failed"; ok=1; }
+    done
+    return $ok
+}
+run "vk-turn-proxy-console — built and vetted for the five release targets" \
+    console_targets
+
 run "swiftcheck — Swift value types and source scans" \
     ./tools/swiftcheck/run.sh
 

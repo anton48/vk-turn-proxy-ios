@@ -1,0 +1,87 @@
+# vk-turn-proxy-console: the five binaries of the console client.
+#
+#   - on every push and pull request to main: built (and its tests run once), to
+#     learn of a broken target before a release does;
+#   - by release.sh (workflow_dispatch with the release's tag): built from that
+#     tag and attached to its GitHub release beside VKTurnProxy.ipa, with
+#     SHA256SUMS.txt. The release must exist (release.sh creates it first);
+#     a binary already attached is replaced (--clobber).
+#
+# Static binaries (CGO_ENABLED=0), -trimpath, the tag as `-version`. macOS
+# builds are not signed: a copy downloaded by a browser is quarantined
+# (docs/console.md says how to lift it).
+name: vk-turn-proxy-console
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "the release tag to build from and attach the binaries to (e.g. v1.0-build441)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: freebsd, goarch: amd64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }} # empty on push / pull_request: the triggering commit
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: test (once, on the runner's own target)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: go test -count=1 ./tools/vk-turn-proxy-console/
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          TAG: ${{ inputs.tag }}
+        run: |
+          version="${TAG:-dev-${GITHUB_SHA::7}}"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=${version}" \
+            -o "dist/vk-turn-proxy-console-${GOOS}-${GOARCH}" ./tools/vk-turn-proxy-console
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vk-turn-proxy-console-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        working-directory: dist
+        run: sha256sum vk-turn-proxy-console-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release upload "$TAG" dist/vk-turn-proxy-console-* dist/SHA256SUMS.txt --clobber -R "$GITHUB_REPOSITORY"
