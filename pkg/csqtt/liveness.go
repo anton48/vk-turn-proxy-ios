@@ -277,12 +277,29 @@ const (
 //
 // wakeListenStep: a wake round's listening is counted in steps this long by a
 // watcher of its own (the monitor's five-second tick is too coarse for a
-// five-second wait). A step that takes more than twice its length means the
+// five-second wait). A step that ran more than wakeStepSlack late means the
 // process did not run — see deafInput.RoundListened. Variables so a test need
 // not wait them out.
 var (
 	wakeDeafAfter  = 5 * time.Second
 	wakeListenStep = 250 * time.Millisecond
+
+	// wakeStepSlack: a watcher's step that ran this much late, and no more, ran
+	// late the way a running process's sleeps do — the scheduler's, the
+	// collector's — and is listening, counted whole; a step later than that had
+	// the process NOT running for a stretch of it: a freeze, as a tick that is
+	// descheduledSlack late is a deschedule to the monitor, and the round
+	// predates it (listenTo). 🚨 A length of its own, not a multiple of the
+	// step: a freeze is an absolute stretch of time the process did not run,
+	// and the lateness a running process shows does not shrink with the step.
+	// Measured as "twice the step" (until 2026-09-29), the threshold fell to
+	// 40 ms in the tests that shorten the step to 20 ms, and the race
+	// detector's pauses crossed it now and then: a fresh wake round was dropped
+	// as frozen through, nobody asked again inside the test's wait, and the
+	// verdict never came. A test that shortens the step leaves this at its
+	// full length; with the field's step the two together are the half-second
+	// a step was allowed before.
+	wakeStepSlack = 250 * time.Millisecond
 
 	// wakeAskAgainEvery: a wake round that stands unanswered is asked again
 	// after every this much LISTENING (the monitor's round: at every on-time
