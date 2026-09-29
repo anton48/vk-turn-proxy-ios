@@ -542,9 +542,9 @@ type sessionClientHolder struct {
 // set; newDirectDialer overwrites Timeout with the client's WithTimeoutSeconds.
 func vkDiagDialer() net.Dialer {
 	return net.Dialer{
-		Control: func(network, address string, _ syscall.RawConn) error {
+		Control: func(network, address string, c syscall.RawConn) error {
 			log.Printf("vk-dial: requesting %s %s", network, address)
-			return nil
+			return dialControl(network, address, c) // the console's pin; nothing on iOS (dialhook.go)
 		},
 	}
 }

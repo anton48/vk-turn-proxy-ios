@@ -142,6 +142,19 @@ type Config struct {
 	// record on every SRTP-WRAP-S stream (server allowlist key; read+ignored
 	// unless the server runs -clients-file). Only used when UseWrapS.
 	ClientID string
+
+	// GOMAXPROCS is the scheduler thread count Start sets. 0 = 2, the iOS
+	// extension's setting (its CPU wake-up budget — see Start). A console on a
+	// desktop has no such budget and up to 120 connections of crypto: > 0 sets
+	// that many, < 0 leaves Go's default (every core) alone.
+	GOMAXPROCS int
+
+	// CredPoolSize replaces the credential pool's size in ANONYMOUS mode; 0 =
+	// poolSizeForNumConns, the app's four identities per ten connections —
+	// three reserve sets, because a path change cools every identity in use and
+	// a phone switches networks often. Cookie mode keeps its one slot per relay
+	// whatever this says: the relays are a finite set.
+	CredPoolSize int
 }
 
 // Stats holds live tunnel statistics.
@@ -622,6 +635,9 @@ func NewProxy(cfg Config) *Proxy {
 	// VK-supplied expiry timestamp (see parseCredExpiry / credExpiryBuffer
 	// in creds.go) — no separate TTL setting needed.
 	poolSize := poolSizeForNumConns(cfg.NumConns)
+	if cfg.CredPoolSize > 0 {
+		poolSize = cfg.CredPoolSize // the console's reserve sets (Config.CredPoolSize)
+	}
 	if cookieAuthEnabled.Load() {
 		// Cookie (VKAuth) mode: one slot per relay (2 per call link), no 4×
 		// reserve — the relays are a finite set, so extra slots would just
@@ -656,6 +672,17 @@ func NewProxy(cfg Config) *Proxy {
 	}
 
 	return p
+}
+
+// applyGOMAXPROCS is Start's thread count: 0 → 2 (the app), > 0 → n, < 0 →
+// Go's own default left in place (Config.GOMAXPROCS).
+func applyGOMAXPROCS(n int) {
+	switch {
+	case n == 0:
+		runtime.GOMAXPROCS(2)
+	case n > 0:
+		runtime.GOMAXPROCS(n)
+	}
 }
 
 // signalBootstrapDone fires the bootstrap-ready channel exactly once per
@@ -707,7 +734,8 @@ func (p *Proxy) Start() error {
 	// iOS Network Extensions are killed if they exceed 45000 wakeups/300s.
 	// With 10 connections and ~50 goroutines, unrestricted GOMAXPROCS
 	// causes ~1500 wakes/sec. Limiting to 2 threads keeps us well under.
-	runtime.GOMAXPROCS(2)
+	// The console, with no such budget, sets Config.GOMAXPROCS.
+	applyGOMAXPROCS(p.config.GOMAXPROCS)
 
 	// p.linkID is fixed in NewProxy (parseVKLinkID) and never written here:
 	// RefreshCaptchaURL reads it on Swift's thread with no ordering against
@@ -3399,6 +3427,9 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// Connect to TURN server
 	var turnConn net.PacketConn
 	if p.config.UseUDP {
+		if err := beforeDial(udpNetworkOf(turnUDPAddr), turnUDPAddr.String()); err != nil {
+			return fmt.Errorf("dial TURN UDP: %w", err)
+		}
 		udpConn, err := net.DialUDP("udp", nil, turnUDPAddr)
 		if err != nil {
 			return fmt.Errorf("dial TURN UDP: %w", err)
@@ -3408,7 +3439,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	} else {
 		tcpCtx, tcpCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer tcpCancel()
-		var d net.Dialer
+		d := net.Dialer{Control: dialControl}
 		tcpConn, err := d.DialContext(tcpCtx, "tcp", turnAddr)
 		if err != nil {
 			return fmt.Errorf("dial TURN TCP: %w", err)
@@ -5537,13 +5568,18 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	// transport plumbing.
 	var ctlConn net.PacketConn
 	if p.config.UseUDP {
+		// Unconnected: pion writes to the relay itself, so the hook is asked
+		// here, about the relay, before the socket exists.
+		if err := beforeDialUDP(turnAddr); err != nil {
+			return nil, fmt.Errorf("udp to relay: %w", err)
+		}
 		uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
 			return nil, fmt.Errorf("local udp listen: %w", err)
 		}
 		ctlConn = uc
 	} else {
-		dialer := net.Dialer{Timeout: 5 * time.Second}
+		dialer := net.Dialer{Timeout: 5 * time.Second, Control: dialControl}
 		tcp, err := dialer.Dial("tcp", turnAddr)
 		if err != nil {
 			return nil, fmt.Errorf("dial tcp to relay: %w", err)

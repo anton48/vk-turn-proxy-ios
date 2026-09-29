@@ -87,6 +87,18 @@ func resolvedVKHostIPs(host string) []string {
 	return vkHostIPs[host]
 }
 
+// browserDialer is the dialer behind every browser-TLS connection, with the
+// dial hook on it (dialhook.go).
+func browserDialer() *net.Dialer {
+	return &net.Dialer{
+		// Per-IP connect timeout — short enough that walking 4-5 IPs
+		// stays well under the outer request budget.
+		Timeout:   8 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   dialControl,
+	}
+}
+
 // chromeRoundTripper routes requests through HTTP/2 or HTTP/1.1 based
 // on what the server negotiates via ALPN. Uses uTLS to mimic Chrome's
 // TLS fingerprint for both protocols.
@@ -143,6 +155,9 @@ func newBrowserTransport(helloID utls.ClientHelloID) http.RoundTripper {
 			}
 			return conn, nil
 		},
+		// A plain-http request (none today) would otherwise dial with the
+		// transport's own zero dialer, around the hook.
+		DialContext:         browserDialer().DialContext,
 		ForceAttemptHTTP2:   false,
 		MaxIdleConns:        10,
 		IdleConnTimeout:     30 * time.Second,
@@ -202,12 +217,7 @@ func dialBrowserTLS(ctx context.Context, network, addr string, forceH1 bool, hel
 		dialAddrs = []string{addr}
 	}
 
-	dialer := &net.Dialer{
-		// Per-IP connect timeout — short enough that walking 4-5 IPs
-		// stays well under the outer request budget.
-		Timeout:   8 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
+	dialer := browserDialer()
 
 	var rawConn net.Conn
 	var lastErr error
