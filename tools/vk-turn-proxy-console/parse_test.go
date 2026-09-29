@@ -5,6 +5,7 @@ package main
 // kept; a disabled service kept; resolvectl's suffixes kept.
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -78,5 +79,44 @@ func TestTheRelayHostsComeFromTheCredentialCache(t *testing.T) {
 	}
 	if relayHostsFromCache(t.TempDir()+"/none.json") != nil {
 		t.Fatal("a missing cache yields relays")
+	}
+}
+
+// After a clean stop, and after a crash over TCP, the previous run's seats are
+// free and its cached identities are usable at once; after a crash over UDP
+// they are not (the allocations live until they expire). Sabotage seen red:
+// a UDP crash trusted; a clean stop not trusted; last_used_at left; another
+// field of the cache lost.
+func TestTheCacheIsTrustedWhenThePreviousRunFreedItsSeats(t *testing.T) {
+	for _, tc := range []struct {
+		prev *stateDoc
+		want bool
+	}{
+		{nil, true}, {&stateDoc{Transport: "tcp"}, true}, {&stateDoc{Transport: "udp"}, false}, {&stateDoc{}, false},
+	} {
+		if got := trustCachedIdentities(tc.prev); got != tc.want {
+			t.Errorf("trustCachedIdentities(%+v) = %v, want %v", tc.prev, got, tc.want)
+		}
+	}
+	p := t.TempDir() + "/creds.json"
+	writeFile(t, p, `{"version":2,"saved_at":1789820566,"x_ns":1789820566123456789,"creds":[`+
+		`{"slot":0,"address":"203.0.113.50:19302","username":"1790000000:a","password":"pa","last_used_at":1789820500},`+
+		`{"slot":1,"address":"203.0.113.50:19302","username":"1790000000:b","password":"pb"},`+
+		`{"slot":2,"address":"203.0.113.51:3478","username":"1790000000:c","password":"pc","last_used_at":1789820510}]}`)
+	if n := forgetLastUse(p); n != 2 {
+		t.Fatalf("forgetLastUse touched %d identities, want 2", n)
+	}
+	b, _ := os.ReadFile(p)
+	s := string(b)
+	if strings.Contains(s, "last_used_at") {
+		t.Fatalf("last_used_at left: %s", s)
+	}
+	for _, keep := range []string{`"version":2`, `"saved_at":1789820566`, `"x_ns":1789820566123456789`, `"username":"1790000000:c"`, `"password":"pb"`, `"address":"203.0.113.51:3478"`, `"slot":2`} {
+		if !strings.Contains(s, keep) {
+			t.Fatalf("%s lost: %s", keep, s)
+		}
+	}
+	if forgetLastUse(p) != 0 || forgetLastUse(t.TempDir()+"/none.json") != 0 {
+		t.Fatal("nothing to forget, yet something touched")
 	}
 }

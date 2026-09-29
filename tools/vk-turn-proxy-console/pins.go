@@ -179,7 +179,7 @@ func (p *pinner) removeAll() {
 	defer p.mu.Unlock()
 	for ip := range p.pinned {
 		_, del := p.cmds.pin(ip, p.gw)
-		if _, err := p.run(del); err != nil {
+		if _, err := p.run(del); err != nil && !alreadyGone(err) {
 			p.logf("unpin %s: %v", ip, err)
 			continue
 		}

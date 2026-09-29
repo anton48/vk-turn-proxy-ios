@@ -33,9 +33,10 @@ type undoStep struct {
 }
 
 type stateDoc struct {
-	PID     int        `json:"pid"`
-	Started string     `json:"started"`
-	Undo    []undoStep `json:"undo"`
+	PID       int        `json:"pid"`
+	Started   string     `json:"started"`
+	Transport string     `json:"transport,omitempty"` // tcp / udp to the relay: after a crash, whether the kernel's close freed the seats
+	Undo      []undoStep `json:"undo"`
 }
 
 type journal struct {
@@ -46,6 +47,13 @@ type journal struct {
 
 func newJournal(path string) *journal {
 	return &journal{path: path, doc: stateDoc{PID: os.Getpid(), Started: time.Now().Format(time.RFC3339)}}
+}
+
+// setTransport records the run's transport to the relay (before the first save).
+func (j *journal) setTransport(t string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.doc.Transport = t
 }
 
 // add records a change's undo — before the change is made.
@@ -114,6 +122,31 @@ func (j *journal) remove() error {
 	return nil
 }
 
+// alreadyGone: the undo failed because what it takes back is not there any
+// more — the route went with its interface when the process died (FreeBSD's
+// halves, seen on the stand 2026-09-29), the interface was destroyed, the
+// link vanished. The change is taken back; a step that insisted would keep the
+// state file for ever and refuse every later start.
+func alreadyGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		"route has not been found", // BSD route(8)
+		"not in table",             // BSD route(8), older wording
+		"No such process",          // Linux: ip route del of a route that is gone
+		"Cannot find device",       // Linux: the interface is gone
+		"does not exist",           // FreeBSD ifconfig: no such interface
+		"No such device",           // resolvectl: the link is gone
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // runUndo carries one step out; run executes a command.
 func runUndo(s undoStep, run func(argv []string) error) error {
 	if s.File != "" {
@@ -138,7 +171,7 @@ func (j *journal) undoAll(run func(argv []string) error, logf func(string, ...an
 	var failed []undoStep
 	for i := len(steps) - 1; i >= 0; i-- {
 		s := steps[i]
-		if err := runUndo(s, run); err != nil {
+		if err := runUndo(s, run); err != nil && !alreadyGone(err) {
 			logf("undo %s: %v", s.Key, err)
 			failed = append(failed, s)
 			continue
@@ -161,7 +194,7 @@ func (j *journal) undoPrefix(prefix string, run func(argv []string) error, logf 
 	}
 	j.mu.Unlock()
 	for i := len(steps) - 1; i >= 0; i-- {
-		if err := runUndo(steps[i], run); err != nil {
+		if err := runUndo(steps[i], run); err != nil && !alreadyGone(err) {
 			logf("undo %s: %v", steps[i].Key, err)
 			continue
 		}
@@ -206,21 +239,22 @@ func readState(path string) (*stateDoc, error) {
 }
 
 // recoverLeftovers takes back what a crashed run left. An instance still
-// running is not touched: its state is its own.
-func recoverLeftovers(path string, run func([]string) error, logf func(string, ...any)) error {
+// running is not touched: its state is its own. prev is the state the crashed
+// run left (nil: the previous run, if any, ended cleanly).
+func recoverLeftovers(path string, run func([]string) error, logf func(string, ...any)) (prev *stateDoc, err error) {
 	d, err := readState(path)
 	if err != nil || d == nil {
-		return err
+		return nil, err
 	}
 	if consoleRunning(d.PID) {
-		return fmt.Errorf("another vk-turn-proxy-console is running (pid %d, state %s)", d.PID, path)
+		return nil, fmt.Errorf("another vk-turn-proxy-console is running (pid %d, state %s)", d.PID, path)
 	}
 	if len(d.Undo) > 0 {
 		logf("state: a run started %s (pid %d) did not clean up — taking back %d change(s)", d.Started, d.PID, len(d.Undo))
 	}
 	old := &journal{path: path, doc: *d}
 	if failed := old.undoAll(run, logf); len(failed) > 0 {
-		return fmt.Errorf("%d leftover change(s) could not be taken back (see above); %s kept", len(failed), path)
+		return d, fmt.Errorf("%d leftover change(s) could not be taken back (see above); %s kept", len(failed), path)
 	}
-	return old.remove()
+	return d, old.remove()
 }

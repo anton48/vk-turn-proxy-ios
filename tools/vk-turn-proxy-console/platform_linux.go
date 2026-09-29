@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -25,6 +26,15 @@ func openTUN(name string, mtu int) (tun.Device, string, error) {
 		return nil, "", err
 	}
 	return dev, real, nil
+}
+
+// sshPeers: the clients of this host's established SSH sessions.
+func sshPeers() []string {
+	b, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		return nil
+	}
+	return parseProcNetTCP(string(b))
 }
 
 func readDefaultRoute() (gateway, bool) {

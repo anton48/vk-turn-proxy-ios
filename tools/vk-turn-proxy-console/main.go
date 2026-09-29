@@ -198,7 +198,7 @@ func realMain(args []string) int {
 			log.Print(err)
 			return 1
 		}
-		if err := recoverLeftovers(o.stateFile, quiet(runCmd), log.Printf); err != nil {
+		if _, err := recoverLeftovers(o.stateFile, quiet(runCmd), log.Printf); err != nil {
 			log.Printf("cleanup: %v", err)
 			return 1
 		}
@@ -316,11 +316,18 @@ type console struct {
 }
 
 func (c *console) run(ctx context.Context) int {
-	if err := recoverLeftovers(c.o.stateFile, quiet(runCmd), log.Printf); err != nil {
+	prev, err := recoverLeftovers(c.o.stateFile, quiet(runCmd), log.Printf)
+	if err != nil {
 		log.Printf("state: %v", err)
 		return 1
 	}
+	if trustCachedIdentities(prev) {
+		if n := forgetLastUse(c.o.credCache); n > 0 {
+			log.Printf("credentials: %d cached identities usable at once — the previous run closed its allocations", n)
+		}
+	}
 	c.j = newJournal(c.o.stateFile)
+	c.j.setTransport(transportName(c.st.UseUDP))
 	if err := c.j.save(); err != nil {
 		log.Printf("state: %v — the console journals every change before it makes it, and cannot", err)
 		return 1
@@ -395,11 +402,14 @@ func (c *console) run(ctx context.Context) int {
 // stands), -keep-hosts, the network's DNS servers and the relays the
 // credential cache names.
 func (c *console) prePin() {
+	ssh := sshPeers() // sudo drops $SSH_CLIENT: the socket table knows every session
 	for _, env := range []string{"SSH_CLIENT", "SSH_CONNECTION"} {
 		if ip := sshClientIP(os.Getenv(env)); ip != "" {
-			_ = c.pin.ensure(ip)
-			break
+			ssh = appendUnique(ssh, ip)
 		}
+	}
+	for _, ip := range ssh {
+		_ = c.pin.ensure(ip)
 	}
 	for _, h := range splitCSV(c.o.keepHosts) {
 		ips, err := net.LookupIP(h)

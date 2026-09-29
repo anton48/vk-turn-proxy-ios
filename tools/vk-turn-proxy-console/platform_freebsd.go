@@ -33,6 +33,15 @@ func openTUN(name string, mtu int) (tun.Device, string, error) {
 	return dev, real, nil
 }
 
+// sshPeers: the clients of this host's established SSH sessions.
+func sshPeers() []string {
+	out, err := runCmd([]string{"sockstat", "-4", "-c"})
+	if err != nil {
+		return nil
+	}
+	return parseSockstat(out)
+}
+
 func readDefaultRoute() (gateway, bool) {
 	out, err := runCmd([]string{"route", "-n", "get", "default"})
 	if err != nil {
