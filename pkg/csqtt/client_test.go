@@ -2399,7 +2399,7 @@ func undeafen(c *Client) {
 // still replaced. Sabotage seen red: the verdict carried out although its round
 // was replaced.
 func TestAVerdictOnAReplacedRoundIsNotCarriedOut(t *testing.T) {
-	defer func() { deafVerdictReached = nil }() // after the Closes below: nobody reads it any more
+	defer deafVerdictReached.Store(nil) // after the Closes below: nobody reads it any more
 	quickWake(t)
 
 	srv := newFakeServer(t)
@@ -2411,7 +2411,7 @@ func TestAVerdictOnAReplacedRoundIsNotCarriedOut(t *testing.T) {
 	gen := c.Stats().Generation
 	verdictTick := driveToTheVerdict(c)
 	reached := 0
-	deafVerdictReached = func(a deafAction) {
+	hook := func(a deafAction) {
 		if a != deafRestartAll {
 			return
 		}
@@ -2423,6 +2423,7 @@ func TestAVerdictOnAReplacedRoundIsNotCarriedOut(t *testing.T) {
 		c.WakeHealthCheck() // … a wake publishes a fresh round …
 		waitFor(t, "real answers to the fresh round", func() bool { return c.rxSeq.Load() >= heard+2 })
 	}
+	deafVerdictReached.Store(&hook)
 	verdictTick()
 	if reached != 1 {
 		t.Fatalf("the fixture never reached a restart-all verdict (%d)", reached)
@@ -2441,7 +2442,7 @@ func TestAVerdictOnAReplacedRoundIsNotCarriedOut(t *testing.T) {
 	verdictTick2 := driveToTheVerdict(c2)
 	reached = 0
 	var fresh *probeRound
-	deafVerdictReached = func(a deafAction) {
+	hook2 := func(a deafAction) {
 		if a != deafRestartAll {
 			return
 		}
@@ -2451,6 +2452,7 @@ func TestAVerdictOnAReplacedRoundIsNotCarriedOut(t *testing.T) {
 		c2.WakeHealthCheck() // a wake — and the workers are still deaf
 		fresh = c2.round.Load()
 	}
+	deafVerdictReached.Store(&hook2) // c is still up, and its monitor reads the hook at every tick: the swap is atomic
 	probesBefore := c2.Stats().Probes
 	verdictTick2()
 	if st := c2.Stats(); st.DeafAll != 0 || c2.round.Load() != fresh || fresh == nil || !fresh.wake {
@@ -2467,7 +2469,7 @@ func TestAVerdictOnAReplacedRoundIsNotCarriedOut(t *testing.T) {
 // inbound that arrives between the verdict and its execution — with no new
 // round published — voids it too. Sabotage seen red: the last look dropped.
 func TestAnAnswerAtTheLastInstantVoidsTheVerdict(t *testing.T) {
-	defer func() { deafVerdictReached = nil }()
+	defer deafVerdictReached.Store(nil)
 	srv := newFakeServer(t)
 	loopbackRelay(t, nil)
 	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
@@ -2476,7 +2478,7 @@ func TestAnAnswerAtTheLastInstantVoidsTheVerdict(t *testing.T) {
 	first := srv.seen()
 	verdictTick := driveToTheVerdict(c)
 	reached := 0
-	deafVerdictReached = func(a deafAction) {
+	hook := func(a deafAction) {
 		if a != deafRestartAll {
 			return
 		}
@@ -2488,6 +2490,7 @@ func TestAnAnswerAtTheLastInstantVoidsTheVerdict(t *testing.T) {
 		c.workers[0].probe(time.Now().UnixNano()) // one worker asks, and is answered: a real inbound, no new round
 		waitFor(t, "the late answer", func() bool { return c.rxSeq.Load() > heard })
 	}
+	deafVerdictReached.Store(&hook)
 	verdictTick()
 	if g, _, _ := srv.counts(); reached != 1 || c.Stats().DeafAll != 0 || g != len(first) {
 		t.Fatalf("reached %d; an answer had arrived before the verdict was carried out, and it was carried out: restart-alls %d, %d new GETCONF(s)",
@@ -2500,7 +2503,7 @@ func TestAnAnswerAtTheLastInstantVoidsTheVerdict(t *testing.T) {
 // sent — the hook's round stands, with its two probes and no more. Sabotage
 // seen red: the monitor probing whether or not its round was published.
 func TestTheMonitorDoesNotAskAgainWhenTheWakeHookJustDid(t *testing.T) {
-	defer func() { deafVerdictReached = nil }()
+	defer deafVerdictReached.Store(nil)
 	srv := newFakeServer(t)
 	loopbackRelay(t, nil)
 	c := dialReady(t, testConfig(srv, 2, (&lease{}).creds))
@@ -2514,13 +2517,14 @@ func TestTheMonitorDoesNotAskAgainWhenTheWakeHookJustDid(t *testing.T) {
 		c.monitorStep(start.Add(time.Duration(s) * time.Second))
 	}
 	reached := 0
-	deafVerdictReached = func(a deafAction) {
+	hook := func(a deafAction) {
 		if a == deafProbeAll {
 			if reached++; reached == 1 {
 				c.WakeHealthCheck() // default timings: its watcher's verdict is seconds away, the test is over before
 			}
 		}
 	}
+	deafVerdictReached.Store(&hook)
 	c.monitorStep(start.Add(30 * time.Second)) // thirty seconds of silence: the monitor wants to ask — the hook just did
 	r := c.round.Load()
 	if st := c.Stats(); reached != 1 || st.Probes != 2 || r == nil || !r.wake {
