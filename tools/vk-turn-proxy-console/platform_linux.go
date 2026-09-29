@@ -30,11 +30,7 @@ func openTUN(name string, mtu int) (tun.Device, string, error) {
 
 // sshPeers: the clients of this host's established SSH sessions.
 func sshPeers() []string {
-	b, err := os.ReadFile("/proc/net/tcp")
-	if err != nil {
-		return nil
-	}
-	return parseProcNetTCP(string(b))
+	return procPeers(os.ReadFile)
 }
 
 func readDefaultRoute() (gateway, bool) {

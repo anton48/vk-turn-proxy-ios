@@ -316,6 +316,10 @@ type console struct {
 }
 
 func (c *console) run(ctx context.Context) int {
+	if why := v6BlockRefusal(c.o.blockIPv6, c.o.defaultRoute, sshPeers(), ipv6Networks()); why != "" {
+		log.Print(why)
+		return 2
+	}
 	prev, err := recoverLeftovers(c.o.stateFile, quiet(runCmd), log.Printf)
 	if err != nil {
 		log.Printf("state: %v", err)
@@ -402,7 +406,7 @@ func (c *console) run(ctx context.Context) int {
 // stands), -keep-hosts, the network's DNS servers and the relays the
 // credential cache names.
 func (c *console) prePin() {
-	ssh := sshPeers() // sudo drops $SSH_CLIENT: the socket table knows every session
+	ssh, _ := byFamily(sshPeers()) // sudo drops $SSH_CLIENT: the socket table knows every session
 	for _, env := range []string{"SSH_CLIENT", "SSH_CONNECTION"} {
 		if ip := sshClientIP(os.Getenv(env)); ip != "" {
 			ssh = appendUnique(ssh, ip)

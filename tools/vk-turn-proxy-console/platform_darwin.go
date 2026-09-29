@@ -30,7 +30,7 @@ func openTUN(name string, mtu int) (tun.Device, string, error) {
 
 // sshPeers: the clients of this host's established SSH sessions.
 func sshPeers() []string {
-	out, err := runCmd([]string{"netstat", "-anp", "tcp"})
+	out, err := runCmd(netstatArgs)
 	if err != nil {
 		return nil
 	}

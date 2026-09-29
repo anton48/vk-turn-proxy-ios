@@ -49,6 +49,31 @@ func interfaceSubnets(name string) []*net.IPNet {
 	return out
 }
 
+// ipv6Networks: the IPv6 networks of every interface that is up — the
+// clients reached on-link, whatever the routes to ::/1 and 8000::/1 say.
+func ipv6Networks() []*net.IPNet {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []*net.IPNet
+	for _, ifi := range ifs {
+		if ifi.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() == nil {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
 // networkIdentity is what makes a network another one: the next hop, the
 // interface and the interface's own IPv4 addresses (the same router address
 // on a new Wi-Fi is still a new network).

@@ -124,8 +124,9 @@ func (j *journal) remove() error {
 
 // alreadyGone: the undo failed because what it takes back is not there any
 // more — the route went with its interface when the process died (FreeBSD's
-// halves, seen on the stand 2026-09-29), the interface was destroyed, the
-// link vanished. The change is taken back; a step that insisted would keep the
+// halves, seen on the stand 2026-09-29; on macOS the utun itself dies with
+// the process, and route(8) cannot even name it: "bad address: utun8", seen
+// on the stand 2026-09-30), the interface was destroyed, the link vanished. The change is taken back; a step that insisted would keep the
 // state file for ever and refuse every later start.
 func alreadyGone(err error) bool {
 	if err == nil {
@@ -135,6 +136,7 @@ func alreadyGone(err error) bool {
 	for _, s := range []string{
 		"route has not been found", // BSD route(8)
 		"not in table",             // BSD route(8), older wording
+		"bad address: utun",        // macOS route(8): -interface names a utun that died with its process
 		"No such process",          // Linux: ip route del of a route that is gone
 		"Cannot find device",       // Linux: the interface is gone
 		"does not exist",           // FreeBSD ifconfig: no such interface

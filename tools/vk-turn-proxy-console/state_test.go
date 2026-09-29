@@ -104,17 +104,25 @@ func TestAnUndoWhoseTargetIsGoneIsDone(t *testing.T) {
 	_ = j.add(undoStep{Key: "iface vktp0", Argv: []string{"ifconfig", "destroy"}})
 	_ = j.add(undoStep{Key: "pin 203.0.113.50", Argv: []string{"ip", "del"}})
 	_ = j.add(undoStep{Key: "dns resolvectl vktp0", Argv: []string{"resolvectl", "revert"}})
+	_ = j.add(undoStep{Key: "route subnet 192.168.102.0/24", Argv: []string{"route-darwin", "delete"}})
 	_ = j.add(undoStep{Key: "route split 128.0.0.0/1", Argv: []string{"really", "fails"}})
+	_ = j.add(undoStep{Key: "pin 203.0.113.51", Argv: []string{"route-malformed", "delete"}})
 	gone := map[string]string{
-		"route":      "route: route has not been found",
-		"ifconfig":   "ifconfig: interface vktp0 does not exist",
-		"ip":         "RTNETLINK answers: No such process",
-		"resolvectl": `Failed to resolve interface "vktp0": No such device`,
-		"really":     "permission denied",
+		"route":           "route: route has not been found",
+		"route-darwin":    "route: bad address: utun8",
+		"ifconfig":        "ifconfig: interface vktp0 does not exist",
+		"ip":              "RTNETLINK answers: No such process",
+		"resolvectl":      `Failed to resolve interface "vktp0": No such device`,
+		"really":          "permission denied",
+		"route-malformed": "route: bad address: 203.0.113",
 	}
-	failed := j.undoAll(func(argv []string) error { return errors.New(argv[0] + ": exit status 1: " + gone[argv[0]]) }, t.Logf)
-	if len(failed) != 1 || failed[0].Key != "route split 128.0.0.0/1" {
-		t.Fatalf("failed = %v — a target already gone is taken back; a real failure is not", failed)
+	failed := j.undoAll(func(argv []string) error { return errors.New(argv[0] + ": exit status 68: " + gone[argv[0]]) }, t.Logf)
+	var keys []string
+	for _, f := range failed {
+		keys = append(keys, f.Key)
+	}
+	if strings.Join(keys, ",") != "pin 203.0.113.51,route split 128.0.0.0/1" {
+		t.Fatalf("failed = %v — a target already gone is taken back (a utun that died with its process too); a real failure is not, nor a bad address that is not a utun", keys)
 	}
 }
 
