@@ -20,13 +20,20 @@ import (
 
 // dialRelayStand is a pion TURN server on loopback, UDP and TCP, that accepts or
 // refuses the Allocate and the permission as told, and says what it was asked.
+//
+// onPermit, if given, is called as the permission is asked, before it is
+// answered — on the server's read loop, which turn.NewServer starts. So it is
+// handed in HERE and captured before that loop exists: the go statement orders
+// the capture before every call (the memory model's rule). It used to be a field
+// a test set on the stand after the server was up, and that write raced the
+// loop's read under -race (2026-09-30, Linux): the CreatePermission request that
+// followed it crossed a loopback socket, which orders nothing.
 type dialRelayStand struct {
 	udp, tcp    string
 	permissions atomic.Int32 // CreatePermission requests that reached the permission handler
-	onPermit    func()       // called as the permission is asked, before it is answered
 }
 
-func newDialRelayStand(t *testing.T, acceptAllocate, permit bool) *dialRelayStand {
+func newDialRelayStand(t *testing.T, acceptAllocate, permit bool, onPermit func()) *dialRelayStand {
 	t.Helper()
 	s := &dialRelayStand{}
 	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -40,8 +47,8 @@ func newDialRelayStand(t *testing.T, acceptAllocate, permit bool) *dialRelayStan
 	gen := &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"}
 	permission := func(net.Addr, net.IP) bool {
 		s.permissions.Add(1)
-		if s.onPermit != nil {
-			s.onPermit()
+		if onPermit != nil {
+			onPermit()
 		}
 		return permit
 	}
@@ -79,10 +86,9 @@ func TestDialRelayReportsTheAllocationTheMomentTheRelayAcceptsIt(t *testing.T) {
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
 	for _, transport := range []string{"udp", "tcp"} {
 		t.Run(transport+": the permission fails BEHIND an accepted Allocate — the allocation is reported, and before the permission was asked", func(t *testing.T) {
-			s := newDialRelayStand(t, true, false)
 			var reported atomic.Int32
 			var reportedWhenAsked atomic.Int32
-			s.onPermit = func() { reportedWhenAsked.Store(reported.Load()) }
+			s := newDialRelayStand(t, true, false, func() { reportedWhenAsked.Store(reported.Load()) })
 			relay, err := DialRelay(TURNCredentials{Username: "u", Password: "pw", Address: s.addr(transport)}, peer, transport, logging.LogLevelError, func() { reported.Add(1) })
 			if err == nil {
 				relay.Close()
@@ -99,7 +105,7 @@ func TestDialRelayReportsTheAllocationTheMomentTheRelayAcceptsIt(t *testing.T) {
 			}
 		})
 		t.Run(transport+": the control — the Allocate is refused: nothing is reported", func(t *testing.T) {
-			s := newDialRelayStand(t, false, true)
+			s := newDialRelayStand(t, false, true, nil)
 			var reported atomic.Int32
 			relay, err := DialRelay(TURNCredentials{Username: "u", Password: "pw", Address: s.addr(transport)}, peer, transport, logging.LogLevelError, func() { reported.Add(1) })
 			if err == nil {
@@ -114,7 +120,7 @@ func TestDialRelayReportsTheAllocationTheMomentTheRelayAcceptsIt(t *testing.T) {
 			}
 		})
 		t.Run(transport+": the relay comes up — reported once, and a nil callback is no bookkeeping", func(t *testing.T) {
-			s := newDialRelayStand(t, true, true)
+			s := newDialRelayStand(t, true, true, nil)
 			var reported atomic.Int32
 			relay, err := DialRelay(TURNCredentials{Username: "u", Password: "pw", Address: s.addr(transport)}, peer, transport, logging.LogLevelError, func() { reported.Add(1) })
 			if err != nil {
