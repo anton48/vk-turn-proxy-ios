@@ -1583,6 +1583,33 @@ func TestResendsMadeIntoAGeneralBlackoutAreNotEvidenceAgainstAWorker(t *testing.
 	}
 }
 
+// heldBeforeClearing is readLoopStamped's hook for ONE worker: w's read loop,
+// the stamps of a real inbound made, closes `stamped` and is held right before
+// it clears the probe until `release` is closed. The hold is one inbound's, the
+// hook is not: the read loop runs it on every inbound of w's, and it stands
+// until the test's Cleanup — after the deferred release AND the deferred Close
+// — so a second inbound in that window closed `stamped` a second time and took
+// a full -race run of the package down with it ("close of closed channel",
+// once, on a loaded 4-core host). There is such an inbound: dialReady returns
+// on the READY SENT, not on its answer, and under load the handshake's own
+// READY_OK can reach w after the first test has installed the hook — held in
+// the answer's place, the answer queued behind it and through the hook once
+// the loop is let go (the fake server's second READY_OK held back 10 ms: the
+// panic on the first run). Only the first inbound closes `stamped`; every
+// later one passes through — in the second test too, whose hook goes up at
+// the verdict, long after the handshake, and has the same shape.
+func heldBeforeClearing(w *worker) (hook func(*worker), stamped, release chan struct{}) {
+	stamped, release = make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	hook = func(x *worker) {
+		if x == w {
+			once.Do(func() { close(stamped) })
+			<-release
+		}
+	}
+	return hook, stamped, release
+}
+
 // Finding 2: the read loop stamps a real inbound (lastRx, heardAt) BEFORE it
 // clears the probe, and the monitor does not take turns with it: a verdict
 // computed in that window saw the old probe fields — thirty seconds out, enough
@@ -1601,13 +1628,7 @@ func TestAnAnswerThatHasArrivedVoidsTheVerdictOnTheOldProbeFields(t *testing.T) 
 	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
 	w2 := c.workers[1]
 	ripeProbe(c, w2, at(0), at(25)) // out for thirty seconds at +30, asked again and again while others heard
-	stamped, release := make(chan struct{}), make(chan struct{})
-	hook := func(w *worker) {
-		if w == w2 {
-			close(stamped)
-			<-release
-		}
-	}
+	hook, stamped, release := heldBeforeClearing(w2)
 	readLoopStamped.Store(&hook)
 	verdicts := 0
 	reached := func(_ *worker, a livenessAction) {
@@ -1652,13 +1673,7 @@ func TestAnAnswerBetweenTheVerdictAndItsExecutionVoidsTheRestart(t *testing.T) {
 	at := func(s int) time.Time { return start.Add(time.Duration(s) * time.Second) }
 	w2 := c.workers[1]
 	ripeProbe(c, w2, at(0), at(25))
-	stamped, release := make(chan struct{}), make(chan struct{})
-	held := func(w *worker) {
-		if w == w2 {
-			close(stamped)
-			<-release
-		}
-	}
+	held, stamped, release := heldBeforeClearing(w2)
 	reached := 0
 	hook := func(w *worker, a livenessAction) {
 		if w != w2 || a != livenessRestart {
