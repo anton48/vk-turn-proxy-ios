@@ -54,7 +54,7 @@ func TestALeftoverIsTakenBackAtTheNextStart(t *testing.T) {
 	_ = j.add(undoStep{Key: "dns " + conf, File: conf, Content: "nameserver 192.168.1.1\n", Perm: 0o644})
 	_ = j.add(undoStep{Key: "pin 203.0.113.50", Argv: []string{"route", "delete", "203.0.113.50/32"}})
 	var ran []string
-	_, err := recoverLeftovers(path, func(argv []string) error { ran = append(ran, strings.Join(argv, " ")); return nil }, t.Logf)
+	err := recoverLeftovers(path, func(argv []string) error { ran = append(ran, strings.Join(argv, " ")); return nil }, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestALeftoverIsTakenBackAtTheNextStart(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("the state file stays after everything was taken back")
 	}
-	if _, err := recoverLeftovers(path, nil, t.Logf); err != nil {
+	if err := recoverLeftovers(path, nil, t.Logf); err != nil {
 		t.Fatalf("no state file: %v", err)
 	}
 }
@@ -123,30 +123,5 @@ func TestAnUndoWhoseTargetIsGoneIsDone(t *testing.T) {
 	}
 	if strings.Join(keys, ",") != "pin 203.0.113.51,route split 128.0.0.0/1" {
 		t.Fatalf("failed = %v — a target already gone is taken back (a utun that died with its process too); a real failure is not, nor a bad address that is not a utun", keys)
-	}
-}
-
-// The state file carries the run's transport — after a crash it says whether
-// the kernel's close freed the seats (cache.go). The source says where it is
-// set: in run, before the journal's first save.
-func TestTheRunRecordsItsTransport(t *testing.T) {
-	src, err := os.ReadFile("main.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := string(src)
-	set := strings.Index(s, "c.j.setTransport(transportName(c.st.UseUDP))")
-	save := strings.Index(s, "if err := c.j.save(); err != nil {")
-	if set < 0 || save < 0 || set > save {
-		t.Fatalf("the journal's transport is set at %d, its first save at %d — it must be set before the file is first written", set, save)
-	}
-	j := newJournal(filepath.Join(t.TempDir(), "state.json"))
-	j.setTransport("udp")
-	if err := j.save(); err != nil {
-		t.Fatal(err)
-	}
-	d, err := readState(j.path)
-	if err != nil || d.Transport != "udp" {
-		t.Fatalf("the saved state: %+v, %v", d, err)
 	}
 }

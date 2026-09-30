@@ -33,10 +33,9 @@ type undoStep struct {
 }
 
 type stateDoc struct {
-	PID       int        `json:"pid"`
-	Started   string     `json:"started"`
-	Transport string     `json:"transport,omitempty"` // tcp / udp to the relay: after a crash, whether the kernel's close freed the seats
-	Undo      []undoStep `json:"undo"`
+	PID     int        `json:"pid"`
+	Started string     `json:"started"`
+	Undo    []undoStep `json:"undo"`
 }
 
 type journal struct {
@@ -47,13 +46,6 @@ type journal struct {
 
 func newJournal(path string) *journal {
 	return &journal{path: path, doc: stateDoc{PID: os.Getpid(), Started: time.Now().Format(time.RFC3339)}}
-}
-
-// setTransport records the run's transport to the relay (before the first save).
-func (j *journal) setTransport(t string) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.doc.Transport = t
 }
 
 // add records a change's undo — before the change is made.
@@ -240,23 +232,24 @@ func readState(path string) (*stateDoc, error) {
 	return &d, nil
 }
 
-// recoverLeftovers takes back what a crashed run left. An instance still
-// running is not touched: its state is its own. prev is the state the crashed
-// run left (nil: the previous run, if any, ended cleanly).
-func recoverLeftovers(path string, run func([]string) error, logf func(string, ...any)) (prev *stateDoc, err error) {
+// recoverLeftovers takes back what a crashed run left. 🚨 Its caller holds the
+// pid file's lock (guarded, main.go): no other console is alive on this
+// machine, so a state file found here is a dead run's — whatever pid it
+// names. (The pid in it was once asked of ps, by name; the kernel cuts a
+// process name — 15 characters on Linux, 19 on FreeBSD — the name never
+// matched there, and a -cleanup beside a LIVE console took its routes away
+// and left it running, its traffic direct: a stand, 2026-09-30.)
+func recoverLeftovers(path string, run func([]string) error, logf func(string, ...any)) error {
 	d, err := readState(path)
 	if err != nil || d == nil {
-		return nil, err
-	}
-	if consoleRunning(d.PID) {
-		return nil, fmt.Errorf("another vk-turn-proxy-console is running (pid %d, state %s)", d.PID, path)
+		return err
 	}
 	if len(d.Undo) > 0 {
 		logf("state: a run started %s (pid %d) did not clean up — taking back %d change(s)", d.Started, d.PID, len(d.Undo))
 	}
 	old := &journal{path: path, doc: *d}
 	if failed := old.undoAll(run, logf); len(failed) > 0 {
-		return d, fmt.Errorf("%d leftover change(s) could not be taken back (see above); %s kept", len(failed), path)
+		return fmt.Errorf("%d leftover change(s) could not be taken back (see above); %s kept", len(failed), path)
 	}
-	return d, old.remove()
+	return old.remove()
 }

@@ -57,6 +57,7 @@ type options struct {
 	keepHosts, route string
 
 	credCache, stateFile, cookieFile string
+	pidFile                          string
 	logFile                          string
 	gomaxprocs, keepalive            int
 	statsEvery                       time.Duration
@@ -89,6 +90,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.StringVar(&o.credCache, "cred-cache", ".vk-turn-proxy-console-creds.json", "the console's own TURN credential cache (never the backup's)")
 	fs.StringVar(&o.stateFile, "state-file", ".vk-turn-proxy-console-state.json", "where the changes to the system are journaled with their undo")
 	fs.BoolVar(&o.cleanup, "cleanup", false, "take back what a crashed run left (the state file) and exit")
+	fs.StringVar(&o.pidFile, "pid-file", defaultPidFile, "the pid file: the running console keeps it locked, and a second one — a run or a -cleanup — is refused")
 	fs.StringVar(&o.logFile, "log", "", "write the log to this file as well as to stderr (appended; created 0600 and handed to the sudo user)")
 	fs.StringVar(&o.cookieFile, "vk-cookie-file", "", "a VK login as Netscape cookies.txt: the authenticated (VKAuth) mode")
 	fs.IntVar(&o.gomaxprocs, "gomaxprocs", 0, "scheduler threads (0 = every core, Go's default)")
@@ -213,12 +215,14 @@ func realMain(args []string) int {
 			log.Print(err)
 			return 1
 		}
-		if _, err := recoverLeftovers(o.stateFile, quiet(runCmd), log.Printf); err != nil {
-			log.Printf("cleanup: %v", err)
-			return 1
-		}
-		log.Printf("cleanup: nothing left to take back (%s)", o.stateFile)
-		return 0
+		return guarded(o.pidFile, func() int {
+			if err := recoverLeftovers(o.stateFile, quiet(runCmd), log.Printf); err != nil {
+				log.Printf("cleanup: %v", err)
+				return 1
+			}
+			log.Printf("cleanup: nothing left to take back (%s)", o.stateFile)
+			return 0
+		})
 	}
 	b, err := loadBackup(o.configPath)
 	if err != nil {
@@ -287,7 +291,26 @@ func realMain(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	c := &console{o: o, st: st, dnsPlan: plan, cookie: cookie}
-	return c.run(ctx)
+	return guarded(o.pidFile, func() int { return c.run(ctx) })
+}
+
+// defaultPidFile: /var/run is there, root's and emptied at boot on macOS,
+// Linux (where it is /run) and FreeBSD alike. The state file is NOT kept
+// there: it must outlive a reboot — a DNS setting it has to put back does.
+const defaultPidFile = "/var/run/vk-turn-proxy-console.pid"
+
+// guarded runs fn under the pid file's lock (pidfile_unix.go): one console
+// per machine — two would fight over the default route and the DNS whatever
+// directories they were started in — and a second one, a run or a -cleanup,
+// is refused before it touches anything.
+func guarded(pidPath string, fn func() int) int {
+	pf, err := takePidFile(pidPath)
+	if err != nil {
+		log.Print(err)
+		return 1
+	}
+	defer pf.release()
+	return fn()
 }
 
 // ignoreBrokenPipe: a dead log must not kill a process that owes a cleanup.
@@ -350,18 +373,11 @@ func (c *console) run(ctx context.Context) int {
 		log.Print(why)
 		return 2
 	}
-	prev, err := recoverLeftovers(c.o.stateFile, quiet(runCmd), log.Printf)
-	if err != nil {
+	if err := recoverLeftovers(c.o.stateFile, quiet(runCmd), log.Printf); err != nil {
 		log.Printf("state: %v", err)
 		return 1
 	}
-	if trustCachedIdentities(prev) {
-		if n := forgetLastUse(c.o.credCache); n > 0 {
-			log.Printf("credentials: %d cached identities usable at once — the previous run closed its allocations", n)
-		}
-	}
 	c.j = newJournal(c.o.stateFile)
-	c.j.setTransport(transportName(c.st.UseUDP))
 	if err := c.j.save(); err != nil {
 		log.Printf("state: %v — the console journals every change before it makes it, and cannot", err)
 		return 1
