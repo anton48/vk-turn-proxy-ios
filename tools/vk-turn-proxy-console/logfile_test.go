@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -88,14 +89,39 @@ func TestTheSudoUserIsReadFromSudosEnvironment(t *testing.T) {
 	}
 }
 
+// logCapture is the log's output for a test — read while goroutines of the
+// code under test may still be writing to it.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *logCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+func (c *logCapture) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf.Reset()
+}
+
 // captureLog points the log package at a buffer for the test.
-func captureLog(t *testing.T) *bytes.Buffer {
+func captureLog(t *testing.T) *logCapture {
 	t.Helper()
-	var buf bytes.Buffer
+	c := &logCapture{}
 	old, flags := log.Writer(), log.Flags()
-	log.SetOutput(&buf)
+	log.SetOutput(c)
 	t.Cleanup(func() { log.SetOutput(old); log.SetFlags(flags) })
-	return &buf
+	return c
 }
 
 func TestWireguardLogsThroughTheLogPackage(t *testing.T) {

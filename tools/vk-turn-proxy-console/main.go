@@ -364,8 +364,12 @@ type console struct {
 	src   *dnsSource
 	p     *proxy.Proxy
 	dev   *device.Device
+	peer  wgPeer // the server, as WireGuard has it: asked to handshake after a sleep (wake.go)
 	tun   string
 	ticks int // the network monitor's, for the DNS refresh's pace
+
+	mctx     context.Context    // the monitor's life
+	wakeStop context.CancelFunc // the wake handshake in progress, if any
 }
 
 func (c *console) run(ctx context.Context) int {
@@ -439,8 +443,9 @@ func (c *console) run(ctx context.Context) int {
 		c.routeHosts()
 	}
 
-	mon := newNetMonitor(2*time.Second, readDefaultRoute, networkIdentity, gw, up, time.Now())
+	mon := newNetMonitor(netPoll, readDefaultRoute, networkIdentity, gw, up, time.Now())
 	mctx, cancel := context.WithCancel(ctx)
+	c.mctx = mctx
 	defer cancel()
 	go mon.run(mctx, c.onNetwork)
 
@@ -614,6 +619,7 @@ func (c *console) attach() error {
 	if err := c.dev.IpcSet(uapi); err != nil {
 		return fmt.Errorf("wireguard: %v", err)
 	}
+	c.peer = findPeer(c.dev, c.st.PeerPublicKey)
 	if err := c.dev.Up(); err != nil {
 		return fmt.Errorf("wireguard: %v", err)
 	}
@@ -711,11 +717,17 @@ func (c *console) routeHosts() {
 	log.Printf("split mode: the tunnel's subnet and -route go through the tunnel, everything else as before")
 }
 
-// onNetwork moves the pins and the network's DNS with the network, and tells
-// the proxy what the monitor saw — ONE path change per handover (paths.go).
+// netPoll is the network monitor's interval.
+const netPoll = 2 * time.Second
+
+// onNetwork moves the pins and the network's DNS with the network, tells the
+// proxy what the monitor saw — ONE path change per handover (paths.go) — and
+// after a sleep has WireGuard handshake anew (wake.go).
 func (c *console) onNetwork(ev netEvents) {
+	var asleep proxy.Stats // the proxy as the sleep left it: read BEFORE its health check forces a reconnect
 	if ev.slept > 0 {
 		log.Printf("woke after about %s — health check", ev.slept.Round(time.Second))
+		asleep = c.p.GetStats()
 	}
 	switch {
 	case ev.changed && !ev.up:
@@ -738,6 +750,9 @@ func (c *console) onNetwork(ev netEvents) {
 		}
 	}
 	tellPath(c.p, proxy.RotateVKSessionClient, ev)
+	if ev.slept > 0 {
+		c.rekeyAfterWake(asleep, time.Now())
+	}
 }
 
 // serve prints the stats and waits for a signal or a failure no retry mends.
@@ -847,6 +862,7 @@ func readWG(dev *device.Device) wgState {
 	if err != nil {
 		return st
 	}
+	var sec, nsec int64
 	for _, line := range strings.Split(out, "\n") {
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
@@ -858,10 +874,13 @@ func readWG(dev *device.Device) wgState {
 		case "tx_bytes":
 			st.txBytes, _ = strconv.ParseInt(v, 10, 64)
 		case "last_handshake_time_sec":
-			if sec, _ := strconv.ParseInt(v, 10, 64); sec > 0 {
-				st.lastHandshake = time.Unix(sec, 0)
-			}
+			sec, _ = strconv.ParseInt(v, 10, 64)
+		case "last_handshake_time_nsec":
+			nsec, _ = strconv.ParseInt(v, 10, 64)
 		}
+	}
+	if sec > 0 {
+		st.lastHandshake = time.Unix(sec, nsec)
 	}
 	return st
 }
