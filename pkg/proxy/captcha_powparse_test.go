@@ -68,6 +68,61 @@ func TestParsePowPageObfuscated(t *testing.T) {
 	}
 }
 
+// The page of 2026-09-30: the IIFE gained a FOURTH argument, an array of the
+// telemetry probes' names, and the pattern that wanted `))` right behind the
+// error label found nothing on every page — the user's console and phone alike
+// («captcha pow parameters not found in HTML», 48 of 48 attempts). The fixture
+// is that page's PoW <script> block, captured on a stand with
+// VK_DUMP_POW_HTML the same night (no token, no JWT, no UUID in it). The
+// envelope did not change: six fields on the page, `v2.`, tel_hash — the
+// telemetry5 shape.
+//
+// SABOTAGE SEEN TO FAIL: the pattern back to `\)\s*\)` after the label.
+const powFixtureProbeList = "testdata/captcha_pow_page_2026_09_30.html"
+
+func TestParsePowPageWithTheProbeListArgument(t *testing.T) {
+	b, err := os.ReadFile(powFixtureProbeList)
+	if err != nil {
+		t.Fatalf("read %s: %v", powFixtureProbeList, err)
+	}
+	html := string(b)
+	if !strings.Contains(html, `'pow_timeout',["nav_tamper"`) {
+		t.Fatal("fixture: the fourth argument (the probe-name array) is not where the page of 2026-09-30 had it")
+	}
+	p, err := parsePowPage(html)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(p.Input) != 16 || p.Difficulty != 2 || p.Prefix != "v2." || p.Envelope != envelopeTelemetry5 {
+		t.Errorf("input %d chars, difficulty %d, prefix %q, envelope %s — want 16, 2, v2., telemetry5", len(p.Input), p.Difficulty, p.Prefix, p.Envelope)
+	}
+	hash, _ := solvePoW(p.Input, p.Difficulty)
+	if !strings.HasPrefix(hash, "00") {
+		t.Errorf("the page's own parameters did not solve to a hash of difficulty 2: %q", hash)
+	}
+
+	// The same call, hand-written, with and without the array; and the array
+	// alone must not pass for the arguments (the input is the FIRST argument).
+	for _, tc := range []struct {
+		name, tail string
+		ok         bool
+	}{
+		{"three arguments", `}('fnZQN7lKKXvo37tH',2,'pow_timeout'));`, true},
+		{"four arguments", `}('fnZQN7lKKXvo37tH',2,'pow_timeout',["globals","ua"]));`, true},
+		{"four arguments, spaced", "}( 'fnZQN7lKKXvo37tH' , 2 , 'pow_timeout' ,\n[\"globals\"] ) );", true},
+		{"no arguments at all", `}());`, false},
+	} {
+		html := `<script>window['captchaPowResult']='v2.'+x({'hash':h,'nonce':n,'error':e,'duration_ms':0,'telemetry':t,'tel_hash':''});` + tc.tail + `</script>`
+		p, err := parsePowPage(html)
+		if tc.ok && (err != nil || p.Input != "fnZQN7lKKXvo37tH" || p.Difficulty != 2) {
+			t.Errorf("%s: parse = %+v, %v — want the input and difficulty 2", tc.name, p, err)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("%s: parsed %+v, want a refusal", tc.name, p)
+		}
+	}
+}
+
 // The pre-obfuscation page must keep parsing: VK serves different pages to
 // different identities, and a rollback on their side must not need a build on
 // ours.

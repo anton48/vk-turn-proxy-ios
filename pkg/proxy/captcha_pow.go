@@ -2035,10 +2035,19 @@ func powSnippet(html string) {
 // Identifiers are regenerated per release (`_0x421042`, `_0x543e3e`, …) and
 // every member access is a string literal, so nothing named survives. What DOES
 // survive is the shape of the call that starts the whole thing: the script is
-// one IIFE and its three arguments are the session's input, the difficulty and
-// an error label, spelled out at the very end of the block:
+// one IIFE and its first three arguments are the session's input, the
+// difficulty and an error label, spelled out at the very end of the block:
 //
 //	}("gMbKzMjN77r4NVrv",2,"pow_timeout"));
+//
+// 🚨 Since 2026-09-30 a FOURTH argument follows the label — an array of the
+// names of the telemetry probes the page runs (`["nav_tamper","plugins",…]`,
+// 23 of them on the captured page) — and a pattern that wanted the closing
+// `))` right behind the label found nothing on every page (the user's console
+// and phone alike; the fork met the same day, its commit a2d9a88). The
+// envelope's shape did not move with it. So the pattern reads the three
+// arguments and lets the call go on: a comma or the closing `))` after the
+// label, whatever the page appends next.
 //
 // Parse the ARGUMENTS, not the names.
 // powEnvelope is the SHAPE the page wraps a solved PoW in.
@@ -2093,8 +2102,10 @@ type powPageParams struct {
 
 var (
 	// The obfuscated IIFE's arguments. The input is base64-ish (VK's is 16
-	// chars); the third argument is the error label, matched but discarded.
-	rePowIIFEArgs = regexp.MustCompile(`\}\(\s*["']([A-Za-z0-9+/=_-]{8,})["']\s*,\s*(\d+)\s*,\s*["'][^"']*["']\s*\)\s*\)`)
+	// chars); the third argument is the error label, matched but discarded;
+	// what follows it — the closing `))`, or a comma and further arguments
+	// (the probe-name array since 2026-09-30) — is not the parser's concern.
+	rePowIIFEArgs = regexp.MustCompile(`\}\(\s*["']([A-Za-z0-9+/=_-]{8,})["']\s*,\s*(\d+)\s*,\s*["'][^"']*["']\s*(?:,|\)\s*\))`)
 	// The pre-obfuscation form, kept because VK serves different pages to
 	// different identities and a rollback must not need a new build.
 	rePowLegacyInput = regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)
