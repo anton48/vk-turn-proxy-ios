@@ -62,6 +62,8 @@ SOURCES=(
     "$S/UnseededStartPolicy.swift"
     "$S/PublishChain.swift"
     "$S/TurnCacheFiles.swift"
+    # The cache file's mirror and the seed's mode rule: RUN on fixtures.
+    "$S/CredCache.swift"
     "$S/SessionServer.swift"
     "$S/ConnectionLinkInbox.swift"
     "$S/DirectOutcome.swift"

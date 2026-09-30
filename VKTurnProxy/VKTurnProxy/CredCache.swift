@@ -33,9 +33,19 @@ struct CredCacheEntry: Codable {
 }
 
 /// On-disk JSON shape. Mirrors the Go-side credCacheFile.
+///
+/// `mode` is the kind of identity the pool that wrote the file mints —
+/// `CredCache.modeAnon` or `CredCache.modeCookie` (Go-side credCacheModeAnon /
+/// credCacheModeCookie, build 441); absent in files from before it, which are
+/// anonymous ones. It is HERE, not only in Go, because BackupManager encodes
+/// this struct into the backup and back into creds-pool.json on a restore: a
+/// mirror without the field dropped it on the way, and the restored file came
+/// back as an anonymous one — a cookie pool refused its own creds, and an
+/// account's creds restored under an anonymous connect would have seeded it.
 struct CredCacheFile: Codable {
     let version: Int
     let saved_at: Int64
+    let mode: String?
     let creds: [CredCacheEntry]
 }
 
@@ -104,6 +114,22 @@ enum CredCache {
     /// persisted slot was reused with VK's lingering allocations.
     static let saturationCooldown: TimeInterval = 600
 
+    /// The two modes a cache file can be in — the Go pool's words.
+    static let modeAnon = "anon"
+    static let modeCookie = "cookie"
+
+    /// The mode a connect is in, in the file's words.
+    static func mode(useCookieAuth: Bool) -> String { useCookieAuth ? modeCookie : modeAnon }
+
+    /// Is this file the current mode's? The Go pool's rule exactly: a file
+    /// without the field is an anonymous one. The other mode's file gives NO
+    /// seed — an account's cred seeded into an anonymous session deanonymises
+    /// the account; the guard in connect clears the cache on a mode CHANGE, but
+    /// a restored backup never changed it.
+    static func fileIsForMode(_ f: CredCacheFile, useCookieAuth: Bool) -> Bool {
+        (f.mode ?? modeAnon) == mode(useCookieAuth: useCookieAuth)
+    }
+
     /// App Group container path matching SharedLogger's vpn.log directory
     /// and the Go-side `filepath.Dir(logFilePath) + "/creds-pool.json"`.
     static var cacheURL: URL? {
@@ -113,20 +139,29 @@ enum CredCache {
     }
 
     /// Loads the cache and returns the first valid cred (any slot), or
-    /// nil if the file is missing, unreadable, version-mismatched, or
-    /// every entry is expired/expiring soon.
+    /// nil if the file is missing, unreadable, version-mismatched, the other
+    /// mode's, or every entry is expired/expiring soon.
     ///
     /// Validity check: parses `<unix_expiry>:<key_id>` from username,
     /// requires `expiry - now > 60s`. Malformed usernames are skipped.
-    static func loadValidCred() -> (address: String, username: String, password: String)? {
+    static func loadValidCred(useCookieAuth: Bool) -> (address: String, username: String, password: String)? {
         guard let url = cacheURL else { return nil }
         guard let data = try? Data(contentsOf: url) else { return nil }
         guard let f = try? JSONDecoder().decode(CredCacheFile.self, from: data) else {
             return nil
         }
-        guard f.version == supportedVersion else { return nil }
+        return validCred(in: f, now: Date().timeIntervalSince1970, useCookieAuth: useCookieAuth)
+    }
 
-        let now = Date().timeIntervalSince1970
+    /// The decision behind loadValidCred, on a decoded file: Foundation only, so
+    /// the swiftcheck harness runs it on fixtures.
+    static func validCred(in f: CredCacheFile, now: TimeInterval, useCookieAuth: Bool) -> (address: String, username: String, password: String)? {
+        guard f.version == supportedVersion else { return nil }
+        guard fileIsForMode(f, useCookieAuth: useCookieAuth) else {
+            SharedLogger.shared.log("[AppDebug] CredCache: the cache holds \(f.mode ?? modeAnon) identities and this connect is \(mode(useCookieAuth: useCookieAuth)) — no seed from it")
+            return nil
+        }
+
         var skipReasons: [String] = []
 
         for entry in f.creds {

@@ -629,7 +629,7 @@ class TunnelManager: ObservableObject {
             // parse error), we fall through to the normal probe loop and
             // the extension's credPool will repopulate the cache on its
             // first successful fetch.
-            if let cached = CredCache.loadValidCred() {
+            if let cached = CredCache.loadValidCred(useCookieAuth: config.useCookieAuth) {
                 seededTURN = cached
                 SharedLogger.shared.log("[AppDebug] pre-bootstrap: using cached TURN cred from disk (addr=\(cached.address)), skipping captcha probe")
             } else {
@@ -956,7 +956,7 @@ class TunnelManager: ObservableObject {
         // extension cannot be left to do it. The probe runs AFTER the stop on
         // purpose: the app's own sockets are captured by the tunnel, and a
         // probe through it would show VK the server's address, not ours.
-        var seed = CredCache.loadValidCred()
+        var seed = CredCache.loadValidCred(useCookieAuth: config.useCookieAuth)
         var probe: UnseededStartPolicy.Probe = seed == nil ? .failed : .seeded
         if seed == nil {
             switch await probeFreshCredWithoutUI(config: config) {

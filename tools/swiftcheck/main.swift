@@ -2976,7 +2976,7 @@ do {
         if let c = tm.range(of: "if let blocked = clearCredCacheIfAuthModeChanged(config: config) {\n                errorMessage = blocked\n                return\n            }") {
             // …and it stands BEFORE the first thing that reads the cache or probes.
             let after = String(tm[c.upperBound...])
-            connectStops = after.range(of: "CredCache.loadValidCred()") != nil
+            connectStops = after.range(of: "CredCache.loadValidCred(useCookieAuth: config.useCookieAuth)") != nil
                 && !String(tm[..<c.lowerBound]).hasSuffix("_ = ")
         }
         check(connectStops, "🚨 connect() stops on a surviving cache — before anything reads the cache or probes")
@@ -2984,7 +2984,7 @@ do {
         if let sw = tm.range(of: "func switchAndReconnect(") {
             let sbody = String(tm[sw.upperBound...]).prefix(7000)
             if let g = sbody.range(of: "if let blocked = clearCredCacheIfAuthModeChanged(config: config) {"),
-               let seedRead = sbody.range(of: "CredCache.loadValidCred()"), g.lowerBound < seedRead.lowerBound {
+               let seedRead = sbody.range(of: "CredCache.loadValidCred(useCookieAuth: config.useCookieAuth)"), g.lowerBound < seedRead.lowerBound {
                 let arm = String(sbody[g.upperBound..<seedRead.lowerBound])
                 switchStops = arm.contains("errorMessage = blocked") && arm.contains("await LiveActivityController.shared.releaseHold()")
                     && arm.contains("return .refusedUncleared(reason: blocked)")
@@ -4466,6 +4466,49 @@ do {
     }
     check(!source("VKTurnProxy/VKTurnProxy/ContentView.swift").contains("csqttBoundedWrites"),
           "ContentView does not read csqttBoundedWrites (the NavigationView host must not re-render on it)")
+}
+
+// The credential cache's mode (build 441 in Go, 442 here): the pool stamps
+// creds-pool.json with "anon" / "cookie" and refuses the other mode's file. The
+// app's mirror of the file has to CARRY the field — BackupManager encodes it into
+// the backup and back to disk on a restore, and a mirror without it dropped the
+// mode on the way (the user's export of 09-30 had none) — and the app's own seed
+// read has to apply the same rule: a restored backup never changed the mode, so
+// the guard in connect does not clear it. RUN on fixtures, not scanned.
+do {
+    func file(_ mode: String?, _ user: String = "\(Int(Date().timeIntervalSince1970) + 8 * 3600):u") -> CredCacheFile {
+        CredCacheFile(version: CredCache.supportedVersion, saved_at: Int64(Date().timeIntervalSince1970), mode: mode,
+                      creds: [CredCacheEntry(slot: 0, address: "203.0.113.11:19302", username: user, password: "pw", last_used_at: 0)])
+    }
+    let now = Date().timeIntervalSince1970
+    let cookie = file(CredCache.modeCookie), anon = file(CredCache.modeAnon), old = file(nil)
+    check(CredCache.validCred(in: cookie, now: now, useCookieAuth: true) != nil, "a cookie file seeds a cookie connect")
+    check(CredCache.validCred(in: cookie, now: now, useCookieAuth: false) == nil, "🚨 a cookie file gives NO seed to an anonymous connect (the account's cred would deanonymise it)")
+    check(CredCache.validCred(in: anon, now: now, useCookieAuth: false) != nil, "an anonymous file seeds an anonymous connect")
+    check(CredCache.validCred(in: anon, now: now, useCookieAuth: true) == nil, "an anonymous file gives no seed to a cookie connect")
+    check(CredCache.validCred(in: old, now: now, useCookieAuth: false) != nil, "a file from before the field is an anonymous one: it seeds an anonymous connect")
+    check(CredCache.validCred(in: old, now: now, useCookieAuth: true) == nil, "…and not a cookie one")
+    // The round trip BackupManager makes: encode the struct, decode it — the mode survives both ways,
+    // and a file without it stays without it (the Go pool reads absent as anonymous).
+    let enc = JSONEncoder(); enc.outputFormatting = [.sortedKeys]
+    if let data = try? enc.encode(cookie), let text = String(data: data, encoding: .utf8),
+       let back = try? JSONDecoder().decode(CredCacheFile.self, from: data) {
+        check(text.contains("\"mode\":\"cookie\"") && back.mode == CredCache.modeCookie, "🚨 the mode survives the backup's encode and decode")
+    } else {
+        check(false, "the cache file did not round-trip through Codable")
+    }
+    if let data = try? enc.encode(old), let text = String(data: data, encoding: .utf8) {
+        check(!text.contains("\"mode\""), "a file without a mode is written without one, not as an empty string")
+    } else {
+        check(false, "the old-style cache file did not encode")
+    }
+    let bm = codeWithoutComments("VKTurnProxy/VKTurnProxy/BackupManager.swift")
+    check(bm.contains("JSONDecoder().decode(CredCacheFile.self, from: data)") && bm.contains("try encoder.encode(pool)"),
+          "the backup carries the cache as the CredCacheFile struct both ways (so the field above is what carries the mode)")
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(tm.components(separatedBy: "CredCache.loadValidCred(useCookieAuth: config.useCookieAuth)").count == 3
+          && !tm.contains("loadValidCred()"),
+          "both seed reads (connect, the switch) tell the loader the connect's mode")
 }
 
 print("")
