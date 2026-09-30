@@ -6,9 +6,9 @@ package main
 // physical default route; a change of the network (next hop, interface, the
 // interface's own addresses) or its loss is an event, and a tick that comes
 // much later by the WALL clock than it was due is a wake from sleep (a laptop
-// lid) — the proxy is told both, the way the app's extension tells it:
-// OnPathChange on every change, OnPathUp when a network is there, WakeHealthCheck
-// after a sleep.
+// lid). What the proxy is told of them is paths.go's: the app's calls, but
+// ONE path change per handover — a poller's "gone" and "back" are seconds
+// apart, and the pool reads two path changes that far apart as two handovers.
 
 import (
 	"context"

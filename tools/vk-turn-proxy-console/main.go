@@ -57,6 +57,7 @@ type options struct {
 	keepHosts, route string
 
 	credCache, stateFile, cookieFile string
+	logFile                          string
 	gomaxprocs, keepalive            int
 	statsEvery                       time.Duration
 	tunName                          string
@@ -88,6 +89,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.StringVar(&o.credCache, "cred-cache", ".vk-turn-proxy-console-creds.json", "the console's own TURN credential cache (never the backup's)")
 	fs.StringVar(&o.stateFile, "state-file", ".vk-turn-proxy-console-state.json", "where the changes to the system are journaled with their undo")
 	fs.BoolVar(&o.cleanup, "cleanup", false, "take back what a crashed run left (the state file) and exit")
+	fs.StringVar(&o.logFile, "log", "", "write the log to this file as well as to stderr (appended; created 0600 and handed to the sudo user)")
 	fs.StringVar(&o.cookieFile, "vk-cookie-file", "", "a VK login as Netscape cookies.txt: the authenticated (VKAuth) mode")
 	fs.IntVar(&o.gomaxprocs, "gomaxprocs", 0, "scheduler threads (0 = every core, Go's default)")
 	fs.DurationVar(&o.statsEvery, "stats-every", 30*time.Second, "stats line interval (0 = none)")
@@ -180,6 +182,7 @@ func main() {
 }
 
 func realMain(args []string) int {
+	ignoreBrokenPipe() // before the first byte is written: see the function
 	o, err := parseFlags(args)
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
@@ -193,6 +196,18 @@ func realMain(args []string) int {
 		return 0
 	}
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	if o.logFile != "" {
+		f, err := openLog(o.logFile, os.Getenv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "-log: %v\n", err)
+			return 2
+		}
+		// Never closed: the proxy's goroutines go on logging behind its stop
+		// — the last connection stats — until the process exits, and the file
+		// holds every line stderr does (a close here cut that block short).
+		log.SetOutput(fanout{os.Stderr, f})
+		log.Printf("vk-turn-proxy-console %s started %s (pid %d), log %s", version, time.Now().Format("2006-01-02 15:04:05 -0700"), os.Getpid(), o.logFile)
+	}
 	if o.cleanup {
 		if err := requireRoot(); err != nil {
 			log.Print(err)
@@ -273,6 +288,21 @@ func realMain(args []string) int {
 	defer stop()
 	c := &console{o: o, st: st, dnsPlan: plan, cookie: cookie}
 	return c.run(ctx)
+}
+
+// ignoreBrokenPipe: a dead log must not kill a process that owes a cleanup.
+// A write to a closed pipe on stdout or stderr ends a Go program with SIGPIPE
+// unless the signal is ignored — and that is what Ctrl-C does to
+// `console 2>&1 | tee file`: the terminal signals the whole foreground
+// group, tee dies of it, and the console's next log line is a write to a
+// broken pipe. It died in the middle of its shutdown, the DNS and the split
+// routes taken back and the pins left — pointing at the gateway of a network
+// the machine then left, with that network's own DNS servers among them (the
+// field, 2026-09-30; reproduced on a stand: exit 141). With the signal
+// ignored the write fails, the log package drops the line, and the shutdown
+// goes on to its end.
+func ignoreBrokenPipe() {
+	signal.Ignore(syscall.SIGPIPE)
 }
 
 func requireRoot() error {
@@ -564,11 +594,7 @@ func (c *console) attach() error {
 		_ = tdev.Close()
 		return fmt.Errorf("server %q: %w", c.st.ServerName, err)
 	}
-	lvl := device.LogLevelError
-	if c.o.wgVerbose {
-		lvl = device.LogLevelVerbose
-	}
-	c.dev = device.NewDevice(proxy.WrapTUNForStats(tdev), turnbind.NewTURNBind(c.p), device.NewLogger(lvl, "(wireguard) "))
+	c.dev = device.NewDevice(proxy.WrapTUNForStats(tdev), turnbind.NewTURNBind(c.p), wgLogger(c.o.wgVerbose))
 	if err := c.dev.IpcSet(uapi); err != nil {
 		return fmt.Errorf("wireguard: %v", err)
 	}
@@ -669,20 +695,17 @@ func (c *console) routeHosts() {
 	log.Printf("split mode: the tunnel's subnet and -route go through the tunnel, everything else as before")
 }
 
-// onNetwork tells the proxy what the network monitor saw, as the app's
-// PathMonitor does, and moves the pins and the network's DNS with it.
+// onNetwork moves the pins and the network's DNS with the network, and tells
+// the proxy what the monitor saw — ONE path change per handover (paths.go).
 func (c *console) onNetwork(ev netEvents) {
 	if ev.slept > 0 {
 		log.Printf("woke after about %s — health check", ev.slept.Round(time.Second))
-		c.p.WakeHealthCheck()
 	}
-	if ev.changed {
-		if !ev.up {
-			log.Printf("network: gone (was via %s)", ev.prev)
-			c.pin.setGateway(gateway{}, false, nil)
-			c.p.OnPathChange()
-			return
-		}
+	switch {
+	case ev.changed && !ev.up:
+		log.Printf("network: gone (was via %s)", ev.prev)
+		c.pin.setGateway(gateway{}, false, nil)
+	case ev.changed:
 		was := "none"
 		if ev.prevUp {
 			was = ev.prev.String()
@@ -693,13 +716,12 @@ func (c *console) onNetwork(ev netEvents) {
 		for _, s := range c.src.list() {
 			_ = c.pin.ensure(s)
 		}
-		c.p.OnPathChange()
-		c.p.OnPathUp()
-		return
+	default:
+		if c.ticks++; ev.up && c.ticks%5 == 0 {
+			c.src.set(c.dns.refresh(ev.cur)) // every ~10 s: a rewritten resolv.conf, a new DHCP server
+		}
 	}
-	if c.ticks++; ev.up && c.ticks%5 == 0 {
-		c.src.set(c.dns.refresh(ev.cur)) // every ~10 s: a rewritten resolv.conf, a new DHCP server
-	}
+	tellPath(c.p, proxy.RotateVKSessionClient, ev)
 }
 
 // serve prints the stats and waits for a signal or a failure no retry mends.
@@ -730,11 +752,19 @@ func (c *console) serve(ctx context.Context) int {
 }
 
 func (c *console) printStats() {
-	s := c.p.GetStats()
-	w := readWG(c.dev)
+	log.Print(statsLine(c.p.GetStats(), c.st.NumConns, readWG(c.dev).lastHandshake, c.pin.count(), time.Now()))
+}
+
+// statsLine is the periodic line. "conns" is the connections that are up out
+// of the number CONFIGURED; the proxy's total_conns — every session
+// established since the process started, 80 after one restart of forty — is
+// "sessions", and its reconnects — the watchdog's full restarts alone — are
+// named as that. (Printed as "conns 40/80 · reconnects 0" the two read as a
+// half-dead tunnel that had never reconnected.)
+func statsLine(s proxy.Stats, configured int, lastHandshake time.Time, pins int, now time.Time) string {
 	hs := "never"
-	if !w.lastHandshake.IsZero() {
-		hs = time.Since(w.lastHandshake).Round(time.Second).String() + " ago"
+	if !lastHandshake.IsZero() {
+		hs = now.Sub(lastHandshake).Round(time.Second).String() + " ago"
 	}
 	extra := ""
 	if s.CaptchaImageURL != "" {
@@ -743,15 +773,19 @@ func (c *console) printStats() {
 	if s.CredPoolQuotaRefusals > 0 {
 		extra += fmt.Sprintf(" · 486 ×%d", s.CredPoolQuotaRefusals)
 	}
-	log.Printf("stats: conns %d/%d · tx %.1f MB rx %.1f MB · reconnects %d · pool %d/%d (relays %d) · turn rtt %.0f ms · wg handshake %s · pins %d%s",
-		s.ActiveConns, s.TotalConns, mb(s.TxBytes), mb(s.RxBytes), s.Reconnects,
-		s.CredPoolWithCreds, s.CredPoolSize, s.CredPoolDistinctRelays, s.TurnRTTms, hs, c.pin.count(), extra)
+	return fmt.Sprintf("stats: conns %d/%d · sessions %d since start · tx %.1f MB rx %.1f MB · watchdog restarts %d · pool %d/%d (relays %d) · turn rtt %.0f ms · wg handshake %s · pins %d%s",
+		s.ActiveConns, configured, s.TotalConns, mb(s.TxBytes), mb(s.RxBytes), s.Reconnects,
+		s.CredPoolWithCreds, s.CredPoolSize, s.CredPoolDistinctRelays, s.TurnRTTms, hs, pins, extra)
 }
 
 // shutdown takes everything back in the order that keeps the machine usable:
 // the DNS first (the system resolves again), the routes into the tunnel next
-// (traffic back on the physical path), then the proxy and the device (on
-// FreeBSD the interface goes with it), the pins, whatever is left.
+// (traffic back on the physical path), the pins right behind them — with the
+// default route physical again they change nothing, and whatever ends this
+// process later (the proxy's stop is where it writes most of its log) must
+// not find them in the table: a pin outlives the network it was made on, and
+// on the next network it cuts off what it names — then the proxy and the
+// device (on FreeBSD the interface goes with it), whatever is left.
 func (c *console) shutdown() {
 	run := quiet(runCmd)
 	if c.j.hasPrefix("dns ") {
@@ -759,6 +793,10 @@ func (c *console) shutdown() {
 		afterDNSChange()
 	}
 	c.j.undoPrefix("route ", run, log.Printf)
+	proxy.SetDialHook(nil) // no dial pins anything from here on
+	if c.pin != nil {
+		c.pin.removeAll()
+	}
 	if c.p != nil {
 		c.p.StopWithTimeout(2 * time.Second) // the proxy first, the device second — wgTurnOff's order
 	}
@@ -770,8 +808,6 @@ func (c *console) shutdown() {
 			}
 		}
 	}
-	proxy.SetDialHook(nil)
-	c.pin.removeAll()
 	c.j.undoPrefix("", run, log.Printf)
 	if err := c.j.remove(); err != nil {
 		log.Printf("state: %v", err)
