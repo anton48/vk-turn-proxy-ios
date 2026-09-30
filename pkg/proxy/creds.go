@@ -974,6 +974,32 @@ type credPoolEntry struct {
 // skipping the genuinely saturated ones.
 const credCacheVersion = 2
 
+// credCacheMode names the kind of identity a pool mints and its cache file
+// holds: VK's anonymous ones, or the logged-in account's (creds_vkcookie.go).
+// A file of the other kind is not loaded — the identities must not mix: an
+// account's credential used in anonymous mode deanonymises the account, and
+// anonymous ones used under the account are the previous run's, not its own
+// (the console, 2026-09-30: forty connections ran on the anonymous cache in
+// cookie mode while the account's identity sat in two reserve slots). The app
+// also clears the cache from Swift when the mode changes; the console has no
+// state of its own to know that it did. A file without the field is an
+// anonymous one — every cache written before the field existed. The mode is
+// the pool's from its creation (credCacheModeNow at newCredPool), not the
+// global flag's at save time: the app turns cookie auth off at stop, before
+// the pool's last save.
+const (
+	credCacheModeAnon   = "anon"
+	credCacheModeCookie = "cookie"
+)
+
+// credCacheModeNow is the mode a pool created now mints in.
+func credCacheModeNow() string {
+	if cookieAuthEnabled.Load() {
+		return credCacheModeCookie
+	}
+	return credCacheModeAnon
+}
+
 // credSaturationCooldown is the minimum gap from a slot's last release
 // before we trust it on load. VK allows 10 concurrent TURN allocations
 // per cred set with ~600s server-side lifetime. When a session ends,
@@ -1155,6 +1181,7 @@ const cascadePauseDuration = 30 * time.Second
 type credCacheFile struct {
 	Version int              `json:"version"`
 	SavedAt int64            `json:"saved_at"`
+	Mode    string           `json:"mode,omitempty"` // credCacheModeAnon / credCacheModeCookie; absent in files from before it
 	Creds   []credCacheEntry `json:"creds"`
 }
 
@@ -1197,6 +1224,7 @@ type credPool struct {
 	nextGen  uint64          // last claim stamp handed out — see credPoolEntry.gen
 	size     int             // pool capacity, derived from NumConns via poolSizeForNumConns
 	cooldown time.Duration   // post-failure skip-fetch window (default 5m)
+	mode     string          // credCacheModeAnon / credCacheModeCookie — fixed at creation; what the cache file is stamped with and checked against
 
 	// holders is the pool's record of the leases still out — get() has handed
 	// them out, release() has not yet taken them back — by WHAT each was taken
@@ -1638,6 +1666,7 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 		cooldown:  cooldown,
 		cachePath: cachePath,
 		fetch:     fetch,
+		mode:      credCacheModeNow(),
 		// Pre-size to `size` so later code (loadFromDisk, seedSlot,
 		// the relocation loop in seedSlot, etc.) always sees the full
 		// slot array with empty zero-entries in unused positions
@@ -1724,6 +1753,14 @@ func (cp *credPool) loadFromDisk() {
 	}
 	if f.Version != credCacheVersion {
 		log.Printf("credpool: load: version %d != expected %d — ignoring file", f.Version, credCacheVersion)
+		return
+	}
+	fileMode := f.Mode
+	if fileMode == "" {
+		fileMode = credCacheModeAnon // from before the field existed
+	}
+	if fileMode != cp.mode {
+		log.Printf("credpool: load: the cache holds %s identities and this pool mints %s — ignoring file (it is rewritten at the next save)", fileMode, cp.mode)
 		return
 	}
 
@@ -1824,6 +1861,7 @@ func (cp *credPool) saveToDisk() {
 	f := credCacheFile{
 		Version: credCacheVersion,
 		SavedAt: now.Unix(),
+		Mode:    cp.mode,
 	}
 	for slot, entry := range cp.pool {
 		if entry.creds == nil {
