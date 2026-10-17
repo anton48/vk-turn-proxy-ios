@@ -41,7 +41,11 @@ type pinner struct {
 	tunnel *net.IPNet
 	never  map[string]bool // the tunnel's DNS servers
 
-	wanted  map[string]bool    // every address ever asked for, pinned or not yet
+	// wanted is only what was ASKED — the addresses setGateway follows; it
+	// says nothing about the routing table. What the table holds is pinned
+	// (a route of ours, confirmed by its command) and foreign (one that was
+	// there already); a pin that failed is in neither and is tried again.
+	wanted  map[string]bool    // every address ever asked for, pinned or not
 	pinned  map[string]gateway // pinned by us, and via which gateway: re-pointed when it changes, deleted on exit
 	foreign map[string]bool    // a route existed already: not ours, left alone
 }
@@ -93,29 +97,51 @@ func (p *pinner) skipLocked(ip net.IP) string {
 	return ""
 }
 
-// ensure pins ip via the physical gateway unless it needs none or has one.
+// ensure pins ip via the physical gateway unless it needs none or has one —
+// on every call until the routing table has it: a pin whose command failed,
+// or a re-point that failed at a gateway change, is tried again here, and its
+// error goes back to the dial (which then does not go into the tunnel).
 func (p *pinner) ensure(ip string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.enabled || p.wanted[ip] {
+	if !p.enabled {
 		return nil
 	}
 	parsed := net.ParseIP(ip)
 	if parsed == nil || parsed.To4() == nil {
 		return nil
 	}
-	if why := p.skipLocked(parsed); why != "" {
-		if why == "one of the tunnel's DNS servers" {
-			p.logf("pin %s: not pinned — %s (a pin would take everyone's DNS around the tunnel)", ip, why)
+	first := !p.wanted[ip]
+	p.wanted[ip] = true
+	if via, ours := p.pinned[ip]; ours {
+		if !p.hasGW || via == p.gw {
+			return nil
 		}
-		p.wanted[ip] = true
+		return p.repinLocked(ip) // still via a gateway that is gone: its re-point failed
+	}
+	if p.foreign[ip] {
 		return nil
 	}
-	p.wanted[ip] = true
+	if why := p.skipLocked(parsed); why != "" {
+		if first && why == "one of the tunnel's DNS servers" {
+			p.logf("pin %s: not pinned — %s (a pin would take everyone's DNS around the tunnel)", ip, why)
+		}
+		return nil
+	}
 	if !p.hasGW {
 		return nil // no network now: pinned when a gateway appears (setGateway)
 	}
 	return p.addLocked(ip)
+}
+
+// repinLocked points an existing pin at the current gateway.
+func (p *pinner) repinLocked(ip string) error {
+	if _, err := p.run(p.cmds.repin(ip, p.gw)); err != nil {
+		p.logf("re-pin %s via %s: %v", ip, p.gw, err)
+		return err
+	}
+	p.pinned[ip] = p.gw
+	return nil
 }
 
 func (p *pinner) addLocked(ip string) error {
@@ -153,11 +179,7 @@ func (p *pinner) setGateway(gw gateway, up bool, onlink []*net.IPNet) {
 		via, ours := p.pinned[ip]
 		switch {
 		case ours && via != gw:
-			if _, err := p.run(p.cmds.repin(ip, gw)); err != nil {
-				p.logf("re-pin %s via %s: %v", ip, gw, err)
-				continue
-			}
-			p.pinned[ip] = gw
+			_ = p.repinLocked(ip) // a failure stays via the old gateway: ensure tries again
 		case !ours && !p.foreign[ip]:
 			if parsed := net.ParseIP(ip); parsed != nil && p.skipLocked(parsed) == "" {
 				_ = p.addLocked(ip)

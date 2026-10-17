@@ -30,6 +30,7 @@ type fakeRun struct {
 	mu     sync.Mutex
 	cmds   []string
 	exists map[string]bool
+	fail   map[string]int // a host whose add / change fails this many more times
 	j      *journal
 	// journaledFirst: the pin's undo was in the journal when its add ran.
 	journaledFirst []bool
@@ -42,6 +43,12 @@ func (f *fakeRun) run(argv []string) (string, error) {
 	f.cmds = append(f.cmds, cmd)
 	if len(argv) > 5 && argv[3] == "add" && strings.HasSuffix(argv[5], "/32") && f.j != nil {
 		f.journaledFirst = append(f.journaledFirst, f.j.has(pinKey(strings.TrimSuffix(argv[5], "/32"))))
+	}
+	for h, n := range f.fail {
+		if n > 0 && (strings.Contains(cmd, " add ") || strings.Contains(cmd, " change ")) && strings.Contains(cmd, h+"/32") {
+			f.fail[h] = n - 1
+			return "route: writing to routing socket: Network is unreachable", errors.New("exit status 1")
+		}
 	}
 	for h := range f.exists {
 		if strings.Contains(cmd, " add ") && strings.Contains(cmd, h+"/32") {
@@ -60,7 +67,7 @@ func (f *fakeRun) list() []string {
 func testPinner(t *testing.T) (*pinner, *fakeRun, *journal) {
 	t.Helper()
 	j := newJournal(filepath.Join(t.TempDir(), "state.json"))
-	f := &fakeRun{exists: map[string]bool{}, j: j}
+	f := &fakeRun{exists: map[string]bool{}, fail: map[string]int{}, j: j}
 	p := newPinner(darwinCmds{}, f.run, j, t.Logf)
 	_, p.tunnel, _ = net.ParseCIDR("10.66.66.2/24")
 	p.never["1.1.1.1"] = true
