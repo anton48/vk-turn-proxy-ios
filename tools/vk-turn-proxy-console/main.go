@@ -32,6 +32,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -370,6 +371,10 @@ type console struct {
 
 	mctx     context.Context    // the monitor's life
 	wakeStop context.CancelFunc // the wake handshake in progress, if any
+
+	monStop context.CancelFunc // ends the monitor (startMonitor)
+	monDone chan struct{}      // closed when the monitor's goroutine has returned
+	bg      sync.WaitGroup     // what the monitor started (the wake's handshake): spawn
 }
 
 func (c *console) run(ctx context.Context) int {
@@ -449,10 +454,7 @@ func (c *console) run(ctx context.Context) int {
 	}
 
 	mon := newNetMonitor(netPoll, readDefaultRoute, networkIdentity, gw, up, time.Now())
-	mctx, cancel := context.WithCancel(ctx)
-	c.mctx = mctx
-	defer cancel()
-	go mon.run(mctx, c.onNetwork)
+	c.startMonitor(ctx, func(mctx context.Context) { mon.run(mctx, c.onNetwork) })
 
 	return c.serve(ctx)
 }
@@ -834,6 +836,56 @@ func statsLine(s proxy.Stats, configured int, lastHandshake time.Time, pins int,
 		s.CredPoolWithCreds, s.CredPoolSize, s.CredPoolDistinctRelays, s.TurnRTTms, hs, pins, extra)
 }
 
+// startMonitor runs the network monitor's loop on a goroutine of its own,
+// under a context of its own (c.mctx — the wake's handshake derives from it).
+func (c *console) startMonitor(parent context.Context, loop func(ctx context.Context)) {
+	mctx, cancel := context.WithCancel(parent)
+	c.mctx, c.monStop, c.monDone = mctx, cancel, make(chan struct{})
+	go func() {
+		defer close(c.monDone)
+		loop(mctx)
+	}()
+}
+
+// spawn runs f on a goroutine the stop waits for (stopMonitor) — anything the
+// monitor starts that outlives its handler.
+func (c *console) spawn(f func()) {
+	c.bg.Add(1)
+	go func() {
+		defer c.bg.Done()
+		f()
+	}()
+}
+
+// monitorStopWait bounds the stop's wait for the monitor: a handler runs a few
+// short commands (a re-pin, the DNS's refresh); one that hangs must not keep
+// the machine's routes and DNS in the tunnel for ever.
+var monitorStopWait = 10 * time.Second
+
+// stopMonitor ends the network monitor and WAITS for it — the handler that may
+// be running, and what it started — before anything is taken back. Cancelling
+// alone is not enough: a handler already under way would refresh the DNS
+// after its undo (to a resolv.conf rewriter the restored file is «something
+// else rewrote it», and the tunnel's servers go back in, journaled anew) or
+// make a pin after the pins are gone.
+func (c *console) stopMonitor() {
+	if c.monStop == nil {
+		return // never started
+	}
+	c.monStop()
+	done := make(chan struct{})
+	go func() {
+		<-c.monDone // the monitor's own goroutine first: only it can spawn
+		c.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(monitorStopWait):
+		log.Printf("network monitor: still busy %s after the stop — the cleanup goes on; whatever it changes after this may survive it (-cleanup takes back what the journal records)", monitorStopWait)
+	}
+}
+
 // shutdown takes everything back in the order that keeps the machine usable:
 // the DNS first (the system resolves again), the routes into the tunnel next
 // (traffic back on the physical path), the pins right behind them — with the
@@ -843,6 +895,7 @@ func statsLine(s proxy.Stats, configured int, lastHandshake time.Time, pins int,
 // on the next network it cuts off what it names — then the proxy and the
 // device (on FreeBSD the interface goes with it), whatever is left.
 func (c *console) shutdown() {
+	c.stopMonitor()
 	run := quiet(runCmd)
 	if c.j.hasPrefix("dns ") {
 		c.j.undoPrefix("dns ", run, log.Printf)

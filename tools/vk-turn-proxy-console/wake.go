@@ -151,7 +151,7 @@ func (c *console) rekeyAfterWake(before proxy.Stats, noticed time.Time) {
 	ctx, stop := context.WithCancel(c.mctx)
 	c.wakeStop = stop
 	k := &wakeKick{since: since, before: before}
-	go func() {
+	c.spawn(func() {
 		defer stop()
 		t := time.NewTicker(wakeKickTick)
 		defer t.Stop()
@@ -181,5 +181,5 @@ func (c *console) rekeyAfterWake(before proxy.Stats, noticed time.Time) {
 				}
 			}
 		}
-	}()
+	})
 }

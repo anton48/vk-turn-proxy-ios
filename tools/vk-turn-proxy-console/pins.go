@@ -173,10 +173,11 @@ func (p *pinner) enable(on bool) {
 	p.mu.Unlock()
 }
 
-// removeAll deletes every pin the console made.
+// removeAll deletes every pin the console made and turns pinning off.
 func (p *pinner) removeAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.enabled = false // from here on nothing pins: a late dial or a gateway change must not put one back
 	for ip := range p.pinned {
 		_, del := p.cmds.pin(ip, p.gw)
 		if _, err := p.run(del); err != nil && !alreadyGone(err) {

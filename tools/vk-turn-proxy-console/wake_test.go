@@ -442,7 +442,8 @@ func TestOnNetworkHasWireGuardHandshakeAfterASleep(t *testing.T) {
 		return true
 	})
 	// attach: c.peer = findPeer(c.dev, c.st.PeerPublicKey), after the device
-	// has its configuration; run: c.mctx = mctx, before the monitor starts.
+	// has its configuration; startMonitor (run's way to start the monitor):
+	// c.mctx = mctx, before the monitor's loop starts.
 	assigned := func(fn, field string) (call *ast.CallExpr, rhs ast.Expr, pos token.Pos) {
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
@@ -451,12 +452,14 @@ func TestOnNetworkHasWireGuardHandshakeAfterASleep(t *testing.T) {
 			}
 			ast.Inspect(fd, func(n ast.Node) bool {
 				as, ok := n.(*ast.AssignStmt)
-				if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+				if !ok || len(as.Lhs) != len(as.Rhs) {
 					return true
 				}
-				if l, ok := as.Lhs[0].(*ast.SelectorExpr); ok && l.Sel.Name == field {
-					rhs, pos = as.Rhs[0], as.Pos()
-					call, _ = as.Rhs[0].(*ast.CallExpr)
+				for i, lhs := range as.Lhs {
+					if l, ok := lhs.(*ast.SelectorExpr); ok && l.Sel.Name == field {
+						rhs, pos = as.Rhs[i], as.Pos()
+						call, _ = as.Rhs[i].(*ast.CallExpr)
+					}
 				}
 				return true
 			})
@@ -495,11 +498,27 @@ func TestOnNetworkHasWireGuardHandshakeAfterASleep(t *testing.T) {
 	} else if set := firstCall("attach", "IpcSet"); set == token.NoPos || peerAt < set {
 		t.Error("attach looks for the peer before the device has its configuration — there is none to find yet")
 	}
-	_, ctxRHS, ctxAt := assigned("run", "mctx")
+	_, ctxRHS, ctxAt := assigned("startMonitor", "mctx")
+	loopAt := token.NoPos // startMonitor's call of the monitor's loop
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "startMonitor" {
+			ast.Inspect(fd, func(n ast.Node) bool {
+				if c, ok := n.(*ast.CallExpr); ok && loopAt == token.NoPos {
+					if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "loop" {
+						loopAt = c.Pos()
+					}
+				}
+				return true
+			})
+		}
+	}
 	if id, ok := ctxRHS.(*ast.Ident); !ok || id.Name != "mctx" {
-		t.Error("run does not keep the monitor's context (c.mctx = mctx) — the wake's handshake would not start")
-	} else if mon := firstCall("run", "run"); mon == token.NoPos || ctxAt > mon {
-		t.Error("run keeps the monitor's context after the monitor has started — the first wake may find none")
+		t.Error("startMonitor does not keep the monitor's context (c.mctx = mctx) — the wake's handshake would not start")
+	} else if loopAt == token.NoPos || ctxAt > loopAt {
+		t.Error("startMonitor keeps the monitor's context after the monitor has started — the first wake may find none")
+	}
+	if firstCall("run", "startMonitor") == token.NoPos {
+		t.Error("run does not start the monitor through startMonitor — nothing keeps its context, and the stop cannot wait for it")
 	}
 	switch {
 	case statsAt == token.NoPos || tellAt == token.NoPos || rekeyAt == token.NoPos:

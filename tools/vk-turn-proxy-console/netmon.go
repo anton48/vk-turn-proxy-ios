@@ -69,6 +69,9 @@ func (m *netMonitor) run(ctx context.Context, handle func(netEvents)) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			if ctx.Err() != nil {
+				return // a tick that was ready beside the cancel: select picks either
+			}
 			handle(m.step(time.Now()))
 		}
 	}
