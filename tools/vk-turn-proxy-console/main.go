@@ -436,7 +436,12 @@ func (c *console) run(ctx context.Context) int {
 		return 0
 	}
 	if c.o.defaultRoute {
-		if !c.switchDefaultRoute(ctx) {
+		ok, err := c.switchDefaultRoute(ctx)
+		if err != nil {
+			log.Print(err)
+			return 1 // the deferred shutdown takes back whatever is left
+		}
+		if !ok {
 			return 0
 		}
 	} else {
@@ -649,33 +654,54 @@ func (c *console) waitHandshake(ctx context.Context) bool {
 
 // switchDefaultRoute moves everything into the tunnel once every connection
 // is up, or after -default-route-wait: the two halves, the IPv6 block, the DNS.
-func (c *console) switchDefaultRoute(ctx context.Context) bool {
+// false: the console is stopping; an error: it must not go on (activate).
+func (c *console) switchDefaultRoute(ctx context.Context) (bool, error) {
 	deadline := time.Now().Add(c.o.defaultRouteWait)
 	for int(c.p.GetStats().ActiveConns) < c.st.NumConns && time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			return false
+			return false, nil
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	for _, r := range hostCmds.splitRoutes(c.tun) {
+	return true, c.activate(hostCmds, runCmd, func() int { return int(c.p.GetStats().ActiveConns) })
+}
+
+// activate is the switch itself. Every route's undo is journaled before the
+// route is made.
+//   - The two halves: one that cannot be made leaves the default route where
+//     it is — the halves made are taken back and the console goes on, nothing
+//     moved.
+//   - The IPv6 block, with -block-ipv6: one route that cannot be made (or
+//     journaled) ENDS the activation — the IPv6 routes made and the two halves
+//     are taken back, the DNS is not touched, and the error stops the console.
+//     Going on would carry IPv4 into the tunnel and leave IPv6 on the physical
+//     path the user asked to block.
+//   - The DNS, then the line that says the default route is in the tunnel.
+func (c *console) activate(cmds netCmds, run func([]string) (string, error), active func() int) error {
+	undo := quiet(run)
+	for _, r := range cmds.splitRoutes(c.tun) {
 		if err := c.j.add(undoStep{Key: "route split " + r.key, Argv: r.del}); err != nil {
 			log.Printf("state: %v — the default route stays where it is", err)
-			return true
+			c.j.undoPrefix("route split ", undo, log.Printf)
+			return nil
 		}
-		if _, err := runCmd(r.add); err != nil {
+		if _, err := run(r.add); err != nil {
 			log.Printf("default route: %v — it stays where it is", err)
-			c.j.undoPrefix("route split ", quiet(runCmd), log.Printf)
-			return true
+			c.j.undoPrefix("route split ", undo, log.Printf)
+			return nil
 		}
 	}
 	if c.pin.blockV6 {
-		for _, r := range hostCmds.ipv6Block(c.tun) {
-			if err := c.j.add(undoStep{Key: "route ipv6 " + r.key, Argv: r.del}); err != nil {
-				break
+		for _, r := range cmds.ipv6Block(c.tun) {
+			err := c.j.add(undoStep{Key: "route ipv6 " + r.key, Argv: r.del})
+			if err == nil {
+				_, err = run(r.add)
 			}
-			if _, err := runCmd(r.add); err != nil {
-				log.Printf("-block-ipv6: %v", err)
+			if err != nil {
+				c.j.undoPrefix("route ipv6 ", undo, log.Printf)
+				c.j.undoPrefix("route split ", undo, log.Printf)
+				return fmt.Errorf("-block-ipv6: %v — IPv6 cannot be sent into the tunnel, so the default route is NOT moved (IPv6 would go around the tunnel): the routes made are taken back and the console stops", err)
 			}
 		}
 	}
@@ -687,9 +713,8 @@ func (c *console) switchDefaultRoute(ctx context.Context) bool {
 			dnsNote = "DNS " + strings.Join(c.dnsPlan.servers, ", ")
 		}
 	}
-	s := c.p.GetStats()
-	log.Printf("DEFAULT ROUTE → the tunnel (%d/%d connections up); %s; %d pin(s) via the physical gateway", s.ActiveConns, c.st.NumConns, dnsNote, c.pin.count())
-	return true
+	log.Printf("DEFAULT ROUTE → the tunnel (%d/%d connections up); %s; %d pin(s) via the physical gateway", active(), c.st.NumConns, dnsNote, c.pin.count())
+	return nil
 }
 
 // routeHosts: split mode — -route hosts into the tunnel.
