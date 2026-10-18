@@ -32,6 +32,15 @@ type fakeRun struct {
 	exists map[string]bool
 	fail   map[string]int // a host whose add / change fails this many more times
 	j      *journal
+	// The routing table's /32s as route(8) leaves them, with the answers
+	// measured on the stands (2026-10-18): `route -n get` shows a host's own
+	// route (destination, a /32 mask) or the covering one (destination
+	// default); `change` of a /32 that is gone answers «route has not been
+	// found» on FreeBSD and, on macOS, 0 — having changed the covering route
+	// (counted in coverChanged).
+	table        map[string]string // host → the gateway argv tail
+	freebsd      bool
+	coverChanged int
 	// journaledFirst: the pin's undo was in the journal when its add ran.
 	journaledFirst []bool
 }
@@ -44,6 +53,13 @@ func (f *fakeRun) run(argv []string) (string, error) {
 	if len(argv) > 5 && argv[3] == "add" && strings.HasSuffix(argv[5], "/32") && f.j != nil {
 		f.journaledFirst = append(f.journaledFirst, f.j.has(pinKey(strings.TrimSuffix(argv[5], "/32"))))
 	}
+	if len(argv) == 5 && argv[1] == "-n" && argv[2] == "get" {
+		h := argv[4]
+		if _, ok := f.table[h]; ok {
+			return "   route to: " + h + "\ndestination: " + h + "\n       mask: 255.255.255.255\n      flags: <UP,DONE,STATIC>\n", nil
+		}
+		return "   route to: " + h + "\ndestination: default\n       mask: default\n      flags: <UP,GATEWAY,DONE,STATIC>\n", nil
+	}
 	for h, n := range f.fail {
 		if n > 0 && (strings.Contains(cmd, " add ") || strings.Contains(cmd, " change ")) && strings.Contains(cmd, h+"/32") {
 			f.fail[h] = n - 1
@@ -55,7 +71,44 @@ func (f *fakeRun) run(argv []string) (string, error) {
 			return "route: writing to routing socket: File exists", errors.New("exit status 1")
 		}
 	}
+	if len(argv) > 5 && argv[0] == "route" && strings.HasSuffix(argv[5], "/32") {
+		h, tail := strings.TrimSuffix(argv[5], "/32"), strings.Join(argv[6:], " ")
+		_, have := f.table[h]
+		switch argv[3] {
+		case "add":
+			f.table[h] = tail
+		case "delete":
+			if !have {
+				return "route: writing to routing socket: not in table", errors.New("exit status 1: not in table")
+			}
+			delete(f.table, h)
+		case "change":
+			if !have {
+				if f.freebsd {
+					return "route: route has not been found", errors.New("exit status 1: route: route has not been found")
+				}
+				f.coverChanged++ // macOS: 0, and the covering route re-pointed
+				return "change net " + h + ": gateway " + tail, nil
+			}
+			f.table[h] = tail
+		}
+	}
 	return "", nil
+}
+
+// vanish takes a host's route out of the table, as the kernel does when the
+// interface it went through goes away.
+func (f *fakeRun) vanish(h string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.table, h)
+}
+
+func (f *fakeRun) via(h string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g, ok := f.table[h]
+	return g, ok
 }
 
 func (f *fakeRun) list() []string {
@@ -67,7 +120,7 @@ func (f *fakeRun) list() []string {
 func testPinner(t *testing.T) (*pinner, *fakeRun, *journal) {
 	t.Helper()
 	j := newJournal(filepath.Join(t.TempDir(), "state.json"))
-	f := &fakeRun{exists: map[string]bool{}, fail: map[string]int{}, j: j}
+	f := &fakeRun{exists: map[string]bool{}, fail: map[string]int{}, j: j, table: map[string]string{}}
 	p := newPinner(darwinCmds{}, f.run, j, t.Logf)
 	_, p.tunnel, _ = net.ParseCIDR("10.66.66.2/24")
 	p.never["1.1.1.1"] = true

@@ -41,7 +41,7 @@ func stopping(t *testing.T) (c *console, rc, orig string, d *resolvConfDNS) {
 	if err := d.apply("", []string{"198.51.100.53"}); err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeRun{exists: map[string]bool{}, j: j}
+	f := &fakeRun{exists: map[string]bool{}, j: j, table: map[string]string{}}
 	c = &console{j: j, dns: d, pin: newPinner(linuxCmds{}, f.run, j, t.Logf)}
 	return c, rc, orig, d
 }

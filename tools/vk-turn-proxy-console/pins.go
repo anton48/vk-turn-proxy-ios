@@ -134,14 +134,33 @@ func (p *pinner) ensure(ip string) error {
 	return p.addLocked(ip)
 }
 
-// repinLocked points an existing pin at the current gateway.
+// repinLocked points a pin at the current gateway — or, when its route is
+// gone (it went with the old interface), makes it anew: a re-point of a route
+// that is not there is no re-point (hostRouteQuery says why).
 func (p *pinner) repinLocked(ip string) error {
+	if q := p.cmds.hostRouteQuery(ip); q != nil {
+		if out, err := p.run(q); err != nil || !isOwnHostRoute(out, ip) {
+			return p.remakeLocked(ip)
+		}
+	}
 	if _, err := p.run(p.cmds.repin(ip, p.gw)); err != nil {
+		if routeNotFound(err) { // gone between the query and the change
+			return p.remakeLocked(ip)
+		}
 		p.logf("re-pin %s via %s: %v", ip, p.gw, err)
 		return err
 	}
 	p.pinned[ip] = p.gw
 	return nil
+}
+
+// remakeLocked: the pin's route is gone — it is no longer ours to re-point,
+// and it is made again via the current gateway (a failure is tried again at
+// the next ask, as any pin's).
+func (p *pinner) remakeLocked(ip string) error {
+	delete(p.pinned, ip)
+	p.logf("pin %s: its route is gone (with the old interface) — made again via %s", ip, p.gw)
+	return p.addLocked(ip)
 }
 
 func (p *pinner) addLocked(ip string) error {

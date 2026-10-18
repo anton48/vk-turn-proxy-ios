@@ -174,3 +174,43 @@ func sshClientIP(env string) string {
 	}
 	return ""
 }
+
+// isOwnHostRoute reads `route -n get -inet <ip>` (BSD): true when the route
+// found is a host route for ip itself — destination ip, and the HOST flag
+// (FreeBSD) or a /32 mask (macOS, which shows a /32 added as -inet ip/32 with
+// a mask and no HOST flag). A missing host route reads as its covering route:
+// destination 0.0.0.0 / default, or a network.
+func isOwnHostRoute(out, ip string) bool {
+	dest, host := false, false
+	for _, line := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		switch strings.TrimSpace(k) {
+		case "destination":
+			dest = v == ip
+		case "mask":
+			if v == "255.255.255.255" {
+				host = true
+			}
+		case "flags":
+			for _, f := range strings.FieldsFunc(v, func(r rune) bool { return r == '<' || r == '>' || r == ',' }) {
+				if f == "HOST" {
+					host = true
+				}
+			}
+		}
+	}
+	return dest && host
+}
+
+// routeNotFound: route(8)'s words for a route the table does not hold.
+func routeNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "route has not been found") || strings.Contains(msg, "not in table")
+}

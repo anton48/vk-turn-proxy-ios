@@ -60,6 +60,13 @@ type netCmds interface {
 	// pin at a new one.
 	pin(ip string, gw gateway) (add, del []string)
 	repin(ip string, gw gateway) []string
+	// hostRouteQuery asks the table for ip's route before a repin, nil where
+	// repin itself makes a missing route (Linux: ip route replace). On the
+	// BSDs `route change` of a host route that is gone is NOT a re-point:
+	// FreeBSD answers «route has not been found», and macOS answers 0 and
+	// changes the best-matching route instead — the default, or the half of
+	// the address space that is in the tunnel (measured 2026-10-18).
+	hostRouteQuery(ip string) []string
 	// destroy removes a tunnel interface that outlives its process (FreeBSD's
 	// cloned tun); nil elsewhere.
 	destroy(ifname string) []string
@@ -107,6 +114,10 @@ func (bsdRoutes) pin(ip string, gw gateway) (add, del []string) {
 
 func (bsdRoutes) repin(ip string, gw gateway) []string {
 	return append([]string{"route", "-q", "-n", "change", "-inet", ip + "/32"}, bsdHop(gw)...)
+}
+
+func (bsdRoutes) hostRouteQuery(ip string) []string {
+	return []string{"route", "-n", "get", "-inet", ip}
 }
 
 type darwinCmds struct{ bsdRoutes }
@@ -200,5 +211,7 @@ func (linuxCmds) pin(ip string, gw gateway) (add, del []string) {
 func (linuxCmds) repin(ip string, gw gateway) []string {
 	return append([]string{"ip", "-4", "route", "replace", ip + "/32"}, linuxHop(gw)...)
 }
+
+func (linuxCmds) hostRouteQuery(string) []string { return nil } // ip route replace makes it if it is gone
 
 func (linuxCmds) destroy(string) []string { return nil } // a tun without TUNSETPERSIST goes with its descriptor
