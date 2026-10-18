@@ -14,6 +14,7 @@ package main
 // file /etc/resolv.conf, its old content in the state file (this file).
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -122,9 +123,13 @@ func (d *resolvConfDNS) refresh(gateway) []string {
 // system's DNS from its own goroutine — from the proxy's start on — while
 // the default route's switch applies it.
 type lockedDNS struct {
-	mu sync.Mutex
-	d  systemDNS
+	mu     sync.Mutex
+	d      systemDNS
+	closed bool     // the stop has begun: nothing may change the system's DNS again
+	last   []string // the last refresh's answer, given after the close
 }
+
+var errDNSClosed = errors.New("the console is stopping: the system's DNS is not changed again")
 
 func (l *lockedDNS) originals() []string {
 	l.mu.Lock()
@@ -135,11 +140,30 @@ func (l *lockedDNS) originals() []string {
 func (l *lockedDNS) apply(tun string, servers []string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return errDNSClosed
+	}
 	return l.d.apply(tun, servers)
 }
 
+// refresh after the close answers what it last read and touches nothing: a
+// resolv.conf refresh writes the tunnel's servers back when the file is not
+// what it wrote — which the stop's undo has just made true.
 func (l *lockedDNS) refresh(gw gateway) []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.d.refresh(gw)
+	if l.closed {
+		return l.last
+	}
+	l.last = l.d.refresh(gw)
+	return l.last
+}
+
+// close ends every later change, after the call under way (a command is
+// bounded by cmdTimeout): the stop closes the DNS before it takes it back, so
+// that a monitor handler it could not wait out changes nothing after it.
+func (l *lockedDNS) close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true
 }

@@ -3,16 +3,29 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os/exec"
 	"strings"
+	"time"
 )
+
+// cmdTimeout bounds every OS tool the console runs: route(8), ip(8),
+// ifconfig, networksetup, resolvectl take milliseconds; one that hangs is
+// killed, so that nothing the console waits for — the network monitor's
+// handler at the stop above all — waits for ever.
+var cmdTimeout = 20 * time.Second
 
 // runCmd runs an OS tool and returns its combined output. The commands carry
 // addresses and interface names, never a secret.
 func runCmd(argv []string) (string, error) {
-	out, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), cmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, argv[0], argv[1:]...).CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), fmt.Errorf("%s: killed after %s", strings.Join(argv, " "), cmdTimeout)
+	}
 	if err != nil {
 		return string(out), fmt.Errorf("%s: %v: %s", strings.Join(argv, " "), err, strings.TrimSpace(string(out)))
 	}

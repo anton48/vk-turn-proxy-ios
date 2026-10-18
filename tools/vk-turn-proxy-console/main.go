@@ -917,6 +917,9 @@ func (c *console) stopMonitor() {
 // device (on FreeBSD the interface goes with it), whatever is left.
 func (c *console) shutdown() {
 	c.stopMonitor()
+	if l, ok := c.dns.(*lockedDNS); ok {
+		l.close() // a handler the stop could not wait out changes the DNS no more
+	}
 	run := quiet(runCmd)
 	if c.j.hasPrefix("dns ") {
 		c.j.undoPrefix("dns ", run, log.Printf)

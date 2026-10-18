@@ -58,7 +58,14 @@ func (j *journal) add(s undoStep) error {
 		}
 	}
 	j.doc.Undo = append(j.doc.Undo, s)
-	return j.writeLocked()
+	if err := j.writeLocked(); err != nil {
+		// Not on disk, so not recorded: an entry kept in memory would read as
+		// «recorded already» at the next attempt and the change would be made
+		// with no undo the file knows of — a crash would leave it behind.
+		j.doc.Undo = j.doc.Undo[:len(j.doc.Undo)-1]
+		return err
+	}
+	return nil
 }
 
 // done drops the undo of a change taken back.

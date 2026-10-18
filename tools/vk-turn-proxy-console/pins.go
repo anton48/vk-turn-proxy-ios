@@ -48,6 +48,7 @@ type pinner struct {
 	wanted  map[string]bool    // every address ever asked for, pinned or not
 	pinned  map[string]gateway // pinned by us, and via which gateway: re-pointed when it changes, deleted on exit
 	foreign map[string]bool    // a route existed already: not ours, left alone
+	lost    bool               // the path was lost since the pins were last confirmed: an interface that went took its routes with it
 }
 
 func newPinner(cmds netCmds, run func([]string) (string, error), j *journal, logf func(string, ...any)) *pinner {
@@ -154,6 +155,26 @@ func (p *pinner) repinLocked(ip string) error {
 	return nil
 }
 
+// recheckLocked confirms a pin after the path was lost, the gateway the same:
+// the routing table is asked (the BSDs), and a pin that went with the
+// interface is made again; Linux's re-point (ip route replace) makes a route
+// that is gone and leaves one that is there. A pin that cannot be confirmed
+// is no pin: out of pinned, made at the next ask.
+func (p *pinner) recheckLocked(ip string) error {
+	if q := p.cmds.hostRouteQuery(ip); q != nil {
+		if out, err := p.run(q); err == nil && isOwnHostRoute(out, ip) {
+			return nil
+		}
+		return p.remakeLocked(ip)
+	}
+	if _, err := p.run(p.cmds.repin(ip, p.gw)); err != nil {
+		p.logf("pin %s: not confirmed after the path came back via %s: %v", ip, p.gw, err)
+		delete(p.pinned, ip)
+		return err
+	}
+	return nil
+}
+
 // remakeLocked: the pin's route is gone — it is no longer ours to re-point,
 // and it is made again via the current gateway (a failure is tried again at
 // the next ask, as any pin's).
@@ -191,14 +212,22 @@ func (p *pinner) setGateway(gw gateway, up bool, onlink []*net.IPNet) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.gw, p.hasGW, p.onlink = gw, up, onlink
-	if !up || !p.enabled {
+	if !up {
+		p.lost = true // the interface may have gone, and with it every route through it — the pins too
 		return
 	}
+	if !p.enabled {
+		return
+	}
+	recheck := p.lost // back after a loss: a pin recorded via THIS gateway may be gone all the same
+	p.lost = false
 	for ip := range p.wanted {
 		via, ours := p.pinned[ip]
 		switch {
 		case ours && via != gw:
 			_ = p.repinLocked(ip) // a failure stays via the old gateway: ensure tries again
+		case ours && recheck:
+			_ = p.recheckLocked(ip)
 		case !ours && !p.foreign[ip]:
 			if parsed := net.ParseIP(ip); parsed != nil && p.skipLocked(parsed) == "" {
 				_ = p.addLocked(ip)
