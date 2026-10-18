@@ -49,11 +49,17 @@ type pinner struct {
 	pinned  map[string]gateway // pinned by us, and via which gateway: re-pointed when it changes, deleted on exit
 	foreign map[string]bool    // a route existed already: not ours, left alone
 	lost    bool               // the path was lost since the pins were last confirmed: an interface that went took its routes with it
+	// unsure: pins of ours a check could not confirm — the query (or Linux's
+	// replace) FAILED, which says nothing of the route. They stay ours, undo
+	// and all, and are checked again at the next ask or gateway reading. A
+	// failed check is never «gone»: a remake of a route that is there gets
+	// «File exists» and would hand our own route over as foreign.
+	unsure map[string]bool
 }
 
 func newPinner(cmds netCmds, run func([]string) (string, error), j *journal, logf func(string, ...any)) *pinner {
 	return &pinner{cmds: cmds, run: run, j: j, logf: logf, never: map[string]bool{},
-		wanted: map[string]bool{}, pinned: map[string]gateway{}, foreign: map[string]bool{}}
+		wanted: map[string]bool{}, pinned: map[string]gateway{}, foreign: map[string]bool{}, unsure: map[string]bool{}}
 }
 
 // hook is proxy.SetDialHook's function.
@@ -115,10 +121,15 @@ func (p *pinner) ensure(ip string) error {
 	first := !p.wanted[ip]
 	p.wanted[ip] = true
 	if via, ours := p.pinned[ip]; ours {
-		if !p.hasGW || via == p.gw {
+		switch {
+		case !p.hasGW:
 			return nil
+		case via != p.gw:
+			return p.repinLocked(ip) // still via a gateway that is gone: its re-point failed
+		case p.unsure[ip]:
+			return p.recheckLocked(ip) // its last check failed: the route may or may not be there
 		}
-		return p.repinLocked(ip) // still via a gateway that is gone: its re-point failed
+		return nil
 	}
 	if p.foreign[ip] {
 		return nil
@@ -140,7 +151,14 @@ func (p *pinner) ensure(ip string) error {
 // that is not there is no re-point (hostRouteQuery says why).
 func (p *pinner) repinLocked(ip string) error {
 	if q := p.cmds.hostRouteQuery(ip); q != nil {
-		if out, err := p.run(q); err != nil || !isOwnHostRoute(out, ip) {
+		out, err := p.run(q)
+		if err != nil {
+			// The table could not be asked: the pin stays ours, via the old
+			// gateway — the next ask re-points it.
+			p.logf("re-pin %s via %s: the table could not be asked: %v", ip, p.gw, err)
+			return err
+		}
+		if !isOwnHostRoute(out, ip) {
 			return p.remakeLocked(ip)
 		}
 	}
@@ -162,16 +180,25 @@ func (p *pinner) repinLocked(ip string) error {
 // is no pin: out of pinned, made at the next ask.
 func (p *pinner) recheckLocked(ip string) error {
 	if q := p.cmds.hostRouteQuery(ip); q != nil {
-		if out, err := p.run(q); err == nil && isOwnHostRoute(out, ip) {
-			return nil
+		out, err := p.run(q)
+		if err != nil {
+			p.unsure[ip] = true
+			p.logf("pin %s: the table could not be asked after the path came back: %v — kept, checked again", ip, err)
+			return err
 		}
-		return p.remakeLocked(ip)
+		if !isOwnHostRoute(out, ip) {
+			delete(p.unsure, ip)
+			return p.remakeLocked(ip) // asked, and it is gone
+		}
+		delete(p.unsure, ip)
+		return nil
 	}
 	if _, err := p.run(p.cmds.repin(ip, p.gw)); err != nil {
-		p.logf("pin %s: not confirmed after the path came back via %s: %v", ip, p.gw, err)
-		delete(p.pinned, ip)
+		p.unsure[ip] = true
+		p.logf("pin %s: not confirmed after the path came back via %s: %v — kept, checked again", ip, p.gw, err)
 		return err
 	}
+	delete(p.unsure, ip)
 	return nil
 }
 
@@ -186,17 +213,26 @@ func (p *pinner) remakeLocked(ip string) error {
 
 func (p *pinner) addLocked(ip string) error {
 	add, del := p.cmds.pin(ip, p.gw)
+	ours := p.j.has(pinKey(ip)) // its undo is journaled: a route to it there now is the one we made
 	if err := p.j.add(undoStep{Key: pinKey(ip), Argv: del}); err != nil {
 		return err
 	}
 	out, err := p.run(add)
 	if err != nil {
-		_ = p.j.done(pinKey(ip))
 		if strings.Contains(out+err.Error(), "File exists") {
+			if ours {
+				// Our own route, there all along: it stays ours (its undo
+				// with it), via a gateway not known — the next ask re-points it.
+				p.pinned[ip] = gateway{}
+				p.logf("pin %s: its route is there already — ours (journaled), kept", ip)
+				return nil
+			}
+			_ = p.j.done(pinKey(ip))
 			p.foreign[ip] = true
 			p.logf("pin %s: a route to it exists already — not ours, left as it is", ip)
 			return nil
 		}
+		_ = p.j.done(pinKey(ip))
 		p.logf("pin %s via %s: %v", ip, p.gw, err)
 		return err
 	}
@@ -226,7 +262,7 @@ func (p *pinner) setGateway(gw gateway, up bool, onlink []*net.IPNet) {
 		switch {
 		case ours && via != gw:
 			_ = p.repinLocked(ip) // a failure stays via the old gateway: ensure tries again
-		case ours && recheck:
+		case ours && (recheck || p.unsure[ip]):
 			_ = p.recheckLocked(ip)
 		case !ours && !p.foreign[ip]:
 			if parsed := net.ParseIP(ip); parsed != nil && p.skipLocked(parsed) == "" {

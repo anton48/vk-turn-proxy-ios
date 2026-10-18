@@ -30,7 +30,8 @@ type fakeRun struct {
 	mu     sync.Mutex
 	cmds   []string
 	exists map[string]bool
-	fail   map[string]int // a host whose add / change fails this many more times
+	fail   map[string]int // a host whose add / change / replace fails this many more times
+	failQ  map[string]int // a host whose `route get` fails this many more times
 	j      *journal
 	// The routing table's /32s as route(8) leaves them, with the answers
 	// measured on the stands (2026-10-18): `route -n get` shows a host's own
@@ -55,13 +56,17 @@ func (f *fakeRun) run(argv []string) (string, error) {
 	}
 	if len(argv) == 5 && argv[1] == "-n" && argv[2] == "get" {
 		h := argv[4]
+		if n := f.failQ[h]; n > 0 {
+			f.failQ[h] = n - 1
+			return "", errors.New("route -n get -inet " + h + ": signal: killed")
+		}
 		if _, ok := f.table[h]; ok {
 			return "   route to: " + h + "\ndestination: " + h + "\n       mask: 255.255.255.255\n      flags: <UP,DONE,STATIC>\n", nil
 		}
 		return "   route to: " + h + "\ndestination: default\n       mask: default\n      flags: <UP,GATEWAY,DONE,STATIC>\n", nil
 	}
 	for h, n := range f.fail {
-		if n > 0 && (strings.Contains(cmd, " add ") || strings.Contains(cmd, " change ")) && strings.Contains(cmd, h+"/32") {
+		if n > 0 && (strings.Contains(cmd, " add ") || strings.Contains(cmd, " change ") || strings.Contains(cmd, " replace ")) && strings.Contains(cmd, h+"/32") {
 			f.fail[h] = n - 1
 			return "route: writing to routing socket: Network is unreachable", errors.New("exit status 1")
 		}
@@ -76,6 +81,9 @@ func (f *fakeRun) run(argv []string) (string, error) {
 		_, have := f.table[h]
 		switch argv[3] {
 		case "add":
+			if have {
+				return "route: writing to routing socket: File exists", errors.New("exit status 1: File exists")
+			}
 			f.table[h] = tail
 		case "delete":
 			if !have {
@@ -120,7 +128,7 @@ func (f *fakeRun) list() []string {
 func testPinner(t *testing.T) (*pinner, *fakeRun, *journal) {
 	t.Helper()
 	j := newJournal(filepath.Join(t.TempDir(), "state.json"))
-	f := &fakeRun{exists: map[string]bool{}, fail: map[string]int{}, j: j, table: map[string]string{}}
+	f := &fakeRun{exists: map[string]bool{}, fail: map[string]int{}, failQ: map[string]int{}, j: j, table: map[string]string{}}
 	p := newPinner(darwinCmds{}, f.run, j, t.Logf)
 	_, p.tunnel, _ = net.ParseCIDR("10.66.66.2/24")
 	p.never["1.1.1.1"] = true
