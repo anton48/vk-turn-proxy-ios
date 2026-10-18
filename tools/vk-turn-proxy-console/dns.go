@@ -96,6 +96,13 @@ func (d *resolvConfDNS) apply(_ string, servers []string) error {
 // back), and the tunnel's are written again.
 func (d *resolvConfDNS) refresh(gateway) []string {
 	if !d.applied {
+		// Not ours yet (before the switch, -dns=false, split mode): the file is
+		// the system's, and whatever wrote it last — a DHCP client on a new
+		// network — gave the network's servers. Read it every time; the
+		// content to put back at an apply is the latest too.
+		if b, err := os.ReadFile(d.path); err == nil {
+			d.orig = string(b)
+		}
 		return d.originals()
 	}
 	b, err := os.ReadFile(d.path)

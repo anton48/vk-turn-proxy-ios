@@ -373,6 +373,8 @@ type console struct {
 	dnsSystem  []string   // ... at these
 	dnsNote    string     // the crossing's last line, said once
 	localNote  string     // the local resolver's line, said once
+	netDNS     []string   // the network's servers as last read — a change is said
+	netKnown   bool
 	tun        string
 	ticks      int // the network monitor's, for the DNS refresh's pace
 

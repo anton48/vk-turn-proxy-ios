@@ -115,6 +115,10 @@ func (c *console) applyDNSSplit(network []string) {
 	sp := crossDNS(network, c.tunnelDNS())
 	c.dnsMu.Lock()
 	defer c.dnsMu.Unlock()
+	if c.netKnown && !sameList(dedupe(network), c.netDNS) {
+		log.Printf("dns: the network's servers are now %s (were %s)", strings.Join(dedupe(network), ", "), strings.Join(c.netDNS, ", "))
+	}
+	c.netDNS, c.netKnown = dedupe(network), true
 	c.pin.setNever(sp.never)
 	c.src.set(sp.proxy)
 	if sp.note != c.dnsNote {
