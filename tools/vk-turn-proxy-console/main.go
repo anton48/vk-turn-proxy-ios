@@ -372,6 +372,7 @@ type console struct {
 	dnsApplied bool       // the system's DNS is pointed at the tunnel's
 	dnsSystem  []string   // ... at these
 	dnsNote    string     // the crossing's last line, said once
+	localNote  string     // the local resolver's line, said once
 	tun        string
 	ticks      int // the network monitor's, for the DNS refresh's pace
 

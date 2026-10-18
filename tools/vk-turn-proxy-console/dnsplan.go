@@ -23,6 +23,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"strings"
 )
 
@@ -122,6 +123,12 @@ func (c *console) applyDNSSplit(network []string) {
 		}
 		c.dnsNote = sp.note
 	}
+	if local := localResolverNote(network, c.pin.on()); local != c.localNote {
+		if local != "" {
+			log.Print(local)
+		}
+		c.localNote = local
+	}
 	if c.dnsApplied && !sameList(sp.system, c.dnsSystem) {
 		if err := c.dns.apply(c.tun, sp.system); err != nil {
 			log.Printf("dns: %v", err)
@@ -142,4 +149,30 @@ func (c *console) applySystemDNS() (string, error) {
 	}
 	c.dnsApplied, c.dnsSystem = true, sp.system
 	return strings.Join(sp.system, ", "), nil
+}
+
+// localResolverNote: the network's DNS is a resolver on this machine itself
+// (a cache or a recursor on a loopback address — local_unbound, dnsmasq).
+// The console cannot keep ITS path around the tunnel: it may forward to
+// servers the console does not know, or recurse to the root and every
+// authority — none of it can be pinned. So it is said, in the default-route
+// mode, once per change: with every session lost, the proxy's lookups of VK
+// wait on the tunnel (or on what the cache still holds). A whole answer
+// needs the lookups not to need DNS — VK's addresses resolved ahead (the
+// app's pre-resolution, extended to the console) — the user's direction,
+// 2026-10-18; not done here.
+func localResolverNote(network []string, defaultRoute bool) string {
+	if !defaultRoute {
+		return ""
+	}
+	var local []string
+	for _, s := range dedupe(network) {
+		if ip := net.ParseIP(s); ip != nil && ip.IsLoopback() {
+			local = append(local, s)
+		}
+	}
+	if len(local) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("dns: the network's DNS is a resolver on this machine (%s) — its own queries leave by the default route, so with the default route in the tunnel the proxy's lookups of VK depend on the tunnel: should every session be lost, new credentials wait on it (or on what that resolver has cached)", strings.Join(local, ", "))
 }

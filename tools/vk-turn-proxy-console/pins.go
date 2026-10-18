@@ -229,6 +229,13 @@ func (p *pinner) setNever(list []string) {
 	}
 }
 
+// on reports the default-route mode (pinning on).
+func (p *pinner) on() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.enabled
+}
+
 // enable turns pinning on (the default-route mode) and pins what is known.
 func (p *pinner) enable(on bool) {
 	p.mu.Lock()
