@@ -148,14 +148,21 @@ func (p *pinner) ensure(ip string) error {
 
 // repinLocked points a pin at the current gateway — or, when its route is
 // gone (it went with the old interface), makes it anew: a re-point of a route
-// that is not there is no re-point (hostRouteQuery says why).
+// that is not there is no re-point (hostRouteQuery says why). A failure here
+// — the query's or the re-point's — leaves the pin ours via the old gateway
+// AND unsure: the route may have gone with that gateway's interface, and
+// should the old gateway come back (A → B → A, no loss seen in between) the
+// pin would otherwise read as confirmed, via the gateway it was made for,
+// with nothing in the table — the dial into the console's own tunnel.
 func (p *pinner) repinLocked(ip string) error {
 	if q := p.cmds.hostRouteQuery(ip); q != nil {
 		out, err := p.run(q)
 		if err != nil {
 			// The table could not be asked: the pin stays ours, via the old
-			// gateway — the next ask re-points it.
-			p.logf("re-pin %s via %s: the table could not be asked: %v", ip, p.gw, err)
+			// gateway, marked — the next ask re-points it, or checks it
+			// should the old gateway return.
+			p.unsure[ip] = true
+			p.logf("re-pin %s via %s: the table could not be asked: %v — kept, checked again", ip, p.gw, err)
 			return err
 		}
 		if !isOwnHostRoute(out, ip) {
@@ -166,18 +173,20 @@ func (p *pinner) repinLocked(ip string) error {
 		if routeNotFound(err) { // gone between the query and the change
 			return p.remakeLocked(ip)
 		}
-		p.logf("re-pin %s via %s: %v", ip, p.gw, err)
+		p.unsure[ip] = true // the route's state after a failed change is nobody's word
+		p.logf("re-pin %s via %s: %v — kept, checked again", ip, p.gw, err)
 		return err
 	}
 	p.pinned[ip] = p.gw
+	delete(p.unsure, ip) // confirmed: the change found the route and moved it
 	return nil
 }
 
 // recheckLocked confirms a pin after the path was lost, the gateway the same:
 // the routing table is asked (the BSDs), and a pin that went with the
 // interface is made again; Linux's re-point (ip route replace) makes a route
-// that is gone and leaves one that is there. A pin that cannot be confirmed
-// is no pin: out of pinned, made at the next ask.
+// that is gone and leaves one that is there. A pin whose check FAILED stays
+// ours and unsure — checked again at the next ask (never «gone»).
 func (p *pinner) recheckLocked(ip string) error {
 	if q := p.cmds.hostRouteQuery(ip); q != nil {
 		out, err := p.run(q)
@@ -206,7 +215,7 @@ func (p *pinner) recheckLocked(ip string) error {
 // and it is made again via the current gateway (a failure is tried again at
 // the next ask, as any pin's).
 func (p *pinner) remakeLocked(ip string) error {
-	delete(p.pinned, ip)
+	delete(p.pinned, ip) // and its mark goes with the add that follows (addLocked clears it)
 	p.logf("pin %s: its route is gone (with the old interface) — made again via %s", ip, p.gw)
 	return p.addLocked(ip)
 }
@@ -224,6 +233,7 @@ func (p *pinner) addLocked(ip string) error {
 				// Our own route, there all along: it stays ours (its undo
 				// with it), via a gateway not known — the next ask re-points it.
 				p.pinned[ip] = gateway{}
+				delete(p.unsure, ip) // the add found it there: confirmed
 				p.logf("pin %s: its route is there already — ours (journaled), kept", ip)
 				return nil
 			}
@@ -237,6 +247,7 @@ func (p *pinner) addLocked(ip string) error {
 		return err
 	}
 	p.pinned[ip] = p.gw
+	delete(p.unsure, ip)
 	return nil
 }
 
@@ -321,6 +332,7 @@ func (p *pinner) removeAll() {
 		}
 		_ = p.j.done(pinKey(ip))
 		delete(p.pinned, ip)
+		delete(p.unsure, ip)
 	}
 }
 
