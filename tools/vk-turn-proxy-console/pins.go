@@ -207,6 +207,28 @@ func (p *pinner) setGateway(gw gateway, up bool, onlink []*net.IPNet) {
 	}
 }
 
+// setNever replaces the tunnel's servers that must not be pinned. One that is
+// pinned now (it was the crossing's, asked by the proxy) is unpinned: with the
+// system pointed at it, the pin would take everyone's DNS around the tunnel.
+func (p *pinner) setNever(list []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.never = map[string]bool{}
+	for _, s := range list {
+		p.never[s] = true
+		if _, ours := p.pinned[s]; ours {
+			_, del := p.cmds.pin(s, p.gw)
+			if _, err := p.run(del); err != nil && !alreadyGone(err) {
+				p.logf("unpin %s: %v", s, err)
+				continue
+			}
+			_ = p.j.done(pinKey(s))
+			delete(p.pinned, s)
+			p.logf("pin %s: removed — it is one of the tunnel's DNS servers again", s)
+		}
+	}
+}
+
 // enable turns pinning on (the default-route mode) and pins what is known.
 func (p *pinner) enable(on bool) {
 	p.mu.Lock()

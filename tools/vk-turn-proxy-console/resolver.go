@@ -56,7 +56,9 @@ func resolverDial(src *dnsSource, pin func(ip string) error) func(ctx context.Co
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		var d net.Dialer
 		if s, ok := src.pick(); ok {
-			_ = pin(s) // a failed pin is logged by the pinner; the query tries anyway
+			if err := pin(s); err != nil {
+				return nil, err // no pin, no path around the tunnel: Go's resolver asks the next server
+			}
 			return d.DialContext(ctx, network, net.JoinHostPort(s, "53"))
 		}
 		return d.DialContext(ctx, network, address)

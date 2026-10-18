@@ -359,16 +359,21 @@ type console struct {
 	dnsPlan dnsPlan
 	cookie  string
 
-	j     *journal
-	pin   *pinner
-	dns   systemDNS
-	src   *dnsSource
-	p     *proxy.Proxy
-	dev   *device.Device
-	peer  wgPeer     // the server, as WireGuard has it: asked to handshake after a sleep (wake.go)
-	wgMu  sync.Mutex // dev and peer: set by attach while the monitor may read them (wgNow)
-	tun   string
-	ticks int // the network monitor's, for the DNS refresh's pace
+	j    *journal
+	pin  *pinner
+	dns  systemDNS
+	src  *dnsSource
+	p    *proxy.Proxy
+	dev  *device.Device
+	peer wgPeer     // the server, as WireGuard has it: asked to handshake after a sleep (wake.go)
+	wgMu sync.Mutex // dev and peer: set by attach while the monitor may read them (wgNow)
+
+	dnsMu      sync.Mutex // the split's state (dnsplan.go): the run and the monitor both apply it
+	dnsApplied bool       // the system's DNS is pointed at the tunnel's
+	dnsSystem  []string   // ... at these
+	dnsNote    string     // the crossing's last line, said once
+	tun        string
+	ticks      int // the network monitor's, for the DNS refresh's pace
 
 	mctx     context.Context    // the monitor's life
 	wakeStop context.CancelFunc // the wake handshake in progress, if any
@@ -404,16 +409,12 @@ func (c *console) run(ctx context.Context) int {
 	}
 	c.dns = &lockedDNS{d: newSystemDNS(c.j, runCmd, log.Printf)} // the monitor refreshes it while the switch applies it
 	c.src = &dnsSource{}
-	c.src.set(c.dns.refresh(gw))
+	netDNS := c.dns.refresh(gw)
 
 	_, tunnelNet, _ := net.ParseCIDR(c.st.TunnelAddress)
 	c.pin = newPinner(hostCmds, runCmd, c.j, log.Printf)
 	c.pin.tunnel = tunnelNet
-	if c.dnsPlan.managed {
-		for _, s := range c.dnsPlan.servers {
-			c.pin.never[s] = true
-		}
-	}
+	c.applyDNSSplit(netDNS) // the proxy's servers, the tunnel's never pinned — and where they cross (dnsplan.go)
 	c.pin.blockV6 = c.o.blockIPv6 && c.o.defaultRoute
 	c.pin.enable(c.o.defaultRoute)
 	c.pin.setGateway(gw, up, interfaceSubnets(gw.Iface))
@@ -719,10 +720,10 @@ func (c *console) activate(cmds netCmds, run func([]string) (string, error), act
 	}
 	dnsNote := "the system's DNS left alone"
 	if c.dnsPlan.managed {
-		if err := c.dns.apply(c.tun, c.dnsPlan.servers); err != nil {
+		if list, err := c.applySystemDNS(); err != nil {
 			log.Printf("dns: %v", err)
 		} else {
-			dnsNote = "DNS " + strings.Join(c.dnsPlan.servers, ", ")
+			dnsNote = "DNS " + list
 		}
 	}
 	log.Printf("DEFAULT ROUTE → the tunnel (%d/%d connections up); %s; %d pin(s) via the physical gateway", active(), c.st.NumConns, dnsNote, c.pin.count())
@@ -777,13 +778,13 @@ func (c *console) onNetwork(ev netEvents) {
 		}
 		log.Printf("network: via %s (was %s)", ev.cur, was)
 		c.pin.setGateway(ev.cur, true, interfaceSubnets(ev.cur.Iface))
-		c.src.set(c.dns.refresh(ev.cur))
+		c.applyDNSSplit(c.dns.refresh(ev.cur))
 		for _, s := range c.src.list() {
 			_ = c.pin.ensure(s)
 		}
 	default:
 		if c.ticks++; ev.up && c.ticks%5 == 0 {
-			c.src.set(c.dns.refresh(ev.cur)) // every ~10 s: a rewritten resolv.conf, a new DHCP server
+			c.applyDNSSplit(c.dns.refresh(ev.cur)) // every ~10 s: a rewritten resolv.conf, a new DHCP server
 		}
 	}
 	tellPath(c.p, proxy.RotateVKSessionClient, ev)
