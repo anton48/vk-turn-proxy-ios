@@ -365,7 +365,8 @@ type console struct {
 	src   *dnsSource
 	p     *proxy.Proxy
 	dev   *device.Device
-	peer  wgPeer // the server, as WireGuard has it: asked to handshake after a sleep (wake.go)
+	peer  wgPeer     // the server, as WireGuard has it: asked to handshake after a sleep (wake.go)
+	wgMu  sync.Mutex // dev and peer: set by attach while the monitor may read them (wgNow)
 	tun   string
 	ticks int // the network monitor's, for the DNS refresh's pace
 
@@ -401,7 +402,7 @@ func (c *console) run(ctx context.Context) int {
 	} else {
 		log.Printf("network: no default route yet — waiting for one")
 	}
-	c.dns = newSystemDNS(c.j, runCmd, log.Printf)
+	c.dns = &lockedDNS{d: newSystemDNS(c.j, runCmd, log.Printf)} // the monitor refreshes it while the switch applies it
 	c.src = &dnsSource{}
 	c.src.set(c.dns.refresh(gw))
 
@@ -426,6 +427,14 @@ func (c *console) run(ctx context.Context) int {
 		log.Print(err)
 		return 1
 	}
+	// The network is watched from here on, through the waits below: a network
+	// that changes while the first session or the handshake is awaited moves
+	// the pins and the proxy's DNS as it would later — the connection may be
+	// waiting for exactly that (the monitor is what mends a stale path, and it
+	// must not wait for the connection it would mend).
+	mon := newNetMonitor(netPoll, readDefaultRoute, networkIdentity, gw, up, time.Now())
+	c.startMonitor(ctx, func(mctx context.Context) { mon.run(mctx, c.onNetwork) })
+
 	if err := c.waitFirstSession(ctx); err != nil {
 		if ctx.Err() == nil {
 			log.Print(err)
@@ -452,10 +461,6 @@ func (c *console) run(ctx context.Context) int {
 	} else {
 		c.routeHosts()
 	}
-
-	mon := newNetMonitor(netPoll, readDefaultRoute, networkIdentity, gw, up, time.Now())
-	c.startMonitor(ctx, func(mctx context.Context) { mon.run(mctx, c.onNetwork) })
-
 	return c.serve(ctx)
 }
 
@@ -622,11 +627,16 @@ func (c *console) attach() error {
 		_ = tdev.Close()
 		return fmt.Errorf("server %q: %w", c.st.ServerName, err)
 	}
-	c.dev = device.NewDevice(proxy.WrapTUNForStats(tdev), turnbind.NewTURNBind(c.p), wgLogger(c.o.wgVerbose))
-	if err := c.dev.IpcSet(uapi); err != nil {
+	dev := device.NewDevice(proxy.WrapTUNForStats(tdev), turnbind.NewTURNBind(c.p), wgLogger(c.o.wgVerbose))
+	c.wgMu.Lock()
+	c.dev = dev // the stop closes it, whatever fails below
+	c.wgMu.Unlock()
+	if err := dev.IpcSet(uapi); err != nil {
 		return fmt.Errorf("wireguard: %v", err)
 	}
+	c.wgMu.Lock()
 	c.peer = findPeer(c.dev, c.st.PeerPublicKey)
+	c.wgMu.Unlock()
 	if err := c.dev.Up(); err != nil {
 		return fmt.Errorf("wireguard: %v", err)
 	}
@@ -834,6 +844,13 @@ func statsLine(s proxy.Stats, configured int, lastHandshake time.Time, pins int,
 	return fmt.Sprintf("stats: conns %d/%d · sessions %d since start · tx %.1f MB rx %.1f MB · watchdog restarts %d · pool %d/%d (relays %d) · turn rtt %.0f ms · wg handshake %s · pins %d%s",
 		s.ActiveConns, configured, s.TotalConns, mb(s.TxBytes), mb(s.RxBytes), s.Reconnects,
 		s.CredPoolWithCreds, s.CredPoolSize, s.CredPoolDistinctRelays, s.TurnRTTms, hs, pins, extra)
+}
+
+// wgNow is WireGuard as attach has left it so far: nothing before attach.
+func (c *console) wgNow() (*device.Device, wgPeer) {
+	c.wgMu.Lock()
+	defer c.wgMu.Unlock()
+	return c.dev, c.peer
 }
 
 // startMonitor runs the network monitor's loop on a goroutine of its own,

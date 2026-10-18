@@ -122,7 +122,12 @@ func (k *wakeKick) step(now time.Time, s proxy.Stats, lastHandshake time.Time) (
 // end. Called from the monitor's goroutine; a wake inside a wake replaces the
 // earlier one.
 func (c *console) rekeyAfterWake(before proxy.Stats, noticed time.Time) {
-	if c.peer == nil || c.mctx == nil {
+	dev, peer := c.wgNow()
+	if dev == nil && peer == nil { // before attach: the monitor runs from the proxy's start on
+		log.Printf("wireguard: not up yet at this wake — its first handshake is still to come, no keys to drop")
+		return
+	}
+	if peer == nil || c.mctx == nil {
 		// Never in a running console (attach keeps the peer, run the
 		// context) — and if ever, said: a wake that tells WireGuard nothing
 		// costs 15 s of silence that no line would explain.
@@ -137,7 +142,7 @@ func (c *console) rekeyAfterWake(before proxy.Stats, noticed time.Time) {
 	// WireGuard made by itself in between is the wake's too — those keys are
 	// new on both sides, and dropping them would only cost another.
 	since := noticed.Add(-netPoll).Round(0)
-	if readWG(c.dev).lastHandshake.After(since) {
+	if readWG(dev).lastHandshake.After(since) {
 		log.Printf("wireguard: it made a handshake by itself as the machine woke — its keys are new, nothing to ask")
 		return
 	}
@@ -146,7 +151,7 @@ func (c *console) rekeyAfterWake(before proxy.Stats, noticed time.Time) {
 	// is. Left to the first ask, a wake into no network that outlasts
 	// wakeKickGiveUp would end with the stale keys in place — and the
 	// network's return would meet the 15 s of silence after all.
-	c.peer.ExpireCurrentKeypairs()
+	peer.ExpireCurrentKeypairs()
 	log.Printf("wireguard: its keys did not see the sleep — dropped; a new handshake is asked as soon as a session can carry it")
 	ctx, stop := context.WithCancel(c.mctx)
 	c.wakeStop = stop
@@ -162,7 +167,7 @@ func (c *console) rekeyAfterWake(before proxy.Stats, noticed time.Time) {
 			case <-t.C:
 			}
 			now := time.Now().Round(0)
-			hs := readWG(c.dev).lastHandshake
+			hs := readWG(dev).lastHandshake
 			kick, done := k.step(now, c.p.GetStats(), hs)
 			switch {
 			case done && hs.After(k.since):
@@ -176,7 +181,7 @@ func (c *console) rekeyAfterWake(before proxy.Stats, noticed time.Time) {
 				log.Printf("wireguard: no handshake since the wake (asked %d time(s)) — left to WireGuard: its keys are dropped, it handshakes before it sends", k.kicks)
 				return
 			case kick:
-				if err := rekey(c.peer); err != nil {
+				if err := rekey(peer); err != nil {
 					log.Printf("wireguard: handshake after the wake: %v", err)
 				}
 			}

@@ -322,11 +322,18 @@ func TestAWakeRunsItsHandshakeToTheEnd(t *testing.T) {
 		}
 	}
 
-	// A console that holds no peer says so instead of doing nothing in silence.
+	// A console whose device holds no peer says so instead of doing nothing in
+	// silence; one that has no WireGuard yet (a wake before attach — the
+	// monitor runs from the proxy's start on) says that.
 	buf.Reset()
-	(&console{p: p, mctx: ctx}).rekeyAfterWake(p.GetStats(), time.Now())
+	(&console{p: p, dev: client, mctx: ctx}).rekeyAfterWake(p.GetStats(), time.Now())
 	if !strings.Contains(buf.String(), "NOT told to WireGuard") {
 		t.Errorf("a wake with no peer to ask passed in silence: %q", buf.String())
+	}
+	buf.Reset()
+	(&console{p: p, mctx: ctx}).rekeyAfterWake(p.GetStats(), time.Now())
+	if !strings.Contains(buf.String(), "wireguard: not up yet at this wake") {
+		t.Errorf("a wake before WireGuard is up: %q — want it said", buf.String())
 	}
 }
 

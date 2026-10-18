@@ -16,6 +16,7 @@ package main
 import (
 	"os"
 	"strings"
+	"sync"
 )
 
 type systemDNS interface {
@@ -108,4 +109,30 @@ func (d *resolvConfDNS) refresh(gateway) []string {
 		d.logf("dns: %v", err)
 	}
 	return d.originals()
+}
+
+// lockedDNS takes one call at a time: the network monitor refreshes the
+// system's DNS from its own goroutine — from the proxy's start on — while
+// the default route's switch applies it.
+type lockedDNS struct {
+	mu sync.Mutex
+	d  systemDNS
+}
+
+func (l *lockedDNS) originals() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.d.originals()
+}
+
+func (l *lockedDNS) apply(tun string, servers []string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.d.apply(tun, servers)
+}
+
+func (l *lockedDNS) refresh(gw gateway) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.d.refresh(gw)
 }
