@@ -224,7 +224,7 @@ func TestOnlyTheFlagsGivenOverrideTheBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if st.NumConns != 120 || st.PeerAddress != "198.51.100.20:443" || !st.UseUDP || st.MTU != 1300 || st.UplinkPaceKiB != 0 ||
-		strings.Join(st.VKLinks, ",") != "https://vk.ru/call/join/other" || st.TurnServer != "203.0.113.9" || st.TurnPort != "3478" {
+		strings.Join(st.VKLinks, ",") != "https://vk.ru/call/join/other" || strings.Join(st.TurnServers, ",") != "203.0.113.9:3478" {
 		t.Fatalf("flags not applied: %+v", st)
 	}
 	if strings.Join(plan.servers, ",") != "9.9.9.9" || !plan.managed {
@@ -271,15 +271,33 @@ func TestAConfigOthersCanReadIsNoticed(t *testing.T) {
 	}
 }
 
-func TestParseTurnOverrideIsTheApps(t *testing.T) {
-	for in, want := range map[string]string{"203.0.113.9:3478": "203.0.113.9|3478", " relay.example:19302 ": "relay.example|19302", "": "", "host": "", "host:": "", ":80": "", "host:x": ""} {
-		h, p, ok := parseTurnOverride(in)
-		got := ""
-		if ok {
-			got = h + "|" + p
+// The backup's turnServerOverride is read as the app reads it since
+// 2026-10-19: a list of host:port, comma-separated; an invalid value is
+// ignored (the editor says it will be). Sabotage seen red: the list not
+// reaching the settings.
+func TestTheTURNOverrideListIsTheApps(t *testing.T) {
+	for in, want := range map[string]string{
+		"203.0.113.9:3478":                     "203.0.113.9:3478",
+		" relay.example:19302 ":                "relay.example:19302",
+		"203.0.113.9:3478, 203.0.113.10:19302": "203.0.113.9:3478,203.0.113.10:19302",
+		"203.0.113.9:3478,203.0.113.9:3478":    "203.0.113.9:3478",
+		"":                                     "",
+		"host":                                 "",
+		"host:":                                "",
+		":80":                                  "",
+		"host:x":                               "",
+		"203.0.113.9:3478,host":                "",
+	} {
+		srv := srtpServer("Home")
+		srv["turnServerOverride"] = in
+		b, err := loadBackup(writeBackup(t, globals(srv)))
+		if err != nil {
+			t.Fatal(err)
 		}
-		if got != want {
-			t.Errorf("parseTurnOverride(%q) = %q, want %q", in, got, want)
+		s, _ := selectServer(b.servers(), "")
+		st := buildSettings(b, s)
+		if got := strings.Join(st.TurnServers, ","); got != want {
+			t.Errorf("turnServerOverride %q → TurnServers %q, want %q", in, got, want)
 		}
 	}
 }

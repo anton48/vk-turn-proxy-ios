@@ -4478,7 +4478,21 @@ do {
 do {
     func file(_ mode: String?, _ user: String = "\(Int(Date().timeIntervalSince1970) + 8 * 3600):u") -> CredCacheFile {
         CredCacheFile(version: CredCache.supportedVersion, saved_at: Int64(Date().timeIntervalSince1970), mode: mode,
-                      creds: [CredCacheEntry(slot: 0, address: "203.0.113.11:19302", username: user, password: "pw", last_used_at: 0)])
+                      creds: [CredCacheEntry(slot: 0, address: "203.0.113.11:19302", addresses: nil, username: user, password: "pw", last_used_at: 0)])
+    }
+    // 2026-10-19: every relay VK returned with the credential rides in `addresses`
+    // (Go's cache field); the mirror has to carry it through a backup round trip,
+    // or a restore leaves the credential with one relay and no failover.
+    do {
+        let json = Data("""
+        {"version": \(CredCache.supportedVersion), "saved_at": 1, "mode": "anon", "creds": [{"slot": 0, "address": "203.0.113.11:19302", "addresses": ["203.0.113.11:19302", "203.0.113.12:19302"], "username": "1:u", "password": "pw"}]}
+        """.utf8)
+        if let f = try? JSONDecoder().decode(CredCacheFile.self, from: json) {
+            check(f.creds.first?.addresses == ["203.0.113.11:19302", "203.0.113.12:19302"], "the cache mirror reads every relay of a credential (`addresses`)")
+            if let back = try? JSONEncoder().encode(f), let text = String(data: back, encoding: .utf8) {
+                check(text.contains("203.0.113.12:19302"), "the cache mirror writes the other relays back (a backup round trip keeps them)")
+            } else { check(false, "the cache mirror re-encodes") }
+        } else { check(false, "the cache mirror decodes a file with `addresses`") }
     }
     let now = Date().timeIntervalSince1970
     let cookie = file(CredCache.modeCookie), anon = file(CredCache.modeAnon), old = file(nil)

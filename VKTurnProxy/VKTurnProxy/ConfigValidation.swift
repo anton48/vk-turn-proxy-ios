@@ -122,8 +122,16 @@ enum ConfigValidation {
     static func turnOverride(_ s: String) -> Issue? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return nil }
-        if !isHostPort(t) {
-            return Issue(.warning, "Not a valid IP:port — it will be ignored (VK's relay is used).")
+        // A list since 2026-10-19: host:port entries separated by commas (or
+        // semicolons, spaces, newlines), tried in order. An invalid entry is
+        // ignored by the parser (TunnelManager.parseTurnServers).
+        let parts = t.split(whereSeparator: { ",; \n\t\r".contains($0) }).map(String.init)
+        let bad = parts.filter { !isHostPort($0) }
+        if bad.count == parts.count {
+            return Issue(.warning, "Not a valid IP:port list — it will be ignored (VK's relays are used).")
+        }
+        if !bad.isEmpty {
+            return Issue(.warning, "Ignored (not IP:port): \(bad.joined(separator: ", ")). The valid entries are used in order.")
         }
         return nil
     }

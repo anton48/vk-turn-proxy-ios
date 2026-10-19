@@ -28,9 +28,10 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cacggghp/vk-turn-proxy/pkg/proxy"
 )
 
 type backupFile struct {
@@ -244,7 +245,7 @@ type settings struct {
 	DNSServers                              []string
 	NumConns                                int
 	CredPoolCooldown                        time.Duration
-	TurnServer, TurnPort                    string
+	TurnServers                             []string // the TURN relay override list, host:port each (the server's turnServerOverride, comma-separated)
 	UseUDP                                  bool
 	VKLinks                                 []string // [0] mints anonymously; all of them in cookie mode
 	VKAuth                                  bool
@@ -291,20 +292,6 @@ func splitDNS(s string) []string {
 	return out
 }
 
-// parseTurnOverride is TunnelManager.parseTurnOverride: "host:port" or nothing.
-func parseTurnOverride(raw string) (host, port string, ok bool) {
-	t := strings.TrimSpace(raw)
-	i := strings.LastIndex(t, ":")
-	if t == "" || i <= 0 || i == len(t)-1 {
-		return "", "", false
-	}
-	host, port = t[:i], t[i+1:]
-	if _, err := strconv.Atoi(port); err != nil {
-		return "", "", false
-	}
-	return host, port, true
-}
-
 func buildSettings(b *backupFile, s server) settings {
 	st := settings{
 		ServerName:         s.Name,
@@ -323,8 +310,11 @@ func buildSettings(b *backupFile, s server) settings {
 		MTU:                resolveMTU(intOr(b.Settings.TunnelMTU, 0)),
 		ForceLegacyCaptcha: boolOr(b.Settings.ForceLegacyCaptcha, false),
 	}
-	if h, p, ok := parseTurnOverride(s.TurnServerOverride); ok {
-		st.TurnServer, st.TurnPort = h, p
+	// The backup's turnServerOverride: a list of host:port (one entry in the
+	// app before 2026-10-19); an invalid value is ignored, as the app's editor
+	// says it will be.
+	if list, err := proxy.ParseTURNServers(s.TurnServerOverride); err == nil {
+		st.TurnServers = list
 	}
 	return st
 }

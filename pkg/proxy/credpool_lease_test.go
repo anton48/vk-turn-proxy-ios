@@ -306,7 +306,7 @@ func TestEveryLeaseHolderNamesItsCredential(t *testing.T) {
 	if n := strings.Count(proxySrc, "invalidateEntry(credSlot, creds)"); n != 3 {
 		t.Errorf("proxy.go: %d invalidateEntry(credSlot, creds) calls, want 3", n)
 	}
-	for _, call := range []string{"a.pool.Release(slot, creds)", "a.pool.MarkSaturated(slot, creds)", "a.pool.InvalidateSlot(slot, creds)", "a.refused(workerID, slot, creds, err)"} {
+	for _, call := range []string{"a.pool.Release(slot, creds)", "a.pool.MarkSaturated(slot, creds)", "a.pool.InvalidateSlot(slot, creds)", "a.refused(workerID, idx, slot, creds, addr, attempt, err)"} {
 		if !strings.Contains(bridge, call) {
 			t.Errorf("csqtt_bridge.go lacks %q — the adapter must hand the leased credential on", call)
 		}

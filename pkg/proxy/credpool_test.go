@@ -209,20 +209,28 @@ func TestCredPoolGrowPaceIsPinned(t *testing.T) {
 	}
 }
 
-// The TURN override rewrites every address (the fresh-fetch path only) and
-// the primary follows. Sabotage seen red: skipping the port override.
-func TestApplyTURNOverride(t *testing.T) {
+// The TURN override is a list of candidates applied when a credential is
+// handed out (relayhealth.go); the older host / port pair rewrites VK's
+// addresses. Sabotage seen red: skipping the port override.
+func TestTheTURNOverrideShapesACredentialsCandidates(t *testing.T) {
 	c := &TURNCreds{Addresses: []string{"203.0.113.11:19302", "203.0.113.12:19302"}}
-	addr, err := applyTURNOverride(c, "", "3478")
-	if err != nil || addr != "203.0.113.11:3478" || c.Address != addr || c.Addresses[1] != "203.0.113.12:3478" {
-		t.Fatalf("port override: addr %q err %v creds %+v", addr, err, c)
+	got := turnOverride{port: "3478"}.candidatesFor(c)
+	if len(got) != 2 || got[0] != "203.0.113.11:3478" || got[1] != "203.0.113.12:3478" {
+		t.Fatalf("port override: %v", got)
 	}
-	addr, err = applyTURNOverride(c, "10.0.0.1", "")
-	if err != nil || addr != "10.0.0.1:3478" || c.Addresses[1] != "10.0.0.1:3478" {
-		t.Fatalf("host override: addr %q err %v creds %+v", addr, err, c)
+	got = turnOverride{host: "10.0.0.1"}.candidatesFor(c)
+	if len(got) != 1 || got[0] != "10.0.0.1:19302" {
+		t.Fatalf("host override (one host, two equal entries deduplicated): %v", got)
 	}
-	if _, err := applyTURNOverride(&TURNCreds{}, "", ""); err == nil {
-		t.Fatal("no addresses must be an error, not an empty primary")
+	got = turnOverride{servers: []string{"198.51.100.1:19302", "198.51.100.2:3478"}, host: "ignored"}.candidatesFor(c)
+	if len(got) != 2 || got[0] != "198.51.100.1:19302" || got[1] != "198.51.100.2:3478" {
+		t.Fatalf("the list wins over the pair: %v", got)
+	}
+	if got := (turnOverride{}).candidatesFor(c); len(got) != 2 || got[0] != c.Addresses[0] {
+		t.Fatalf("no override: VK's own, in order: %v", got)
+	}
+	if got := (turnOverride{}).candidatesFor(&TURNCreds{}); len(got) != 0 {
+		t.Fatalf("no addresses must be no candidates, not an empty one: %v", got)
 	}
 	if got := parseVKLinkID("https://vk.ru/call/join/hO-B7Xq?x=1"); got != "hO-B7Xq" {
 		t.Fatalf("parseVKLinkID = %q", got)
@@ -272,10 +280,11 @@ func TestCredPoolSeedServesTheFirstAcquireWithoutAMint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Acquire(0): %v", err)
 	}
-	// Verbatim: the port override must NOT touch the seed (a cached cred keeps
-	// its stored address, as in NewProxy).
-	if slot != 0 || addr != "203.0.113.13:19302" || creds == nil || creds.Username != seed.Username {
-		t.Fatalf("Acquire(0) = slot %d addr %q creds %+v, want the seed in slot 0 untouched", slot, addr, creds)
+	// Since 2026-10-19 the override reaches every credential when it is handed
+	// out — the seed too (issue #102): the port override applies, the seed's
+	// own credential is served.
+	if slot != 0 || addr != "203.0.113.13:3478" || creds == nil || creds.Username != seed.Username {
+		t.Fatalf("Acquire(0) = slot %d addr %q creds %+v, want the seed in slot 0 under the port override", slot, addr, creds)
 	}
 	if m.count() != 0 {
 		t.Fatalf("the first acquire minted %d time(s) despite the seed", m.count())

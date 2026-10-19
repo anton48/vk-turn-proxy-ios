@@ -132,7 +132,7 @@ extension TunnelConfig {
         let lines = vkLink.split(whereSeparator: { $0.isNewline })
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        let turnOv = parseTurnOverride(s.turnServerOverride)
+        let turnServers = parseTurnServers(s.turnServerOverride)
         // Global (Settings › Advanced), not per-server: what drives this number
         // is the network path, which follows the phone rather than the profile.
         let storedMTU = TunnelMTU.stored(in: d)
@@ -171,8 +171,7 @@ extension TunnelConfig {
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
-            turnServerOverride: turnOv?.host,
-            turnPortOverride: turnOv?.port,
+            turnServerOverrides: turnServers,
             serverID: s.id,
             serverName: s.serverName
         )
@@ -180,12 +179,18 @@ extension TunnelConfig {
 
     /// "IP:port" -> (host, port), or nil when empty/malformed (= no override).
     /// Splits on the LAST colon so IPv4:port parses cleanly.
-    static func parseTurnOverride(_ raw: String) -> (host: String, port: String)? {
-        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty, let colon = t.lastIndex(of: ":") else { return nil }
-        let host = String(t[..<colon]), port = String(t[t.index(after: colon)...])
-        guard !host.isEmpty, !port.isEmpty, port.allSatisfy(\.isNumber), Int(port) != nil else { return nil }
-        return (host, port)
+    /// parseTurnServers reads the profile's TURN override field as a list of
+    /// host:port entries separated by commas, semicolons, spaces or newlines;
+    /// an entry that is not host:port with a numeric port is dropped (the editor
+    /// warns about it). Duplicates are dropped, order is kept.
+    static func parseTurnServers(_ raw: String) -> [String] {
+        var out: [String] = []
+        for part in raw.split(whereSeparator: { ",; \n\t\r".contains($0) }) {
+            let t = String(part)
+            guard ConfigValidation.isHostPort(t), !out.contains(t) else { continue }
+            out.append(t)
+        }
+        return out
     }
 }
 
@@ -587,14 +592,11 @@ class TunnelManager: ObservableObject {
                 if attemptCancelled() { return } // a late probe answer after a Disconnect: no error, no captcha
                 switch cookieProbe {
                 case .ok(let addr, let user, let pass):
-                    if let h = config.turnServerOverride, !h.isEmpty,
-                       let pt = config.turnPortOverride, !pt.isEmpty {
-                        seededTURN = ("\(h):\(pt)", user, pass)
-                        SharedLogger.shared.log("[AppDebug] VKAuth: TURN override active — using \(h):\(pt) (VK gave \(addr))")
-                    } else {
-                        seededTURN = (addr, user, pass)
-                        SharedLogger.shared.log("[AppDebug] VKAuth: TURN creds via cookie path (addr=\(addr))")
-                    }
+                    // VK's own address: the TURN override (a list since 2026-10-19)
+                    // is applied by the extension's pool when the credential is
+                    // handed out — to this seed, to cached ones, to every mint.
+                    seededTURN = (addr, user, pass)
+                    SharedLogger.shared.log("[AppDebug] VKAuth: TURN creds via cookie path (addr=\(addr))")
                 case .cookieRejected:
                     SharedLogger.shared.log("[AppDebug] VKAuth: cookie rejected by VK — aborting")
                     errorMessage = "VK перестал принимать сохранённую сессию. Войдите заново (Настройки → Log in to VK)."
@@ -651,19 +653,12 @@ class TunnelManager: ObservableObject {
                 if attemptCancelled() { return } // a late probe answer after a Disconnect: no captcha, no error, no retry
                 switch result {
                 case .ok(let addr, let user, let pass):
-                    // A fresh probe is a VK "receive" → honor the TURN override
-                    // if set + valid. Cached seeds (above) are NOT overridden.
-                    // The cred is relay-agnostic across VK's set, so forcing a
-                    // different relay works.
-                    if let h = config.turnServerOverride, !h.isEmpty,
-                       let pt = config.turnPortOverride, !pt.isEmpty {
-                        let ov = "\(h):\(pt)"
-                        seededTURN = (ov, user, pass)
-                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: TURN override active — using \(ov) for the probe seed (VK gave \(addr))")
-                    } else {
-                        seededTURN = (addr, user, pass)
-                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: TURN creds acquired (addr=\(addr))")
-                    }
+                    // VK's own address. The TURN override (a list since 2026-10-19)
+                    // is the extension's pool's business: applied when the credential
+                    // is handed out, to this seed, to cached ones and to every mint
+                    // alike (issue #102: the app-side rewrite never reached a cache).
+                    seededTURN = (addr, user, pass)
+                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: TURN creds acquired (addr=\(addr))")
                     break probeLoop
                 case .captcha(let url, let sid, let ts, let captchaAttempt, let token1, let clientID, let isRateLimit):
                     if isRateLimit {
@@ -844,11 +839,7 @@ class TunnelManager: ObservableObject {
 
         switch await probeVKCreds(linkID: linkID, vkHostIPsJSON: "") {
         case .ok(let addr, let user, let pass):
-            if let h = config.turnServerOverride, !h.isEmpty,
-               let pt = config.turnPortOverride, !pt.isEmpty {
-                SharedLogger.shared.log("[AppDebug] live-activity: fresh cred, TURN override \(h):\(pt) (VK gave \(addr))")
-                return .seed(address: "\(h):\(pt)", username: user, password: pass)
-            }
+            // VK's own address; the TURN override is applied by the pool at hand-out.
             SharedLogger.shared.log("[AppDebug] live-activity: fresh TURN cred acquired (addr=\(addr))")
             return .seed(address: addr, username: user, password: pass)
         case .captcha:
@@ -2924,8 +2915,7 @@ class TunnelManager: ObservableObject {
             "use_srtp": config.useSrtp,
             "num_conns": config.effectiveNumConnections,
             "cred_pool_cooldown_seconds": config.credPoolCooldownSeconds,
-            "turn_server": config.turnServerOverride ?? "",
-            "turn_port": config.turnPortOverride ?? "",
+            "turn_servers": config.turnServerOverrides,
             "use_cookie_auth": config.useCookieAuth
         ]
         // WRAP-A (amurcanov interop): the server provisions WireGuard via
@@ -3496,8 +3486,11 @@ struct TunnelConfig {
     // forget our captcha-failure rate-limit window without making real
     // failed-cred recovery feel laggy.
     var credPoolCooldownSeconds: Int = 150
-    var turnServerOverride: String?
-    var turnPortOverride: String?
+    /// The TURN relay override as a LIST of host:port (2026-10-19; one entry
+    /// before). Applied by the extension's pool when a credential is handed
+    /// out — cached credentials included; the relays are tried in order and a
+    /// relay that stops answering is marked, the next one taken. Empty = VK's.
+    var turnServerOverrides: [String] = []
     /// WHICH profile this config was built from. Carried so the one place that
     /// starts a tunnel can record what the session is running (SessionServer.swift).
     /// A caller cannot forget to pass it, which is the point: the previous

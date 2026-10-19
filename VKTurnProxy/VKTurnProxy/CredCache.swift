@@ -27,6 +27,12 @@ import Foundation
 struct CredCacheEntry: Codable {
     let slot: Int
     let address: String
+    /// Every relay VK returned WITH this credential (`address` is the first) —
+    /// Go's `addresses`, 2026-10-19; absent in files from before it. HERE for
+    /// the same reason as `mode` below: BackupManager encodes this struct into
+    /// the backup and back into creds-pool.json on a restore, and a mirror
+    /// without the field would drop the other relays on the way.
+    let addresses: [String]?
     let username: String
     let password: String
     let last_used_at: Int64?

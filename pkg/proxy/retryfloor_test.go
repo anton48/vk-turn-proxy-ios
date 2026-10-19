@@ -376,7 +376,7 @@ func TestTheRetryWaitsConsultTheFloor(t *testing.T) {
 		t.Error("the direct session's \"established\" line carries the session-up stamp — that line precedes the allocation and is evidence of nothing")
 	}
 	turn := goFuncBody(t, "proxy.go", "func (p *Proxy) runTURN(")
-	alloc, stamp := strings.Index(turn, "p.credPool.noteAllocated(slotIdx, creds)"), strings.Index(turn, "p.noteSessionUp(connIdx)")
+	alloc, stamp := strings.Index(turn, "p.relayAllocatedAt(slotIdx, creds, turnAddr)"), strings.Index(turn, "p.noteSessionUp(connIdx)")
 	if alloc < 0 || stamp < alloc || !strings.Contains(turn[alloc:stamp], "if p.directMode() {") {
 		t.Error("runTURN does not stamp the direct mode's session-up at its allocation (under directMode, after the allocation succeeded)")
 	}

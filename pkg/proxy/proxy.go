@@ -35,8 +35,9 @@ import (
 // Config holds proxy configuration.
 type Config struct {
 	PeerAddr         string        // vk-turn-proxy server address (host:port)
-	TurnServer       string        // override TURN server host (optional)
+	TurnServer       string        // override TURN server host (optional; the older pair — TurnServers wins when set)
 	TurnPort         string        // override TURN port (optional)
+	TurnServers      []string      // override TURN relays, host:port each: replaces VK's addresses for EVERY credential, cached ones included (relayhealth.go)
 	VKLink           string        // VK call invite link or link ID
 	UseDTLS          bool          // true = DTLS obfuscation (default mode)
 	UseUDP           bool          // true = UDP to TURN, false = TCP
@@ -648,6 +649,10 @@ func NewProxy(cfg Config) *Proxy {
 	}
 	p.credPool = newCredPool(ctx, poolSize, cfg.CredPoolCooldown, cfg.CredCachePath, p.fetchFreshCreds)
 	p.credPool.setColdStartTarget(cfg.NumConns)
+	// The TURN override is applied when a credential is HANDED OUT, to every
+	// credential — the cache's included (issue #102: an override that did not
+	// reach a cached credential kept the client on a dead relay).
+	p.credPool.setOverride(turnOverride{servers: cfg.TurnServers, host: cfg.TurnServer, port: cfg.TurnPort})
 
 	p.initGroupHello(cfg)
 
@@ -656,12 +661,10 @@ func NewProxy(cfg Config) *Proxy {
 	// call, dodging the .connecting-window captcha deadlock.
 	if cfg.SeededTURN != nil {
 		// The seed comes from the main app's pre-bootstrap — either a
-		// disk-cached cred or a fresh probe. Its address is used VERBATIM: the
-		// TurnServer/TurnPort override does NOT apply here. The override only
-		// rewrites fresh VK fetches in fetchFreshCreds; a disk-cached seed
-		// keeps its stored address (the "setting must not affect cached creds"
-		// guarantee), and a fresh probe-seed is already overridden Swift-side
-		// before it reaches here.
+		// disk-cached cred or a fresh probe. Its address is VK's (or the one
+		// the app chose); the TURN override applies to it as to every
+		// credential when it is handed out (credpool_relay.go) — since
+		// 2026-10-19 the setting DOES reach a cached credential.
 		turnHost, _, err := net.SplitHostPort(cfg.SeededTURN.Address)
 		if err == nil {
 			p.credPool.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
@@ -2301,7 +2304,7 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 		// conns spread across relays — each (okcdn_userid, relay) is its own ~10
 		// allocation quota (2026-06-28 finding). No captcha bookkeeping here.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		c, cerr := cookieCredForSlot(ctx, slot)
+		c, cerr := cookieCredForSlot(ctx, slot, p.config.TurnServers)
 		cancel()
 		if cerr != nil {
 			if errors.Is(cerr, ErrCookieRejected) {
@@ -2357,32 +2360,46 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 		}
 		creds = c
 	} // end else (anonymous path)
-	// Apply the "TURN server" override (Settings → optional turn_server/
-	// turn_port; empty = no override) to every VK-returned address. This is
-	// the fresh-fetch path: the override affects creds RECEIVED FROM VK and
-	// bakes into the cred + on-disk cache (intended). Cached/seeded creds are
-	// used as STORED — the seed path in NewProxy does NOT re-apply the
-	// override (the "setting must not affect cached creds" guarantee). Today
-	// only Addresses[0] is dialed (resolveTURNAddr), but we override all
-	// entries uniformly so a future failover doesn't redo the pass. Addresses
-	// must be non-empty (getVKCredsWithClientID guarantees ≥1).
-	for i, vkAddr := range creds.Addresses {
-		h, pport, perr := net.SplitHostPort(vkAddr)
-		if perr != nil {
+	// The credential keeps VK's own addresses — ALL of them, into the pool
+	// and the on-disk cache. The "TURN server" override is no longer baked in
+	// here: the pool applies it when the credential is handed out, to cached
+	// credentials too (credpool_relay.go, issue #102); and the relay a session
+	// is on is chosen there as well, by the relay health (relayhealth.go) —
+	// TURNServerIP is set at the allocation, from the relay that answered.
+	if len(creds.Addresses) == 0 {
+		if creds.Address == "" {
+			return "", nil, errors.New("VK returned no TURN address")
+		}
+		creds.Addresses = []string{creds.Address}
+	}
+	for _, vkAddr := range creds.Addresses {
+		if _, _, perr := net.SplitHostPort(vkAddr); perr != nil {
 			return "", nil, fmt.Errorf("parse TURN address %q: %w", vkAddr, perr)
 		}
-		if p.config.TurnServer != "" {
-			h = p.config.TurnServer
-		}
-		if p.config.TurnPort != "" {
-			pport = p.config.TurnPort
-		}
-		creds.Addresses[i] = net.JoinHostPort(h, pport)
 	}
 	creds.Address = creds.Addresses[0]
-	firstHost, _, _ := net.SplitHostPort(creds.Addresses[0])
-	p.turnServerIP.Store(firstHost)
 	return creds.Addresses[0], creds, nil
+}
+
+// relayUnanswered is the relay leg's way out on an Allocate that got NO
+// answer: the pool hears which relay, which credential and when the attempt
+// began (relayhealth.go decides whether that marks the relay), the error
+// goes back as it is. Any other error passes through untouched.
+func (p *Proxy) relayUnanswered(connIdx, slot int, creds *TURNCreds, turnAddr string, attempt time.Time, err error) error {
+	if isRelayUnanswered(err) {
+		p.credPool.noteRelayUnanswered(connIdx, slot, creds, turnAddr, attempt)
+	}
+	return err
+}
+
+// relayAllocatedAt: the relay at turnAddr accepted the credential — the pool's
+// quota mark and the relay health's evidence, and the host the app's next
+// connect names as serverAddress (TURNServerIP).
+func (p *Proxy) relayAllocatedAt(slot int, creds *TURNCreds, turnAddr string) {
+	p.credPool.noteAllocatedAt(slot, creds, turnAddr)
+	if host, _, err := net.SplitHostPort(turnAddr); err == nil && host != "" {
+		p.turnServerIP.Store(host)
+	}
 }
 
 // runDTLSSession runs a long-lived DTLS session.
@@ -3419,6 +3436,7 @@ func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
 func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, gave *gaveBack) error {
+	attempt := time.Now() // when this relay attempt began — the relay health's window (relayhealth.go)
 	turnUDPAddr, err := net.ResolveUDPAddr("udp", turnAddr)
 	if err != nil {
 		return fmt.Errorf("resolve TURN: %w", err)
@@ -3428,11 +3446,11 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	var turnConn net.PacketConn
 	if p.config.UseUDP {
 		if err := beforeDial(udpNetworkOf(turnUDPAddr), turnUDPAddr.String()); err != nil {
-			return fmt.Errorf("dial TURN UDP: %w", err)
+			return p.relayUnanswered(connIdx, slotIdx, creds, turnAddr, attempt, fmt.Errorf("dial TURN UDP: %w", err))
 		}
 		udpConn, err := net.DialUDP("udp", nil, turnUDPAddr)
 		if err != nil {
-			return fmt.Errorf("dial TURN UDP: %w", err)
+			return p.relayUnanswered(connIdx, slotIdx, creds, turnAddr, attempt, fmt.Errorf("dial TURN UDP: %w", err))
 		}
 		defer udpConn.Close()
 		turnConn = &connectedUDPConn{udpConn}
@@ -3442,7 +3460,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		d := net.Dialer{Control: dialControl}
 		tcpConn, err := d.DialContext(tcpCtx, "tcp", turnAddr)
 		if err != nil {
-			return fmt.Errorf("dial TURN TCP: %w", err)
+			return p.relayUnanswered(connIdx, slotIdx, creds, turnAddr, attempt, fmt.Errorf("dial TURN TCP: %w", err))
 		}
 		defer tcpConn.Close()
 		// Registered AFTER the Close defer, so LIFO runs unregister FIRST and
@@ -3481,7 +3499,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	gave.lifeOf().fresh()
 	relayConn, err := client.Allocate()
 	if err != nil {
-		return fmt.Errorf("TURN allocate: %w", err)
+		return p.relayUnanswered(connIdx, slotIdx, creds, turnAddr, attempt, fmt.Errorf("TURN allocate: %w", err))
 	}
 	gave.lifeOf().askMappingAtAllocate(client)
 	// The relay accepted this identity: mark it NOW, before anything
@@ -3491,7 +3509,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// while the relay's answer was in flight, and a late success of the old
 	// credential must not certify the new one (quotabreaker.go; builds 391
 	// and 392, both caught on the user's control stand).
-	p.credPool.noteAllocated(slotIdx, creds)
+	p.relayAllocatedAt(slotIdx, creds, turnAddr)
 	if p.directMode() {
 		// The direct session has nothing above the relay: the allocation is the
 		// session coming up — the retry floor's evidence that the network works
@@ -5563,6 +5581,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 // whose Close tears down the SRTP wrapper, the relay allocation, the
 // TURN client, and the underlying control conn together.
 func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TURNCreds, credSlot, connIdx int, gave *gaveBack) (net.Conn, error) {
+	attempt := time.Now() // when this relay attempt began — the relay health's window (relayhealth.go)
 	// Local control conn: UDP socket (UDP-control) or TCP dial wrapped
 	// in turn.NewSTUNConn (TCP-control). Mirrors tools/turn_srtp_test
 	// transport plumbing.
@@ -5571,7 +5590,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		// Unconnected: pion writes to the relay itself, so the hook is asked
 		// here, about the relay, before the socket exists.
 		if err := beforeDialUDP(turnAddr); err != nil {
-			return nil, fmt.Errorf("udp to relay: %w", err)
+			return nil, p.relayUnanswered(connIdx, credSlot, creds, turnAddr, attempt, fmt.Errorf("udp to relay: %w", err))
 		}
 		uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
@@ -5582,7 +5601,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		dialer := net.Dialer{Timeout: 5 * time.Second, Control: dialControl}
 		tcp, err := dialer.Dial("tcp", turnAddr)
 		if err != nil {
-			return nil, fmt.Errorf("dial tcp to relay: %w", err)
+			return nil, p.relayUnanswered(connIdx, credSlot, creds, turnAddr, attempt, fmt.Errorf("dial tcp to relay: %w", err))
 		}
 		// 🚨 THE SECOND DIAL SITE, AND THE ONE THAT MATTERS. Build 233 registered
 		// only runTURN's socket and shipped: SRTP is the production transport and
@@ -5625,14 +5644,14 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	if err != nil {
 		tc.Close()
 		_ = ctlConn.Close()
-		return nil, fmt.Errorf("turn allocate: %w", err)
+		return nil, p.relayUnanswered(connIdx, credSlot, creds, turnAddr, attempt, fmt.Errorf("turn allocate: %w", err))
 	}
 	gave.lifeOf().askMappingAtAllocate(tc) // how the relay sees this socket while the allocation is fresh — outofreach.go
 	// The relay accepted this identity: mark it NOW, before the permission
 	// and the SRTP handshake — the mark means the allocation, not the
 	// session, and names the credential, not the slot (quotabreaker.go; see
 	// runTURN).
-	p.credPool.noteAllocated(credSlot, creds)
+	p.relayAllocatedAt(credSlot, creds, turnAddr)
 	allocDur := time.Since(allocStart)
 	// Surface the TURN-allocate roundtrip to the UI / Stats endpoint
 	// — same field runDTLSSession populates at proxy.go:2706, so the

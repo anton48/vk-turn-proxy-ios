@@ -87,6 +87,7 @@ type csqttConfig struct {
 	BoundedWrites           bool                `json:"csqtt_bounded_writes"` // pkg/csqtt/stall.go; absent = the unbounded write
 	TurnServer              string              `json:"turn_server"`
 	TurnPort                string              `json:"turn_port"`
+	TurnServers             []string            `json:"turn_servers"` // the override as a LIST of host:port (2026-10-19); wins over the pair
 	CredPoolCooldownSeconds int                 `json:"cred_pool_cooldown_seconds"`
 	VKHostIPs               map[string][]string `json:"vk_host_ips"`
 	SeededTURN              *struct {
@@ -325,6 +326,7 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 		avail := a.pool.SlotAvailable()
 		addr, creds, slot, err := a.pool.Acquire(idx)
 		if err == nil {
+			attempt := time.Now() // the worker dials right behind this — the relay health's window
 			var once sync.Once
 			var allocated atomic.Bool
 			return csqtt.Credential{
@@ -343,8 +345,8 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 						a.pool.Release(slot, creds)
 					})
 				},
-				Failed:    func(err error) { a.refused(workerID, slot, creds, err) },
-				Allocated: func() { allocated.Store(true); a.pool.NoteAllocated(slot, creds) },
+				Failed:    func(err error) { a.refused(workerID, idx, slot, creds, addr, attempt, err) },
+				Allocated: func() { allocated.Store(true); a.pool.NoteAllocatedAt(slot, creds, addr) },
 			}, nil
 		}
 		if terminal := csqttTerminalCredError(err); terminal != nil {
@@ -367,13 +369,18 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 // bookkeeping, exactly as Proxy's SRTP session does — a 486 marks the slot
 // saturated (its allocations are used up; the next Creds comes from another
 // slot or a fresh mint), a 401/403 invalidates it (the credential is dead).
-// Anything else (a dead relay, a timeout) is the worker's to retry. 🚨
+// A relay that never ANSWERED (a dial timeout, the retransmissions run out)
+// is told to the pool's relay health — the worker's next credential names
+// the next relay, and a relay is marked unreachable with evidence
+// (relayhealth.go). Anything else is the worker's to retry. 🚨
 // Without this the pool never hears of the refusal and hands the same
 // exhausted credential back to the same worker on every retry — its slot
 // selection cannot act on what it is not told (the user's review,
 // 2026-09-06: two 486s, one mint, zero saturated slots).
-func (a *csqttPoolAdapter) refused(workerID, slot int, creds *proxy.TURNCreds, err error) {
+func (a *csqttPoolAdapter) refused(workerID, connIdx, slot int, creds *proxy.TURNCreds, addr string, attempt time.Time, err error) {
 	switch {
+	case proxy.IsRelayUnanswered(err):
+		a.pool.NoteRelayUnanswered(connIdx, slot, creds, addr, attempt)
 	case proxy.IsQuotaError(err):
 		cd := a.pool.MarkSaturated(slot, creds)
 		log.Printf("csqtt: worker %d: TURN allocate quota error (486) on slot %d (cooldown %s) — the next credential comes from another slot",
@@ -485,13 +492,14 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	pool := csqttNewPool(ctx, proxy.CredPoolConfig{
-		VKLink:     cfg.VKLink,
-		NumConns:   cfg.NumConns,
-		Cooldown:   time.Duration(cfg.CredPoolCooldownSeconds) * time.Second,
-		CachePath:  cachePath,
-		TurnServer: cfg.TurnServer,
-		TurnPort:   cfg.TurnPort,
-		SeededTURN: seed,
+		VKLink:      cfg.VKLink,
+		NumConns:    cfg.NumConns,
+		Cooldown:    time.Duration(cfg.CredPoolCooldownSeconds) * time.Second,
+		CachePath:   cachePath,
+		TurnServer:  cfg.TurnServer,
+		TurnPort:    cfg.TurnPort,
+		TurnServers: cfg.TurnServers,
+		SeededTURN:  seed,
 	})
 	e := &csqttEntry{ctx: ctx, cancel: cancel, pool: pool, started: time.Now(), dialed: make(chan struct{})}
 	csqttTunnelsMu.Lock()

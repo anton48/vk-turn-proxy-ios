@@ -280,10 +280,12 @@ func TestTheMintPauseDoublesPerTripAndHoldsTheCap(t *testing.T) {
 // in exactly two places, runTURN (DTLS, direct, WRAP-A) and setupSRTPSession
 // (SRTP); each Allocate() is followed by the mark before its "TURN relay
 // allocated" line and before CreatePermission; no "session established" line
-// carries one. csqtt: Credential.Allocated right after the relay dial; the
-// adapter wires it (the bridge test). Sabotage seen red: either mark
-// dropped; the marks moved back to "session established"; a mark placed
-// after CreatePermission.
+// carries one. Since 2026-10-19 the mark is relayAllocatedAt(slot, creds,
+// turnAddr) — noteAllocated plus the relay health's evidence (relayhealth.go)
+// and the relay IP for the app's next connect. csqtt: Credential.Allocated
+// right after the relay dial; the adapter wires it (the bridge test).
+// Sabotage seen red: either mark dropped; the marks moved back to "session
+// established"; a mark placed after CreatePermission.
 func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	src, err := os.ReadFile("proxy.go")
 	if err != nil {
@@ -309,20 +311,23 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 			t.Fatalf("no \"TURN relay allocated\" line after the Allocate at byte %d", a)
 		}
 		span := after[:logAt]
-		if n := strings.Count(span, "noteAllocated("); n != 1 {
-			t.Errorf("Allocate at byte %d: %d noteAllocated calls between it and its \"TURN relay allocated\" line, want exactly 1 — the mark is the allocation", a, n)
+		if n := strings.Count(span, "p.relayAllocatedAt("); n != 1 {
+			t.Errorf("Allocate at byte %d: %d relayAllocatedAt calls between it and its \"TURN relay allocated\" line, want exactly 1 — the mark is the allocation", a, n)
 		}
-		if perm := strings.Index(span, "CreatePermission("); perm >= 0 && strings.Index(span, "noteAllocated(") > perm {
+		if perm := strings.Index(span, "CreatePermission("); perm >= 0 && strings.Index(span, "p.relayAllocatedAt(") > perm {
 			t.Errorf("Allocate at byte %d: the mark sits after CreatePermission — a permission failure is not the relay refusing the identity", a)
 		}
 	}
-	if n := strings.Count(code, "noteAllocated("); n != 2 {
-		t.Errorf("proxy.go: %d noteAllocated calls, want 2 — one per allocation site, none at a session line", n)
+	if n := strings.Count(code, "p.relayAllocatedAt("); n != 2 {
+		t.Errorf("proxy.go: %d relayAllocatedAt calls, want 2 — one per allocation site, none at a session line", n)
+	}
+	if !strings.Contains(code, "p.credPool.noteAllocatedAt(slot, creds, turnAddr)") || strings.Count(code, "noteAllocated(") != 0 {
+		t.Error("proxy.go: the mark reaches the pool through relayAllocatedAt → noteAllocatedAt (the credential AND the relay that answered), nowhere else")
 	}
 	// The mark carries the LEASED credential, not the slot number alone: the
 	// slot may have been refilled while the relay's answer was in flight
 	// (the user's stand on 392; allocmark_identity_test.go).
-	for _, call := range []string{"noteAllocated(slotIdx, creds)", "noteAllocated(credSlot, creds)"} {
+	for _, call := range []string{"relayAllocatedAt(slotIdx, creds, turnAddr)", "relayAllocatedAt(credSlot, creds, turnAddr)"} {
 		if !strings.Contains(code, call) {
 			t.Errorf("proxy.go lacks %q — the mark must name the credential the session leased", call)
 		}
@@ -331,8 +336,8 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(bridge), "NoteAllocated(slot, creds)") {
-		t.Error("csqtt_bridge.go: the adapter's Allocated callback does not hand the leased credential to NoteAllocated")
+	if !strings.Contains(string(bridge), "NoteAllocatedAt(slot, creds, addr)") {
+		t.Error("csqtt_bridge.go: the adapter's Allocated callback does not hand the leased credential and its relay to NoteAllocatedAt")
 	}
 	for _, lit := range []string{"DTLS+TURN session established", "direct TURN session established", "WRAP-A+TURN session established", "SRTP+TURN session established"} {
 		i := strings.Index(code, lit)

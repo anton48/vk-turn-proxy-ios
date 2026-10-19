@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
+package proxy
+
+// The standing of every TURN relay the pool dials, by host:port (issues #98
+// and #102, 2026-10-19). VK returns two or more relays with a credential and
+// any VK relay accepts any VK credential (measured 2026-10-19); until now only
+// the first address was ever dialled, and a relay that stopped answering kept
+// every connection on it until the credential expired — and the TURN override
+// never reached a cached credential.
+//
+// The rule, decided with the user:
+//
+//   - An Allocate that gets NO answer (a dial timeout, pion's retransmissions
+//     run out, a refused connection) is a verdict on the relay ONLY WITH
+//     EVIDENCE that the network works — another relay allocated, or VK's API
+//     answered, inside the window (the attempt's start − relayEvidenceWindow)
+//     … (its end), on the same path. Without evidence it is the network's
+//     failure for all we know: the connection's own CURSOR moves to the next
+//     candidate, nothing is marked. When an answer comes later, every address
+//     left unanswered on this path since the previous answer is marked then.
+//   - A mark does not expire. A marked address is tried again only when a
+//     credential has no unmarked candidate left — the oldest mark first, one
+//     connection at a time, at growing intervals — at a path change (every
+//     mark is cleared: the old verdicts say nothing about the new network) or
+//     in a new process (marks live in memory, never on disk).
+//   - Nothing here races two relays inside one connection: one attempt at a
+//     time, the next candidate after a failure.
+//
+// Guarded by the pool's mutex (the pool is the only caller).
+
+import (
+	"net"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	// relayEvidenceWindow: how far before an unanswered attempt's start an
+	// answer still counts as evidence that the network works — longer than
+	// one UDP Allocate's retransmissions (≈ 25–40 s), shorter than a conn's
+	// dormancy (30–60 s).
+	relayEvidenceWindow = 60 * time.Second
+	// relayProbeBackoffMin / Max: the growing interval between re-tries of a
+	// marked address once a credential has no other candidate.
+	relayProbeBackoffMin = time.Minute
+	relayProbeBackoffMax = 30 * time.Minute
+	// relayProbeClaim: how long a re-try of a marked address is reserved for
+	// the one connection that drew it — one attempt's worth, retransmissions
+	// included — so the others do not pile onto the same dead relay.
+	relayProbeClaim = 45 * time.Second
+	// deadMintPause: how long the pool mints nothing more after a fresh
+	// credential named only relays already marked unreachable (VK keeps
+	// returning the dead pair — measured 2026-10-19: three mints in a row
+	// from one host, the same pair). Doubles up to deadMintPauseMax while
+	// the mints keep landing dead.
+	deadMintPause    = 2 * time.Minute
+	deadMintPauseMax = 16 * time.Minute
+)
+
+type relayRecord struct {
+	unansweredSince time.Time // the first unanswered attempt of the running streak; zero = none
+	unanswered      int       // attempts in the streak
+	dead            bool      // marked: unreachable, with evidence
+	deadSince       time.Time
+	retried         time.Time // the last re-try of a marked address
+	retries         int       // re-tries since the mark
+	claimedUntil    time.Time // a re-try is out on this address until then
+}
+
+type relayHealth struct {
+	rec        map[string]*relayRecord
+	lastAnswer time.Time // the latest answer on this path — a relay's or VK's API
+	now        func() time.Time
+}
+
+func newRelayHealth() *relayHealth {
+	return &relayHealth{rec: map[string]*relayRecord{}, now: time.Now}
+}
+
+func (h *relayHealth) record(addr string) *relayRecord {
+	r := h.rec[addr]
+	if r == nil {
+		r = &relayRecord{}
+		h.rec[addr] = r
+	}
+	return r
+}
+
+// unanswered records an attempt on addr that got no answer, begun at start.
+// It reports whether the address is marked now (evidence inside the window).
+func (h *relayHealth) unanswered(addr string, start time.Time) bool {
+	now := h.now()
+	r := h.record(addr)
+	if r.unanswered == 0 {
+		r.unansweredSince = start
+	}
+	r.unanswered++
+	r.claimedUntil = time.Time{}
+	if r.dead {
+		r.retried, r.retries = now, r.retries+1
+		return true
+	}
+	if !h.lastAnswer.IsZero() && !h.lastAnswer.Before(start.Add(-relayEvidenceWindow)) {
+		h.markLocked(r, now)
+		return true
+	}
+	return false
+}
+
+func (h *relayHealth) markLocked(r *relayRecord, now time.Time) {
+	r.dead, r.deadSince, r.retries, r.retried = true, now, 0, time.Time{}
+}
+
+// answered records an answer from addr ("" for VK's API): the network works
+// — the address is alive again, and every other address unanswered since
+// the previous answer is marked now.
+func (h *relayHealth) answered(addr string) {
+	now := h.now()
+	prev := h.lastAnswer
+	h.lastAnswer = now
+	if addr != "" {
+		if r := h.rec[addr]; r != nil {
+			*r = relayRecord{}
+		}
+	}
+	for a, r := range h.rec {
+		if a == addr || r.dead || r.unanswered == 0 {
+			continue
+		}
+		if prev.IsZero() || !r.unansweredSince.Before(prev) {
+			h.markLocked(r, now)
+		}
+	}
+}
+
+// pathChanged forgets everything: the verdicts were about the old network.
+func (h *relayHealth) pathChanged() {
+	h.rec = map[string]*relayRecord{}
+	h.lastAnswer = time.Time{}
+}
+
+func (h *relayHealth) isDead(addr string) bool {
+	r := h.rec[addr]
+	return r != nil && r.dead
+}
+
+// alive is the unmarked candidates, in the list's order.
+func (h *relayHealth) alive(cands []string) []string {
+	out := make([]string, 0, len(cands))
+	for _, a := range cands {
+		if !h.isDead(a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func probeBackoff(retries int) time.Duration {
+	d := relayProbeBackoffMin
+	for i := 0; i < retries && d < relayProbeBackoffMax; i++ {
+		d *= 2
+	}
+	if d > relayProbeBackoffMax {
+		d = relayProbeBackoffMax
+	}
+	return d
+}
+
+// dueAt is when a marked address may be tried again.
+func (r *relayRecord) dueAt() time.Time {
+	from := r.deadSince
+	if r.retried.After(from) {
+		from = r.retried
+	}
+	return from.Add(probeBackoff(r.retries))
+}
+
+// probe picks, among marked candidates, the one longest due for a re-try
+// and reserves it for the caller; ok=false when none is due. nextDue is the
+// earliest moment one will be (zero when nothing is marked).
+func (h *relayHealth) probe(cands []string) (addr string, ok bool, nextDue time.Time) {
+	now := h.now()
+	type due struct {
+		addr string
+		at   time.Time
+	}
+	var dues []due
+	for _, a := range cands {
+		r := h.rec[a]
+		if r == nil || !r.dead {
+			continue
+		}
+		if r.claimedUntil.After(now) {
+			// A re-try is out on this credential's relays: one connection
+			// at a time — the others wait for its answer.
+			return "", false, r.claimedUntil
+		}
+		dues = append(dues, due{a, r.dueAt()})
+	}
+	if len(dues) == 0 {
+		return "", false, time.Time{}
+	}
+	sort.SliceStable(dues, func(i, j int) bool { return dues[i].at.Before(dues[j].at) })
+	if dues[0].at.After(now) {
+		return "", false, dues[0].at
+	}
+	h.rec[dues[0].addr].claimedUntil = now.Add(relayProbeClaim)
+	return dues[0].addr, true, time.Time{}
+}
+
+// untried is the unmarked candidates no attempt has gone unanswered on since
+// the last answer — the ones worth a connection's next try.
+func (h *relayHealth) untried(cands []string) []string {
+	out := make([]string, 0, len(cands))
+	for _, a := range cands {
+		if r := h.rec[a]; r == nil || (!r.dead && r.unanswered == 0) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// hasCandidate: an untried candidate, or a marked one due for a re-try. A
+// credential whose EVERY candidate went unanswered since the last answer has
+// none — it is not ready, and the pool mints (VK's answer is the evidence
+// that marks the silent relays; the fresh credential may name others). 🚫
+// Not «alive»: a dead cached relay with no alternative and no evidence would
+// otherwise be dialled until the credential expired (ams-int, 2026-10-19 —
+// the cache held one address).
+func (h *relayHealth) hasCandidate(cands []string) bool {
+	if len(h.untried(cands)) > 0 {
+		return true
+	}
+	now := h.now()
+	due := false
+	for _, a := range cands {
+		r := h.rec[a]
+		if r == nil || !r.dead {
+			continue
+		}
+		if r.claimedUntil.After(now) {
+			return false // a re-try is out: one at a time
+		}
+		if !r.dueAt().After(now) {
+			due = true
+		}
+	}
+	return due
+}
+
+// deadList names the marked candidates, for a log line.
+func (h *relayHealth) deadList(cands []string) string {
+	var out []string
+	for _, a := range cands {
+		if h.isDead(a) {
+			out = append(out, a)
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
+// isRelayUnanswered: the relay gave NO answer — the dial timed out, pion's
+// retransmissions ran out, the host refused the connection, or the kernel
+// could not even send (no route, network unreachable: an ISP's null route for
+// ONE relay looks exactly like that — issue #98's «unavailable to this
+// client»; a network that is down fails every candidate alike, and the
+// cursor's turn costs nothing there, while a MARK needs evidence that the
+// network works — relayHealth). Two things are not «no answer»: a STUN error
+// response (486, 401, 400, 437 — the relay spoke), and our own closing of the
+// socket or cancelling of the attempt.
+func isRelayUnanswered(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "error response"), strings.Contains(s, "error 4"):
+		return false // the relay answered
+	case strings.Contains(s, "use of closed network connection"),
+		strings.Contains(s, "operation was canceled"),
+		strings.Contains(s, "context canceled"):
+		return false // our own doing
+	}
+	return true
+}
+
+// turnOverride is the user's TURN relay setting: a LIST of host:port that
+// replaces VK's addresses for every credential (cached ones included — the
+// address is chosen when the credential is handed out), or the older pair
+// (a host, a port, either may be empty) rewritten into each VK address.
+type turnOverride struct {
+	servers    []string
+	host, port string
+}
+
+func (o turnOverride) set() bool { return len(o.servers) > 0 || o.host != "" || o.port != "" }
+
+// candidatesFor is the list a credential may be dialled on: the override
+// list when set, else the pair applied to VK's addresses, else VK's own —
+// deduplicated, never empty when creds has an address.
+func (o turnOverride) candidatesFor(creds *TURNCreds) []string {
+	if len(o.servers) > 0 {
+		return dedupeAddrs(o.servers)
+	}
+	var vk []string
+	if creds != nil {
+		vk = creds.Addresses
+		if len(vk) == 0 && creds.Address != "" {
+			vk = []string{creds.Address}
+		}
+	}
+	if o.host == "" && o.port == "" {
+		return dedupeAddrs(vk)
+	}
+	out := make([]string, 0, len(vk))
+	for _, a := range vk {
+		h, p, err := net.SplitHostPort(a)
+		if err != nil {
+			continue
+		}
+		if o.host != "" {
+			h = o.host
+		}
+		if o.port != "" {
+			p = o.port
+		}
+		out = append(out, net.JoinHostPort(h, p))
+	}
+	return dedupeAddrs(out)
+}
+
+func dedupeAddrs(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, a := range in {
+		if a == "" || seen[a] {
+			continue
+		}
+		seen[a] = true
+		out = append(out, a)
+	}
+	return out
+}
+
+// ParseTURNServers reads the TURN override list as the app's setting and the
+// console's flag spell it: host:port entries separated by commas, spaces or
+// newlines; each port numeric. An empty string is no override.
+func ParseTURNServers(raw string) ([]string, error) {
+	f := func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t' || r == '\r' }
+	var out []string
+	for _, e := range strings.FieldsFunc(raw, f) {
+		h, p, err := net.SplitHostPort(e)
+		if err != nil || h == "" {
+			return nil, &TURNServerListError{Entry: e}
+		}
+		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
+			return nil, &TURNServerListError{Entry: e}
+		}
+		out = append(out, net.JoinHostPort(h, p))
+	}
+	return dedupeAddrs(out), nil
+}
+
+// TURNServerListError names the entry of a TURN override list that is not
+// host:port with a numeric port.
+type TURNServerListError struct{ Entry string }
+
+func (e *TURNServerListError) Error() string {
+	return "TURN server " + strconv.Quote(e.Entry) + " is not host:port"
+}

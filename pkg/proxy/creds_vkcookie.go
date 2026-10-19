@@ -144,7 +144,12 @@ func cookieLinkID(s string) string {
 // or fewer than 2 per call. If there are fewer distinct relays than slot+1, the
 // slot is left unfilled with a clear error (instead of a 486 collision). Mints
 // are cached per link and re-minted near expiry. NO captcha.
-func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
+//
+// With a TURN override list (2026-10-19) the slots are made of the LIST
+// instead: slot s → its s-th relay, each its own (okcdn_userid, relay) quota —
+// any VK credential works on any VK relay (measured) — and a list shorter than
+// the slots asked for leaves the rest unfilled, as a short relay set does.
+func cookieCredForSlot(ctx context.Context, slot int, override []string) (*TURNCreds, error) {
 	ch := vkCookieHeader()
 	if ch == "" {
 		return nil, fmt.Errorf("no VK cookie stored: %w", ErrCookieRejected)
@@ -158,6 +163,17 @@ func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
 	}
 
 	cookieMu.Lock()
+	if len(override) > 0 {
+		defer cookieMu.Unlock()
+		if slot >= len(override) {
+			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s) — slot %d unfilled (add relays to the list, or lower Connections)", len(override), slot)
+		}
+		creds, err := cookieMintCachedLocked(ctx, links[slot%len(links)], ch)
+		if err != nil {
+			return nil, err
+		}
+		return &TURNCreds{Username: creds.Username, Password: creds.Password, Address: override[slot], Addresses: []string{override[slot]}}, nil
+	}
 	defer cookieMu.Unlock()
 
 	// Discover distinct relays lazily until we have more than `slot` of them, or

@@ -245,7 +245,7 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		// holds a distinct (call, relay) bucket. Single-relay creds; NO captcha;
 		// NO anonymous fallback.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		creds, err := cookieCredForSlot(ctx, 0)
+		creds, err := cookieCredForSlot(ctx, 0, nil) // the app's probe: VK's relay; the pool's slot 0 takes the override's first when a list is set
 		cancel()
 		if err != nil {
 			if errors.Is(err, ErrCookieRejected) {
@@ -850,6 +850,7 @@ func getVKCredsWithClientID(linkID string, vc vkCredentials, captchaSolver Captc
 // or empty. Each slot tracks its own freshness and cooldown independently.
 type credPoolEntry struct {
 	addr  string
+	addrs []string // the relays this credential may be dialled on — VK's own, or the override's (relayhealth.go); addr is the first VK one, for the cache and the logs
 	creds *TURNCreds
 	ts    time.Time // when this slot was last filled; zero for empty slots
 
@@ -1186,10 +1187,13 @@ type credCacheFile struct {
 }
 
 type credCacheEntry struct {
-	Slot     int    `json:"slot"`
-	Address  string `json:"address"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Slot    int    `json:"slot"`
+	Address string `json:"address"`
+	// Addresses: every relay VK returned WITH this credential (Address is
+	// the first). Since 2026-10-19; a file without it has the one address.
+	Addresses []string `json:"addresses,omitempty"`
+	Username  string   `json:"username"`
+	Password  string   `json:"password"`
 	// LastUsedAt is the most recent moment a conn was holding a TURN
 	// allocation against this cred (Unix seconds, 0 = never used in
 	// this session). Drives the per-entry saturation-cooldown check
@@ -1225,6 +1229,19 @@ type credPool struct {
 	size     int             // pool capacity, derived from NumConns via poolSizeForNumConns
 	cooldown time.Duration   // post-failure skip-fetch window (default 5m)
 	mode     string          // credCacheModeAnon / credCacheModeCookie — fixed at creation; what the cache file is stamped with and checked against
+
+	// The relay health (relayhealth.go, credpool_relay.go): the standing of
+	// every relay address by host:port, the user's override setting, each
+	// connection's cursor among a credential's candidates, and the pause after
+	// a mint that named only marked relays.
+	health        *relayHealth
+	override      turnOverride
+	cursor        map[int]int
+	deadMintUntil time.Time
+	deadMintPause time.Duration
+	healthTimer   *time.Timer
+	healthWakeAt  time.Time
+	saverDone     chan struct{} // closed when runPeriodicSave has written its last file (tests wait for it)
 
 	// holders is the pool's record of the leases still out — get() has handed
 	// them out, release() has not yet taken them back — by WHAT each was taken
@@ -1529,6 +1546,7 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	}
 	cp.pool[slot] = credPoolEntry{
 		addr:   addr,
+		addrs:  cp.candidatesForSlot(slot, creds),
 		creds:  creds,
 		ts:     time.Now(),
 		active: cp.outstandingLocked(slot, creds), // the record's count — see credPool.holders
@@ -1688,12 +1706,15 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 		// built without a connection count (tests); production callers
 		// overwrite it through setColdStartTarget.
 		coldStartTarget: (size + 3) / 4,
+		health:          newRelayHealth(),
+		cursor:          map[int]int{},
 	}
 	if cachePath != "" {
 		cp.loadFromDisk()
 		// Periodic-save goroutine keeps lastUsedAt fresh on disk so a
 		// kill-mid-session leaves the file reflecting current activity.
 		// See credPeriodicSaveInterval comment.
+		cp.saverDone = make(chan struct{})
 		go cp.runPeriodicSave(ctx)
 	}
 	log.Printf("credpool: initialized with %d slots (expiry-buffer=%s, cooldown=%s, cache=%q)", size, credExpiryBuffer, cp.cooldown, cachePath)
@@ -1708,6 +1729,7 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 func (cp *credPool) runPeriodicSave(ctx context.Context) {
 	ticker := time.NewTicker(credPeriodicSaveInterval)
 	defer ticker.Stop()
+	defer close(cp.saverDone)
 	for {
 		select {
 		case <-ticker.C:
@@ -1774,10 +1796,12 @@ func (cp *credPool) loadFromDisk() {
 			skipped++
 			continue
 		}
+		vk := dedupeAddrs(append([]string{entry.Address}, entry.Addresses...))
 		creds := &TURNCreds{
-			Username: entry.Username,
-			Password: entry.Password,
-			Address:  entry.Address,
+			Username:  entry.Username,
+			Password:  entry.Password,
+			Address:   entry.Address,
+			Addresses: vk,
 		}
 		exp, ok := parseCredExpiry(creds.Username)
 		if !ok {
@@ -1815,6 +1839,7 @@ func (cp *credPool) loadFromDisk() {
 		}
 		cp.pool[entry.Slot] = credPoolEntry{
 			addr:        entry.Address,
+			addrs:       cp.candidatesForSlot(entry.Slot, creds),
 			creds:       creds,
 			ts:          now,
 			active:      cp.outstandingLocked(entry.Slot, creds), // the record's count — see credPool.holders
@@ -1882,6 +1907,7 @@ func (cp *credPool) saveToDisk() {
 		f.Creds = append(f.Creds, credCacheEntry{
 			Slot:       slot,
 			Address:    entry.addr,
+			Addresses:  entry.creds.Addresses,
 			Username:   entry.creds.Username,
 			Password:   entry.creds.Password,
 			LastUsedAt: lastUsed,
@@ -1978,7 +2004,11 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 	now := time.Now()
 
 	// Priority 1: ownSlot, unconditionally preferred when usable.
-	if cp.isFreshLocked(ownSlot) && cp.pool[ownSlot].active < connsPerSlot {
+	if cp.isFreshLocked(ownSlot) && !cp.usableLocked(ownSlot) && logSkips {
+		log.Printf("credpool: conn %d skipping slot %d (every relay it names is marked unreachable: %s)",
+			connIdx, ownSlot, cp.health.deadList(cp.candidatesLocked(ownSlot)))
+	}
+	if cp.usableLocked(ownSlot) && cp.pool[ownSlot].active < connsPerSlot {
 		if now.Before(cp.pool[ownSlot].saturatedUntil) {
 			if logSkips {
 				log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
@@ -1997,7 +2027,7 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 		if i == ownSlot {
 			continue
 		}
-		if !cp.isFreshLocked(i) || cp.pool[i].active >= connsPerSlot {
+		if !cp.usableLocked(i) || cp.pool[i].active >= connsPerSlot {
 			continue
 		}
 		if now.Before(cp.pool[i].saturatedUntil) {
@@ -2097,6 +2127,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// pickAcquireSlotLocked for the selection logic + rationale (each
 	// path event marks fewer slots when conns cluster).
 	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, true); slot >= 0 {
+		// The ADDRESS is chosen now, for this connection (credpool_relay.go):
+		// the override list's or VK's, the first not marked unreachable.
+		addr, _ := cp.pickAddrLocked(slot, connIdx)
 		cp.seatLocked(slot)
 		e := cp.pool[slot]
 		cp.mu.Unlock()
@@ -2109,9 +2142,16 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		default: // "fresh"
 			tag = "fallback fresh slot"
 		}
-		log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%d, age %s)",
-			connIdx, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second))
-		return e.addr, e.creds, slot, nil
+		log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%d, age %s) — relay %s",
+			connIdx, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second), addr)
+		return addr, e.creds, slot, nil
+	}
+
+	// Every fresh credential blocked by its relay marks, and a mint no way out
+	// (the override list, or the dead-mint pause): wait (credpool_relay.go).
+	if park := cp.healthParkLocked(); park != nil {
+		cp.mu.Unlock()
+		return "", nil, -1, park
 	}
 
 	// The relay-refusal breaker (quotabreaker.go): while the relay refuses
@@ -2241,7 +2281,8 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		// to mint and thirty connections wait out a 10-minute cooldown.
 		for _, slot := range candidatesOrdered() {
 			e := cp.pool[slot]
-			if e.creds != nil && now.Before(e.saturatedUntil) && e.active == 0 && !e.fetching && !now.Before(e.cooldownUntil) {
+			blocked := e.creds != nil && !cp.health.hasCandidate(cp.candidatesLocked(slot)) // every relay it names is marked: a fresh mint may bring others
+			if e.creds != nil && (now.Before(e.saturatedUntil) || blocked) && e.active == 0 && !e.fetching && !now.Before(e.cooldownUntil) {
 				target = slot
 				break
 			}
@@ -2285,7 +2326,14 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			// credential is what earns a 486 — so the credential is kept and we
 			// park: those holders' releases announce the room.
 			held := cp.outstandingLocked(target, creds)
-			cp.pool[target] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: held, gen: gen}
+			cp.pool[target] = credPoolEntry{addr: addr, addrs: cp.candidatesForSlot(target, creds), creds: creds, ts: time.Now(), active: held, gen: gen}
+			cp.noteVKAnsweredLocked()
+			if !cp.noteMintLocked(target) {
+				wake := cp.slotAvailableCh
+				cp.mu.Unlock()
+				cp.saveToDisk()
+				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", target), wake: wake}
+			}
 			if held >= connsPerSlot {
 				wake := cp.slotAvailableCh
 				cp.mu.Unlock()
@@ -2298,7 +2346,18 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			}
 			cp.seatLocked(target)
 		} else {
-			got, why = cp.placeIntoEmptySlotLocked(addr, creds, 1)
+			cp.noteVKAnsweredLocked()
+			if !cp.health.hasCandidate(cp.candidatesForSlot(-1, creds)) {
+				if got, why = cp.placeIntoEmptySlotLocked(addr, creds, 0); got >= 0 {
+					_ = cp.noteMintLocked(got)
+					wake := cp.slotAvailableCh
+					cp.mu.Unlock()
+					cp.saveToDisk()
+					return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", got), wake: wake}
+				}
+			} else {
+				got, why = cp.placeIntoEmptySlotLocked(addr, creds, 1)
+			}
 		}
 		if got < 0 {
 			// Not kept: fall through to the failure path with an error of our
@@ -2308,6 +2367,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			log.Printf("credpool: conn %d: slot %d changed hands during the fetch — fetched cred dropped (%s)", connIdx, target, why)
 			fetchErr = fmt.Errorf("credpool: slot %d changed hands during the fetch, fetched cred dropped (%s)", target, why)
 		} else {
+			dial, _ := cp.pickAddrLocked(got, connIdx)
 			filled := cp.countFreshLocked()
 			cp.mu.Unlock()
 			if got == target {
@@ -2326,7 +2386,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			// the remaining connsPerSlot-1 slots of capacity are open for
 			// other parked conns that lost the race for ownSlot.
 			cp.broadcastSlotAvailable()
-			return addr, creds, got, nil
+			return dial, creds, got, nil
 		}
 	}
 
@@ -2668,6 +2728,9 @@ func (cp *credPool) applySaturationLocked(slot int, cooldown time.Duration, reas
 // seatcool.go; the 486s that build 69's wgForceReconnect test drew 0.4–0.8 s
 // behind its Refresh(0) were that second).
 func (cp *credPool) MarkInUseSlotsForPathChange() {
+	cp.mu.Lock()
+	cp.pathChangedHealthLocked() // the relay marks were about the old network (credpool_relay.go)
+	cp.mu.Unlock()
 	const vkAllocLifetime = 600 * time.Second
 	// Safety buffer: clock skew + jitter in VK's quota-release task.
 	// If a slot becomes usable a few seconds before this expires the
@@ -3010,7 +3073,9 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 		// credential): 0 for a new identity — the old identity's sessions are
 		// counted under THEIR key and their releases never reach this entry —
 		// and the previous holders when the same credential is issued again.
-		cp.pool[slot] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: cp.outstandingLocked(slot, creds), gen: gen}
+		cp.pool[slot] = credPoolEntry{addr: addr, addrs: cp.candidatesForSlot(slot, creds), creds: creds, ts: time.Now(), active: cp.outstandingLocked(slot, creds), gen: gen}
+		cp.noteVKAnsweredLocked()
+		_ = cp.noteMintLocked(slot)
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()
 		log.Printf("credpool: background filled slot %d (%d/%d slots filled)", slot, filled, cp.size)
@@ -3089,7 +3154,7 @@ func (cp *credPool) placeIntoEmptySlotLocked(addr string, creds *TURNCreds, acti
 	for i := range cp.pool {
 		if cp.pool[i].creds == nil && !cp.pool[i].fetching {
 			cp.nextGen++
-			cp.pool[i] = credPoolEntry{addr: addr, creds: creds, ts: time.Now(), active: cp.outstandingLocked(i, creds), gen: cp.nextGen}
+			cp.pool[i] = credPoolEntry{addr: addr, addrs: cp.candidatesForSlot(i, creds), creds: creds, ts: time.Now(), active: cp.outstandingLocked(i, creds), gen: cp.nextGen}
 			for n := 0; n < active; n++ {
 				cp.seatLocked(i) // the caller's own seat(s) — `active` of them
 			}
@@ -3378,8 +3443,8 @@ func (cp *credPool) countFreshLocked() int {
 // UI "available" count.
 func (cp *credPool) countAvailableLocked() int {
 	n := 0
-	for _, e := range cp.pool {
-		if entryIsAvailable(e) {
+	for i, e := range cp.pool {
+		if entryIsAvailable(e) && cp.health.hasCandidate(cp.candidatesLocked(i)) {
 			n++
 		}
 	}
