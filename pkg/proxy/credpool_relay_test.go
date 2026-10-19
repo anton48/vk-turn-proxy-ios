@@ -463,3 +463,33 @@ func TestTheOverrideListIsCycledAgainWhenEveryEntryWentUnanswered(t *testing.T) 
 		t.Fatalf("after the list's one entry went unanswered: %q, mints %d — want the entry again, no mint", addr, mints.Load())
 	}
 }
+
+// The app's seed names ONE relay (its cache read hands over `address`); the
+// same credential loaded from disk knows both. The seed takes its twin's
+// relays, or slot 0 alone would have nothing to fail over to (the user's
+// phone, 2026-10-19: slot 0 stayed on the dead relay's one address while the
+// other slots moved). Sabotage seen red: the seed kept to its one address.
+func TestTheSeedTakesItsDiskTwinsRelays(t *testing.T) {
+	user := futureUser("twin")
+	path := writeCache(t, t.TempDir(),
+		credCacheEntry{Slot: 0, Address: relayC, Addresses: []string{relayC}, Username: futureUser("other"), Password: "p", LastUsedAt: time.Now().Add(-time.Minute).Unix()},
+		credCacheEntry{Slot: 4, Address: relayA, Addresses: []string{relayA, relayB}, Username: user, Password: "p"})
+	cp, _, _ := relayPool(t, path, relayC)
+	cp.seedSlot(0, relayA, &TURNCreds{Username: user, Password: "p", Address: relayA, Addresses: []string{relayA}})
+	if c := cp.candidatesLocked(0); len(c) != 2 || c[0] != relayA || c[1] != relayB {
+		t.Fatalf("the seed's candidates: %v, want its disk twin's [%s %s]", c, relayA, relayB)
+	}
+	if cp.pool[4].creds != nil {
+		t.Fatal("the disk twin was not cleared as a duplicate")
+	}
+	// And it fails over: A silent, B next.
+	addr, creds, slot := mustGet(t, cp, 0)
+	if addr != relayA || slot != 0 {
+		t.Fatalf("precondition: %q slot %d", addr, slot)
+	}
+	cp.release(slot, creds)
+	cp.noteRelayUnanswered(0, slot, creds, relayA, time.Now())
+	if addr, _, _ := mustGet(t, cp, 0); addr != relayB {
+		t.Fatalf("after A went unanswered the seed slot dials %q, want %s", addr, relayB)
+	}
+}

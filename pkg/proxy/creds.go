@@ -1544,6 +1544,22 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		copyEntry := entry
 		displaced = &copyEntry
 	}
+	// The seed names ONE relay (the app's cache read hands over `address`); its
+	// twin loaded from disk — the same credential, found by username below and
+	// cleared as a duplicate — knows every relay VK returned with it. The seed
+	// takes them: a seed with one relay has nothing to fail over to (the user's
+	// phone, 2026-10-19: slot 0 alone stayed on the dead relay's one address
+	// while the other slots had both).
+	if creds != nil {
+		for i := range cp.pool {
+			if e := cp.pool[i]; e.creds != nil && e.creds.Username == creds.Username && len(e.creds.Addresses) > 0 {
+				creds.Addresses = dedupeAddrs(append(append([]string{}, creds.Addresses...), e.creds.Addresses...))
+				if creds.Address == "" {
+					creds.Address = creds.Addresses[0]
+				}
+			}
+		}
+	}
 	cp.pool[slot] = credPoolEntry{
 		addr:   addr,
 		addrs:  cp.candidatesForSlot(slot, creds),
