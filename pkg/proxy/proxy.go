@@ -2395,8 +2395,8 @@ func (p *Proxy) relayUnanswered(connIdx, slot int, creds *TURNCreds, turnAddr st
 // relayAllocatedAt: the relay at turnAddr accepted the credential — the pool's
 // quota mark and the relay health's evidence, and the host the app's next
 // connect names as serverAddress (TURNServerIP).
-func (p *Proxy) relayAllocatedAt(slot int, creds *TURNCreds, turnAddr string) {
-	p.credPool.noteAllocatedAt(slot, creds, turnAddr)
+func (p *Proxy) relayAllocatedAt(slot int, creds *TURNCreds, turnAddr string, attempt time.Time) {
+	p.credPool.noteAllocatedAt(slot, creds, turnAddr, attempt)
 	if host, _, err := net.SplitHostPort(turnAddr); err == nil && host != "" {
 		p.turnServerIP.Store(host)
 	}
@@ -3509,7 +3509,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// while the relay's answer was in flight, and a late success of the old
 	// credential must not certify the new one (quotabreaker.go; builds 391
 	// and 392, both caught on the user's control stand).
-	p.relayAllocatedAt(slotIdx, creds, turnAddr)
+	p.relayAllocatedAt(slotIdx, creds, turnAddr, attempt)
 	if p.directMode() {
 		// The direct session has nothing above the relay: the allocation is the
 		// session coming up — the retry floor's evidence that the network works
@@ -5651,7 +5651,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	// and the SRTP handshake — the mark means the allocation, not the
 	// session, and names the credential, not the slot (quotabreaker.go; see
 	// runTURN).
-	p.relayAllocatedAt(credSlot, creds, turnAddr)
+	p.relayAllocatedAt(credSlot, creds, turnAddr, attempt)
 	allocDur := time.Since(allocStart)
 	// Surface the TURN-allocate roundtrip to the UI / Stats endpoint
 	// — same field runDTLSSession populates at proxy.go:2706, so the

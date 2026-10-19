@@ -42,6 +42,13 @@ func (cp *credPool) candidatesForSlot(slot int, creds *TURNCreds) []string {
 		if n := len(cp.override.servers); n > 0 && slot >= 0 && slot < n {
 			return []string{cp.override.servers[slot]}
 		}
+		// The slot's ONE relay (an (identity, relay) quota of its own): never
+		// the credential's whole list — the same username sits in other slots
+		// for other relays (the user's review: a merged list let two slots
+		// allocate on one relay under one identity, 20 where 10 is the quota).
+		if creds != nil && creds.Address != "" {
+			return []string{creds.Address}
+		}
 		return (turnOverride{}).candidatesFor(creds)
 	}
 	return cp.override.candidatesFor(creds)
@@ -124,7 +131,7 @@ func (cp *credPool) noteRelayUnanswered(connIdx, slot int, creds *TURNCreds, add
 // quota bookkeeping (noteAllocated) and the health's evidence: the address
 // is alive, the network works, and every address left unanswered since the
 // previous answer is marked now.
-func (cp *credPool) noteAllocatedAt(slot int, creds *TURNCreds, addr string) {
+func (cp *credPool) noteAllocatedAt(slot int, creds *TURNCreds, addr string, start time.Time) {
 	if cp == nil {
 		return
 	}
@@ -132,7 +139,7 @@ func (cp *credPool) noteAllocatedAt(slot int, creds *TURNCreds, addr string) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 	before := cp.deadCountLocked()
-	cp.health.answered(addr)
+	cp.health.answered(addr, start)
 	if after := cp.deadCountLocked(); after > before {
 		log.Printf("credpool: relay %s answered — %d relay(s) unanswered since the previous answer marked UNREACHABLE", addr, after-before)
 	}
@@ -148,10 +155,11 @@ func (cp *credPool) deadCountLocked() int {
 	return n
 }
 
-// noteVKAnsweredLocked: VK's API minted a credential — the network works.
-func (cp *credPool) noteVKAnsweredLocked() {
+// noteVKAnsweredLocked: VK's API minted a credential (the fetch begun at
+// start) — the network works.
+func (cp *credPool) noteVKAnsweredLocked(start time.Time) {
 	before := cp.deadCountLocked()
-	cp.health.answered("")
+	cp.health.answered("", start)
 	if after := cp.deadCountLocked(); after > before {
 		log.Printf("credpool: VK answered — %d relay(s) unanswered since the previous answer marked UNREACHABLE", after-before)
 	}

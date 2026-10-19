@@ -1550,7 +1550,9 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	// takes them: a seed with one relay has nothing to fail over to (the user's
 	// phone, 2026-10-19: slot 0 alone stayed on the dead relay's one address
 	// while the other slots had both).
-	if creds != nil {
+	// 🚫 Not in cookie mode: there the same username sits in several slots
+	// for several relays, each an (identity, relay) quota of its own.
+	if creds != nil && cp.mode != credCacheModeCookie {
 		for i := range cp.pool {
 			if e := cp.pool[i]; e.creds != nil && e.creds.Username == creds.Username && len(e.creds.Addresses) > 0 {
 				creds.Addresses = dedupeAddrs(append(append([]string{}, creds.Addresses...), e.creds.Addresses...))
@@ -2317,6 +2319,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	cp.mu.Unlock()
 
 	// Inline fetch — runs WITHOUT mu so get() on other slots stays fast.
+	fetchStart := time.Now()
 	addr, creds, fetchErr := cp.fetch(allowCaptchaBlock, target)
 
 	cp.mu.Lock()
@@ -2343,7 +2346,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			// park: those holders' releases announce the room.
 			held := cp.outstandingLocked(target, creds)
 			cp.pool[target] = credPoolEntry{addr: addr, addrs: cp.candidatesForSlot(target, creds), creds: creds, ts: time.Now(), active: held, gen: gen}
-			cp.noteVKAnsweredLocked()
+			cp.noteVKAnsweredLocked(fetchStart)
 			if !cp.noteMintLocked(target) {
 				wake := cp.slotAvailableCh
 				cp.mu.Unlock()
@@ -2362,7 +2365,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			}
 			cp.seatLocked(target)
 		} else {
-			cp.noteVKAnsweredLocked()
+			cp.noteVKAnsweredLocked(fetchStart)
 			if !cp.health.hasCandidate(cp.candidatesForSlot(-1, creds)) {
 				if got, why = cp.placeIntoEmptySlotLocked(addr, creds, 0); got >= 0 {
 					_ = cp.noteMintLocked(got)
@@ -2418,6 +2421,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// one. logSkips=false because Phase 1's initial scan already
 	// emitted any per-slot "VK-saturated" lines for these slots.
 	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, false); slot >= 0 {
+		dial, _ := cp.pickAddrLocked(slot, connIdx) // the same choice as every hand-out: the override's, the health's
 		cp.seatLocked(slot)
 		e := cp.pool[slot]
 		cp.mu.Unlock()
@@ -2430,9 +2434,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		default: // "fresh"
 			tag = "fallback fresh slot"
 		}
-		log.Printf("credpool: conn %d fetch into slot %d failed (%v), falling back to slot %d (%s, active=%d/%d, age %s), cooldown %s",
-			connIdx, target, fetchErr, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second), cp.cooldown)
-		return e.addr, e.creds, slot, nil
+		log.Printf("credpool: conn %d fetch into slot %d failed (%v), falling back to slot %d (%s, active=%d/%d, age %s), cooldown %s — relay %s",
+			connIdx, target, fetchErr, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second), cp.cooldown, dial)
+		return dial, e.creds, slot, nil
 	}
 	cp.mu.Unlock()
 	log.Printf("credpool: conn %d fetch into slot %d failed and no fallback available: %v (cooldown %s)",
@@ -3047,9 +3051,17 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 		cp.mu.Unlock()
 		return false
 	}
+	// The dead-mint pause (credpool_relay.go): the grower, too, mints nothing
+	// while the last mint named only relays marked unreachable — its reserve
+	// fills would land the same dead pair and lengthen the pause.
+	if cp.health.now().Before(cp.deadMintUntil) {
+		cp.mu.Unlock()
+		return false
+	}
 	gen := cp.claimForFetchLocked(slot)
 	cp.mu.Unlock()
 
+	fetchStart := time.Now()
 	addr, creds, err := cp.fetch(allowCaptchaBlock, slot)
 
 	cp.mu.Lock()
@@ -3090,7 +3102,7 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 		// counted under THEIR key and their releases never reach this entry —
 		// and the previous holders when the same credential is issued again.
 		cp.pool[slot] = credPoolEntry{addr: addr, addrs: cp.candidatesForSlot(slot, creds), creds: creds, ts: time.Now(), active: cp.outstandingLocked(slot, creds), gen: gen}
-		cp.noteVKAnsweredLocked()
+		cp.noteVKAnsweredLocked(fetchStart)
 		_ = cp.noteMintLocked(slot)
 		filled := cp.countFreshLocked()
 		cp.mu.Unlock()

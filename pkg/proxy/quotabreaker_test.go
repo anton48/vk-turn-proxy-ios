@@ -321,13 +321,13 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	if n := strings.Count(code, "p.relayAllocatedAt("); n != 2 {
 		t.Errorf("proxy.go: %d relayAllocatedAt calls, want 2 — one per allocation site, none at a session line", n)
 	}
-	if !strings.Contains(code, "p.credPool.noteAllocatedAt(slot, creds, turnAddr)") || strings.Count(code, "noteAllocated(") != 0 {
+	if !strings.Contains(code, "p.credPool.noteAllocatedAt(slot, creds, turnAddr, attempt)") || strings.Count(code, "noteAllocated(") != 0 {
 		t.Error("proxy.go: the mark reaches the pool through relayAllocatedAt → noteAllocatedAt (the credential AND the relay that answered), nowhere else")
 	}
 	// The mark carries the LEASED credential, not the slot number alone: the
 	// slot may have been refilled while the relay's answer was in flight
 	// (the user's stand on 392; allocmark_identity_test.go).
-	for _, call := range []string{"relayAllocatedAt(slotIdx, creds, turnAddr)", "relayAllocatedAt(credSlot, creds, turnAddr)"} {
+	for _, call := range []string{"relayAllocatedAt(slotIdx, creds, turnAddr, attempt)", "relayAllocatedAt(credSlot, creds, turnAddr, attempt)"} {
 		if !strings.Contains(code, call) {
 			t.Errorf("proxy.go lacks %q — the mark must name the credential the session leased", call)
 		}
@@ -336,7 +336,7 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(bridge), "NoteAllocatedAt(slot, creds, addr)") {
+	if !strings.Contains(string(bridge), "NoteAllocatedAt(slot, creds, addr, attempt)") {
 		t.Error("csqtt_bridge.go: the adapter's Allocated callback does not hand the leased credential and its relay to NoteAllocatedAt")
 	}
 	for _, lit := range []string{"DTLS+TURN session established", "direct TURN session established", "WRAP-A+TURN session established", "SRTP+TURN session established"} {

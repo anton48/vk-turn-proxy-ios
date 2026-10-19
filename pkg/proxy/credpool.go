@@ -238,11 +238,12 @@ func (p *CredPool) MarkSaturated(slot int, creds *TURNCreds) time.Duration {
 // the one there now (quotabreaker.go).
 func (p *CredPool) NoteAllocated(slot int, creds *TURNCreds) { p.cp.noteAllocated(slot, creds) }
 
-// NoteAllocatedAt is NoteAllocated with the relay that answered: the relay
-// health's evidence that the network works and that addr is alive, and the
-// host RelayIP reports from now on (relayhealth.go).
-func (p *CredPool) NoteAllocatedAt(slot int, creds *TURNCreds, addr string) {
-	p.cp.noteAllocatedAt(slot, creds, addr)
+// NoteAllocatedAt is NoteAllocated with the relay that answered and when the
+// attempt began: the relay health's evidence that the network works and that
+// addr is alive (an attempt begun before the last path change is no evidence),
+// and the host RelayIP reports from now on (relayhealth.go).
+func (p *CredPool) NoteAllocatedAt(slot int, creds *TURNCreds, addr string, start time.Time) {
+	p.cp.noteAllocatedAt(slot, creds, addr, start)
 	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
 		p.relayIP.Store(host)
 	}

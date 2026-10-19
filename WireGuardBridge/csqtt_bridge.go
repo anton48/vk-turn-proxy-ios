@@ -346,7 +346,7 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 					})
 				},
 				Failed:    func(err error) { a.refused(workerID, idx, slot, creds, addr, attempt, err) },
-				Allocated: func() { allocated.Store(true); a.pool.NoteAllocatedAt(slot, creds, addr) },
+				Allocated: func() { allocated.Store(true); a.pool.NoteAllocatedAt(slot, creds, addr, attempt) },
 			}, nil
 		}
 		if terminal := csqttTerminalCredError(err); terminal != nil {

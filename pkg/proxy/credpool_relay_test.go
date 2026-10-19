@@ -117,7 +117,7 @@ func TestAnUnansweredRelayMovesTheConnectionOnAndIsMarkedByEvidence(t *testing.T
 		t.Fatalf("a connection with no failure of its own dials %q, want %q", addr, relayA)
 	}
 	// B answers: A, unanswered since before that answer, is marked now.
-	cp.noteAllocatedAt(slot, creds, relayB)
+	cp.noteAllocatedAt(slot, creds, relayB, time.Now())
 	if !cp.health.isDead(relayA) || cp.health.isDead(relayB) {
 		t.Fatalf("after B answered: A dead %v (want true), B dead %v (want false)", cp.health.isDead(relayA), cp.health.isDead(relayB))
 	}
@@ -134,7 +134,7 @@ func TestAnUnansweredRelayIsMarkedOnlyWithEvidenceInsideTheWindow(t *testing.T) 
 	h := newRelayHealth()
 	clock := time.Now()
 	h.now = func() time.Time { return clock }
-	h.answered("") // VK's API answered at T
+	h.answered("", time.Time{}) // VK's API answered at T
 	clock = clock.Add(90 * time.Second)
 	if h.unanswered(relayA, clock.Add(-29*time.Second)) { // the attempt began 61 s after the answer
 		t.Fatal("an answer 61 s before the attempt began is no evidence — marked all the same")
@@ -143,7 +143,7 @@ func TestAnUnansweredRelayIsMarkedOnlyWithEvidenceInsideTheWindow(t *testing.T) 
 		t.Fatal("an answer 59 s before the attempt began is evidence — not marked")
 	}
 	// A later answer marks A, unanswered since before it.
-	h.answered(relayC)
+	h.answered(relayC, time.Time{})
 	if !h.isDead(relayA) {
 		t.Fatal("A, unanswered since before C's answer, not marked when C answered")
 	}
@@ -153,7 +153,7 @@ func TestAnUnansweredRelayIsMarkedOnlyWithEvidenceInsideTheWindow(t *testing.T) 
 func TestAPathChangeClearsTheRelayMarks(t *testing.T) {
 	cp, _, _ := relayPool(t, "", relayA, relayB)
 	_, creds, slot := mustGet(t, cp, 0)
-	cp.noteAllocatedAt(slot, creds, relayB)
+	cp.noteAllocatedAt(slot, creds, relayB, time.Now())
 	cp.noteRelayUnanswered(1, slot, creds, relayA, time.Now())
 	if !cp.health.isDead(relayA) {
 		t.Fatal("precondition: A marked")
@@ -171,7 +171,7 @@ func TestACredentialWithEveryRelayMarkedIsKeptNotReadyAndTheMintingPauses(t *tes
 	cp, mints, clock := relayPool(t, "", relayA, relayB)
 	_, creds, slot := mustGet(t, cp, 0)
 	cp.release(slot, creds)
-	cp.health.answered("") // evidence: VK answered just now
+	cp.health.answered("", time.Time{}) // evidence: VK answered just now
 	cp.noteRelayUnanswered(0, slot, creds, relayA, *clock)
 	cp.noteRelayUnanswered(0, slot, creds, relayB, *clock)
 	if !cp.health.isDead(relayA) || !cp.health.isDead(relayB) {
@@ -218,7 +218,7 @@ func TestWithTheOverrideListMarkedTheConnectionsWaitAndMintNothing(t *testing.T)
 		t.Fatalf("precondition: %q", addr)
 	}
 	cp.release(slot, creds)
-	cp.health.answered("")
+	cp.health.answered("", time.Time{})
 	cp.noteRelayUnanswered(0, slot, creds, relayO, *clock)
 	_, _, _, err := cp.get(1, false)
 	if err == nil || !strings.Contains(err.Error(), "override list") || mints.Load() != 0 {
@@ -491,5 +491,148 @@ func TestTheSeedTakesItsDiskTwinsRelays(t *testing.T) {
 	cp.noteRelayUnanswered(0, slot, creds, relayA, time.Now())
 	if addr, _, _ := mustGet(t, cp, 0); addr != relayB {
 		t.Fatalf("after A went unanswered the seed slot dials %q, want %s", addr, relayB)
+	}
+}
+
+// The user's review of cc197cd (2026-10-19), five findings.
+
+// (1) Only a re-try that was handed out moves a marked address's backoff —
+// not the late failures of attempts begun before the mark, which parallel
+// connections report by the dozen (thirty of them had put the first re-try
+// thirty minutes away on the user's stand).
+func TestLateFailuresOfEarlierAttemptsDoNotInflateTheRetries(t *testing.T) {
+	h := newRelayHealth()
+	clock := time.Now()
+	h.now = func() time.Time { return clock }
+	h.answered("", time.Time{})
+	t0 := clock
+	if !h.unanswered(relayA, t0) {
+		t.Fatal("precondition: A marked with evidence")
+	}
+	r := h.rec[relayA]
+	for i := 1; i <= 30; i++ {
+		h.unanswered(relayA, t0.Add(-time.Duration(i)*time.Second)) // begun before the mark
+	}
+	if r.retries != 0 || !r.dueAt().Equal(r.deadSince.Add(relayProbeBackoffMin)) {
+		t.Fatalf("after thirty late failures: retries %d, due in %s — want 0 and the first backoff", r.retries, r.dueAt().Sub(clock))
+	}
+	clock = clock.Add(relayProbeBackoffMin + time.Second)
+	addr, ok, _ := h.probe([]string{relayA})
+	if !ok || addr != relayA {
+		t.Fatalf("the re-try not handed out: %q %v", addr, ok)
+	}
+	h.unanswered(relayA, clock) // the re-try's own failure
+	if r.retries != 1 {
+		t.Fatalf("after the re-try failed: retries %d, want 1", r.retries)
+	}
+	h.unanswered(relayA, clock.Add(-time.Minute)) // a late failure of an attempt begun before the re-try
+	if r.retries != 1 {
+		t.Fatalf("a late failure moved the backoff: retries %d, want 1", r.retries)
+	}
+}
+
+// (2) Cookie mode: a slot IS one (identity, relay) quota — the seed takes no
+// twin's relays there, and a slot dials its one relay whatever its
+// credential's list says.
+func TestCookieModeTheSeedKeepsItsSlotsRelay(t *testing.T) {
+	SetVKCookieAuth(true, "remixsid=x", []string{"https://vk.ru/call/join/abcdef"})
+	t.Cleanup(func() { SetVKCookieAuth(false, "", nil) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cp := newCredPool(ctx, 4, 2*time.Minute, "", nil)
+	user := futureUser("cookie")
+	other := &TURNCreds{Username: user, Password: "p", Address: relayB, Addresses: []string{relayB}}
+	cp.mu.Lock()
+	cp.pool[1] = credPoolEntry{addr: relayB, addrs: cp.candidatesForSlot(1, other), creds: other, ts: time.Now()}
+	cp.mu.Unlock()
+	cp.seedSlot(0, relayA, &TURNCreds{Username: user, Password: "p", Address: relayA, Addresses: []string{relayA}})
+	if c := cp.candidatesLocked(0); len(c) != 1 || c[0] != relayA {
+		t.Fatalf("the cookie seed's candidates: %v, want its own relay alone", c)
+	}
+	if a := cp.pool[0].creds.Addresses; len(a) != 1 || a[0] != relayA {
+		t.Fatalf("the cookie seed's credential was merged with its twin's relays: %v — want its own alone (the cache would carry both)", a)
+	}
+	if c := cp.candidatesForSlot(1, &TURNCreds{Username: user, Address: relayB, Addresses: []string{relayA, relayB}}); len(c) != 1 || c[0] != relayB {
+		t.Fatalf("a cookie slot's candidates from a credential naming two relays: %v, want the slot's one", c)
+	}
+}
+
+// (3) An attempt begun before the last path change belongs to the old
+// network: its late failure is no verdict on the new one, its late success
+// no evidence for it.
+func TestAnAttemptOfTheOldPathIsNoVerdictAndNoEvidence(t *testing.T) {
+	h := newRelayHealth()
+	clock := time.Now()
+	h.now = func() time.Time { return clock }
+	oldStart := clock
+	clock = clock.Add(time.Second)
+	h.pathChanged()
+	clock = clock.Add(time.Second)
+	h.answered(relayB, clock) // the new path works
+	if h.unanswered(relayA, oldStart) || h.isDead(relayA) {
+		t.Fatal("a timeout of the OLD path's attempt marked A on the new path")
+	}
+	h.pathChanged()
+	clock = clock.Add(time.Second)
+	h.answered(relayC, oldStart) // the old path's late success
+	if h.unanswered(relayD, clock) || h.isDead(relayD) {
+		t.Fatal("the old path's late success counted as evidence on the new path")
+	}
+}
+
+const relayD = "203.0.113.14:19302"
+
+// (4) The fallback after a failed mint (another slot came up meanwhile) hands
+// out the address the way every hand-out does — the override's, the health's
+// — not the slot's stored one.
+func TestTheFallbackAfterAFailedMintPicksTheAddress(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		override []string
+		markA    bool
+		want     string
+	}{
+		{"the override list", []string{relayO}, false, relayO},
+		{"a marked relay", nil, true, relayB},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cp *credPool
+			c := &TURNCreds{Username: futureUser("landed"), Password: "p", Address: relayA, Addresses: []string{relayA, relayB}}
+			fetch := func(bool, int) (string, *TURNCreds, error) {
+				cp.mu.Lock() // another slot came up during the fetch
+				cp.pool[5] = credPoolEntry{addr: relayA, addrs: cp.candidatesForSlot(5, c), creds: c, ts: time.Now()}
+				cp.mu.Unlock()
+				return "", nil, errors.New("vk down")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			cp = newCredPool(ctx, 12, 2*time.Minute, "", fetch)
+			cp.setOverride(turnOverride{servers: tc.override})
+			if tc.markA {
+				cp.mu.Lock()
+				cp.health.answered("", time.Time{})
+				cp.health.unanswered(relayA, time.Now())
+				cp.mu.Unlock()
+			}
+			addr, _, slot, err := cp.get(0, false)
+			if err != nil || slot != 5 || addr != tc.want {
+				t.Fatalf("the fallback: addr %q slot %d err %v — want %q from slot 5", addr, slot, err, tc.want)
+			}
+		})
+	}
+}
+
+// (5) The dead-mint pause holds the grower too.
+func TestTheGrowerMintsNothingUnderTheDeadMintPause(t *testing.T) {
+	cp, mints, clock := relayPool(t, "", relayA, relayB)
+	cp.mu.Lock()
+	cp.deadMintUntil = clock.Add(time.Minute)
+	cp.mu.Unlock()
+	if cp.tryFill(3, false, 0) || mints.Load() != 0 {
+		t.Fatalf("the grower minted under the pause: %d", mints.Load())
+	}
+	*clock = clock.Add(2 * time.Minute)
+	if !cp.tryFill(3, false, 0) || mints.Load() != 1 {
+		t.Fatalf("after the pause: filled %v, mints %d", mints.Load() == 1, mints.Load())
 	}
 }

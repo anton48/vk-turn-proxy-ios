@@ -73,7 +73,13 @@ type relayRecord struct {
 type relayHealth struct {
 	rec        map[string]*relayRecord
 	lastAnswer time.Time // the latest answer on this path — a relay's or VK's API
-	now        func() time.Time
+	// pathChangedAt: when the path last changed. An attempt that BEGAN before
+	// it belongs to the old network — its late failure is no verdict on the
+	// new one and its late success no evidence for it (the user's review,
+	// 2026-10-19: a TCP dial of the old path timing out after a new-path
+	// allocation would have marked the relay on the new path).
+	pathChangedAt time.Time
+	now           func() time.Time
 }
 
 func newRelayHealth() *relayHealth {
@@ -91,18 +97,29 @@ func (h *relayHealth) record(addr string) *relayRecord {
 
 // unanswered records an attempt on addr that got no answer, begun at start.
 // It reports whether the address is marked now (evidence inside the window).
+// An attempt begun before the last path change says nothing. On a marked
+// address only a RE-TRY that was handed out (probe) moves the backoff — not
+// the late failures of attempts begun before the mark, which arrive by the
+// dozen from parallel connections (the user's review: thirty of them had put
+// the first re-try thirty minutes away).
 func (h *relayHealth) unanswered(addr string, start time.Time) bool {
 	now := h.now()
+	if start.Before(h.pathChangedAt) {
+		return false
+	}
 	r := h.record(addr)
+	probeOut := !r.claimedUntil.IsZero()
+	r.claimedUntil = time.Time{}
+	if r.dead {
+		if probeOut && !start.Before(r.deadSince) {
+			r.retried, r.retries = now, r.retries+1
+		}
+		return true
+	}
 	if r.unanswered == 0 {
 		r.unansweredSince = start
 	}
 	r.unanswered++
-	r.claimedUntil = time.Time{}
-	if r.dead {
-		r.retried, r.retries = now, r.retries+1
-		return true
-	}
 	if !h.lastAnswer.IsZero() && !h.lastAnswer.Before(start.Add(-relayEvidenceWindow)) {
 		h.markLocked(r, now)
 		return true
@@ -114,11 +131,16 @@ func (h *relayHealth) markLocked(r *relayRecord, now time.Time) {
 	r.dead, r.deadSince, r.retries, r.retried = true, now, 0, time.Time{}
 }
 
-// answered records an answer from addr ("" for VK's API): the network works
-// — the address is alive again, and every other address unanswered since
-// the previous answer is marked now.
-func (h *relayHealth) answered(addr string) {
+// answered records an answer from addr ("" for VK's API) to an attempt begun
+// at start (zero: now): the network works — the address is alive again, and
+// every other address unanswered since the previous answer is marked now. An
+// answer to an attempt begun before the last path change is the OLD network's
+// and no evidence for this one.
+func (h *relayHealth) answered(addr string, start time.Time) {
 	now := h.now()
+	if !start.IsZero() && start.Before(h.pathChangedAt) {
+		return
+	}
 	prev := h.lastAnswer
 	h.lastAnswer = now
 	if addr != "" {
@@ -140,6 +162,7 @@ func (h *relayHealth) answered(addr string) {
 func (h *relayHealth) pathChanged() {
 	h.rec = map[string]*relayRecord{}
 	h.lastAnswer = time.Time{}
+	h.pathChangedAt = h.now()
 }
 
 func (h *relayHealth) isDead(addr string) bool {
