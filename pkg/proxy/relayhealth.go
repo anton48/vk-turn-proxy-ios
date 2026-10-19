@@ -68,6 +68,7 @@ type relayRecord struct {
 	retried         time.Time // the last re-try of a marked address
 	retries         int       // re-tries since the mark
 	claimedUntil    time.Time // a re-try is out on this address until then
+	claimedAt       time.Time // when that re-try was handed out: a result belongs to it only if its attempt began after
 }
 
 type relayHealth struct {
@@ -108,10 +109,15 @@ func (h *relayHealth) unanswered(addr string, start time.Time) bool {
 		return false
 	}
 	r := h.record(addr)
-	probeOut := !r.claimedUntil.IsZero()
-	r.claimedUntil = time.Time{}
 	if r.dead {
-		if probeOut && !start.Before(r.deadSince) {
+		// Only the re-try's OWN result — an attempt begun after the claim was
+		// handed out — releases the claim and moves the backoff. A late
+		// failure of an earlier attempt, or of a re-try whose claim has run
+		// out and been handed out again, touches neither (the user's review,
+		// 2026-10-19: it had freed the claim, and a second re-try went out
+		// beside the first).
+		if !r.claimedUntil.IsZero() && !start.Before(r.claimedAt) {
+			r.claimedUntil, r.claimedAt = time.Time{}, time.Time{}
 			r.retried, r.retries = now, r.retries+1
 		}
 		return true
@@ -221,6 +227,13 @@ func (h *relayHealth) probe(cands []string) (addr string, ok bool, nextDue time.
 			// at a time — the others wait for its answer.
 			return "", false, r.claimedUntil
 		}
+		if !r.claimedUntil.IsZero() {
+			// A re-try whose claim ran out with no result: counted as a failed
+			// re-try at the claim's end — the next one after the backoff, not
+			// at once — and its late result, if any, touches nothing.
+			r.retried, r.retries = r.claimedUntil, r.retries+1
+			r.claimedUntil, r.claimedAt = time.Time{}, time.Time{}
+		}
 		dues = append(dues, due{a, r.dueAt()})
 	}
 	if len(dues) == 0 {
@@ -230,7 +243,7 @@ func (h *relayHealth) probe(cands []string) (addr string, ok bool, nextDue time.
 	if dues[0].at.After(now) {
 		return "", false, dues[0].at
 	}
-	h.rec[dues[0].addr].claimedUntil = now.Add(relayProbeClaim)
+	h.rec[dues[0].addr].claimedUntil, h.rec[dues[0].addr].claimedAt = now.Add(relayProbeClaim), now
 	return dues[0].addr, true, time.Time{}
 }
 

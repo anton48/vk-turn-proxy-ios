@@ -636,3 +636,57 @@ func TestTheGrowerMintsNothingUnderTheDeadMintPause(t *testing.T) {
 		t.Fatalf("after the pause: filled %v, mints %d", mints.Load() == 1, mints.Load())
 	}
 }
+
+// A result releases only the claim of ITS OWN re-try (an attempt begun after
+// the claim was handed out): a late failure of an earlier attempt, or of a
+// re-try whose claim ran out and was handed out again, leaves the standing
+// claim and the backoff alone (the user's review of d58792e: a late result had
+// freed the claim, and a second re-try went out beside the first — 10 of 10).
+func TestOnlyTheReTrysOwnResultReleasesItsClaim(t *testing.T) {
+	h := newRelayHealth()
+	clock := time.Now()
+	h.now = func() time.Time { return clock }
+	h.answered("", time.Time{})
+	markAt := clock
+	if !h.unanswered(relayA, markAt) {
+		t.Fatal("precondition: A marked")
+	}
+	clock = clock.Add(relayProbeBackoffMin + time.Second)
+	if _, ok, _ := h.probe([]string{relayA}); !ok {
+		t.Fatal("precondition: the re-try handed out")
+	}
+	claimedAt := clock
+	h.unanswered(relayA, markAt.Add(-time.Second)) // a late failure of an attempt begun before the mark
+	if _, ok, _ := h.probe([]string{relayA}); ok {
+		t.Fatal("the late failure freed the claim — a second re-try went out beside the first")
+	}
+	if r := h.rec[relayA]; r.retries != 0 {
+		t.Fatalf("the late failure moved the backoff: retries %d", r.retries)
+	}
+	clock = clock.Add(2 * time.Second)
+	h.unanswered(relayA, claimedAt.Add(time.Second)) // the re-try's own result
+	if r := h.rec[relayA]; r.retries != 1 || !r.claimedUntil.IsZero() {
+		t.Fatalf("the re-try's own failure: retries %d, claim standing %v — want 1 and released", r.retries, !r.claimedUntil.IsZero())
+	}
+	// A re-try whose claim ran out: its late result does not touch the next claim.
+	clock = clock.Add(probeBackoff(1) + time.Second)
+	if _, ok, _ := h.probe([]string{relayA}); !ok {
+		t.Fatal("the second re-try not handed out")
+	}
+	second := clock
+	clock = clock.Add(relayProbeClaim + time.Second) // its claim ran out with no result
+	if _, ok, _ := h.probe([]string{relayA}); ok {
+		t.Fatal("a third re-try at once after the second's claim ran out — want the backoff first (the run-out counts as a failed re-try)")
+	}
+	if r := h.rec[relayA]; r.retries != 2 {
+		t.Fatalf("the run-out claim not counted as a failed re-try: retries %d, want 2", r.retries)
+	}
+	clock = clock.Add(probeBackoff(2))
+	if _, ok, _ := h.probe([]string{relayA}); !ok {
+		t.Fatal("the third re-try not handed out after the backoff")
+	}
+	h.unanswered(relayA, second) // the second re-try's late result
+	if r := h.rec[relayA]; r.claimedUntil.IsZero() || r.retries != 2 {
+		t.Fatalf("the second re-try's late result touched the third's claim or the backoff: claim %v retries %d", !r.claimedUntil.IsZero(), r.retries)
+	}
+}
