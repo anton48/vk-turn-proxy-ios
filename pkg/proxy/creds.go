@@ -2147,7 +2147,12 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, true); slot >= 0 {
 		// The ADDRESS is chosen now, for this connection (credpool_relay.go):
 		// the override list's or VK's, the first not marked unreachable.
-		addr, _ := cp.pickAddrLocked(slot, connIdx)
+		addr, ok := cp.pickAddrLocked(slot, connIdx)
+		if !ok { // no address after all (a re-try's claim ran out between the two looks): no seat, a park
+			park := cp.relayParkLocked(connIdx, slot)
+			cp.mu.Unlock()
+			return "", nil, -1, park
+		}
 		cp.seatLocked(slot)
 		e := cp.pool[slot]
 		cp.mu.Unlock()
@@ -2363,7 +2368,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				log.Printf("credpool: conn %d: slot %d's credential was issued again with its %d previous holders still out — kept, no seat until they release", connIdx, target, held)
 				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's credential was issued again with its %d previous holders still out — parking until they release", target, held), wake: wake}
 			}
-			cp.seatLocked(target)
+			// The seat is taken below, after the address is picked.
 		} else {
 			cp.noteVKAnsweredLocked(fetchStart)
 			if !cp.health.hasCandidate(cp.candidatesForSlot(-1, creds)) {
@@ -2375,7 +2380,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 					return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", got), wake: wake}
 				}
 			} else {
-				got, why = cp.placeIntoEmptySlotLocked(addr, creds, 1)
+				got, why = cp.placeIntoEmptySlotLocked(addr, creds, 0) // the seat below, after the pick
 			}
 		}
 		if got < 0 {
@@ -2386,7 +2391,14 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			log.Printf("credpool: conn %d: slot %d changed hands during the fetch — fetched cred dropped (%s)", connIdx, target, why)
 			fetchErr = fmt.Errorf("credpool: slot %d changed hands during the fetch, fetched cred dropped (%s)", target, why)
 		} else {
-			dial, _ := cp.pickAddrLocked(got, connIdx)
+			dial, ok := cp.pickAddrLocked(got, connIdx)
+			if !ok {
+				park := cp.relayParkLocked(connIdx, got)
+				cp.mu.Unlock()
+				cp.saveToDisk()
+				return "", nil, -1, park
+			}
+			cp.seatLocked(got)
 			filled := cp.countFreshLocked()
 			cp.mu.Unlock()
 			if got == target {
@@ -2421,7 +2433,12 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// one. logSkips=false because Phase 1's initial scan already
 	// emitted any per-slot "VK-saturated" lines for these slots.
 	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, false); slot >= 0 {
-		dial, _ := cp.pickAddrLocked(slot, connIdx) // the same choice as every hand-out: the override's, the health's
+		dial, ok := cp.pickAddrLocked(slot, connIdx) // the same choice as every hand-out: the override's, the health's
+		if !ok {
+			park := cp.relayParkLocked(connIdx, slot)
+			cp.mu.Unlock()
+			return "", nil, -1, park
+		}
 		cp.seatLocked(slot)
 		e := cp.pool[slot]
 		cp.mu.Unlock()

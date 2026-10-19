@@ -227,13 +227,7 @@ func (h *relayHealth) probe(cands []string) (addr string, ok bool, nextDue time.
 			// at a time — the others wait for its answer.
 			return "", false, r.claimedUntil
 		}
-		if !r.claimedUntil.IsZero() {
-			// A re-try whose claim ran out with no result: counted as a failed
-			// re-try at the claim's end — the next one after the backoff, not
-			// at once — and its late result, if any, touches nothing.
-			r.retried, r.retries = r.claimedUntil, r.retries+1
-			r.claimedUntil, r.claimedAt = time.Time{}, time.Time{}
-		}
+		h.settleRunOutClaim(r)
 		dues = append(dues, due{a, r.dueAt()})
 	}
 	if len(dues) == 0 {
@@ -259,6 +253,19 @@ func (h *relayHealth) untried(cands []string) []string {
 	return out
 }
 
+// settleRunOutClaim: a re-try whose claim ran out with no result is counted
+// as a failed re-try at the claim's end — the next one after the backoff, not
+// at once — and its late result, if any, touches nothing. Called wherever a
+// marked address is judged (probe AND hasCandidate — the two agree, so a
+// credential never reads as ready on a stale due time and then yields no
+// address: the user's review of 5283092).
+func (h *relayHealth) settleRunOutClaim(r *relayRecord) {
+	if !r.claimedUntil.IsZero() && !r.claimedUntil.After(h.now()) {
+		r.retried, r.retries = r.claimedUntil, r.retries+1
+		r.claimedUntil, r.claimedAt = time.Time{}, time.Time{}
+	}
+}
+
 // hasCandidate: an untried candidate, or a marked one due for a re-try. A
 // credential whose EVERY candidate went unanswered since the last answer has
 // none — it is not ready, and the pool mints (VK's answer is the evidence
@@ -280,6 +287,7 @@ func (h *relayHealth) hasCandidate(cands []string) bool {
 		if r.claimedUntil.After(now) {
 			return false // a re-try is out: one at a time
 		}
+		h.settleRunOutClaim(r)
 		if !r.dueAt().After(now) {
 			due = true
 		}

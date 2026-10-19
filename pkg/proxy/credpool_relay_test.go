@@ -690,3 +690,51 @@ func TestOnlyTheReTrysOwnResultReleasesItsClaim(t *testing.T) {
 		t.Fatalf("the second re-try's late result touched the third's claim or the backoff: claim %v retries %d", !r.claimedUntil.IsZero(), r.retries)
 	}
 }
+
+// A re-try's claim that ran out: hasCandidate and probe agree (both settle it
+// into a failed re-try), and every hand-out checks its pick — a credential
+// never reads as ready on a stale due time and then yields an empty address
+// with a seat taken (the user's review of 5283092: get() handed out "" with
+// err nil, and the connection dialled nothing).
+func TestARunOutClaimNeverYieldsAnEmptyAddress(t *testing.T) {
+	h := newRelayHealth()
+	clock := time.Now()
+	h.now = func() time.Time { return clock }
+	h.answered("", time.Time{})
+	h.unanswered(relayA, clock)
+	clock = clock.Add(relayProbeBackoffMin + time.Second)
+	if _, ok, _ := h.probe([]string{relayA}); !ok {
+		t.Fatal("precondition: the re-try handed out")
+	}
+	clock = clock.Add(relayProbeClaim + time.Second) // the claim ran out, no result
+	if h.hasCandidate([]string{relayA}) {
+		t.Fatal("hasCandidate says due on the stale due time while probe would settle the run-out claim and refuse")
+	}
+	if addr, ok, _ := h.probe([]string{relayA}); ok || addr != "" {
+		t.Fatalf("probe after the run-out: %q %v", addr, ok)
+	}
+	// The pool: the same sequence through get — a park, no seat, never "".
+	path := writeCache(t, t.TempDir(), credCacheEntry{Slot: 0, Address: relayA, Username: futureUser("cached"), Password: "p"})
+	cp, _, pclock := relayPool(t, path, relayC)
+	cp.setOverride(turnOverride{servers: []string{relayO}})
+	_, creds, slot := mustGet(t, cp, 0)
+	cp.release(slot, creds)
+	cp.mu.Lock()
+	cp.health.answered("", time.Time{})
+	cp.health.unanswered(relayO, *pclock)
+	cp.mu.Unlock()
+	*pclock = pclock.Add(relayProbeBackoffMin + time.Second)
+	if addr, _, _ := mustGet(t, cp, 1); addr != relayO { // the re-try handed out to conn 1
+		t.Fatalf("the re-try: %q", addr)
+	}
+	*pclock = pclock.Add(relayProbeClaim + time.Second) // its claim ran out
+	before := cp.pool[slot].active
+	addr, c, s, err := cp.get(2, false)
+	var park *poolParkError
+	if err == nil || !errors.As(err, &park) || addr != "" || c != nil || s != -1 {
+		t.Fatalf("after the run-out claim get(2) = %q %v %d %v — want a park, nothing handed out", addr, c, s, err)
+	}
+	if cp.pool[slot].active != before {
+		t.Fatalf("a seat was taken for nothing: active %d → %d", before, cp.pool[slot].active)
+	}
+}

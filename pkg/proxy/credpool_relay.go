@@ -108,6 +108,21 @@ func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 	return addr, ok
 }
 
+// relayParkLocked: a hand-out found no address to dial on slot's credential
+// after all (every relay marked, no re-try due or one already out) — the
+// connection parks until the next re-try comes due; no seat is taken.
+func (cp *credPool) relayParkLocked(connIdx, slot int) *poolParkError {
+	cands := cp.candidatesLocked(slot)
+	_, _, due := cp.health.probe(cands)
+	cp.armHealthWakeLocked(due)
+	wait := "a re-try is out on another connection"
+	if !due.IsZero() {
+		wait = fmt.Sprintf("the next re-try in %s", due.Sub(cp.health.now()).Round(time.Second))
+	}
+	log.Printf("credpool: conn %d: slot %d has no relay to dial (%s marked) — parking, %s", connIdx, slot, cp.health.deadList(cands), wait)
+	return &poolParkError{msg: fmt.Sprintf("credpool: slot %d has no relay to dial — parking, %s", slot, wait), wake: cp.slotAvailableCh}
+}
+
 // noteRelayUnanswered: connIdx's Allocate on addr (slot's credential) got no
 // answer; the attempt began at start. The connection's cursor moves on; the
 // address is marked only with evidence that the network works (relayhealth.go).
