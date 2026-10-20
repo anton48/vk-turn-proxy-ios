@@ -24,6 +24,7 @@ func (cp *credPool) setOverride(o turnOverride) {
 	for i := range cp.pool {
 		if cp.pool[i].creds != nil {
 			cp.pool[i].addrs = cp.candidatesForSlot(i, cp.pool[i].creds)
+			cp.applyRelayQuarantineLocked(i) // the clock of the relay the slot dials NOW
 		}
 	}
 	if o.set() {
@@ -333,4 +334,59 @@ func (cp *credPool) cookieRelayTwinLocked(slot int, creds *TURNCreds) int {
 // connection before the first mint).
 func (cp *credPool) configuredOffLocked(slot int) bool {
 	return cp.mode == credCacheModeCookie && len(cp.override.servers) > 0 && slot >= len(cp.override.servers)
+}
+
+// relayQuarantineUntilLocked: until when the relay's seats may still be held
+// by leases that ended (cookie mode: one okcdn user id, the quota the
+// relay's) — the zero time when the relay was not used within the cooldown.
+func (cp *credPool) relayQuarantineUntilLocked(relay string) time.Time {
+	if cp.mode != credCacheModeCookie || relay == "" {
+		return time.Time{}
+	}
+	t, ok := cp.relayUsedAt[relay]
+	if !ok {
+		return time.Time{}
+	}
+	if until := t.Add(credSaturationCooldown); until.After(time.Now()) {
+		return until
+	}
+	return time.Time{}
+}
+
+// noteRelayUsedLocked: a lease on slot's relay ended at `at` — the relay's
+// clock moves (cookie mode; the relay the slot DIALS, one in that mode).
+func (cp *credPool) noteRelayUsedLocked(slot int, at time.Time) {
+	if cp.mode != credCacheModeCookie {
+		return
+	}
+	if c := cp.candidatesLocked(slot); len(c) == 1 && at.After(cp.relayUsedAt[c[0]]) {
+		cp.relayUsedAt[c[0]] = at
+	}
+}
+
+// applyRelayQuarantineLocked (cookie mode): slot's availableAt IS the clock
+// of the relay it dials now — not of a relay it dialled under an earlier
+// override, not of a twin on another relay (the user's review of 450: A's
+// quarantine carried onto a never-used B; a twin's quarantine lost with it).
+// The slot's own history lives in the clock already (noteRelayUsedLocked,
+// loadFromDisk). Anonymous mode: the entry's own availableAt, untouched.
+func (cp *credPool) applyRelayQuarantineLocked(slot int) {
+	if cp.mode != credCacheModeCookie || slot < 0 || slot >= len(cp.pool) || cp.pool[slot].creds == nil {
+		return
+	}
+	var until time.Time
+	if c := cp.candidatesLocked(slot); len(c) == 1 {
+		until = cp.relayQuarantineUntilLocked(c[0])
+	}
+	cp.pool[slot].availableAt = until
+}
+
+// placeLocked puts an entry into slot and applies the relay's quota clock to
+// it (cookie mode) — the ONE way an entry with a credential enters the pool.
+func (cp *credPool) placeLocked(slot int, e credPoolEntry) {
+	for len(cp.pool) <= slot {
+		cp.pool = append(cp.pool, credPoolEntry{})
+	}
+	cp.pool[slot] = e
+	cp.applyRelayQuarantineLocked(slot)
 }
