@@ -1600,21 +1600,39 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	// seed sits on, on disk under another call id (2026-10-20, the user's
 	// run 8: two slots on one relay). The seed wins; the displaced pending
 	// credential, if it is on that relay, is not relocated either.
+	// The seed inherits their quota history (lastUsedAt / availableAt): the
+	// relay's seats are still the relay's (the user's review of 449).
 	relayTwins := 0
+	var twinUsed, twinAvail time.Time
+	noteTwin := func(e credPoolEntry) {
+		if e.lastUsedAt.After(twinUsed) {
+			twinUsed = e.lastUsedAt
+		}
+		if e.availableAt.After(twinAvail) {
+			twinAvail = e.availableAt
+		}
+		relayTwins++
+	}
 	if creds != nil {
 		for {
 			twin := cp.cookieRelayTwinLocked(slot, creds)
 			if twin < 0 {
 				break
 			}
+			noteTwin(cp.pool[twin])
 			cp.pool[twin] = credPoolEntry{}
-			relayTwins++
 		}
 		if displaced != nil && cp.mode == credCacheModeCookie {
 			if k, d := cp.candidatesForSlot(slot, creds), cp.candidatesForSlot(slot, displaced.creds); len(k) == 1 && len(d) == 1 && k[0] == d[0] {
+				noteTwin(*displaced)
 				displaced = nil
-				relayTwins++
 			}
+		}
+		if twinUsed.After(cp.pool[slot].lastUsedAt) {
+			cp.pool[slot].lastUsedAt = twinUsed
+		}
+		if twinAvail.After(cp.pool[slot].availableAt) {
+			cp.pool[slot].availableAt = twinAvail
 		}
 	}
 	// Relocate the pre-seed pending cred (if any) into the first now-
@@ -1644,8 +1662,12 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 				duplicates, slot)
 		}
 		if relayTwins > 0 {
-			log.Printf("credpool: cleared %d slot(s) holding the seed's relay %s under another identity (cookie mode: one quota per relay)",
-				relayTwins, addr)
+			wait := ""
+			if now := time.Now(); twinAvail.After(now) {
+				wait = fmt.Sprintf("; their quota history kept — slot %d usable in %s", slot, twinAvail.Sub(now).Round(time.Second))
+			}
+			log.Printf("credpool: cleared %d slot(s) holding the seed's relay %s under another identity (cookie mode: one quota per relay)%s",
+				relayTwins, addr, wait)
 		}
 		if relocatedTo >= 0 {
 			log.Printf("credpool: relocated pre-seed pending cred from slot %d to slot %d (will become usable when its saturation cooldown expires)",
@@ -1885,14 +1907,30 @@ func (cp *credPool) loadFromDisk() {
 		// Cookie mode: two slots on one relay are one quota — the fresher
 		// credential stays, the other is skipped (2026-10-20, the user's
 		// run 8: two slots on each of two relays; run 9: 486 on the second).
+		// The one that stays inherits the other's quota history (lastUsedAt /
+		// availableAt): the relay's seats are the relay's, a fresh credential
+		// does not free them (the user's review of 449).
 		if twin := cp.cookieRelayTwinLocked(entry.Slot, creds); twin >= 0 {
-			if texp, _ := parseCredExpiry(cp.pool[twin].creds.Username); !exp.After(texp) {
-				log.Printf("credpool: load: slot %d holds the same relay %s as slot %d (cookie mode: one quota) — the older skipped",
-					entry.Slot, entry.Address, twin)
+			te := cp.pool[twin]
+			if texp, _ := parseCredExpiry(te.creds.Username); !exp.After(texp) {
+				if lastUsed.After(te.lastUsedAt) {
+					cp.pool[twin].lastUsedAt = lastUsed
+				}
+				if availableAt.After(te.availableAt) {
+					cp.pool[twin].availableAt = availableAt
+				}
+				log.Printf("credpool: load: slot %d holds the same relay %s as slot %d (cookie mode: one quota) — the older skipped, its quota history kept on slot %d",
+					entry.Slot, entry.Address, twin, twin)
 				skipped++
 				continue
 			}
-			log.Printf("credpool: load: slot %d holds the same relay %s as slot %d (cookie mode: one quota) — the older slot %d dropped",
+			if te.lastUsedAt.After(lastUsed) {
+				lastUsed = te.lastUsedAt
+			}
+			if te.availableAt.After(availableAt) {
+				availableAt = te.availableAt
+			}
+			log.Printf("credpool: load: slot %d holds the same relay %s as slot %d (cookie mode: one quota) — the older slot %d dropped, its quota history kept",
 				entry.Slot, entry.Address, twin, twin)
 			cp.pool[twin] = credPoolEntry{}
 			loaded--
@@ -2066,8 +2104,12 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 
 	// Priority 1: ownSlot, unconditionally preferred when usable.
 	if cp.isFreshLocked(ownSlot) && !cp.usableLocked(ownSlot) && logSkips {
-		log.Printf("credpool: conn %d skipping slot %d (every relay it names is marked unreachable: %s)",
-			connIdx, ownSlot, cp.health.deadList(cp.candidatesLocked(ownSlot)))
+		if cp.configuredOffLocked(ownSlot) {
+			log.Printf("credpool: conn %d skipping slot %d (beyond the TURN override list)", connIdx, ownSlot)
+		} else {
+			log.Printf("credpool: conn %d skipping slot %d (every relay it names is marked unreachable: %s)",
+				connIdx, ownSlot, cp.health.deadList(cp.candidatesLocked(ownSlot)))
+		}
 	}
 	if cp.usableLocked(ownSlot) && cp.pool[ownSlot].active < connsPerSlot {
 		if now.Before(cp.pool[ownSlot].saturatedUntil) {

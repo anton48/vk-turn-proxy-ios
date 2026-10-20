@@ -207,3 +207,68 @@ func TestCookieModeALoadedSlotBeyondTheListIsNotUsable(t *testing.T) {
 		t.Fatalf("slot 3 without the list: %v, want its own relay", c)
 	}
 }
+
+// The user's review of 449, (1): a slot switched off by configuration (cookie
+// mode, beyond the override list) is not a slot whose relays are unreachable —
+// it must not make healthParkLocked hold every connection, or a pool whose
+// only cached credential sits beyond the list never mints (the bootstrap
+// without a seed: slots 0–1 empty, the grower not yet running).
+func TestASlotBeyondTheListDoesNotHoldTheBootstrap(t *testing.T) {
+	cookieTestMode(t)
+	path := writeCookieCache(t, t.TempDir(),
+		credCacheEntry{Slot: 3, Address: relayO, Addresses: []string{relayO}, Username: futureUser("s3-beyond"), Password: "p"},
+	)
+	cp, mints, _ := relayPool(t, path, relayC)
+	cp.setOverride(turnOverride{servers: []string{relayE, relayO}})
+	addr, _, slot, err := cp.get(0, false)
+	if err != nil || slot == 3 || mints.Load() != 1 || addr != relayE {
+		t.Fatalf("get(0) with the only cached credential beyond the list: addr %q slot %d mints %d err %v — want a mint into a slot of the list, the list's first relay", addr, slot, mints.Load(), err)
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if len(cp.health.rec) != 0 {
+		t.Fatalf("relay health records %d, want none — nothing was marked", len(cp.health.rec))
+	}
+}
+
+// (2): two slots on one relay share the relay's quota — the credential that
+// stays inherits the other's quota history (lastUsedAt / availableAt), at
+// load whichever is kept, and at seed from the twin cleared and the pending
+// credential dropped; a fresh credential does not free the relay's seats.
+func TestCookieModeTheKeptTwinInheritsTheQuotaHistory(t *testing.T) {
+	usedAMinuteAgo := time.Now().Add(-time.Minute).Unix()
+	older := credCacheEntry{Slot: 2, Address: relayA, Addresses: []string{relayA}, Username: userExpiring(7*time.Hour, "older-used"), Password: "p", LastUsedAt: usedAMinuteAgo}
+	fresher := credCacheEntry{Slot: 8, Address: relayA, Addresses: []string{relayA}, Username: userExpiring(8*time.Hour, "fresher-unused"), Password: "p"}
+	for name, order := range map[string][]credCacheEntry{"the used one loaded first": {older, fresher}, "the unused one loaded first": {fresher, older}} {
+		t.Run(name, func(t *testing.T) {
+			cookieTestMode(t)
+			cp, _, _ := relayPool(t, writeCookieCache(t, t.TempDir(), order...), relayC)
+			cp.mu.Lock()
+			defer cp.mu.Unlock()
+			e := cp.pool[8]
+			if e.creds == nil || cp.pool[2].creds != nil {
+				t.Fatalf("the fresher credential (slot 8) not the one kept: slot 8 %v slot 2 %v", e.creds != nil, cp.pool[2].creds != nil)
+			}
+			if e.lastUsedAt.Unix() != usedAMinuteAgo || e.availableAt.IsZero() || cp.isFreshLocked(8) {
+				t.Fatalf("the kept credential lost the relay's quota history: lastUsedAt %v availableAt %v fresh %v — want the older's, pending", e.lastUsedAt, e.availableAt, cp.isFreshLocked(8))
+			}
+		})
+	}
+	t.Run("the seed", func(t *testing.T) {
+		cookieTestMode(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cp := newCredPool(ctx, 6, 2*time.Minute, "", nil)
+		used, avail := time.Now().Add(-time.Minute), time.Now().Add(9*time.Minute)
+		c := &TURNCreds{Username: futureUser("old-seed-on-A"), Password: "p", Address: relayA, Addresses: []string{relayA}}
+		cp.mu.Lock()
+		cp.pool[4] = credPoolEntry{addr: relayA, addrs: cp.candidatesForSlot(4, c), creds: c, ts: time.Now(), lastUsedAt: used, availableAt: avail}
+		cp.mu.Unlock()
+		cp.seedSlot(0, relayA, &TURNCreds{Username: futureUser("seed-on-A"), Password: "p", Address: relayA, Addresses: []string{relayA}})
+		cp.mu.Lock()
+		defer cp.mu.Unlock()
+		if e := cp.pool[0]; !e.lastUsedAt.Equal(used) || !e.availableAt.Equal(avail) || cp.isFreshLocked(0) {
+			t.Fatalf("the seed on a relay whose seats are still held: lastUsedAt %v availableAt %v fresh %v — want the cleared twin's history, pending", e.lastUsedAt, e.availableAt, cp.isFreshLocked(0))
+		}
+	})
+}

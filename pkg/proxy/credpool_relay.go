@@ -221,7 +221,7 @@ func (cp *credPool) healthParkLocked() error {
 	now := cp.health.now()
 	blocked, nextDue := 0, time.Time{}
 	for i := range cp.pool {
-		if !cp.isFreshLocked(i) || cp.usableLocked(i) {
+		if !cp.isFreshLocked(i) || cp.usableLocked(i) || cp.configuredOffLocked(i) {
 			continue
 		}
 		blocked++
@@ -324,4 +324,13 @@ func (cp *credPool) cookieRelayTwinLocked(slot int, creds *TURNCreds) int {
 		}
 	}
 	return -1
+}
+
+// configuredOffLocked: the slot has no relay by CONFIGURATION — cookie mode
+// under an override list, a slot beyond the list — not because its relays are
+// unreachable: it holds nothing back (the user's review of 449: the only
+// cached credential beyond the list made healthParkLocked park every
+// connection before the first mint).
+func (cp *credPool) configuredOffLocked(slot int) bool {
+	return cp.mode == credCacheModeCookie && len(cp.override.servers) > 0 && slot >= len(cp.override.servers)
 }
