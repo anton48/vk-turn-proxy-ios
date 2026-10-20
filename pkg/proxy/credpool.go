@@ -159,7 +159,7 @@ func (p *CredPool) standardFetch(cfg CredPoolConfig) func(bool, int) (string, *T
 		var creds *TURNCreds
 		if cookieAuthEnabled.Load() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			c, cerr := cookieCredForSlot(ctx, slot, cfg.TurnServers)
+			c, cerr := cookieCredForSlot(ctx, slot, cfg.TurnServers, p.cp.heldRelaysExcept(slot))
 			cancel()
 			if cerr != nil {
 				if errors.Is(cerr, ErrCookieRejected) {

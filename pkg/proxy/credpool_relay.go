@@ -39,8 +39,15 @@ func (cp *credPool) setOverride(o turnOverride) {
 // slot < 0: no slot yet (a credential looked at before it is placed).
 func (cp *credPool) candidatesForSlot(slot int, creds *TURNCreds) []string {
 	if cp.mode == credCacheModeCookie {
-		if n := len(cp.override.servers); n > 0 && slot >= 0 && slot < n {
-			return []string{cp.override.servers[slot]}
+		if n := len(cp.override.servers); n > 0 && slot >= 0 {
+			if slot < n {
+				return []string{cp.override.servers[slot]}
+			}
+			// Beyond the list: nothing to dial. A slot loaded from disk keeps
+			// its stored address, which may be one of the list's own relays
+			// (2026-10-20, the user's run 10: slot 8 held the list's third) —
+			// a second slot on one relay, one quota.
+			return nil
 		}
 		// The slot's ONE relay (an (identity, relay) quota of its own): never
 		// the credential's whole list — the same username sits in other slots
@@ -62,6 +69,11 @@ func (cp *credPool) candidatesLocked(slot int) []string {
 	e := cp.pool[slot]
 	if len(e.addrs) > 0 {
 		return e.addrs
+	}
+	// Cookie mode under a list: a slot beyond the list has no relay — not
+	// its stored address either (candidatesForSlot).
+	if cp.mode == credCacheModeCookie && len(cp.override.servers) > 0 && slot >= len(cp.override.servers) {
+		return nil
 	}
 	if e.addr != "" {
 		return []string{e.addr}
@@ -269,4 +281,47 @@ func (cp *credPool) pathChangedHealthLocked() {
 	cp.health.pathChanged()
 	cp.cursor = map[int]int{}
 	cp.deadMintUntil, cp.deadMintPause = time.Time{}, 0
+}
+
+// heldRelaysExcept lists the relays the pool's slots hold — every filled
+// slot's candidates but slot's own — for the cookie mint: in cookie mode a
+// relay held by one slot must not be minted for another (one okcdn user id,
+// one quota of ten per relay; 2026-10-20, the user's run 9: two slots on one
+// relay, 486 on the second). nil pool, no slots: nothing.
+func (cp *credPool) heldRelaysExcept(slot int) []string {
+	if cp == nil {
+		return nil
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	var out []string
+	for i := range cp.pool {
+		if i == slot || cp.pool[i].creds == nil {
+			continue
+		}
+		out = append(out, cp.candidatesLocked(i)...)
+	}
+	return dedupeAddrs(out)
+}
+
+// cookieRelayTwinLocked: in cookie mode, the other filled slot whose one relay
+// is the same as slot's would be — two slots on one relay under one okcdn
+// user id are one quota of ten (the user's run 9: 486 on the second). -1: none.
+func (cp *credPool) cookieRelayTwinLocked(slot int, creds *TURNCreds) int {
+	if cp.mode != credCacheModeCookie || creds == nil {
+		return -1
+	}
+	key := cp.candidatesForSlot(slot, creds)
+	if len(key) != 1 {
+		return -1
+	}
+	for i := range cp.pool {
+		if i == slot || cp.pool[i].creds == nil {
+			continue
+		}
+		if c := cp.candidatesLocked(i); len(c) == 1 && c[0] == key[0] {
+			return i
+		}
+	}
+	return -1
 }

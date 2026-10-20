@@ -387,16 +387,16 @@ func TestCookieModeSlotsFollowTheOverrideList(t *testing.T) {
 	cookieMu.Unlock()
 	override := []string{relayO, relayC}
 	for slot, want := range override {
-		c, err := cookieCredForSlot(context.Background(), slot, override)
+		c, err := cookieCredForSlot(context.Background(), slot, override, nil)
 		if err != nil || c.Address != want || len(c.Addresses) != 1 || c.Addresses[0] != want {
 			t.Fatalf("slot %d under the list: %+v %v — want %s", slot, c, err, want)
 		}
 	}
-	if _, err := cookieCredForSlot(context.Background(), 2, override); err == nil || !strings.Contains(err.Error(), "unfilled") {
+	if _, err := cookieCredForSlot(context.Background(), 2, override, nil); err == nil || !strings.Contains(err.Error(), "unfilled") {
 		t.Fatalf("slot 2 with a two-entry list: %v — want the shortage refused", err)
 	}
 	// Without the list: VK's distinct relays, as before.
-	if c, err := cookieCredForSlot(context.Background(), 1, nil); err != nil || c.Address != relayB {
+	if c, err := cookieCredForSlot(context.Background(), 1, nil, nil); err != nil || c.Address != relayB {
 		t.Fatalf("slot 1 without a list: %+v %v — want VK's second relay", c, err)
 	}
 	// The pool in cookie mode: a seed in slot 0 takes the list's first; its

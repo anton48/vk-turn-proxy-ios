@@ -245,7 +245,7 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		// holds a distinct (call, relay) bucket. Single-relay creds; NO captcha;
 		// NO anonymous fallback.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		creds, err := cookieCredForSlot(ctx, 0, nil) // the app's probe: VK's relay; the pool's slot 0 takes the override's first when a list is set
+		creds, err := cookieCredForSlot(ctx, 0, nil, nil) // the app's probe: VK's relay; the pool's slot 0 takes the override's first when a list is set
 		cancel()
 		if err != nil {
 			if errors.Is(err, ErrCookieRejected) {
@@ -1594,6 +1594,29 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 			}
 		}
 	}
+	// Cookie mode: a slot on the seed's RELAY under another identity is the
+	// same quota (one okcdn user id) — every start the app's probe mints the
+	// first link and VK answers with the same first relay the previous run's
+	// seed sits on, on disk under another call id (2026-10-20, the user's
+	// run 8: two slots on one relay). The seed wins; the displaced pending
+	// credential, if it is on that relay, is not relocated either.
+	relayTwins := 0
+	if creds != nil {
+		for {
+			twin := cp.cookieRelayTwinLocked(slot, creds)
+			if twin < 0 {
+				break
+			}
+			cp.pool[twin] = credPoolEntry{}
+			relayTwins++
+		}
+		if displaced != nil && cp.mode == credCacheModeCookie {
+			if k, d := cp.candidatesForSlot(slot, creds), cp.candidatesForSlot(slot, displaced.creds); len(k) == 1 && len(d) == 1 && k[0] == d[0] {
+				displaced = nil
+				relayTwins++
+			}
+		}
+	}
 	// Relocate the pre-seed pending cred (if any) into the first now-
 	// empty slot. We'd rather keep it pending and have it become
 	// usable in 10 min than discard a perfectly good cred and pay
@@ -1619,6 +1642,10 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		if duplicates > 0 {
 			log.Printf("credpool: cleared %d duplicate slot(s) holding the same cred set as slot %d (disk-load + app-seed convergence)",
 				duplicates, slot)
+		}
+		if relayTwins > 0 {
+			log.Printf("credpool: cleared %d slot(s) holding the seed's relay %s under another identity (cookie mode: one quota per relay)",
+				relayTwins, addr)
 		}
 		if relocatedTo >= 0 {
 			log.Printf("credpool: relocated pre-seed pending cred from slot %d to slot %d (will become usable when its saturation cooldown expires)",
@@ -1854,6 +1881,22 @@ func (cp *credPool) loadFromDisk() {
 		}
 		for len(cp.pool) <= entry.Slot {
 			cp.pool = append(cp.pool, credPoolEntry{})
+		}
+		// Cookie mode: two slots on one relay are one quota — the fresher
+		// credential stays, the other is skipped (2026-10-20, the user's
+		// run 8: two slots on each of two relays; run 9: 486 on the second).
+		if twin := cp.cookieRelayTwinLocked(entry.Slot, creds); twin >= 0 {
+			if texp, _ := parseCredExpiry(cp.pool[twin].creds.Username); !exp.After(texp) {
+				log.Printf("credpool: load: slot %d holds the same relay %s as slot %d (cookie mode: one quota) — the older skipped",
+					entry.Slot, entry.Address, twin)
+				skipped++
+				continue
+			}
+			log.Printf("credpool: load: slot %d holds the same relay %s as slot %d (cookie mode: one quota) — the older slot %d dropped",
+				entry.Slot, entry.Address, twin, twin)
+			cp.pool[twin] = credPoolEntry{}
+			loaded--
+			skipped++
 		}
 		cp.pool[entry.Slot] = credPoolEntry{
 			addr:        entry.Address,
