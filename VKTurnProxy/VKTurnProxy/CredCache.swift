@@ -53,6 +53,15 @@ struct CredCacheFile: Codable {
     let saved_at: Int64
     let mode: String?
     let creds: [CredCacheEntry]
+    /// Cookie mode's quota clocks: relay → the last moment a lease on it ended
+    /// (Unix seconds) — Go's `relay_used_at`, 2026-10-20. The clock belongs to
+    /// the RELAY (one account, one quota of ten per relay), not to a slot, so it
+    /// lives beside the entries and outlives the slots that were dropped. HERE
+    /// for the same reason as `mode` and `addresses`: BackupManager encodes this
+    /// struct into the backup and back into creds-pool.json on a restore, and a
+    /// mirror without the field would drop every clock on the way. Absent in
+    /// files from before it (the Go pool then migrates the entries' own history).
+    let relay_used_at: [String: Int64]?
 }
 
 enum CredCache {

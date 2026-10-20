@@ -398,3 +398,82 @@ func TestCookieModeTheRelayQuotaClockIsSaved(t *testing.T) {
 		t.Fatalf("slot 5 on A in the next process: loaded %v fresh %v — want loaded, pending (A's clock from the file)", cp2.pool[5].creds != nil, cp2.isFreshLocked(5))
 	}
 }
+
+// The user's review of 451, (1): a fresh mint onto a quarantined relay was
+// handed out — placeLocked set the slot pending, get()'s inline-fetch branch
+// then checked the health and the holders alone, took the seat and returned
+// the credential (their stand: fresh=false, availableAt ≈ now+9min, active=1).
+func TestAFreshMintOntoAQuarantinedRelayIsNotHandedOut(t *testing.T) {
+	cookieTestMode(t)
+	cp, mints, _ := relayPool(t, "", relayA) // the minter answers with A
+	usedAMinuteAgo := time.Now().Add(-time.Minute)
+	cp.mu.Lock()
+	cp.relayUsedAt[relayA] = usedAMinuteAgo // A's seats may still be held
+	cp.mu.Unlock()
+	addr, creds, slot, err := cp.get(0, false)
+	if err == nil || creds != nil {
+		t.Fatalf("a fresh credential on quarantined A handed out: addr %q slot %d — want a park until the relay's clock runs out", addr, slot)
+	}
+	var park *poolParkError
+	if !errorsAs(err, &park) || !strings.Contains(err.Error(), "pending") {
+		t.Fatalf("the refusal is not a park naming the pending slot: %v", err)
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	placed := -1
+	for i := range cp.pool {
+		if cp.pool[i].creds != nil {
+			placed = i
+		}
+	}
+	if mints.Load() != 1 || placed < 0 || cp.pool[placed].active != 0 || cp.isFreshLocked(placed) {
+		t.Fatalf("the minted credential: mints %d placed %d active %d fresh %v — want kept in its slot, no seat, pending", mints.Load(), placed, cp.pool[placed].active, cp.isFreshLocked(placed))
+	}
+}
+
+func errorsAs(err error, target **poolParkError) bool {
+	p, ok := err.(*poolParkError)
+	if ok {
+		*target = p
+	}
+	return ok
+}
+
+// (2): after a save and a reload the quarantine was attributed to the
+// never-used relay again — the seed stored VK's address A while the override
+// sent its allocations to B; the save wrote relay_used_at[B] (right) AND the
+// entry's last_used_at under address A, and the loader fed both. A file WITH
+// the map is the new format: the map alone is the clock. A file WITHOUT it
+// (from before) is migrated from the entries' own history.
+func TestTheLoadTrustsTheFilesRelayClockOverTheEntriesAddress(t *testing.T) {
+	cookieTestMode(t)
+	usedAMinuteAgo := time.Now().Add(-time.Minute).Unix()
+	seedStoredUnderA := credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA}, Username: futureUser("seed-used-on-B"), Password: "p", LastUsedAt: usedAMinuteAgo}
+	t.Run("the new format: the map alone", func(t *testing.T) {
+		dir := t.TempDir()
+		f := credCacheFile{Version: credCacheVersion, SavedAt: time.Now().Unix(), Mode: credCacheModeCookie,
+			Creds: []credCacheEntry{seedStoredUnderA}, RelayUsedAt: map[string]int64{relayB: usedAMinuteAgo}}
+		b, _ := json.Marshal(f)
+		path := filepath.Join(dir, "creds-pool.json")
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cp, _, _ := relayPool(t, path, relayC) // no override now: slot 0 dials A, never used
+		cp.mu.Lock()
+		defer cp.mu.Unlock()
+		if !cp.isFreshLocked(0) || !cp.relayQuarantineUntilLocked(relayA).IsZero() {
+			t.Fatalf("A read as used from the entry's stored address: fresh %v, A quarantined until %v — the file's map says B", cp.isFreshLocked(0), cp.relayQuarantineUntilLocked(relayA))
+		}
+		if cp.relayQuarantineUntilLocked(relayB).IsZero() {
+			t.Fatal("B's clock from the file's map lost")
+		}
+	})
+	t.Run("the old format: migrated from the entries", func(t *testing.T) {
+		cp, _, _ := relayPool(t, writeCookieCache(t, t.TempDir(), seedStoredUnderA), relayC)
+		cp.mu.Lock()
+		defer cp.mu.Unlock()
+		if cp.isFreshLocked(0) || cp.relayQuarantineUntilLocked(relayA).IsZero() {
+			t.Fatal("a file without the map: the entry's own history under its address is all there is — A should be quarantined")
+		}
+	})
+}

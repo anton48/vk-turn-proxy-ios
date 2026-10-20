@@ -4478,7 +4478,7 @@ do {
 do {
     func file(_ mode: String?, _ user: String = "\(Int(Date().timeIntervalSince1970) + 8 * 3600):u") -> CredCacheFile {
         CredCacheFile(version: CredCache.supportedVersion, saved_at: Int64(Date().timeIntervalSince1970), mode: mode,
-                      creds: [CredCacheEntry(slot: 0, address: "203.0.113.11:19302", addresses: nil, username: user, password: "pw", last_used_at: 0)])
+                      creds: [CredCacheEntry(slot: 0, address: "203.0.113.11:19302", addresses: nil, username: user, password: "pw", last_used_at: 0)], relay_used_at: nil)
     }
     // 2026-10-19: every relay VK returned with the credential rides in `addresses`
     // (Go's cache field); the mirror has to carry it through a backup round trip,
@@ -4493,6 +4493,21 @@ do {
                 check(text.contains("203.0.113.12:19302"), "the cache mirror writes the other relays back (a backup round trip keeps them)")
             } else { check(false, "the cache mirror re-encodes") }
         } else { check(false, "the cache mirror decodes a file with `addresses`") }
+    }
+    // 2026-10-20: cookie mode's quota clock is the RELAY's — Go's `relay_used_at`
+    // (relay → Unix seconds) at the file's top level, beside the entries; the
+    // mirror has to carry it through a backup round trip, or a restore drops the
+    // clocks of the relays whose slots were dropped (the user's review of 451).
+    do {
+        let json = Data("""
+        {"version": \(CredCache.supportedVersion), "saved_at": 1, "mode": "cookie", "creds": [], "relay_used_at": {"203.0.113.11:19302": 1760000000}}
+        """.utf8)
+        if let f = try? JSONDecoder().decode(CredCacheFile.self, from: json) {
+            check(f.relay_used_at?["203.0.113.11:19302"] == 1760000000, "the cache mirror reads the relays' quota clocks (`relay_used_at`)")
+            if let back = try? JSONEncoder().encode(f), let text = String(data: back, encoding: .utf8) {
+                check(text.contains("relay_used_at") && text.contains("1760000000"), "🚨 the cache mirror writes the relays' quota clocks back (a backup round trip keeps them)")
+            } else { check(false, "the cache mirror re-encodes a file with `relay_used_at`") }
+        } else { check(false, "the cache mirror decodes a file with `relay_used_at`") }
     }
     let now = Date().timeIntervalSince1970
     let cookie = file(CredCache.modeCookie), anon = file(CredCache.modeAnon), old = file(nil)
@@ -4513,6 +4528,7 @@ do {
     }
     if let data = try? enc.encode(old), let text = String(data: data, encoding: .utf8) {
         check(!text.contains("\"mode\""), "a file without a mode is written without one, not as an empty string")
+        check(!text.contains("relay_used_at"), "a file without the relays' clocks is written without the key (the Go pool reads absent as the old format and migrates the entries' history)")
     } else {
         check(false, "the old-style cache file did not encode")
     }

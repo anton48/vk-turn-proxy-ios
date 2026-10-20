@@ -1961,11 +1961,22 @@ func (cp *credPool) loadFromDisk() {
 				cp.relayUsedAt[relay] = at
 			}
 		}
-		for relay, unix := range f.RelayUsedAt {
-			feed(relay, unix)
-		}
-		for _, entry := range f.Creds {
-			feed(entry.Address, entry.LastUsedAt)
+		if len(f.RelayUsedAt) > 0 {
+			// The new format: the map IS the clock. An entry's stored address
+			// is the credential's VK address, not necessarily the relay it
+			// dialled (a seed under an override list) — reading its history
+			// under that address would quarantine a relay nobody used (the
+			// user's review of 451).
+			for relay, unix := range f.RelayUsedAt {
+				feed(relay, unix)
+			}
+		} else {
+			// A file from before the map: the entries' own history under the
+			// address they were stored with is all there is — migrated once;
+			// the next save writes the map.
+			for _, entry := range f.Creds {
+				feed(entry.Address, entry.LastUsedAt)
+			}
 		}
 		for i := range cp.pool {
 			if cp.pool[i].creds == nil {
@@ -2515,6 +2526,23 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			log.Printf("credpool: conn %d: slot %d changed hands during the fetch — fetched cred dropped (%s)", connIdx, target, why)
 			fetchErr = fmt.Errorf("credpool: slot %d changed hands during the fetch, fetched cred dropped (%s)", target, why)
 		} else {
+			// The fresh credential sits in its slot now — and the slot has to
+			// be READY like any other before a seat is taken: in cookie mode
+			// its relay's seats may still be held by leases that ended a
+			// minute ago (the relay's clock made it pending at placement; the
+			// user's review of 451: handed out with fresh=false, active=1).
+			if e := cp.pool[got]; !e.availableAt.IsZero() && time.Now().Before(e.availableAt) {
+				wait := time.Until(e.availableAt).Round(time.Second)
+				cp.armHealthWakeLocked(e.availableAt)
+				wake := cp.slotAvailableCh
+				cp.mu.Unlock()
+				if got < len(cp.authErrors) {
+					cp.authErrors[got].Store(0)
+				}
+				cp.saveToDisk()
+				log.Printf("credpool: conn %d: the fresh credential in slot %d dials a relay whose seats may still be held — pending, usable in %s — parking", connIdx, got, wait)
+				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's fresh credential is pending (its relay's seats may still be held) — parking, usable in %s", got, wait), wake: wake}
+			}
 			dial, ok := cp.pickAddrLocked(got, connIdx)
 			if !ok {
 				park := cp.relayParkLocked(connIdx, got)
