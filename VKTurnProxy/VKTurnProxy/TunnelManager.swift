@@ -177,7 +177,7 @@ extension TunnelConfig {
         )
     }
 
-    /// "IP:port" -> (host, port), or nil when empty/malformed (= no override).
+    /// "host:port" -> (host, port), or nil when empty/malformed (= no override).
     /// Splits on the LAST colon so IPv4:port parses cleanly.
     /// parseTurnServers reads the profile's TURN override field as a list of
     /// host:port entries separated by commas, semicolons, spaces or newlines;
@@ -189,6 +189,26 @@ extension TunnelConfig {
             let t = String(part)
             guard ConfigValidation.isHostPort(t), !out.contains(t) else { continue }
             out.append(t)
+        }
+        return out
+    }
+
+    /// turnOverrideHosts: the DNS names in the override list — the hosts that
+    /// are not IP literals — for the pre-resolution beside the VK hosts
+    /// (GitHub #105, 2026-10-29). The extension's own resolver lost 5 s to a
+    /// timeout on the first dial and iOS refuses a name as the tunnel's remote
+    /// address; the main app resolves on the physical path before the
+    /// extension starts, and Go turns each name into its IPs before the pool
+    /// keys anything on it.
+    static func turnOverrideHosts(_ servers: [String]) -> [String] {
+        var out: [String] = []
+        for s in servers {
+            guard let colon = s.lastIndex(of: ":") else { continue }
+            let host = String(s[..<colon]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            guard !host.isEmpty, !out.contains(host) else { continue }
+            var v4 = in_addr(), v6 = in6_addr()
+            if inet_pton(AF_INET, host, &v4) == 1 || inet_pton(AF_INET6, host, &v6) == 1 { continue }
+            out.append(host)
         }
         return out
     }
@@ -485,8 +505,9 @@ class TunnelManager: ObservableObject {
             // (EADDRNOTAVAIL) on the VK resolve/dial below can be correlated
             // with whether the device actually has a usable IPv4 source address.
             logNetworkInterfaces()
+            let overrideHosts = TunnelConfig.turnOverrideHosts(config.turnServerOverrides) // the list's DNS names (#105)
             let vkHostIPs = await Task.detached(priority: .userInitiated) { [self] in
-                self.resolveVKHosts()
+                self.resolveVKHosts(extra: overrideHosts)
             }.value
             if attemptCancelled() { return }
             if !vkHostIPs.isEmpty {
@@ -3163,8 +3184,11 @@ class TunnelManager: ObservableObject {
     /// fall through them on connect failure — relying on a single IP
     /// is brittle when VK rotates DNS A-records or when an upstream
     /// network path to one specific IP is temporarily unreachable.
-    nonisolated private func resolveVKHosts() -> [String: [String]] {
-        let hosts = ["login.vk.ru", "api.vk.ru", "id.vk.ru"]
+    /// `extra`: the TURN override list's DNS names (turnOverrideHosts) — resolved
+    /// here, on the physical path, so Go dials them by IP from the first attempt.
+    nonisolated private func resolveVKHosts(extra: [String]) -> [String: [String]] {
+        var hosts = ["login.vk.ru", "api.vk.ru", "id.vk.ru"]
+        for h in extra where !hosts.contains(h) { hosts.append(h) }
         var resolved: [String: [String]] = [:]
 
         for host in hosts {

@@ -110,11 +110,13 @@ func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 	}
 	p.cp = newCredPool(ctx, size, cfg.Cooldown, cfg.CachePath, fetch)
 	p.cp.setColdStartTarget(cfg.NumConns)
-	p.cp.setOverride(turnOverride{servers: cfg.TurnServers, host: cfg.TurnServer, port: cfg.TurnPort})
+	p.cp.setOverride(turnOverride{servers: ResolveTURNServers(ctx, cfg.TurnServers, resolvedVKHostIPs), host: cfg.TurnServer, port: cfg.TurnPort}) // names → IPs first (#105)
 	if cfg.SeededTURN != nil {
-		if host, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
+		if _, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
 			p.cp.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
-			p.relayIP.Store(host)
+			if host, ok := relayHostToPublish(cfg.SeededTURN.Address); ok {
+				p.relayIP.Store(host)
+			}
 		} else {
 			log.Printf("credpool: SeededTURN address %q is not host:port (%v) — ignoring", cfg.SeededTURN.Address, err)
 		}
@@ -244,7 +246,7 @@ func (p *CredPool) NoteAllocated(slot int, creds *TURNCreds) { p.cp.noteAllocate
 // and the host RelayIP reports from now on (relayhealth.go).
 func (p *CredPool) NoteAllocatedAt(slot int, creds *TURNCreds, addr string, start time.Time) {
 	p.cp.noteAllocatedAt(slot, creds, addr, start)
-	if host, _, err := net.SplitHostPort(addr); err == nil && host != "" {
+	if host, ok := relayHostToPublish(addr); ok { // an IP or nothing (#105)
 		p.relayIP.Store(host)
 	}
 }

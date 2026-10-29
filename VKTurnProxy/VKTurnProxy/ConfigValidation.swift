@@ -128,10 +128,10 @@ enum ConfigValidation {
         let parts = t.split(whereSeparator: { ",; \n\t\r".contains($0) }).map(String.init)
         let bad = parts.filter { !isHostPort($0) }
         if bad.count == parts.count {
-            return Issue(.warning, "Not a valid IP:port list — it will be ignored (VK's relays are used).")
+            return Issue(.warning, "Not a valid host:port list — it will be ignored (VK's relays are used).")
         }
         if !bad.isEmpty {
-            return Issue(.warning, "Ignored (not IP:port): \(bad.joined(separator: ", ")). The valid entries are used in order.")
+            return Issue(.warning, "Ignored (not host:port): \(bad.joined(separator: ", ")). The valid entries are used in order.")
         }
         return nil
     }

@@ -30,6 +30,8 @@ package proxy
 // Guarded by the pool's mutex (the pool is the only caller).
 
 import (
+	"context"
+	"log"
 	"net"
 	"sort"
 	"strconv"
@@ -414,4 +416,72 @@ type TURNServerListError struct{ Entry string }
 
 func (e *TURNServerListError) Error() string {
 	return "TURN server " + strconv.Quote(e.Entry) + " is not host:port"
+}
+
+// lookupTURNHost is the bounded lookup behind ResolveTURNServers for a name
+// the app did not pre-resolve (a test swaps it).
+var lookupTURNHost = func(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip4", host)
+}
+
+// ResolveTURNServers turns the override list's DNS names into IP entries
+// before the pool sees them (issue #105): an entry whose host is an IP stays;
+// a name becomes one entry per IPv4 address it resolves to, in its place —
+// from `pre` (the app's pre-resolved map, which the main app fills on the
+// physical path before the extension starts) or, failing that, a bounded
+// lookup; a name that resolves to nothing stays as it is (the dial resolves
+// it later, and no name is ever published as the tunnel's remote address —
+// relayHostToPublish). Why not leave names to the dial: the relay health,
+// the cookie slots and the console's route pins all key on host:port, the
+// extension's resolver lost 5 s to a timeout on the first dial in the field,
+// and iOS refuses a name for the tunnel's remote address.
+func ResolveTURNServers(ctx context.Context, servers []string, pre func(host string) []string) []string {
+	var out []string
+	for _, e := range servers {
+		host, port, err := net.SplitHostPort(e)
+		if err != nil || net.ParseIP(host) != nil {
+			out = append(out, e)
+			continue
+		}
+		var ips []string
+		if pre != nil {
+			for _, ip := range pre(host) {
+				if p := net.ParseIP(ip); p != nil && p.To4() != nil {
+					ips = append(ips, p.String())
+				}
+			}
+		}
+		if len(ips) == 0 {
+			lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			resolved, lerr := lookupTURNHost(lctx, host)
+			cancel()
+			for _, ip := range resolved {
+				if ip.To4() != nil {
+					ips = append(ips, ip.String())
+				}
+			}
+			if lerr != nil || len(ips) == 0 {
+				log.Printf("credpool: TURN relay %s: the name did not resolve (%v) — kept as a name; the dial resolves it, and it is never published as the tunnel's address", e, lerr)
+				out = append(out, e)
+				continue
+			}
+		}
+		for _, ip := range ips {
+			out = append(out, net.JoinHostPort(ip, port))
+		}
+		log.Printf("credpool: TURN relay %s resolved to %s", e, strings.Join(ips, ", "))
+	}
+	return dedupeAddrs(out)
+}
+
+// relayHostToPublish is the host of a relay address as the app may use it for
+// the tunnel's remote address: an IP, or nothing — iOS refuses a name there
+// (issue #105: "Invalid NETunnelNetworkSettings tunnelRemoteAddress"), and a
+// name reaching this point means its resolution failed upstream.
+func relayHostToPublish(addr string) (string, bool) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || net.ParseIP(host) == nil {
+		return "", false
+	}
+	return host, true
 }

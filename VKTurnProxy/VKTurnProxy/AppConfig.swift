@@ -129,7 +129,7 @@ struct AppSettings: Codable {
     /// WRAP-A shared secret (obfuscation key + GETCONF auth). Optional for
     /// back-compat. Plaintext like the WG private key above.
     let wrapAPassword: String?
-    /// turnServerOverride: optional "IP:port" (added 2026-06-08), a comma-
+    /// turnServerOverride: optional "host:port" (added 2026-06-08), a comma-
     /// separated LIST since 2026-10-19. When set, every credential — fresh,
     /// cached or seeded — is dialled on these relays, in order; a relay that
     /// stops answering is marked and the next one taken. nil = no override.
@@ -276,7 +276,7 @@ struct ConnectionSettings: Codable {
     /// Optional for back-compat; nil keeps the device's current value.
     let useWrapA: Bool?
     let wrapAPassword: String?
-    /// turnServerOverride: optional TURN-relay override — "IP:port" (added
+    /// turnServerOverride: optional TURN-relay override — "host:port" (added
     /// 2026-06-08), a comma-separated list since 2026-10-19. nil keeps the
     /// device's current value.
     let turnServerOverride: String?

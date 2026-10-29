@@ -652,7 +652,9 @@ func NewProxy(cfg Config) *Proxy {
 	// The TURN override is applied when a credential is HANDED OUT, to every
 	// credential — the cache's included (issue #102: an override that did not
 	// reach a cached credential kept the client on a dead relay).
-	p.credPool.setOverride(turnOverride{servers: cfg.TurnServers, host: cfg.TurnServer, port: cfg.TurnPort})
+	// A DNS name in the list is resolved HERE, before the pool keys anything on
+	// it (issue #105) — from the app's pre-resolved map first.
+	p.credPool.setOverride(turnOverride{servers: ResolveTURNServers(ctx, cfg.TurnServers, resolvedVKHostIPs), host: cfg.TurnServer, port: cfg.TurnPort})
 
 	p.initGroupHello(cfg)
 
@@ -665,10 +667,11 @@ func NewProxy(cfg Config) *Proxy {
 		// the app chose); the TURN override applies to it as to every
 		// credential when it is handed out (credpool_relay.go) — since
 		// 2026-10-19 the setting DOES reach a cached credential.
-		turnHost, _, err := net.SplitHostPort(cfg.SeededTURN.Address)
-		if err == nil {
+		if _, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
 			p.credPool.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
-			p.turnServerIP.Store(turnHost)
+			if host, ok := relayHostToPublish(cfg.SeededTURN.Address); ok {
+				p.turnServerIP.Store(host)
+			}
 		} else {
 			log.Printf("NewProxy: SeededTURN address %q is not host:port (%v) — ignoring", cfg.SeededTURN.Address, err)
 		}
@@ -2397,7 +2400,7 @@ func (p *Proxy) relayUnanswered(connIdx, slot int, creds *TURNCreds, turnAddr st
 // connect names as serverAddress (TURNServerIP).
 func (p *Proxy) relayAllocatedAt(slot int, creds *TURNCreds, turnAddr string, attempt time.Time) {
 	p.credPool.noteAllocatedAt(slot, creds, turnAddr, attempt)
-	if host, _, err := net.SplitHostPort(turnAddr); err == nil && host != "" {
+	if host, ok := relayHostToPublish(turnAddr); ok { // an IP or nothing: iOS refuses a name as the tunnel's address (#105)
 		p.turnServerIP.Store(host)
 	}
 }

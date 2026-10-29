@@ -4541,6 +4541,26 @@ do {
           "both seed reads (connect, the switch) tell the loader the connect's mode")
 }
 
+// Issue #105 (1), 2026-10-29: a DNS name in the TURN override list. The app
+// pre-resolves the list's hostnames on the physical path beside the VK hosts
+// (the extension's own resolver lost 5 s to a timeout on the first dial, and
+// iOS refuses a name as the tunnel's remote address — Go publishes an IP or
+// nothing), and the field's texts say host:port, which is what the validator
+// accepts.
+print("TURN override: a DNS name in the list (GitHub #105)")
+do {
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(tm.contains("static func turnOverrideHosts(_ servers: [String]) -> [String] {"),
+          "TunnelConfig names the override's hostnames (not its IP literals) in one helper")
+    check(tm.contains("let overrideHosts = TunnelConfig.turnOverrideHosts(config.turnServerOverrides)") && tm.contains("self.resolveVKHosts(extra: overrideHosts)"),
+          "🚨 connect pre-resolves the override's hostnames beside the VK hosts — the map reaches Go as vk_host_ips")
+    check(tm.contains("nonisolated private func resolveVKHosts(extra: [String]) -> [String: [String]] {"),
+          "resolveVKHosts takes the extra hosts")
+    for f in ["VKTurnProxy/VKTurnProxy/ConfigValidation.swift", "VKTurnProxy/VKTurnProxy/ServerEditView.swift", "VKTurnProxy/VKTurnProxy/AppConfig.swift"] {
+        check(!source(f).contains("IP:port"), "\(f) says host:port, not IP:port — a name is accepted")
+    }
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")
