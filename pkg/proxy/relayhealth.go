@@ -338,8 +338,30 @@ func isRelayUnanswered(err error) bool {
 // address is chosen when the credential is handed out), or the older pair
 // (a host, a port, either may be empty) rewritten into each VK address.
 type turnOverride struct {
-	servers    []string
+	servers    []string // the list as the pool dials it: IPs (ResolveTURNServers)
+	raw        []string // the list as configured — names included — for a later resolution (reresolveOverride)
 	host, port string
+}
+
+// hasName: an entry of the list whose host is not an IP literal.
+func (o turnOverride) hasName() bool {
+	for _, e := range o.raw {
+		if h, _, err := net.SplitHostPort(e); err == nil && net.ParseIP(h) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// allIPs: every entry's host is an IP (a resolution that left a name behind
+// is a failed one).
+func allIPs(servers []string) bool {
+	for _, e := range servers {
+		if h, _, err := net.SplitHostPort(e); err != nil || net.ParseIP(h) == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (o turnOverride) set() bool { return len(o.servers) > 0 || o.host != "" || o.port != "" }

@@ -8,6 +8,7 @@ package proxy
 // instead of minting. Everything here runs under cp.mu unless said otherwise.
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -20,6 +21,9 @@ import (
 func (cp *credPool) setOverride(o turnOverride) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
+	if o.raw == nil {
+		o.raw = o.servers
+	}
 	cp.override = o
 	for i := range cp.pool {
 		if cp.pool[i].creds != nil {
@@ -237,6 +241,7 @@ func (cp *credPool) healthParkLocked() error {
 	switch {
 	case len(cp.override.servers) > 0:
 		why = "every relay of the TURN override list is marked unreachable"
+		go cp.reresolveOverride("every relay of the list marked unreachable", true) // DNS may name another relay by now (#105)
 	case now.Before(cp.deadMintUntil):
 		why = fmt.Sprintf("no relay answers and minting is paused for %s more", cp.deadMintUntil.Sub(now).Round(time.Second))
 		if nextDue.IsZero() || cp.deadMintUntil.Before(nextDue) {
@@ -282,6 +287,70 @@ func (cp *credPool) pathChangedHealthLocked() {
 	cp.health.pathChanged()
 	cp.cursor = map[int]int{}
 	cp.deadMintUntil, cp.deadMintPause = time.Time{}, 0
+	go cp.reresolveOverride("path change", false) // the new network may see another DNS answer (#105)
+}
+
+// overrideServers is the override list as the pool dials it — the ONE list
+// the cookie minter is handed too (the user's review of 453: the minter was
+// given the configured names while the pool held their IPs; a name resolving
+// to two IPs left slot 1 "unfilled" with the second IP in the pool).
+func (cp *credPool) overrideServers() []string {
+	if cp == nil {
+		return nil
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return append([]string(nil), cp.override.servers...)
+}
+
+// overrideResolveMinGap: how often the exhaustion trigger may resolve the
+// names again (the park fires on every hand-out while the list is dead).
+const overrideResolveMinGap = 30 * time.Second
+
+// reresolveOverride resolves the override list's names again — when every
+// relay of the list is marked (limited: once per overrideResolveMinGap), at a
+// path change and on an invalidate (unlimited): a DNS change to another relay
+// reaches the client (the user's review of 453: one resolution for the pool's
+// whole life). Runs without the lock (DNS I/O); a lookup that leaves a name
+// unresolved keeps the list as it was; a changed list recomputes every slot's
+// candidates and wakes the parked connections.
+func (cp *credPool) reresolveOverride(reason string, limited bool) {
+	cp.mu.Lock()
+	o := cp.override
+	now := time.Now()
+	if !o.hasName() || cp.overrideResolving || (limited && !cp.overrideResolvedAt.IsZero() && now.Sub(cp.overrideResolvedAt) < overrideResolveMinGap) {
+		cp.mu.Unlock()
+		return
+	}
+	cp.overrideResolving = true
+	cp.overrideResolvedAt = now
+	raw := append([]string(nil), o.raw...)
+	cp.mu.Unlock()
+
+	servers := ResolveTURNServers(context.Background(), raw, resolvedVKHostIPs)
+
+	cp.mu.Lock()
+	cp.overrideResolving = false
+	before := strings.Join(cp.override.servers, ", ")
+	switch {
+	case !allIPs(servers):
+		cp.mu.Unlock()
+		log.Printf("credpool: TURN relay override not resolved again (%s): a name did not resolve — the list stays %s", reason, before)
+		return
+	case strings.Join(servers, ", ") == before:
+		cp.mu.Unlock()
+		return
+	}
+	cp.override.servers = servers
+	for i := range cp.pool {
+		if cp.pool[i].creds != nil {
+			cp.pool[i].addrs = cp.candidatesForSlot(i, cp.pool[i].creds)
+			cp.applyRelayQuarantineLocked(i)
+		}
+	}
+	cp.mu.Unlock()
+	log.Printf("credpool: TURN relay override resolved again (%s): %s → %s", reason, before, strings.Join(servers, ", "))
+	cp.broadcastSlotAvailable()
 }
 
 // heldRelaysExcept lists the relays the pool's slots hold — every filled

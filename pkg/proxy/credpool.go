@@ -110,7 +110,7 @@ func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 	}
 	p.cp = newCredPool(ctx, size, cfg.Cooldown, cfg.CachePath, fetch)
 	p.cp.setColdStartTarget(cfg.NumConns)
-	p.cp.setOverride(turnOverride{servers: ResolveTURNServers(ctx, cfg.TurnServers, resolvedVKHostIPs), host: cfg.TurnServer, port: cfg.TurnPort}) // names → IPs first (#105)
+	p.cp.setOverride(turnOverride{servers: ResolveTURNServers(ctx, cfg.TurnServers, resolvedVKHostIPs), raw: cfg.TurnServers, host: cfg.TurnServer, port: cfg.TurnPort}) // names → IPs first (#105)
 	if cfg.SeededTURN != nil {
 		if _, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
 			p.cp.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
@@ -161,7 +161,7 @@ func (p *CredPool) standardFetch(cfg CredPoolConfig) func(bool, int) (string, *T
 		var creds *TURNCreds
 		if cookieAuthEnabled.Load() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			c, cerr := cookieCredForSlot(ctx, slot, cfg.TurnServers, p.cp.heldRelaysExcept(slot))
+			c, cerr := cookieCredForSlot(ctx, slot, p.cp.overrideServers(), p.cp.heldRelaysExcept(slot)) // the pool's list, resolved (#105)
 			cancel()
 			if cerr != nil {
 				if errors.Is(cerr, ErrCookieRejected) {
@@ -317,8 +317,10 @@ func (p *CredPool) RelayIP() string {
 			return s
 		}
 	}
-	if hosts := p.RelayHosts(); len(hosts) > 0 {
-		return hosts[0]
+	for _, h := range p.RelayHosts() {
+		if net.ParseIP(h) != nil { // an IP or nothing — never a name, the fallback included (#105, the user's review of 453)
+			return h
+		}
 	}
 	return ""
 }

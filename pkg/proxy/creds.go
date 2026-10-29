@@ -1248,6 +1248,9 @@ type credPool struct {
 	// relayUsedAt (cookie mode): relay → the last moment a lease on it ended;
 	// the quota clock of the RELAY — see relayQuarantineUntilLocked.
 	relayUsedAt map[string]time.Time
+	// the override list's re-resolution (credpool_relay.go reresolveOverride)
+	overrideResolving  bool
+	overrideResolvedAt time.Time
 	saverDone     chan struct{} // closed when runPeriodicSave has written its last file (tests wait for it)
 
 	// holders is the pool's record of the leases still out — get() has handed
@@ -3401,6 +3404,7 @@ func (cp *credPool) pickSlotToFill() int {
 // explicit session resets (Pause/Resume/ForceReconnect) and on captcha
 // probes that need to force a fresh VK session.
 func (cp *credPool) invalidate() {
+	go cp.reresolveOverride("invalidate", false) // the credentials are gone; the list's names may point elsewhere by now (#105)
 	cp.mu.Lock()
 	n := 0
 	for _, e := range cp.pool {

@@ -654,7 +654,7 @@ func NewProxy(cfg Config) *Proxy {
 	// reach a cached credential kept the client on a dead relay).
 	// A DNS name in the list is resolved HERE, before the pool keys anything on
 	// it (issue #105) — from the app's pre-resolved map first.
-	p.credPool.setOverride(turnOverride{servers: ResolveTURNServers(ctx, cfg.TurnServers, resolvedVKHostIPs), host: cfg.TurnServer, port: cfg.TurnPort})
+	p.credPool.setOverride(turnOverride{servers: ResolveTURNServers(ctx, cfg.TurnServers, resolvedVKHostIPs), raw: cfg.TurnServers, host: cfg.TurnServer, port: cfg.TurnPort})
 
 	p.initGroupHello(cfg)
 
@@ -2307,7 +2307,7 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 		// conns spread across relays — each (okcdn_userid, relay) is its own ~10
 		// allocation quota (2026-06-28 finding). No captcha bookkeeping here.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		c, cerr := cookieCredForSlot(ctx, slot, p.config.TurnServers, p.credPool.heldRelaysExcept(slot))
+		c, cerr := cookieCredForSlot(ctx, slot, p.credPool.overrideServers(), p.credPool.heldRelaysExcept(slot)) // the pool's list, resolved (#105)
 		cancel()
 		if cerr != nil {
 			if errors.Is(cerr, ErrCookieRejected) {
