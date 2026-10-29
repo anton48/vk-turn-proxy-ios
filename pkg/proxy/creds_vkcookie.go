@@ -70,6 +70,15 @@ var (
 	cookieRelaySeen     = map[string]bool{}              // relay-address dedup set
 	cookieDiscoverIdx   int                              // # call links already minted for relay discovery
 	cookieRelayAssigned = map[int]string{}               // slot -> the relay handed to it in this process (stable across refills while no other slot holds it)
+
+	// cookieAssignMu guards cookieRelayAssigned ALONE and is never held across
+	// I/O: the minter takes it for a moment under cookieMu, the pool under
+	// cp.mu (syncMinterLocked → cookieNoteSlotRelay) — never cookieMu, which
+	// the minter holds for the length of its HTTP request (the user's review
+	// of 456: one slow mint held the whole pool for up to the fetch's 30 s).
+	// Lock order: cookieMu → cookieAssignMu and cp.mu → cookieAssignMu; nothing
+	// is taken under cookieAssignMu.
+	cookieAssignMu sync.Mutex
 )
 
 // cookieCachedCred caches one call's minted (multi-relay) cred so both of its
@@ -113,22 +122,38 @@ func SetVKCookieAuth(enabled bool, cookieHeader string, links []string) {
 	cookieRelayList = nil
 	cookieRelaySeen = map[string]bool{}
 	cookieDiscoverIdx = 0
+	cookieAssignMu.Lock()
 	cookieRelayAssigned = map[int]string{}
+	cookieAssignMu.Unlock()
 	cookieMu.Unlock()
 }
 
 // cookieNoteSlotRelay: the pool tells the minter what slot dials now under a
 // TURN override list ("" — nothing): the reservation follows the placement
-// and the re-binding (credPool.syncMinterLocked). Takes cookieMu; the pool
-// holds cp.mu — cookieCredForSlot never takes cp.mu under cookieMu.
+// and the re-binding (credPool.syncMinterLocked). The minter records its own
+// pick through it too. Takes cookieAssignMu alone — 🚫 never cookieMu, which
+// the minter holds across its HTTP request (the user's review of 456).
 func cookieNoteSlotRelay(slot int, relay string) {
-	cookieMu.Lock()
-	defer cookieMu.Unlock()
+	cookieAssignMu.Lock()
+	defer cookieAssignMu.Unlock()
 	if relay == "" {
 		delete(cookieRelayAssigned, slot)
 		return
 	}
 	cookieRelayAssigned[slot] = relay
+}
+
+// cookieAssigned: a copy of the reservations, read under cookieAssignMu for
+// a moment — what the minter decides by (under cookieMu, so two mints never
+// decide at once; the pool's placement re-checks the truth under cp.mu).
+func cookieAssigned() map[int]string {
+	cookieAssignMu.Lock()
+	defer cookieAssignMu.Unlock()
+	out := make(map[int]string, len(cookieRelayAssigned))
+	for s, a := range cookieRelayAssigned {
+		out[s] = a
+	}
+	return out
 }
 
 func cookieLinks() []string {
@@ -195,13 +220,14 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		}
 	}
 	// free: not held by another slot of the pool, not handed to another slot
-	// in this process (two mints in flight must not take one relay). Under
-	// cookieMu (cookieRelayAssigned).
+	// in this process (two mints in flight must not take one relay). The
+	// reservations read under cookieAssignMu (cookieAssigned), the decision
+	// under cookieMu.
 	free := func(addr string) bool {
 		if heldSet[addr] {
 			return false
 		}
-		for s, a := range cookieRelayAssigned {
+		for s, a := range cookieAssigned() {
 			if a == addr && s != slot {
 				return false
 			}
@@ -237,14 +263,14 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 			if heldSet[addr] {
 				return false
 			}
-			for s, a := range cookieRelayAssigned {
+			for s, a := range cookieAssigned() {
 				if a == addr && s != slot && s < len(override) {
 					return false
 				}
 			}
 			return true
 		}
-		switch a := cookieRelayAssigned[slot]; {
+		switch a := cookieAssigned()[slot]; {
 		case a != "" && inList(a) && freeIn(a):
 			relay = a
 		case freeIn(override[slot]):
@@ -260,7 +286,7 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		if relay == "" {
 			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s), every one held by another slot — slot %d unfilled (add relays to the list, or lower Connections)", len(override), slot)
 		}
-		cookieRelayAssigned[slot] = relay
+		cookieNoteSlotRelay(slot, relay)
 		creds, err := cookieMintCachedLocked(ctx, links[slot%len(links)], ch)
 		if err != nil {
 			return nil, err
@@ -277,7 +303,7 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		return cookieRelayRef{}, false
 	}
 	pick := func() (cookieRelayRef, bool) {
-		if a, ok := cookieRelayAssigned[slot]; ok && free(a) {
+		if a, ok := cookieAssigned()[slot]; ok && free(a) {
 			if ref, ok := byAddr(a); ok {
 				return ref, true
 			}
@@ -315,7 +341,7 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 	if !ok {
 		return nil, fmt.Errorf("cookie auth: only %d distinct TURN relay(s) from %d call link(s), %d held by other slots — slot %d unfilled (add more/different calls, or lower Connections)", len(cookieRelayList), len(links), len(heldSet), slot)
 	}
-	cookieRelayAssigned[slot] = ref.address
+	cookieNoteSlotRelay(slot, ref.address)
 
 	creds, err := cookieMintCachedLocked(ctx, ref.linkID, ch)
 	if err != nil {

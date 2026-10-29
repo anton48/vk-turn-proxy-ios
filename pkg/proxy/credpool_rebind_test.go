@@ -339,15 +339,15 @@ func TestCookieModeAMintPlacedAfterTheListChangedAsksTheListAgain(t *testing.T) 
 	// The minter reserved R2 for slot 1; the placement put the slot on R3 —
 	// the reservation follows, or R2, back in the list later, is refused to
 	// the slot that could take it ("every one held").
-	cookieMu.Lock()
+	cookieAssignMu.Lock()
 	cookieRelayAssigned[1] = r2
-	cookieMu.Unlock()
+	cookieAssignMu.Unlock()
 	cp.cp.mu.Lock()
 	cp.cp.placeLocked(1, credPoolEntry{addr: r2, addrs: cp.cp.candidatesForSlot(1, minted), creds: minted, ts: time.Now()})
 	cp.cp.mu.Unlock()
-	cookieMu.Lock()
+	cookieAssignMu.Lock()
 	reserved := cookieRelayAssigned[1]
-	cookieMu.Unlock()
+	cookieAssignMu.Unlock()
 	if reserved != r3 {
 		t.Fatalf("the minter's reservation for slot 1 after the placement on %s: %q — want %s", r3, reserved, r3)
 	}
@@ -396,9 +396,9 @@ func TestCookieModeAShrunkListHandsTheFreedEntryOn(t *testing.T) {
 	}
 	// The minter, asked for slot 0 with nothing held: R2 — slot 1's old
 	// reservation (set here as the minter left it) is a slot beyond the list.
-	cookieMu.Lock()
+	cookieAssignMu.Lock()
 	cookieRelayAssigned[1] = r2
-	cookieMu.Unlock()
+	cookieAssignMu.Unlock()
 	if c, err := cookieCredForSlot(context.Background(), 0, []string{r2}, nil); err != nil || c.Address != r2 {
 		t.Fatalf("the minter for slot 0 under [R2] with nothing held: %+v %v — want R2 (slot 1's reservation is beyond the list)", c, err)
 	}
@@ -442,5 +442,48 @@ func TestCookieModeTheListArrivingAfterTheLoadLeavesNoEntryIdle(t *testing.T) {
 	c0, c1, c3 := cp.candidatesLocked(0), cp.candidatesLocked(1), cp.candidatesLocked(3)
 	if strings.Join(c0, ",") != relayE || strings.Join(c1, ",") != relayO || len(c3) != 0 {
 		t.Fatalf("the list [E, O] over a cache with slot 3 (beyond) on O: slot 0 dials %v, slot 1 %v, slot 3 %v — want E, O and nothing", c0, c1, c3)
+	}
+}
+
+// The user's review of 456: the minter holds cookieMu across its HTTP mint
+// (up to the fetch's 30 s), and the pool's placement — under cp.mu — told
+// the minter where the slot now dials by taking cookieMu: one slow mint held
+// the whole pool (Stats, releases, the hand-out of a READY slot waited for
+// the HTTP request). The reservations have a mutex of their own, never held
+// across I/O; the pool's sync takes that one.
+func TestAPlacementDoesNotWaitForTheMintersHTTPRequest(t *testing.T) {
+	cookieTestMode(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cp := newCredPool(ctx, 4, 2*time.Minute, "", nil)
+	cp.setOverride(turnOverride{servers: []string{relayE, relayF}})
+	// A mint in flight: cookieMu held for the length of its HTTP request.
+	cookieMu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c := &TURNCreds{Username: futureUser("ready"), Password: "p", Address: relayE, Addresses: []string{relayE}}
+		cp.mu.Lock()
+		cp.placeLocked(0, credPoolEntry{addr: relayE, addrs: cp.candidatesForSlot(0, c), creds: c, ts: time.Now()})
+		cp.mu.Unlock()
+		cp.heldRelaysExcept(1) // another look under cp.mu
+	}()
+	waited := false
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		waited = true
+	}
+	cookieMu.Unlock()
+	<-done
+	if waited {
+		t.Fatal("a placement under cp.mu waited for the minter's HTTP request (cookieMu held): the whole pool is held for up to 30 s")
+	}
+	// The reservation was recorded all the same.
+	cookieAssignMu.Lock()
+	got := cookieRelayAssigned[0]
+	cookieAssignMu.Unlock()
+	if got != relayE {
+		t.Fatalf("the minter's reservation for slot 0 after the placement: %q, want %s", got, relayE)
 	}
 }
