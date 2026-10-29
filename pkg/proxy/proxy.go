@@ -37,7 +37,7 @@ type Config struct {
 	PeerAddr         string        // vk-turn-proxy server address (host:port)
 	TurnServer       string        // override TURN server host (optional; the older pair — TurnServers wins when set)
 	TurnPort         string        // override TURN port (optional)
-	TurnServers      []string      // override TURN relays, host:port each: replaces VK's addresses for EVERY credential, cached ones included (relayhealth.go)
+	TurnServers      []string      // override TURN relays, host:port each, or TURNServersVK for VK's own in its place: replaces VK's addresses for EVERY credential, cached ones included (relayhealth.go)
 	VKLink           string        // VK call invite link or link ID
 	UseDTLS          bool          // true = DTLS obfuscation (default mode)
 	UseUDP           bool          // true = UDP to TURN, false = TCP

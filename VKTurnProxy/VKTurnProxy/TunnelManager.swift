@@ -181,20 +181,23 @@ extension TunnelConfig {
     /// Splits on the LAST colon so IPv4:port parses cleanly.
     /// parseTurnServers reads the profile's TURN override field as a list of
     /// host:port entries separated by commas, semicolons, spaces or newlines;
-    /// an entry that is not host:port with a numeric port is dropped (the editor
-    /// warns about it). Duplicates are dropped, order is kept.
+    /// `$vkurls` (any case) is kept as the word for VK's own relays (GitHub
+    /// #105 (2)); an entry that is neither is dropped (the editor warns about
+    /// it). Duplicates are dropped, order is kept.
     static func parseTurnServers(_ raw: String) -> [String] {
         var out: [String] = []
         for part in raw.split(whereSeparator: { ",; \n\t\r".contains($0) }) {
-            let t = String(part)
-            guard ConfigValidation.isHostPort(t), !out.contains(t) else { continue }
+            var t = String(part)
+            if t.lowercased() == ConfigValidation.turnServersVK { t = ConfigValidation.turnServersVK }
+            guard ConfigValidation.isTurnOverrideEntry(t), !out.contains(t) else { continue }
             out.append(t)
         }
         return out
     }
 
     /// turnOverrideHosts: the DNS names in the override list — the hosts that
-    /// are not IP literals — for the pre-resolution beside the VK hosts
+    /// are not IP literals (`$vkurls`, no host:port, is skipped) — for the
+    /// pre-resolution beside the VK hosts
     /// (GitHub #105, 2026-10-29). The extension's own resolver lost 5 s to a
     /// timeout on the first dial and iOS refuses a name as the tunnel's remote
     /// address; the main app resolves on the physical path before the

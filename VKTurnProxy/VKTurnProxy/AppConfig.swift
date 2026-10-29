@@ -132,7 +132,8 @@ struct AppSettings: Codable {
     /// turnServerOverride: optional "host:port" (added 2026-06-08), a comma-
     /// separated LIST since 2026-10-19. When set, every credential — fresh,
     /// cached or seeded — is dialled on these relays, in order; a relay that
-    /// stops answering is marked and the next one taken. nil = no override.
+    /// stops answering is marked and the next one taken. `$vkurls` in the list
+    /// stands for VK's own relays in its place (2026-10-29). nil = no override.
     let turnServerOverride: String?
     /// UNDOCUMENTED on-device captcha-test toggle (build 149): when true the
     /// extension skips the captcha-free VK Calls path so the legacy
@@ -277,8 +278,8 @@ struct ConnectionSettings: Codable {
     let useWrapA: Bool?
     let wrapAPassword: String?
     /// turnServerOverride: optional TURN-relay override — "host:port" (added
-    /// 2026-06-08), a comma-separated list since 2026-10-19. nil keeps the
-    /// device's current value.
+    /// 2026-06-08), a comma-separated list since 2026-10-19, `$vkurls` for VK's
+    /// own relays since 2026-10-29. nil keeps the device's current value.
     let turnServerOverride: String?
     /// Optional: if absent, the importing device keeps its current
     /// dnsServers value (or the AppStorage default of "1.1.1.1" if

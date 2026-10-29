@@ -235,12 +235,26 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		return true
 	}
 
+	// The list in cookie mode (turnOverride.cookieShape): the FIXED entries
+	// take the slots 0..m-1; `$vkurls` takes every slot from m on — VK's
+	// distinct relays, the discovery below with the slot counted from m.
+	fixed, vkTail := (turnOverride{servers: override}).cookieShape()
+	vslot := slot
 	cookieMu.Lock()
+	defer cookieMu.Unlock()
 	if len(override) > 0 {
-		defer cookieMu.Unlock()
-		if slot >= len(override) {
-			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s) — slot %d unfilled (add relays to the list, or lower Connections)", len(override), slot)
+		if slot >= len(fixed) && !vkTail {
+			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s) — slot %d unfilled (add relays to the list, or lower Connections)", len(fixed), slot)
 		}
+		if slot >= len(fixed) {
+			vslot = slot - len(fixed)
+			for _, a := range fixed {
+				heldSet[a] = true // a fixed entry is a fixed slot's, whoever VK hands it to
+			}
+		}
+	}
+	if len(override) > 0 && slot < len(fixed) {
+		override := fixed
 		// The slot's entry: the one it was given before while the list still
 		// names it and no other slot holds it, else its own index's, else the
 		// first free — never one another slot holds (the user's review of 454:
@@ -293,7 +307,6 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		}
 		return &TURNCreds{Username: creds.Username, Password: creds.Password, Address: relay, Addresses: []string{relay}}, nil
 	}
-	defer cookieMu.Unlock()
 	byAddr := func(addr string) (cookieRelayRef, bool) {
 		for _, ref := range cookieRelayList {
 			if ref.address == addr {
@@ -308,8 +321,8 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 				return ref, true
 			}
 		}
-		if slot < len(cookieRelayList) && free(cookieRelayList[slot].address) {
-			return cookieRelayList[slot], true
+		if vslot < len(cookieRelayList) && free(cookieRelayList[vslot].address) {
+			return cookieRelayList[vslot], true
 		}
 		for _, ref := range cookieRelayList {
 			if free(ref.address) {
@@ -323,7 +336,7 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 	// and something is free, or every call link has been minted (no more
 	// relays to find).
 	ref, ok := pick()
-	for (len(cookieRelayList) <= slot || !ok) && cookieDiscoverIdx < len(links) {
+	for (len(cookieRelayList) <= vslot || !ok) && cookieDiscoverIdx < len(links) {
 		linkID := links[cookieDiscoverIdx]
 		cookieDiscoverIdx++
 		creds, err := cookieMintCachedLocked(ctx, linkID, ch)

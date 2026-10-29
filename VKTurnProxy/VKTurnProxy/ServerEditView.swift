@@ -107,7 +107,7 @@ struct ServerEditView: View {
                     .disableAutocorrection(true)
                 hint(ConfigValidation.peerAddress(draft.peerAddress))
 
-                TextField("TURN servers (host:port, comma-separated, optional)", text: $draft.turnServerOverride)
+                TextField("TURN servers (host:port or $vkurls, comma-separated, optional)", text: $draft.turnServerOverride)
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
                     .keyboardType(.numbersAndPunctuation)

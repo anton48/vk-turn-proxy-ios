@@ -51,7 +51,7 @@ type CredPoolConfig struct {
 	CachePath   string        // on-disk JSON cache (the app's creds-pool.json); empty disables persistence
 	TurnServer  string        // optional TURN host override (the older pair; TurnServers wins when set)
 	TurnPort    string        // optional TURN port override
-	TurnServers []string      // optional TURN relays, host:port each — applied to EVERY credential when it is handed out, cached ones included (relayhealth.go)
+	TurnServers []string      // optional TURN relays, host:port each, or TURNServersVK for VK's own in its place — applied to EVERY credential when it is handed out, cached ones included (relayhealth.go)
 	// SeededTURN pre-fills slot 0 (the app's pre-bootstrap captcha flow hands
 	// it over), so the first acquire needs no VK call — without it the
 	// captcha lands inside iOS's .connecting window. The override applies to

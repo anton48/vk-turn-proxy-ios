@@ -4561,6 +4561,22 @@ do {
     }
 }
 
+// Issue #105 (2), 2026-10-29: `$vkurls` in the TURN override list stands for
+// VK's own relays in its place (Go's proxy.TURNServersVK). The validator and
+// the parser accept the word (any case); the field says so.
+print("TURN override: $vkurls for VK's own relays (GitHub #105 (2))")
+do {
+    let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
+    check(cv.contains("static let turnServersVK = \"$vkurls\""), "ConfigValidation names the word once — the same as Go's TURNServersVK")
+    check(cv.contains("static func isTurnOverrideEntry(_ s: String) -> Bool {") && cv.contains("isHostPort(s) || s.lowercased() == turnServersVK"),
+          "an override entry is host:port OR the word, any case")
+    check(cv.contains("let bad = parts.filter { !isTurnOverrideEntry($0) }"), "🚨 the validator judges the list's entries by isTurnOverrideEntry — $vkurls is not 'ignored'")
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(tm.contains("if t.lowercased() == ConfigValidation.turnServersVK { t = ConfigValidation.turnServersVK }") && tm.contains("guard ConfigValidation.isTurnOverrideEntry(t), !out.contains(t) else { continue }"),
+          "🚨 parseTurnServers keeps $vkurls (folded to the word) — the extension receives it in turn_servers")
+    check(source("VKTurnProxy/VKTurnProxy/ServerEditView.swift").contains("TURN servers (host:port or $vkurls, comma-separated, optional)"), "the field names the word")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

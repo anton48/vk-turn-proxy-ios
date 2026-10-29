@@ -82,7 +82,7 @@ func parseFlags(args []string) (*options, error) {
 	fs.StringVar(&o.dns, "dns", "", "DNS while the default route is in the tunnel: a comma-separated list replacing the server's dnsServers, or false to leave the system's alone")
 	fs.IntVar(&o.uplinkPace, "uplink-pace", -1, "uplink pacer, KiB/s per connection (0 = off; default: the backup's; 247 is the measured knee)")
 	fs.StringVar(&o.vkLink, "vk-link", "", "a VK call link replacing the backup's list")
-	fs.StringVar(&o.turnServer, "turn-server", "", "override the TURN relays: host:port entries, comma-separated (the server's turnServerOverride); tried in order, a relay that stops answering is marked and the next one taken")
+	fs.StringVar(&o.turnServer, "turn-server", "", "override the TURN relays: host:port entries, comma-separated (the server's turnServerOverride), $vkurls among them standing for VK's own relays in its place; tried in order, a relay that stops answering is marked and the next one taken")
 	fs.BoolVar(&o.defaultRoute, "default-route", true, "send everything through the tunnel (false: only the tunnel's subnet and -route)")
 	fs.DurationVar(&o.defaultRouteWait, "default-route-wait", 2*time.Second, "after the first WireGuard handshake, wait this long for every connection before moving the default route anyway")
 	fs.BoolVar(&o.blockIPv6, "block-ipv6", false, "send IPv6 into the tunnel too, where it is dropped (the tunnel carries IPv4 only; without it IPv6 goes around the tunnel)")
@@ -148,7 +148,7 @@ func (o *options) applyTo(st *settings) (dnsPlan, error) {
 	if o.set["turn-server"] {
 		list, err := proxy.ParseTURNServers(o.turnServer)
 		if err != nil || len(list) == 0 {
-			return dnsPlan{}, fmt.Errorf("-turn-server %q: host:port entries, comma-separated", o.turnServer)
+			return dnsPlan{}, fmt.Errorf("-turn-server %q: host:port entries (or $vkurls), comma-separated", o.turnServer)
 		}
 		st.TurnServers = list
 	}

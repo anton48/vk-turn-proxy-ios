@@ -354,14 +354,45 @@ func (o turnOverride) hasName() bool {
 }
 
 // allIPs: every entry's host is an IP (a resolution that left a name behind
-// is a failed one).
+// is a failed one); the word for VK's relays is no name.
 func allIPs(servers []string) bool {
 	for _, e := range servers {
+		if e == TURNServersVK {
+			continue
+		}
 		if h, _, err := net.SplitHostPort(e); err != nil || net.ParseIP(h) == nil {
 			return false
 		}
 	}
 	return true
+}
+
+// hasVK: the list names VK's own relays somewhere (TURNServersVK) — then it
+// is not a FIXED list: a fresh credential may come with other VK relays, and
+// a mint is a way out of an exhausted list, as without an override.
+func (o turnOverride) hasVK() bool {
+	for _, e := range o.servers {
+		if e == TURNServersVK {
+			return true
+		}
+	}
+	return false
+}
+
+// cookieShape is the list as cookie mode reads it, where a slot IS a relay:
+// the FIXED entries before the first `$vkurls` take the slots 0..m-1; with
+// the word present, every slot from m on is a VK slot — VK's distinct relays,
+// as without a list (the minter's discovery); entries after the word are not
+// used (a VK slot's count is open). Without the word a slot beyond the fixed
+// entries is off.
+func (o turnOverride) cookieShape() (fixed []string, vkTail bool) {
+	for _, e := range o.servers {
+		if e == TURNServersVK {
+			return fixed, true
+		}
+		fixed = append(fixed, e)
+	}
+	return fixed, false
 }
 
 func (o turnOverride) set() bool { return len(o.servers) > 0 || o.host != "" || o.port != "" }
@@ -370,15 +401,25 @@ func (o turnOverride) set() bool { return len(o.servers) > 0 || o.host != "" || 
 // list when set, else the pair applied to VK's addresses, else VK's own —
 // deduplicated, never empty when creds has an address.
 func (o turnOverride) candidatesFor(creds *TURNCreds) []string {
-	if len(o.servers) > 0 {
-		return dedupeAddrs(o.servers)
-	}
 	var vk []string
 	if creds != nil {
 		vk = creds.Addresses
 		if len(vk) == 0 && creds.Address != "" {
 			vk = []string{creds.Address}
 		}
+	}
+	if len(o.servers) > 0 {
+		// `$vkurls` stands for VK's own relays — the credential's — in its
+		// place (issue #105 (2)).
+		out := make([]string, 0, len(o.servers)+len(vk))
+		for _, e := range o.servers {
+			if e == TURNServersVK {
+				out = append(out, vk...)
+				continue
+			}
+			out = append(out, e)
+		}
+		return dedupeAddrs(out)
 	}
 	if o.host == "" && o.port == "" {
 		return dedupeAddrs(vk)
@@ -413,6 +454,13 @@ func dedupeAddrs(in []string) []string {
 	return out
 }
 
+// TURNServersVK is the word in the TURN override list that stands for VK's own
+// relays — the addresses the credential came with — in its place (issue #105
+// (2)): `myrelay.example:19302,$vkurls` dials the user's relay while it
+// answers and VK's when it does not. Alone it is no override. A `$` so that
+// it can be no DNS name; folded to lower case by ParseTURNServers.
+const TURNServersVK = "$vkurls"
+
 // ParseTURNServers reads the TURN override list as the app's setting and the
 // console's flag spell it: host:port entries separated by commas, spaces or
 // newlines; each port numeric. An empty string is no override.
@@ -420,6 +468,10 @@ func ParseTURNServers(raw string) ([]string, error) {
 	f := func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t' || r == '\r' }
 	var out []string
 	for _, e := range strings.FieldsFunc(raw, f) {
+		if strings.EqualFold(e, TURNServersVK) {
+			out = append(out, TURNServersVK) // VK's own relays, in this place
+			continue
+		}
 		h, p, err := net.SplitHostPort(e)
 		if err != nil || h == "" {
 			return nil, &TURNServerListError{Entry: e}
@@ -437,7 +489,7 @@ func ParseTURNServers(raw string) ([]string, error) {
 type TURNServerListError struct{ Entry string }
 
 func (e *TURNServerListError) Error() string {
-	return "TURN server " + strconv.Quote(e.Entry) + " is not host:port"
+	return "TURN server " + strconv.Quote(e.Entry) + " is not host:port (nor " + TURNServersVK + ")"
 }
 
 // lookupTURNHost is the bounded lookup behind ResolveTURNServers for a name

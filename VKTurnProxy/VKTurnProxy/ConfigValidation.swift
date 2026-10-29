@@ -117,21 +117,36 @@ enum ConfigValidation {
         return nil
     }
 
+    /// turnServersVK: the word in the TURN override list that stands for VK's
+    /// own relays — the addresses the credential came with — in its place
+    /// (GitHub #105 (2), 2026-10-29): `myrelay.example:19302,$vkurls` dials the
+    /// user's relay while it answers and VK's when it does not. Alone it is no
+    /// override. Go's proxy.TURNServersVK is the same word.
+    static let turnServersVK = "$vkurls"
+
+    /// isTurnOverrideEntry: what one entry of the TURN override list may be —
+    /// host:port, or the word for VK's relays (any case).
+    static func isTurnOverrideEntry(_ s: String) -> Bool {
+        isHostPort(s) || s.lowercased() == turnServersVK
+    }
+
     /// Optional override. Empty = OK (use VK's relay). A non-empty value must be
-    /// host:port, else a warning (the config layer silently ignores it).
+    /// host:port entries (or $vkurls), else a warning (the config layer silently
+    /// ignores it).
     static func turnOverride(_ s: String) -> Issue? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return nil }
         // A list since 2026-10-19: host:port entries separated by commas (or
-        // semicolons, spaces, newlines), tried in order. An invalid entry is
-        // ignored by the parser (TunnelManager.parseTurnServers).
+        // semicolons, spaces, newlines), tried in order; `$vkurls` among them
+        // stands for VK's own relays (2026-10-29). An invalid entry is ignored
+        // by the parser (TunnelManager.parseTurnServers).
         let parts = t.split(whereSeparator: { ",; \n\t\r".contains($0) }).map(String.init)
-        let bad = parts.filter { !isHostPort($0) }
+        let bad = parts.filter { !isTurnOverrideEntry($0) }
         if bad.count == parts.count {
-            return Issue(.warning, "Not a valid host:port list — it will be ignored (VK's relays are used).")
+            return Issue(.warning, "Not a valid list of host:port entries (or \(turnServersVK)) — it will be ignored (VK's relays are used).")
         }
         if !bad.isEmpty {
-            return Issue(.warning, "Ignored (not host:port): \(bad.joined(separator: ", ")). The valid entries are used in order.")
+            return Issue(.warning, "Ignored (not host:port, nor \(turnServersVK)): \(bad.joined(separator: ", ")). The valid entries are used in order.")
         }
         return nil
     }
