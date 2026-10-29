@@ -294,3 +294,153 @@ func TestCookieModeTheListArrivingAfterTheLoadMakesNoTwins(t *testing.T) {
 		t.Fatalf("the list [E, O] over a cache with slot 0 on O: slot 0 dials %v, slot 1 %v, slot 2 %v — want O, E (not O: a twin) and nothing (beyond the list)", c0, c1, c2)
 	}
 }
+
+// The user's review of 455, two findings.
+//
+// (1) A mint begun before the list changed: the minter picked B from [A, B];
+// before the result was placed the list became [C, A]. Slot 0 (ten leases)
+// stayed on A — but the credential for B, no longer in the list, was placed
+// by INDEX: servers[1] == A, an eleventh seat on A. The placement asks the
+// CURRENT list and the relays the other slots hold, under the pool's lock:
+// its own relay when the list names it and no slot holds it, else a free
+// entry, else nothing.
+func TestCookieModeAMintPlacedAfterTheListChangedAsksTheListAgain(t *testing.T) {
+	var answer atomic.Value
+	answer.Store([]string{ipR1, ipR2})
+	cp := cookieNamePool(t, 20, &answer)
+	r1, r2, r3 := ipR1+":19302", ipR2+":19302", ipR3+":19302"
+	var held []*TURNCreds
+	for conn := 0; conn < 10; conn++ {
+		addr, creds, slot, err := cp.Acquire(conn)
+		if err != nil || addr != r1 || slot != 0 {
+			t.Fatalf("conn %d: %q slot %d %v — want slot 0 on %s", conn, addr, slot, err, r1)
+		}
+		held = append(held, creds)
+	}
+	// The mint for slot 1 is in flight with R2; the list becomes [R3, R1].
+	minted := &TURNCreds{Username: futureUser("in-flight"), Password: "p", Address: r2, Addresses: []string{r2}}
+	answer.Store([]string{ipR3, ipR1})
+	cp.OnPathChange()
+	waitForList(t, cp, r3, r1)
+	cp.cp.mu.Lock()
+	got := cp.cp.candidatesForSlot(1, minted)
+	cp.cp.mu.Unlock()
+	if strings.Join(got, ",") != r3 {
+		t.Fatalf("a credential minted for %s placed into slot 1 under the list [R3, R1] with R1 held by slot 0: dials %v — want the free entry %s, never R1 (an eleventh seat)", r2, got, r3)
+	}
+	// A credential minted for R1 itself (two mints in flight took one entry):
+	// R1 is slot 0's — the free entry, not a twin.
+	cp.cp.mu.Lock()
+	got = cp.cp.candidatesForSlot(1, &TURNCreds{Username: futureUser("twin"), Password: "p", Address: r1, Addresses: []string{r1}})
+	cp.cp.mu.Unlock()
+	if strings.Join(got, ",") != r3 {
+		t.Fatalf("a credential minted for R1 placed into slot 1 while slot 0 dials R1: dials %v — want the free entry %s", got, r3)
+	}
+	// The minter reserved R2 for slot 1; the placement put the slot on R3 —
+	// the reservation follows, or R2, back in the list later, is refused to
+	// the slot that could take it ("every one held").
+	cookieMu.Lock()
+	cookieRelayAssigned[1] = r2
+	cookieMu.Unlock()
+	cp.cp.mu.Lock()
+	cp.cp.placeLocked(1, credPoolEntry{addr: r2, addrs: cp.cp.candidatesForSlot(1, minted), creds: minted, ts: time.Now()})
+	cp.cp.mu.Unlock()
+	cookieMu.Lock()
+	reserved := cookieRelayAssigned[1]
+	cookieMu.Unlock()
+	if reserved != r3 {
+		t.Fatalf("the minter's reservation for slot 1 after the placement on %s: %q — want %s", r3, reserved, r3)
+	}
+	if c, err := cookieCredForSlot(context.Background(), 2, []string{r2, r3, r1}, []string{r3, r1}); err != nil || c.Address != r2 {
+		t.Fatalf("the minter for slot 2 under [R2, R3, R1] with R3 and R1 held: %+v %v — want R2 (slot 1 dials R3, its old reservation of R2 must not stand)", c, err)
+	}
+	for _, c := range held {
+		cp.Release(0, c)
+	}
+}
+
+// (2) The list shrinks [A, B] → [B] with both slots filled and no leases:
+// slot 0 found B still slot 1's while slot 1 was not yet switched off as
+// beyond the list — both slots ended without a relay, B idle, and the
+// minter's reservation of B for slot 1 refused the next mint ("every one
+// held"). The re-binding frees first, then assigns; a reservation held by a
+// slot beyond the list reserves nothing.
+func TestCookieModeAShrunkListHandsTheFreedEntryOn(t *testing.T) {
+	var answer atomic.Value
+	answer.Store([]string{ipR1, ipR2})
+	cp := cookieNamePool(t, 20, &answer)
+	r1, r2 := ipR1+":19302", ipR2+":19302"
+	// Slot 0 full for a moment so that conn 10 fills slot 1; then every
+	// lease ends.
+	var held []*TURNCreds
+	for conn := 0; conn < 10; conn++ {
+		addr, creds, slot, err := cp.Acquire(conn)
+		if err != nil || addr != r1 || slot != 0 {
+			t.Fatalf("conn %d: %q slot %d %v — want slot 0 on %s", conn, addr, slot, err, r1)
+		}
+		held = append(held, creds)
+	}
+	if addr, creds, slot, err := cp.Acquire(10); err != nil || addr != r2 || slot != 1 {
+		t.Fatalf("conn 10: %q slot %d %v — want slot 1 on %s", addr, slot, err, r2)
+	} else {
+		cp.Release(slot, creds)
+	}
+	for _, c := range held {
+		cp.Release(0, c)
+	}
+	answer.Store([]string{ipR2})
+	cp.OnPathChange()
+	waitForList(t, cp, r2)
+	if a0, a1 := slotAddrs(cp, 0), slotAddrs(cp, 1); strings.Join(a0, ",") != r2 || len(a1) != 0 {
+		t.Fatalf("the list shrunk to [R2]: slot 0 dials %v, slot 1 %v — want slot 0 on the freed %s, slot 1 (beyond the list) nothing", a0, a1, r2)
+	}
+	// The minter, asked for slot 0 with nothing held: R2 — slot 1's old
+	// reservation (set here as the minter left it) is a slot beyond the list.
+	cookieMu.Lock()
+	cookieRelayAssigned[1] = r2
+	cookieMu.Unlock()
+	if c, err := cookieCredForSlot(context.Background(), 0, []string{r2}, nil); err != nil || c.Address != r2 {
+		t.Fatalf("the minter for slot 0 under [R2] with nothing held: %+v %v — want R2 (slot 1's reservation is beyond the list)", c, err)
+	}
+	// And the pool hands R2 out — on slot 0 — once R2's quota clock (slot 1's
+	// lease on it ended a moment ago: the relay's cooldown) has run out.
+	cp.cp.mu.Lock()
+	cp.cp.relayUsedAt[r2] = time.Now().Add(-2 * credSaturationCooldown)
+	cp.cp.applyRelayQuarantineLocked(0)
+	cp.cp.mu.Unlock()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		addr, creds, slot, err := cp.Acquire(0)
+		if err == nil {
+			cp.Release(slot, creds)
+			if addr != r2 || slot != 0 {
+				t.Fatalf("conn 0 after the shrink: %q on slot %d — want %s on slot 0", addr, slot, r2)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("conn 0 after the shrink: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// The list arriving after the load: a loaded slot BEYOND the list whose
+// stored address is a list entry must not keep that entry from the slot
+// whose index it is (the entry would sit idle).
+func TestCookieModeTheListArrivingAfterTheLoadLeavesNoEntryIdle(t *testing.T) {
+	cookieTestMode(t)
+	path := writeCookieCache(t, t.TempDir(),
+		credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA}, Username: futureUser("s0"), Password: "p"},
+		credCacheEntry{Slot: 1, Address: relayB, Addresses: []string{relayB}, Username: futureUser("s1"), Password: "p"},
+		credCacheEntry{Slot: 3, Address: relayO, Addresses: []string{relayO}, Username: futureUser("s3-on-the-lists-second"), Password: "p"},
+	)
+	cp, _, _ := relayPool(t, path, relayC)
+	cp.setOverride(turnOverride{servers: []string{relayE, relayO}})
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	c0, c1, c3 := cp.candidatesLocked(0), cp.candidatesLocked(1), cp.candidatesLocked(3)
+	if strings.Join(c0, ",") != relayE || strings.Join(c1, ",") != relayO || len(c3) != 0 {
+		t.Fatalf("the list [E, O] over a cache with slot 3 (beyond) on O: slot 0 dials %v, slot 1 %v, slot 3 %v — want E, O and nothing", c0, c1, c3)
+	}
+}

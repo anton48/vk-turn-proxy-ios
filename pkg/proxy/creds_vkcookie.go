@@ -117,6 +117,20 @@ func SetVKCookieAuth(enabled bool, cookieHeader string, links []string) {
 	cookieMu.Unlock()
 }
 
+// cookieNoteSlotRelay: the pool tells the minter what slot dials now under a
+// TURN override list ("" — nothing): the reservation follows the placement
+// and the re-binding (credPool.syncMinterLocked). Takes cookieMu; the pool
+// holds cp.mu — cookieCredForSlot never takes cp.mu under cookieMu.
+func cookieNoteSlotRelay(slot int, relay string) {
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	if relay == "" {
+		delete(cookieRelayAssigned, slot)
+		return
+	}
+	cookieRelayAssigned[slot] = relay
+}
+
 func cookieLinks() []string {
 	if v, ok := cookieLinksStore.Load().([]string); ok {
 		return v
@@ -215,14 +229,29 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 			}
 			return false
 		}
+		// freeIn: free, and a reservation held by a slot BEYOND the list
+		// reserves nothing — that slot dials nothing (the user's review of
+		// 455: the list shrunk, slot 1's old reservation of B kept slot 0's
+		// mint from B).
+		freeIn := func(addr string) bool {
+			if heldSet[addr] {
+				return false
+			}
+			for s, a := range cookieRelayAssigned {
+				if a == addr && s != slot && s < len(override) {
+					return false
+				}
+			}
+			return true
+		}
 		switch a := cookieRelayAssigned[slot]; {
-		case a != "" && inList(a) && free(a):
+		case a != "" && inList(a) && freeIn(a):
 			relay = a
-		case free(override[slot]):
+		case freeIn(override[slot]):
 			relay = override[slot]
 		default:
 			for _, o := range override {
-				if free(o) {
+				if freeIn(o) {
 					relay = o
 					break
 				}
