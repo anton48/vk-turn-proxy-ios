@@ -31,6 +31,26 @@ func (cp *credPool) setOverride(o turnOverride) {
 			cp.applyRelayQuarantineLocked(i) // the clock of the relay the slot dials NOW
 		}
 	}
+	// Cookie mode under a list: a loaded slot whose stored address is a list
+	// entry keeps it (candidatesForSlot) — the slot whose INDEX that entry is
+	// would be a twin: it takes a free entry instead (the lower slot keeps).
+	if cp.mode == credCacheModeCookie && len(o.servers) > 0 {
+		for i := range cp.pool {
+			if cp.pool[i].creds == nil || len(cp.pool[i].addrs) != 1 {
+				continue
+			}
+			for j := 0; j < i; j++ {
+				if cp.pool[j].creds != nil && len(cp.pool[j].addrs) == 1 && cp.pool[j].addrs[0] == cp.pool[i].addrs[0] {
+					cp.pool[i].addrs = nil
+					if next := cp.freeListRelayLocked(i); next != "" {
+						cp.pool[i].addrs = []string{next}
+					}
+					cp.applyRelayQuarantineLocked(i)
+					break
+				}
+			}
+		}
+	}
 	if o.set() {
 		log.Printf("credpool: TURN relay override: %s — applied to every credential, cached ones included, when it is handed out", strings.Join(o.candidatesFor(&TURNCreds{Addresses: []string{"<vk-relay>:19302"}}), ", "))
 	}
@@ -46,6 +66,13 @@ func (cp *credPool) candidatesForSlot(slot int, creds *TURNCreds) []string {
 	if cp.mode == credCacheModeCookie {
 		if n := len(cp.override.servers); n > 0 && slot >= 0 {
 			if slot < n {
+				// The credential's own relay when the list names it: the
+				// minter's choice (cookieCredForSlot takes the entry no other
+				// slot holds, not the slot's index — the user's review of 454:
+				// a list resolved in another order made the index a twin).
+				if creds != nil && cp.inOverrideListLocked(creds.Address) {
+					return []string{creds.Address}
+				}
 				return []string{cp.override.servers[slot]}
 			}
 			// Beyond the list: nothing to dial. A slot loaded from disk keeps
@@ -75,9 +102,10 @@ func (cp *credPool) candidatesLocked(slot int) []string {
 	if len(e.addrs) > 0 {
 		return e.addrs
 	}
-	// Cookie mode under a list: a slot beyond the list has no relay — not
+	// Cookie mode under a list: a slot the list gives no relay — beyond the
+	// list, or no entry free for it (rebindSlotLocked) — dials nothing, not
 	// its stored address either (candidatesForSlot).
-	if cp.mode == credCacheModeCookie && len(cp.override.servers) > 0 && slot >= len(cp.override.servers) {
+	if cp.mode == credCacheModeCookie && len(cp.override.servers) > 0 {
 		return nil
 	}
 	if e.addr != "" {
@@ -95,6 +123,9 @@ func (cp *credPool) candidatesLocked(slot int) []string {
 // other relay to mint for: its unmarked entries are cycled through again.
 func (cp *credPool) usableLocked(slot int) bool {
 	if !cp.isFreshLocked(slot) {
+		return false
+	}
+	if cp.configuredOffLocked(slot) { // no relay by configuration: the list dropped its own, or gives it none
 		return false
 	}
 	cands := cp.candidatesLocked(slot)
@@ -327,7 +358,11 @@ func (cp *credPool) reresolveOverride(reason string, limited bool) {
 	raw := append([]string(nil), o.raw...)
 	cp.mu.Unlock()
 
-	servers := ResolveTURNServers(context.Background(), raw, resolvedVKHostIPs)
+	// 🚫 Not the app's pre-resolved map (resolvedVKHostIPs): it is the
+	// start's snapshot of these very names — read first, it answered every
+	// re-resolution with the start's IPs and no lookup was ever made (the
+	// user's review of 454). DNS, bounded (ResolveTURNServers).
+	servers := ResolveTURNServers(context.Background(), raw, nil)
 
 	cp.mu.Lock()
 	cp.overrideResolving = false
@@ -343,10 +378,15 @@ func (cp *credPool) reresolveOverride(reason string, limited bool) {
 	}
 	cp.override.servers = servers
 	for i := range cp.pool {
-		if cp.pool[i].creds != nil {
-			cp.pool[i].addrs = cp.candidatesForSlot(i, cp.pool[i].creds)
-			cp.applyRelayQuarantineLocked(i)
+		if cp.pool[i].creds == nil {
+			continue
 		}
+		if cp.mode == credCacheModeCookie {
+			cp.rebindSlotLocked(i, reason) // the slot's relay is its own, not the list's i-th
+			continue
+		}
+		cp.pool[i].addrs = cp.candidatesForSlot(i, cp.pool[i].creds)
+		cp.applyRelayQuarantineLocked(i)
 	}
 	cp.mu.Unlock()
 	log.Printf("credpool: TURN relay override resolved again (%s): %s → %s", reason, before, strings.Join(servers, ", "))
@@ -397,12 +437,125 @@ func (cp *credPool) cookieRelayTwinLocked(slot int, creds *TURNCreds) int {
 }
 
 // configuredOffLocked: the slot has no relay by CONFIGURATION — cookie mode
-// under an override list, a slot beyond the list — not because its relays are
-// unreachable: it holds nothing back (the user's review of 449: the only
+// under an override list: a slot beyond the list, a filled slot whose relay
+// the list no longer names (rebindSlotLocked keeps it there while leases are
+// live on it) or one the list has no free entry for — not because its relays
+// are unreachable: it holds nothing back (the user's review of 449: the only
 // cached credential beyond the list made healthParkLocked park every
-// connection before the first mint).
+// connection before the first mint), and it is handed out no more.
 func (cp *credPool) configuredOffLocked(slot int) bool {
-	return cp.mode == credCacheModeCookie && len(cp.override.servers) > 0 && slot >= len(cp.override.servers)
+	if cp.mode != credCacheModeCookie || len(cp.override.servers) == 0 {
+		return false
+	}
+	if slot >= len(cp.override.servers) {
+		return true
+	}
+	if slot >= len(cp.pool) || cp.pool[slot].creds == nil {
+		return false
+	}
+	c := cp.candidatesLocked(slot)
+	return len(c) != 1 || !cp.inOverrideListLocked(c[0])
+}
+
+// inOverrideListLocked: the list names this relay.
+func (cp *credPool) inOverrideListLocked(relay string) bool {
+	if relay == "" {
+		return false
+	}
+	for _, s := range cp.override.servers {
+		if s == relay {
+			return true
+		}
+	}
+	return false
+}
+
+// freeListRelayLocked (cookie mode under a list): the entry of the list no
+// OTHER filled slot dials — slot's own index preferred, else the first free;
+// "" when every entry is held.
+func (cp *credPool) freeListRelayLocked(slot int) string {
+	held := map[string]bool{}
+	for i := range cp.pool {
+		if i == slot || cp.pool[i].creds == nil {
+			continue
+		}
+		for _, a := range cp.candidatesLocked(i) {
+			held[a] = true
+		}
+	}
+	list := cp.override.servers
+	if slot < len(list) && !held[list[slot]] {
+		return list[slot]
+	}
+	for _, a := range list {
+		if !held[a] {
+			return a
+		}
+	}
+	return ""
+}
+
+// rebindSlotLocked (cookie mode under a list): the list changed under a
+// filled slot — its relay is ITS OWN, not the list's s-th entry (the user's
+// review of 454: a DNS answer in the other order re-pointed slot 0, ten leases
+// on A, to B by index, and slot 1, now "on A" with none, was handed an
+// eleventh). The slot keeps its relay while the list still names it. A slot
+// whose relay the list dropped keeps it while leases are live on it — the
+// seats are that relay's, its releases move that relay's clock, and the slot
+// is handed out no more (configuredOffLocked) — and takes the free entry of
+// the list once none is: here, or at the release that frees the last seat
+// (rebindOverrideSlotsLocked). Beyond the list the slot dials nothing once
+// its leases are gone.
+func (cp *credPool) rebindSlotLocked(slot int, reason string) {
+	if cp.mode != credCacheModeCookie || len(cp.override.servers) == 0 || slot < 0 || slot >= len(cp.pool) || cp.pool[slot].creds == nil {
+		return
+	}
+	e := &cp.pool[slot]
+	cur := ""
+	if len(e.addrs) == 1 {
+		cur = e.addrs[0]
+	}
+	if cur != "" && e.active > 0 {
+		return // leases live on its relay: the slot stays that relay's
+	}
+	if cur != "" && slot < len(cp.override.servers) && cp.inOverrideListLocked(cur) {
+		return // the list still names it
+	}
+	next := ""
+	if slot < len(cp.override.servers) {
+		next = cp.freeListRelayLocked(slot)
+	}
+	if next == cur {
+		return
+	}
+	e.addrs = nil
+	if next != "" {
+		e.addrs = []string{next}
+		e.addr = next
+	}
+	cp.applyRelayQuarantineLocked(slot)
+	switch {
+	case slot >= len(cp.override.servers):
+		log.Printf("credpool: slot %d: beyond the TURN override list (%s) and its leases on %s are gone — the slot dials nothing", slot, reason, cur)
+	case next == "":
+		log.Printf("credpool: slot %d: the TURN override list (%s) no longer names its relay %s and has no free entry — the slot dials nothing until one is free", slot, reason, cur)
+	case cur == "":
+		log.Printf("credpool: slot %d: the TURN override list (%s) has a free entry — the slot dials %s", slot, reason, next)
+	default:
+		log.Printf("credpool: slot %d: the TURN override list (%s) no longer names its relay %s — the slot dials %s now", slot, reason, cur, next)
+	}
+}
+
+// rebindOverrideSlotsLocked: every filled slot through rebindSlotLocked — at
+// the release that frees the last seat of a slot the list switched off (its
+// relay dropped), when a free entry may wait for it or for another such slot.
+func (cp *credPool) rebindOverrideSlotsLocked(reason string) {
+	if cp.mode != credCacheModeCookie || len(cp.override.servers) == 0 {
+		return
+	}
+	for i := range cp.pool {
+		cp.rebindSlotLocked(i, reason)
+	}
 }
 
 // relayQuarantineUntilLocked: until when the relay's seats may still be held

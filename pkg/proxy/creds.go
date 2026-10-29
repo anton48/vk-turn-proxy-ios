@@ -2707,6 +2707,12 @@ func (cp *credPool) release(slot int, creds *TURNCreds) {
 		if cp.pool[slot].active == 0 {
 			cp.pool[slot].lastUsedAt = time.Now()
 			cp.noteRelayUsedLocked(slot, cp.pool[slot].lastUsedAt) // the relay's clock (cookie mode)
+			if cp.configuredOffLocked(slot) {
+				// The last seat of a slot whose relay the TURN override list
+				// dropped (cookie mode): the slot may take a free entry now.
+				cp.rebindOverrideSlotsLocked("the last lease on the dropped relay ended")
+				slotBecomesUsable = cp.usableLocked(slot) && !time.Now().Before(cp.pool[slot].saturatedUntil)
+			}
 		}
 	}
 	cp.mu.Unlock()

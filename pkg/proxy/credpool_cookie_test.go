@@ -179,21 +179,22 @@ func TestThePoolTellsTheCookieMintItsRelays(t *testing.T) {
 
 // (4) With an override list, a loaded slot beyond the list's length has no
 // relay to dial: its stored address may coincide with a list entry (run 10:
-// slot 8 held the list's third relay).
+// slot 8 held the list's third relay) — one no slot of the list holds yet
+// (slot 2 is empty here): still nothing, the list's slots are the list's.
 func TestCookieModeALoadedSlotBeyondTheListIsNotUsable(t *testing.T) {
 	cookieTestMode(t)
 	path := writeCookieCache(t, t.TempDir(),
 		credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA}, Username: futureUser("s0"), Password: "p"},
 		credCacheEntry{Slot: 1, Address: relayB, Addresses: []string{relayB}, Username: futureUser("s1"), Password: "p"},
-		credCacheEntry{Slot: 3, Address: relayO, Addresses: []string{relayO}, Username: futureUser("s3-on-the-lists-second"), Password: "p"},
+		credCacheEntry{Slot: 3, Address: relayO, Addresses: []string{relayO}, Username: futureUser("s3-on-the-lists-third"), Password: "p"},
 	)
 	cp, _, _ := relayPool(t, path, relayC)
-	cp.setOverride(turnOverride{servers: []string{relayE, relayO}})
+	cp.setOverride(turnOverride{servers: []string{relayE, relayF, relayO}})
 	cp.mu.Lock()
 	cands, usable := cp.candidatesLocked(3), cp.usableLocked(3)
 	cp.mu.Unlock()
 	if len(cands) != 0 || usable {
-		t.Fatalf("slot 3 beyond a two-entry list: candidates %v usable %v — want none, not usable (it would be a second slot on %s)", cands, usable, relayO)
+		t.Fatalf("slot 3 beyond a three-entry list: candidates %v usable %v — want none, not usable (a slot beyond the list dials nothing, whoever holds %s)", cands, usable, relayO)
 	}
 	// A connection whose own slot is 3 is seated elsewhere.
 	if _, _, slot := mustGet(t, cp, 30); slot == 3 {

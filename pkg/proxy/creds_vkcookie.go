@@ -174,20 +174,6 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		slot = 0
 	}
 
-	cookieMu.Lock()
-	if len(override) > 0 {
-		defer cookieMu.Unlock()
-		if slot >= len(override) {
-			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s) — slot %d unfilled (add relays to the list, or lower Connections)", len(override), slot)
-		}
-		creds, err := cookieMintCachedLocked(ctx, links[slot%len(links)], ch)
-		if err != nil {
-			return nil, err
-		}
-		return &TURNCreds{Username: creds.Username, Password: creds.Password, Address: override[slot], Addresses: []string{override[slot]}}, nil
-	}
-	defer cookieMu.Unlock()
-
 	heldSet := make(map[string]bool, len(held))
 	for _, a := range held {
 		if a != "" {
@@ -195,7 +181,8 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		}
 	}
 	// free: not held by another slot of the pool, not handed to another slot
-	// in this process (two mints in flight must not take one relay).
+	// in this process (two mints in flight must not take one relay). Under
+	// cookieMu (cookieRelayAssigned).
 	free := func(addr string) bool {
 		if heldSet[addr] {
 			return false
@@ -207,6 +194,51 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		}
 		return true
 	}
+
+	cookieMu.Lock()
+	if len(override) > 0 {
+		defer cookieMu.Unlock()
+		if slot >= len(override) {
+			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s) — slot %d unfilled (add relays to the list, or lower Connections)", len(override), slot)
+		}
+		// The slot's entry: the one it was given before while the list still
+		// names it and no other slot holds it, else its own index's, else the
+		// first free — never one another slot holds (the user's review of 454:
+		// a list resolved in another order made the index a twin of the slot
+		// whose ten leases sit on that relay). None free: unfilled.
+		relay := ""
+		inList := func(a string) bool {
+			for _, o := range override {
+				if o == a {
+					return true
+				}
+			}
+			return false
+		}
+		switch a := cookieRelayAssigned[slot]; {
+		case a != "" && inList(a) && free(a):
+			relay = a
+		case free(override[slot]):
+			relay = override[slot]
+		default:
+			for _, o := range override {
+				if free(o) {
+					relay = o
+					break
+				}
+			}
+		}
+		if relay == "" {
+			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s), every one held by another slot — slot %d unfilled (add relays to the list, or lower Connections)", len(override), slot)
+		}
+		cookieRelayAssigned[slot] = relay
+		creds, err := cookieMintCachedLocked(ctx, links[slot%len(links)], ch)
+		if err != nil {
+			return nil, err
+		}
+		return &TURNCreds{Username: creds.Username, Password: creds.Password, Address: relay, Addresses: []string{relay}}, nil
+	}
+	defer cookieMu.Unlock()
 	byAddr := func(addr string) (cookieRelayRef, bool) {
 		for _, ref := range cookieRelayList {
 			if ref.address == addr {
