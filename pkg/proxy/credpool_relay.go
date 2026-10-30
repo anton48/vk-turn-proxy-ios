@@ -11,6 +11,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
+	"sort"
 	"strings"
 	"time"
 )
@@ -24,9 +26,10 @@ func (cp *credPool) setOverride(o turnOverride) {
 	if o.raw == nil {
 		o.raw = o.servers
 	}
+	o.setServers(o.servers) // the quota fields apart from the addresses
 	// `$vkurls` alone — VK's own relays and nothing else — is no override.
 	if len(o.servers) == 1 && o.servers[0] == TURNServersVK {
-		o.servers, o.raw = nil, nil
+		o.servers, o.raw, o.quotas = nil, nil, nil
 	}
 	if fixed, vkTail := o.cookieShape(); cp.mode == credCacheModeCookie && vkTail && len(o.servers) > len(fixed)+1 {
 		log.Printf("credpool: TURN relay override: cookie mode — %s takes every slot after the %d fixed entr(ies); the %d entr(ies) after it are not used", TURNServersVK, len(fixed), len(o.servers)-len(fixed)-1)
@@ -38,6 +41,12 @@ func (cp *credPool) setOverride(o turnOverride) {
 	// whose stored address is a list entry would otherwise hold that entry
 	// from the slot whose index it is while that slot is computed, and the
 	// entry sat idle (the user's review of 455).
+	was := make([]string, len(cp.pool)) // each slot's relay before (cookie mode: one)
+	for i := range cp.pool {
+		if c := cp.pool[i].addrs; len(c) == 1 {
+			was[i] = c[0]
+		}
+	}
 	if cp.mode == credCacheModeCookie && len(o.servers) > 0 {
 		for i := range cp.pool {
 			cp.pool[i].addrs = nil
@@ -46,12 +55,29 @@ func (cp *credPool) setOverride(o turnOverride) {
 	for i := range cp.pool {
 		if cp.pool[i].creds != nil {
 			cp.pool[i].addrs = cp.candidatesForSlot(i, cp.pool[i].creds)
+			if cp.mode == credCacheModeCookie {
+				cp.relayChangedLocked(i, was[i]) // the history was the old relay's
+			}
 			cp.applyRelayQuarantineLocked(i) // the clock of the relay the slot dials NOW
 			cp.syncMinterLocked(i)
 		}
 	}
 	if o.set() {
-		log.Printf("credpool: TURN relay override: %s — applied to every credential, cached ones included, when it is handed out", strings.Join(o.candidatesFor(&TURNCreds{Addresses: []string{"<vk-relay>:19302"}}), ", "))
+		var quotas []string
+		for _, a := range o.servers {
+			if q, ok := o.quota(a); ok {
+				if q == 0 {
+					quotas = append(quotas, a+" no quota")
+				} else {
+					quotas = append(quotas, fmt.Sprintf("%s quota %d", a, q))
+				}
+			}
+		}
+		qs := ""
+		if len(quotas) > 0 {
+			qs = " (" + strings.Join(quotas, ", ") + ")"
+		}
+		log.Printf("credpool: TURN relay override: %s%s — applied to every credential, cached ones included, when it is handed out", strings.Join(o.candidatesFor(&TURNCreds{Addresses: []string{"<vk-relay>:19302"}}), ", "), qs)
 	}
 }
 
@@ -157,6 +183,9 @@ func (cp *credPool) usableLocked(slot int) bool {
 func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
+		if cp.override.unlimited(alive[0]) {
+			return alive[0], true // a relay without a quota takes every connection while it answers — no cursor past it
+		}
 		i := cp.cursor[connIdx] % len(alive)
 		if i < 0 {
 			i = -i
@@ -386,16 +415,19 @@ func (cp *credPool) reresolveOverride(reason string, limited bool) {
 	cp.mu.Lock()
 	cp.overrideResolving = false
 	before := strings.Join(cp.override.servers, ", ")
+	var next turnOverride
+	next.setServers(servers)
 	switch {
 	case !allIPs(servers):
 		cp.mu.Unlock()
 		log.Printf("credpool: TURN relay override not resolved again (%s): a name did not resolve — the list stays %s", reason, before)
 		return
-	case strings.Join(servers, ", ") == before:
+	case strings.Join(next.servers, ", ") == before:
 		cp.mu.Unlock()
 		return
 	}
-	cp.override.servers = servers
+	cp.override.servers, cp.override.quotas = next.servers, next.quotas
+	servers = next.servers
 	if cp.mode == credCacheModeCookie {
 		cp.rebindOverrideSlotsLocked(reason) // the slot's relay is its own, not the list's i-th
 	}
@@ -409,6 +441,95 @@ func (cp *credPool) reresolveOverride(reason string, limited bool) {
 	cp.mu.Unlock()
 	log.Printf("credpool: TURN relay override resolved again (%s): %s → %s", reason, before, strings.Join(servers, ", "))
 	cp.broadcastSlotAvailable()
+}
+
+// unlimitedCap: a slot's cap on a relay without a quota.
+const unlimitedCap = math.MaxInt32
+
+// unlimitedRelayLocked: the relay slot's connections dial now, when the list
+// says it has no quota — the first candidate not marked (pickAddrLocked hands
+// it out ahead of the cursor), else the slot's one relay (cookie mode) while
+// marked. "" otherwise.
+func (cp *credPool) unlimitedRelayLocked(slot int) string {
+	cands := cp.candidatesLocked(slot)
+	if len(cands) == 0 {
+		return ""
+	}
+	first := cands[0]
+	if alive := cp.health.alive(cands); len(alive) > 0 {
+		first = alive[0]
+	}
+	if cp.override.unlimited(first) {
+		return first
+	}
+	return ""
+}
+
+// capLocked is how many connections slot's credential may seat: the relay's
+// configured quota when the relay its connections dial now has one (0 = no
+// limit — the user's own relay), else VK's ten (connsPerSlot). Asked at the
+// hand-out, so once a relay without a quota is marked the cap is the next
+// relay's: the seats already out stay out until their sessions end.
+func (cp *credPool) capLocked(slot int) int {
+	cands := cp.candidatesLocked(slot)
+	if len(cands) == 0 {
+		return connsPerSlot
+	}
+	first := cands[0]
+	if alive := cp.health.alive(cands); len(alive) > 0 {
+		first = alive[0]
+	}
+	if q, ok := cp.override.quota(first); ok {
+		if q == 0 {
+			return unlimitedCap
+		}
+		return q
+	}
+	return connsPerSlot
+}
+
+// quarantinedRelays: the relays whose quota clock is running (cookie mode) —
+// what the minter's discovery is told to prefer others over. Not under cp.mu.
+func (cp *credPool) quarantinedRelays() []string {
+	if cp == nil {
+		return nil
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	var out []string
+	for relay := range cp.relayUsedAt {
+		if !cp.relayQuarantineUntilLocked(relay).IsZero() {
+			out = append(out, relay)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// relayChangedLocked (cookie mode): slot dials another relay than `was` —
+// the entry's history (lastUsedAt) and its smart-pause mark were about the
+// old relay's seats, and the relay clock has that history already; carried
+// over, they marked a slot re-pointed to a relay never used for six minutes
+// (the user's run 6 of 2026-10-30: the bootstrap timed out). The slot starts
+// its new relay with neither.
+func (cp *credPool) relayChangedLocked(slot int, was string) {
+	if slot < 0 || slot >= len(cp.pool) {
+		return
+	}
+	now := ""
+	if c := cp.pool[slot].addrs; len(c) == 1 {
+		now = c[0]
+	}
+	if now == was {
+		return
+	}
+	e := &cp.pool[slot]
+	e.lastUsedAt = time.Time{}
+	if e.saturationTimer != nil {
+		e.saturationTimer.Stop()
+		e.saturationTimer = nil
+	}
+	e.saturatedUntil = time.Time{}
 }
 
 // heldRelaysExcept lists the relays the pool's slots hold — every filled
@@ -566,6 +687,7 @@ func (cp *credPool) releaseStaleRelayLocked(slot int, reason string) {
 		return // the list still names it
 	}
 	e.addrs = nil
+	cp.relayChangedLocked(slot, cur)
 	cp.applyRelayQuarantineLocked(slot)
 	cp.syncMinterLocked(slot)
 	if slot >= len(fixed) {
@@ -589,6 +711,7 @@ func (cp *credPool) takeFreeEntryLocked(slot int, reason string) {
 	}
 	cp.pool[slot].addrs = []string{next}
 	cp.pool[slot].addr = next
+	cp.relayChangedLocked(slot, "")
 	cp.applyRelayQuarantineLocked(slot)
 	cp.syncMinterLocked(slot)
 	log.Printf("credpool: slot %d: the TURN override list (%s) has a free entry — the slot dials %s", slot, reason, next)
@@ -613,8 +736,8 @@ func (cp *credPool) rebindOverrideSlotsLocked(reason string) {
 // by leases that ended (cookie mode: one okcdn user id, the quota the
 // relay's) — the zero time when the relay was not used within the cooldown.
 func (cp *credPool) relayQuarantineUntilLocked(relay string) time.Time {
-	if cp.mode != credCacheModeCookie || relay == "" {
-		return time.Time{}
+	if cp.mode != credCacheModeCookie || relay == "" || cp.override.unlimited(relay) {
+		return time.Time{} // a relay without a quota holds no seats
 	}
 	t, ok := cp.relayUsedAt[relay]
 	if !ok {

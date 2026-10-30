@@ -133,7 +133,9 @@ struct AppSettings: Codable {
     /// separated LIST since 2026-10-19. When set, every credential — fresh,
     /// cached or seeded — is dialled on these relays, in order; a relay that
     /// stops answering is marked and the next one taken. `$vkurls` in the list
-    /// stands for VK's own relays in its place (2026-10-29). nil = no override.
+    /// stands for VK's own relays in its place (2026-10-29); a third field,
+    /// host:port:quota, is the relay's limit — 0 = no quota, every connection
+    /// on it while it answers (2026-10-30). nil = no override.
     let turnServerOverride: String?
     /// UNDOCUMENTED on-device captcha-test toggle (build 149): when true the
     /// extension skips the captcha-free VK Calls path so the legacy

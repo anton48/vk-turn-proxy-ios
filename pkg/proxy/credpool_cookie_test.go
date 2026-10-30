@@ -120,21 +120,21 @@ func TestCookieModeTheMintAvoidsTheRelaysOtherSlotsHold(t *testing.T) {
 	cookieMu.Unlock()
 	ctx := context.Background()
 	// Slot 8 asks while slot 2 (loaded) holds A: the first relay NOT held.
-	c, err := cookieCredForSlot(ctx, 8, nil, []string{relayA})
+	c, err := cookieCredForSlot(ctx, 8, nil, []string{relayA}, nil)
 	if err != nil || c.Address != relayB {
 		t.Fatalf("slot 8 with A held elsewhere: %+v %v — want B (run 9's 486: the mint returned the relay slot 2 held)", c, err)
 	}
 	// Slot 9 asks while slot 8's mint is still in flight (B handed out, not
 	// yet held by the pool): A held, B taken → C.
-	if c, err := cookieCredForSlot(ctx, 9, nil, []string{relayA}); err != nil || c.Address != relayC {
+	if c, err := cookieCredForSlot(ctx, 9, nil, []string{relayA}, nil); err != nil || c.Address != relayC {
 		t.Fatalf("slot 9 beside slot 8's mint in flight: %+v %v — want C (two mints must not take one relay)", c, err)
 	}
 	// Slot 8 again (a refill): its own relay B is not held by another → B, stable.
-	if c, err := cookieCredForSlot(ctx, 8, nil, []string{relayA, relayC}); err != nil || c.Address != relayB {
+	if c, err := cookieCredForSlot(ctx, 8, nil, []string{relayA, relayC}, nil); err != nil || c.Address != relayB {
 		t.Fatalf("slot 8 refilled: %+v %v — want its own B again", c, err)
 	}
 	// Everything held: unfilled, and the message says why.
-	if _, err := cookieCredForSlot(ctx, 10, nil, []string{relayA, relayB, relayC, relayD}); err == nil || !strings.Contains(err.Error(), "unfilled") || !strings.Contains(err.Error(), "held") {
+	if _, err := cookieCredForSlot(ctx, 10, nil, []string{relayA, relayB, relayC, relayD}, nil); err == nil || !strings.Contains(err.Error(), "unfilled") || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("slot 10 with every relay held: %v — want the shortage refused, naming the held relays", err)
 	}
 }

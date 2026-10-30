@@ -109,12 +109,12 @@ func TestCookieModeATrailingVKPlaceholderTakesTheRemainingSlots(t *testing.T) {
 	ctx := context.Background()
 	list := []string{relayO, TURNServersVK}
 	for slot, want := range []string{relayO, relayA, relayB, relayC, relayD} {
-		c, err := cookieCredForSlot(ctx, slot, list, nil)
+		c, err := cookieCredForSlot(ctx, slot, list, nil, nil)
 		if err != nil || c.Address != want {
 			t.Fatalf("slot %d under [O, $vkurls]: %+v %v — want %s", slot, c, err, want)
 		}
 	}
-	if _, err := cookieCredForSlot(ctx, 5, list, nil); err == nil || !strings.Contains(err.Error(), "unfilled") {
+	if _, err := cookieCredForSlot(ctx, 5, list, nil, nil); err == nil || !strings.Contains(err.Error(), "unfilled") {
 		t.Fatalf("slot 5 with four VK relays found: %v — want the shortage refused", err)
 	}
 	// A VK slot never takes a relay another slot holds (the reservations of
@@ -122,7 +122,7 @@ func TestCookieModeATrailingVKPlaceholderTakesTheRemainingSlots(t *testing.T) {
 	for s := 1; s <= 4; s++ {
 		cookieNoteSlotRelay(s, "")
 	}
-	if c, err := cookieCredForSlot(ctx, 1, list, []string{relayA}); err != nil || c.Address != relayB {
+	if c, err := cookieCredForSlot(ctx, 1, list, []string{relayA}, nil); err != nil || c.Address != relayB {
 		t.Fatalf("slot 1 with A held elsewhere: %+v %v — want B", c, err)
 	}
 	// The pool: slot 0 is the fixed entry's, slot 1 and 5 are VK slots on the

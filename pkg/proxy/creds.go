@@ -245,7 +245,7 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		// holds a distinct (call, relay) bucket. Single-relay creds; NO captcha;
 		// NO anonymous fallback.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		creds, err := cookieCredForSlot(ctx, 0, nil, nil) // the app's probe: VK's relay; the pool's slot 0 takes the override's first when a list is set
+		creds, err := cookieCredForSlot(ctx, 0, nil, nil, nil) // the app's probe: VK's relay; the pool's slot 0 takes the override's first when a list is set
 		cancel()
 		if err != nil {
 			if errors.Is(err, ErrCookieRejected) {
@@ -2117,6 +2117,14 @@ func (cp *credPool) saveToDisk() {
 //     VK call). On success, fills pool[connIdx]. On failure, sets
 //     cooldown on pool[connIdx] and re-checks for fresh fallback (some
 //     other goroutine may have filled one while we were fetching).
+// capText spells a slot's cap for a log line.
+func capText(capacity int) string {
+	if capacity >= unlimitedCap {
+		return "∞"
+	}
+	return fmt.Sprint(capacity)
+}
+
 // connsPerSlot is VK's hard quota of simultaneous TURN allocations on
 // one cred set. Confirmed empirically: vpn.wifi.19.1.log showed conn
 // 0-9 saturating cred 0, with conn 10+ ONLY succeeding on a separate
@@ -2164,7 +2172,15 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 				connIdx, ownSlot, cp.health.deadList(cp.candidatesLocked(ownSlot)))
 		}
 	}
-	if cp.usableLocked(ownSlot) && cp.pool[ownSlot].active < connsPerSlot {
+	// Priority 0: a slot whose relay has no quota (the list's host:port:0 —
+	// the user's own relay) takes every connection while it answers, in both
+	// modes (2026-10-30, the user's design).
+	for i := 0; i < cp.size && i < len(cp.pool); i++ {
+		if cp.usableLocked(i) && cp.unlimitedRelayLocked(i) != "" && !now.Before(cp.pool[i].saturatedUntil) {
+			return i, "unlimited relay"
+		}
+	}
+	if cp.usableLocked(ownSlot) && cp.pool[ownSlot].active < cp.capLocked(ownSlot) {
 		if now.Before(cp.pool[ownSlot].saturatedUntil) {
 			if logSkips {
 				log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
@@ -2183,7 +2199,7 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 		if i == ownSlot {
 			continue
 		}
-		if !cp.usableLocked(i) || cp.pool[i].active >= connsPerSlot {
+		if !cp.usableLocked(i) || cp.pool[i].active >= cp.capLocked(i) {
 			continue
 		}
 		if now.Before(cp.pool[i].saturatedUntil) {
@@ -2293,6 +2309,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		}
 		cp.seatLocked(slot)
 		e := cp.pool[slot]
+		capacity := cp.capLocked(slot)
 		cp.mu.Unlock()
 		var tag string
 		switch kind {
@@ -2300,11 +2317,13 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			tag = "own slot"
 		case "compact":
 			tag = "fallback compact-fill"
+		case "unlimited relay":
+			tag = "the relay without a quota"
 		default: // "fresh"
 			tag = "fallback fresh slot"
 		}
-		log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%d, age %s) — relay %s",
-			connIdx, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second), addr)
+		log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%s, age %s) — relay %s",
+			connIdx, slot, tag, e.active, capText(capacity), time.Since(e.ts).Round(time.Second), addr)
 		return addr, e.creds, slot, nil
 	}
 
@@ -2496,7 +2515,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				cp.saveToDisk()
 				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", target), wake: wake}
 			}
-			if held >= connsPerSlot {
+			if held >= cp.capLocked(target) {
 				wake := cp.slotAvailableCh
 				cp.mu.Unlock()
 				if target < len(cp.authErrors) {
@@ -2699,7 +2718,7 @@ func (cp *credPool) release(slot int, creds *TURNCreds) {
 	//      just to have them re-park (slot 0 not fresh → skipped).
 	//   3. Not VK-saturated — get()'s Phase 1 explicitly skips saturated
 	//      slots even when fresh and below cap.
-	slotBecomesUsable := cp.pool[slot].active == connsPerSlot &&
+	slotBecomesUsable := cp.pool[slot].active == cp.capLocked(slot) &&
 		entryIsFresh(cp.pool[slot]) &&
 		!time.Now().Before(cp.pool[slot].saturatedUntil)
 	if cp.pool[slot].active > 0 {
@@ -2983,6 +3002,11 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 		e := cp.pool[slot]
 		// Skip already-saturated (re-marking is no-op but spams logs)
 		if !e.saturatedUntil.IsZero() && e.saturatedUntil.After(now) {
+			continue
+		}
+		// A relay without a quota (the list's host:port:0) holds no seats —
+		// nothing to bench.
+		if cp.unlimitedRelayLocked(slot) != "" {
 			continue
 		}
 		// Skip empty/never-filled slots (no creds, no VK state)

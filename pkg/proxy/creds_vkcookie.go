@@ -200,7 +200,7 @@ func cookieLinkID(s string) string {
 // no other slot holds it (`cookieRelayAssigned`); the s-th distinct relay is
 // still preferred when it is free, so a pool minted from scratch is shaped
 // as before. Nothing free: the slot is left unfilled, the message says why.
-func cookieCredForSlot(ctx context.Context, slot int, override []string, held []string) (*TURNCreds, error) {
+func cookieCredForSlot(ctx context.Context, slot int, override []string, held []string, avoid []string) (*TURNCreds, error) {
 	ch := vkCookieHeader()
 	if ch == "" {
 		return nil, fmt.Errorf("no VK cookie stored: %w", ErrCookieRejected)
@@ -315,21 +315,35 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 		}
 		return cookieRelayRef{}, false
 	}
-	pick := func() (cookieRelayRef, bool) {
-		if a, ok := cookieAssigned()[slot]; ok && free(a) {
-			if ref, ok := byAddr(a); ok {
+	// avoid: relays whose quota clock runs in the pool (quarantined) — another
+	// distinct relay is preferred, one of these taken only when nothing else is
+	// free (the user's runs 6–7 of 2026-10-30: a fresh mint onto a relay used
+	// minutes ago parked for the rest of the window).
+	avoidSet := make(map[string]bool, len(avoid))
+	for _, a := range avoid {
+		avoidSet[a] = true
+	}
+	pickWith := func(ok func(string) bool) (cookieRelayRef, bool) {
+		if a, got := cookieAssigned()[slot]; got && ok(a) {
+			if ref, got := byAddr(a); got {
 				return ref, true
 			}
 		}
-		if vslot < len(cookieRelayList) && free(cookieRelayList[vslot].address) {
+		if vslot < len(cookieRelayList) && ok(cookieRelayList[vslot].address) {
 			return cookieRelayList[vslot], true
 		}
 		for _, ref := range cookieRelayList {
-			if free(ref.address) {
+			if ok(ref.address) {
 				return ref, true
 			}
 		}
 		return cookieRelayRef{}, false
+	}
+	pick := func() (cookieRelayRef, bool) {
+		if ref, ok := pickWith(func(a string) bool { return free(a) && !avoidSet[a] }); ok {
+			return ref, true
+		}
+		return pickWith(free)
 	}
 
 	// Discover distinct relays lazily until the slot's own (the s-th) is known

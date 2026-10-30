@@ -228,19 +228,19 @@ func TestCookieModeTheMintUnderAListTakesTheEntryNotHeld(t *testing.T) {
 	list := []string{relayE, relayF}
 	// Slot 1 asks while slot 0 holds the list's SECOND entry (the list came
 	// back in another order): the first, not a twin.
-	if c, err := cookieCredForSlot(ctx, 1, list, []string{relayF}); err != nil || c.Address != relayE {
+	if c, err := cookieCredForSlot(ctx, 1, list, []string{relayF}, nil); err != nil || c.Address != relayE {
 		t.Fatalf("slot 1 under [E, F] with F held by another slot: %+v %v — want E", c, err)
 	}
 	// Its own entry free: its own, as before.
-	if c, err := cookieCredForSlot(ctx, 1, list, []string{relayE}); err != nil || c.Address != relayF {
+	if c, err := cookieCredForSlot(ctx, 1, list, []string{relayE}, nil); err != nil || c.Address != relayF {
 		t.Fatalf("slot 1 under [E, F] with E held: %+v %v — want F", c, err)
 	}
 	// Every entry held: unfilled, and the message says why.
-	if _, err := cookieCredForSlot(ctx, 0, list, []string{relayE, relayF}); err == nil || !strings.Contains(err.Error(), "unfilled") || !strings.Contains(err.Error(), "held") {
+	if _, err := cookieCredForSlot(ctx, 0, list, []string{relayE, relayF}, nil); err == nil || !strings.Contains(err.Error(), "unfilled") || !strings.Contains(err.Error(), "held") {
 		t.Fatalf("slot 0 with every entry held: %v — want the shortage refused, naming the held entries", err)
 	}
 	// Beyond the list: unfilled whatever is free.
-	if _, err := cookieCredForSlot(ctx, 2, list, nil); err == nil || !strings.Contains(err.Error(), "unfilled") {
+	if _, err := cookieCredForSlot(ctx, 2, list, nil, nil); err == nil || !strings.Contains(err.Error(), "unfilled") {
 		t.Fatalf("slot 2 under a two-entry list: %v — want the shortage refused", err)
 	}
 }
@@ -351,7 +351,7 @@ func TestCookieModeAMintPlacedAfterTheListChangedAsksTheListAgain(t *testing.T) 
 	if reserved != r3 {
 		t.Fatalf("the minter's reservation for slot 1 after the placement on %s: %q — want %s", r3, reserved, r3)
 	}
-	if c, err := cookieCredForSlot(context.Background(), 2, []string{r2, r3, r1}, []string{r3, r1}); err != nil || c.Address != r2 {
+	if c, err := cookieCredForSlot(context.Background(), 2, []string{r2, r3, r1}, []string{r3, r1}, nil); err != nil || c.Address != r2 {
 		t.Fatalf("the minter for slot 2 under [R2, R3, R1] with R3 and R1 held: %+v %v — want R2 (slot 1 dials R3, its old reservation of R2 must not stand)", c, err)
 	}
 	for _, c := range held {
@@ -399,7 +399,7 @@ func TestCookieModeAShrunkListHandsTheFreedEntryOn(t *testing.T) {
 	cookieAssignMu.Lock()
 	cookieRelayAssigned[1] = r2
 	cookieAssignMu.Unlock()
-	if c, err := cookieCredForSlot(context.Background(), 0, []string{r2}, nil); err != nil || c.Address != r2 {
+	if c, err := cookieCredForSlot(context.Background(), 0, []string{r2}, nil, nil); err != nil || c.Address != r2 {
 		t.Fatalf("the minter for slot 0 under [R2] with nothing held: %+v %v — want R2 (slot 1's reservation is beyond the list)", c, err)
 	}
 	// And the pool hands R2 out — on slot 0 — once R2's quota clock (slot 1's

@@ -2307,7 +2307,7 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 		// conns spread across relays — each (okcdn_userid, relay) is its own ~10
 		// allocation quota (2026-06-28 finding). No captcha bookkeeping here.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		c, cerr := cookieCredForSlot(ctx, slot, p.credPool.overrideServers(), p.credPool.heldRelaysExcept(slot)) // the pool's list, resolved (#105)
+		c, cerr := cookieCredForSlot(ctx, slot, p.credPool.overrideServers(), p.credPool.heldRelaysExcept(slot), p.credPool.quarantinedRelays()) // the pool's list, resolved (#105)
 		cancel()
 		if cerr != nil {
 			if errors.Is(cerr, ErrCookieRejected) {

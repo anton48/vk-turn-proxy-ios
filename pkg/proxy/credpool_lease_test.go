@@ -349,7 +349,9 @@ func TestEveryLeaseHolderNamesItsCredential(t *testing.T) {
 			t.Errorf("creds.go publishes a credential without taking its count from the record: %q", strings.Join(strings.Fields(lit), " "))
 		}
 	}
-	if !regexp.MustCompile(`held := cp\.outstandingLocked\(target, creds\)`).MatchString(get) || !strings.Contains(get, "if held >= connsPerSlot {") {
+	// The cap is the slot's (capLocked, 2026-10-30: the relay's quota, VK's
+	// ten by default), read after the credential is placed.
+	if !regexp.MustCompile(`held := cp\.outstandingLocked\(target, creds\)`).MatchString(get) || !strings.Contains(get, "if held >= cp.capLocked(target) {") {
 		t.Error("get(): the fetched credential's count is not read from the record, or a credential issued again with all its previous holders still out still seats the fetching conn — an eleventh lease")
 	}
 	rel := goFuncBody(t, "creds.go", "func (cp *credPool) release(")

@@ -4568,13 +4568,27 @@ print("TURN override: $vkurls for VK's own relays (GitHub #105 (2))")
 do {
     let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
     check(cv.contains("static let turnServersVK = \"$vkurls\""), "ConfigValidation names the word once — the same as Go's TURNServersVK")
-    check(cv.contains("static func isTurnOverrideEntry(_ s: String) -> Bool {") && cv.contains("isHostPort(s) || s.lowercased() == turnServersVK"),
-          "an override entry is host:port OR the word, any case")
+    check(cv.contains("static func isTurnOverrideEntry(_ s: String) -> Bool {") && cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || s.lowercased() == turnServersVK"),
+          "an override entry is host:port, host:port:quota OR the word, any case")
     check(cv.contains("let bad = parts.filter { !isTurnOverrideEntry($0) }"), "🚨 the validator judges the list's entries by isTurnOverrideEntry — $vkurls is not 'ignored'")
     let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
     check(tm.contains("if t.lowercased() == ConfigValidation.turnServersVK { t = ConfigValidation.turnServersVK }") && tm.contains("guard ConfigValidation.isTurnOverrideEntry(t), !out.contains(t) else { continue }"),
           "🚨 parseTurnServers keeps $vkurls (folded to the word) — the extension receives it in turn_servers")
-    check(source("VKTurnProxy/VKTurnProxy/ServerEditView.swift").contains("TURN servers (host:port or $vkurls, comma-separated, optional)"), "the field names the word")
+    check(source("VKTurnProxy/VKTurnProxy/ServerEditView.swift").contains("TURN servers (host:port[:quota] or $vkurls, comma-separated, optional)"), "the field names the word and the quota field")
+}
+
+// 2026-10-30, the user's design: a third field, host:port:quota — the relay's
+// limit, 0 = no quota (the user's own relay takes every connection while it
+// answers). The validator accepts it, the parser passes it to Go as typed, and
+// the pre-resolution strips it before reading the host.
+print("TURN override: the quota field host:port:quota")
+do {
+    let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
+    check(cv.contains("static func turnOverrideQuota(_ s: String) -> (hostPort: String, quota: Int)? {") && cv.contains("field.allSatisfy(\\.isNumber), let q = Int(field), isHostPort(base)"),
+          "turnOverrideQuota reads host:port:digits — the host:port part and the quota")
+    check(cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || s.lowercased() == turnServersVK"), "🚨 an override entry may carry the quota field")
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(tm.contains("let s = ConfigValidation.turnOverrideQuota(entry)?.hostPort ?? entry"), "🚨 the pre-resolution strips the quota field before it reads the host (else the host would be host:port)")
 }
 
 print("")

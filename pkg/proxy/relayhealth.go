@@ -338,15 +338,20 @@ func isRelayUnanswered(err error) bool {
 // address is chosen when the credential is handed out), or the older pair
 // (a host, a port, either may be empty) rewritten into each VK address.
 type turnOverride struct {
-	servers    []string // the list as the pool dials it: IPs (ResolveTURNServers)
-	raw        []string // the list as configured — names included — for a later resolution (reresolveOverride)
+	servers    []string       // the list as the pool dials it: IPs (ResolveTURNServers), the quota fields split off (setServers)
+	quotas     map[string]int // address → its configured quota (splitTURNEntry); absent = VK's ten
+	raw        []string       // the list as configured — names and quota fields included — for a later resolution (reresolveOverride)
 	host, port string
 }
 
 // hasName: an entry of the list whose host is not an IP literal.
 func (o turnOverride) hasName() bool {
 	for _, e := range o.raw {
-		if h, _, err := net.SplitHostPort(e); err == nil && net.ParseIP(h) == nil {
+		addr, _, _, ok := splitTURNEntry(e)
+		if !ok {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(addr); err == nil && net.ParseIP(h) == nil {
 			return true
 		}
 	}
@@ -360,7 +365,11 @@ func allIPs(servers []string) bool {
 		if e == TURNServersVK {
 			continue
 		}
-		if h, _, err := net.SplitHostPort(e); err != nil || net.ParseIP(h) == nil {
+		addr, _, _, ok := splitTURNEntry(e)
+		if !ok {
+			return false
+		}
+		if h, _, err := net.SplitHostPort(addr); err != nil || net.ParseIP(h) == nil {
 			return false
 		}
 	}
@@ -441,6 +450,77 @@ func (o turnOverride) candidatesFor(creds *TURNCreds) []string {
 	return dedupeAddrs(out)
 }
 
+// splitTURNEntry reads one entry of the TURN override list: host:port, or
+// host:port:quota — the relay's limit of allocations per identity (2026-10-30,
+// the user's design): 0 = the relay has no quota (the slot on it takes every
+// connection, has no quota clock and no smart-pause, and takes everyone first
+// while it answers); N > 0 = that limit, 10 being VK's. `has` says the field
+// was given; `ok` false: neither form.
+func splitTURNEntry(e string) (addr string, quota int, has bool, ok bool) {
+	if _, _, err := net.SplitHostPort(e); err == nil {
+		return e, 0, false, true
+	}
+	i := strings.LastIndex(e, ":")
+	if i <= 0 {
+		return "", 0, false, false
+	}
+	base, q := e[:i], e[i+1:]
+	if _, _, err := net.SplitHostPort(base); err != nil {
+		return "", 0, false, false
+	}
+	n, err := strconv.Atoi(q)
+	if err != nil || n < 0 || q != strconv.Itoa(n) {
+		return "", 0, false, false
+	}
+	return base, n, true, true
+}
+
+// joinTURNEntry is the spelling of an address with its quota field, when it
+// has one — the list as configured and as resolved keep the field.
+func joinTURNEntry(addr string, quota int, has bool) string {
+	if !has {
+		return addr
+	}
+	return addr + ":" + strconv.Itoa(quota)
+}
+
+// setServers takes the list as resolved — entries with their quota fields
+// — and keeps the ADDRESSES (what the pool dials) apart from the quotas.
+func (o *turnOverride) setServers(list []string) {
+	o.servers, o.quotas = nil, nil
+	for _, e := range list {
+		if e == TURNServersVK {
+			o.servers = append(o.servers, e)
+			continue
+		}
+		addr, q, has, ok := splitTURNEntry(e)
+		if !ok {
+			o.servers = append(o.servers, e) // an unresolved name stays as it is
+			continue
+		}
+		o.servers = append(o.servers, addr)
+		if has {
+			if o.quotas == nil {
+				o.quotas = map[string]int{}
+			}
+			o.quotas[addr] = q
+		}
+	}
+	o.servers = dedupeAddrs(o.servers)
+}
+
+// quota: the relay's configured limit, when the list gives one (0 = none).
+func (o turnOverride) quota(addr string) (int, bool) {
+	q, ok := o.quotas[addr]
+	return q, ok
+}
+
+// unlimited: the list says this relay has no quota.
+func (o turnOverride) unlimited(addr string) bool {
+	q, ok := o.quotas[addr]
+	return ok && q == 0
+}
+
 func dedupeAddrs(in []string) []string {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(in))
@@ -467,21 +547,34 @@ const TURNServersVK = "$vkurls"
 func ParseTURNServers(raw string) ([]string, error) {
 	f := func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t' || r == '\r' }
 	var out []string
+	seen := map[string]bool{} // by ADDRESS: one spelling of a relay, the first
 	for _, e := range strings.FieldsFunc(raw, f) {
 		if strings.EqualFold(e, TURNServersVK) {
-			out = append(out, TURNServersVK) // VK's own relays, in this place
+			if !seen[TURNServersVK] {
+				out = append(out, TURNServersVK) // VK's own relays, in this place
+				seen[TURNServersVK] = true
+			}
 			continue
 		}
-		h, p, err := net.SplitHostPort(e)
+		addr, quota, has, ok := splitTURNEntry(e)
+		if !ok {
+			return nil, &TURNServerListError{Entry: e}
+		}
+		h, p, err := net.SplitHostPort(addr)
 		if err != nil || h == "" {
 			return nil, &TURNServerListError{Entry: e}
 		}
 		if n, err := strconv.Atoi(p); err != nil || n < 1 || n > 65535 {
 			return nil, &TURNServerListError{Entry: e}
 		}
-		out = append(out, net.JoinHostPort(h, p))
+		addr = net.JoinHostPort(h, p)
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, joinTURNEntry(addr, quota, has))
 	}
-	return dedupeAddrs(out), nil
+	return out, nil
 }
 
 // TURNServerListError names the entry of a TURN override list that is not
@@ -489,7 +582,7 @@ func ParseTURNServers(raw string) ([]string, error) {
 type TURNServerListError struct{ Entry string }
 
 func (e *TURNServerListError) Error() string {
-	return "TURN server " + strconv.Quote(e.Entry) + " is not host:port (nor " + TURNServersVK + ")"
+	return "TURN server " + strconv.Quote(e.Entry) + " is not host:port[:quota] (nor " + TURNServersVK + ")"
 }
 
 // lookupTURNHost is the bounded lookup behind ResolveTURNServers for a name
@@ -512,7 +605,12 @@ var lookupTURNHost = func(ctx context.Context, host string) ([]net.IP, error) {
 func ResolveTURNServers(ctx context.Context, servers []string, pre func(host string) []string) []string {
 	var out []string
 	for _, e := range servers {
-		host, port, err := net.SplitHostPort(e)
+		addr, quota, has, ok := splitTURNEntry(e)
+		if !ok {
+			out = append(out, e)
+			continue
+		}
+		host, port, err := net.SplitHostPort(addr)
 		if err != nil || net.ParseIP(host) != nil {
 			out = append(out, e)
 			continue
@@ -541,7 +639,7 @@ func ResolveTURNServers(ctx context.Context, servers []string, pre func(host str
 			}
 		}
 		for _, ip := range ips {
-			out = append(out, net.JoinHostPort(ip, port))
+			out = append(out, joinTURNEntry(net.JoinHostPort(ip, port), quota, has)) // the name's quota field on each IP
 		}
 		log.Printf("credpool: TURN relay %s resolved to %s", e, strings.Join(ips, ", "))
 	}
