@@ -73,6 +73,42 @@ run "root module — go test ${goflags[*]} ./..." \
 run "vendored fork — separate module, not reached by the root ./..." \
     env -C third_party/speedtest-go go test "${goflags[@]}" ./speedtest/
 
+# 🚨 A SECOND fork since 2026-10-30: pion/turn v5.0.2 with the request's
+# MESSAGE-INTEGRITY check removed, for tools/turn-relay ONLY (the user's own
+# relay in the TURN override list accepts the credentials VK issued). Its guard
+# diffs the tree against pristine upstream (fetched below) and compares with
+# FORK.patch; the patched server package's own tests run too — the one upstream
+# test that asserted the rejection is part of the documented divergence.
+UPSTREAM_TURN=github.com/pion/turn/v5@v5.0.2
+echo "== fetching pristine $UPSTREAM_TURN for the relay fork's guard"
+if go mod download "$UPSTREAM_TURN"; then
+    echo "   ready"
+else
+    echo "   FAIL: could not fetch $UPSTREAM_TURN -- the relay fork's guard cannot run" >&2
+    fail=1
+fi
+# Two upstream tests are skipped: TestServerVNet/AuthEventHandlerFailure waits
+# for the auth-failure event a bad signature raised — the fork raises none
+# (FORK.md); TestConnectRequest dials 127.0.0.1:5000 expecting a refusal, and
+# on a Mac with the AirPlay receiver on that port answers (an environment
+# flake upstream has too).
+run "vendored fork of pion/turn — the guard and the patched packages" \
+    env -C third_party/pion-turn go test "${goflags[@]}" -skip 'TestConnectRequest|TestServerVNet/AuthEventHandlerFailure' . ./internal/server/
+
+# The relay tool: its own module (the fork's replace must never reach the app).
+run "turn-relay — the relay for the user's own-relay scheme (issue #105)" \
+    env -C tools/turn-relay go test "${goflags[@]}" .
+relay_targets() {
+    local ok=0 t
+    for t in linux/amd64 linux/arm64 darwin/arm64; do
+        env -C tools/turn-relay CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build -trimpath -o /dev/null . \
+            || { echo "   build $t failed"; ok=1; }
+    done
+    return $ok
+}
+run "turn-relay — built for the stands" \
+    relay_targets
+
 # 🚨 A FOURTH place since stage 5: the Go bridge is its own module (its go.mod
 # replaces the root module with `..`), so the root ./... never sees
 # csqtt_bridge_test.go — the descriptor-ownership, pump and cleanup checks. Built

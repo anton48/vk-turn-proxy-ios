@@ -1,0 +1,24 @@
+=== internal/server/util.go ===
+@@ -120,12 +120,16 @@
+ 		)
+ 	}
+ 
+-	if err := stun.MessageIntegrity(ourKey).Check(stunMsg); err != nil {
+-		genAuthEvent(req, stunMsg, callingMethod, false)
++	// FORK (vk-turn-proxy, tools/turn-relay): the request's MESSAGE-INTEGRITY is
++	// NOT checked. This relay stands in the TURN override list of a client that
++	// signs with credentials VK issued — a password this server cannot know
++	// (issue #105: the user's own relay first, VK's relays after it). The
++	// AuthHandler still names the user and hands a key for the responses (which
++	// the pion client does not verify); the nonce is still validated above. What
++	// keeps the relay from being open is the PermissionHandler (peers) and the
++	// QuotaHandler (allocations), not the signature.
++	_ = ourKey
+ 
+-		return nil, false, "", buildAndSendErr(req.Conn, req.SrcAddr, err, badRequestMsg...)
+-	}
+-
+ 	genAuthEvent(req, stunMsg, callingMethod, true)
+ 
+ 	return stun.MessageIntegrity(ourKey), true, userID, nil
+

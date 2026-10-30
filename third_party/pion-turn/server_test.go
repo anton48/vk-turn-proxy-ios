@@ -1,0 +1,2115 @@
+// SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
+//go:build !js
+// +build !js
+
+package turn
+
+import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"math/big"
+	"net"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/pion/logging"
+	"github.com/pion/stun/v3"
+	"github.com/pion/transport/v4/reuseport"
+	"github.com/pion/transport/v4/test"
+	"github.com/pion/transport/v4/vnet"
+	"github.com/pion/turn/v5/internal/allocation"
+	"github.com/pion/turn/v5/internal/proto"
+	"github.com/stretchr/testify/assert"
+)
+
+const (
+	timeout  = 200 * time.Millisecond
+	interval = 50 * time.Millisecond
+	stunAddr = "1.2.3.4:3478"
+	turnAddr = "1.2.3.4:3478"
+	testAddr = "127.0.0.1:3478"
+	testUser = "testUser"
+)
+
+type EventHandlerType int
+
+const (
+	unknownEvent EventHandlerType = iota
+	onAuth
+	onAllocationCreated
+	onAllocationDeleted
+	onAllocationError
+	onPermissionCreated
+	onPermissionDeleted
+	onChannelCreated
+	onChannelDeleted
+)
+
+// EventHandlerArgs is a set of arguments passed from the low-level event callbacks to the server.
+type eventHandlerArgs struct {
+	Type                                 EventHandlerType
+	srcAddr, dstAddr, relayAddr          net.Addr
+	protocol                             string
+	userID, realm, method, message, peer string
+	verdict                              bool
+	requestedPort                        int
+	channelNumber                        uint16
+}
+
+// mtuConn enforces a maxMTU limit and returns an error on overflow.
+type mtuConn struct {
+	net.PacketConn
+	mtu int
+}
+
+func (c *mtuConn) WriteTo(data []byte, addr net.Addr) (int, error) {
+	if len(data) > c.mtu {
+		return 0, errors.New("MTU violation") //nolint:err113
+	}
+
+	return c.PacketConn.WriteTo(data, addr)
+}
+
+type mtuConnGenerator struct {
+	RelayAddressGenerator
+	mtu int
+}
+
+// mtuConnGenerator is a relay address generator that wraps the PacketConn returned by a base generator in an mtuConn.
+func (g *mtuConnGenerator) AllocatePacketConn(conf AllocateListenerConfig) (net.PacketConn, net.Addr, error) {
+	conn, addr, err := g.RelayAddressGenerator.AllocatePacketConn(conf)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &mtuConn{conn, g.mtu}, addr, nil
+}
+
+// truncConn truncates send payloads to a given max length.
+type truncConn struct {
+	net.PacketConn
+	mtu int
+}
+
+func (c *truncConn) WriteTo(data []byte, addr net.Addr) (int, error) {
+	if len(data) > c.mtu {
+		return c.PacketConn.WriteTo(data[0:c.mtu], addr)
+	}
+
+	return c.PacketConn.WriteTo(data, addr)
+}
+
+type truncConnGenerator struct {
+	RelayAddressGenerator
+	mtu int
+}
+
+// truncConnGenerator is a relay address generator that wraps the PacketConn returned by a base
+// generator in a truncConn.
+func (g *truncConnGenerator) AllocatePacketConn(conf AllocateListenerConfig) (net.PacketConn, net.Addr, error) {
+	conn, addr, err := g.RelayAddressGenerator.AllocatePacketConn(conf)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &truncConn{conn, g.mtu}, addr, nil
+}
+
+func TestServerConfig(t *testing.T) {
+	udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+	assert.NoError(t, err)
+
+	tcpListener, err := net.Listen("tcp4", testAddr) // nolint: noctx
+	assert.NoError(t, err)
+
+	t.Run("Empty", func(t *testing.T) {
+		assert.ErrorIs(t, (&ServerConfig{}).validate(), errNoAvailableConns)
+	})
+
+	t.Run("No PacketConn", func(t *testing.T) {
+		assert.ErrorIs(t, (&ServerConfig{
+			PacketConnConfigs: []PacketConnConfig{{}},
+		}).validate(), errConnUnset)
+	})
+
+	t.Run("RelayAddressGenerator Error", func(t *testing.T) {
+		assert.ErrorIs(t, (&ServerConfig{
+			PacketConnConfigs: []PacketConnConfig{{
+				PacketConn:            udpListener,
+				RelayAddressGenerator: &RelayAddressGeneratorNone{},
+			}},
+		}).validate(), errListeningAddressInvalid)
+	})
+
+	t.Run("No Listener", func(t *testing.T) {
+		assert.ErrorIs(t, (&ServerConfig{
+			ListenerConfigs: []ListenerConfig{{}},
+		}).validate(), errListenerUnset)
+	})
+
+	t.Run("No RelayAddressGenerator", func(t *testing.T) {
+		assert.ErrorIs(t, (&ServerConfig{
+			ListenerConfigs: []ListenerConfig{{Listener: tcpListener}},
+		}).validate(), errRelayAddressGeneratorUnset)
+	})
+
+	_, _, err = (&RelayAddressGeneratorNone{}).AllocateListener(AllocateListenerConfig{Network: "tcp4"})
+	assert.ErrorIs(t, err, errListeningAddressInvalid)
+
+	relayGen := &RelayAddressGeneratorNone{Address: "0.0.0.0"}
+	listener, _, err := relayGen.AllocateListener(AllocateListenerConfig{Network: "tcp4"})
+	assert.NoError(t, err)
+	assert.NoError(t, listener.Close())
+
+	_, _, err = (&RelayAddressGeneratorStatic{}).AllocateListener(AllocateListenerConfig{Network: "tcp4"})
+	assert.ErrorIs(t, err, errRelayAddressInvalid)
+
+	listener, _, err = (&RelayAddressGeneratorStatic{RelayAddress: net.IP("127.0.0.1"), Address: "0.0.0.0"}).AllocateListener(AllocateListenerConfig{Network: "tcp4"}) // nolint: lll
+	assert.NoError(t, err)
+	assert.NoError(t, listener.Close())
+
+	assert.NoError(t, tcpListener.Close())
+	assert.NoError(t, udpListener.Close())
+}
+
+func TestServer(t *testing.T) { //nolint:maintidx
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	loggerFactory := logging.NewDefaultLoggerFactory()
+
+	credMap := map[string][]byte{
+		testUser: GenerateAuthKey(testUser, "pion.ly", "pass"),
+	}
+
+	t.Run("simple", func(t *testing.T) {
+		udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+		assert.NoError(t, err)
+
+		server, err := NewServer(ServerConfig{
+			AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+				if pw, ok := credMap[ra.Username]; ok {
+					return ra.Username, pw, true
+				}
+
+				return "", nil, false
+			},
+			PacketConnConfigs: []PacketConnConfig{
+				{
+					PacketConn: udpListener,
+					RelayAddressGenerator: &RelayAddressGeneratorStatic{
+						RelayAddress: net.ParseIP("127.0.0.1"),
+						Address:      "127.0.0.1",
+					},
+				},
+			},
+			Realm:         "pion.ly",
+			LoggerFactory: loggerFactory,
+		})
+		assert.NoError(t, err)
+
+		assert.Equal(t, proto.DefaultLifetime, server.channelBindTimeout, "should match")
+
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+		assert.NoError(t, err)
+
+		client, err := NewClient(&ClientConfig{
+			Conn:          conn,
+			LoggerFactory: loggerFactory,
+		})
+		assert.NoError(t, err)
+		assert.NoError(t, client.Listen())
+
+		_, err = client.SendBindingRequestTo(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3478})
+		assert.NoError(t, err, "should succeed")
+
+		client.Close()
+		assert.NoError(t, conn.Close())
+
+		assert.NoError(t, server.Close())
+	})
+
+	t.Run("default inboundMTU", func(t *testing.T) {
+		udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+		assert.NoError(t, err)
+		server, err := NewServer(ServerConfig{
+			LoggerFactory: loggerFactory,
+			PacketConnConfigs: []PacketConnConfig{
+				{
+					PacketConn: udpListener,
+					RelayAddressGenerator: &RelayAddressGeneratorStatic{
+						RelayAddress: net.ParseIP("127.0.0.1"),
+						Address:      "127.0.0.1",
+					},
+				},
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, server.inboundMTU, defaultInboundMTU)
+		assert.NoError(t, server.Close())
+	})
+
+	t.Run("Set inboundMTU", func(t *testing.T) {
+		udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+		assert.NoError(t, err)
+		server, err := NewServer(ServerConfig{
+			InboundMTU:    2000,
+			LoggerFactory: loggerFactory,
+			PacketConnConfigs: []PacketConnConfig{
+				{
+					PacketConn: udpListener,
+					RelayAddressGenerator: &RelayAddressGeneratorStatic{
+						RelayAddress: net.ParseIP("127.0.0.1"),
+						Address:      "127.0.0.1",
+					},
+				},
+			},
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, server.inboundMTU, 2000)
+		assert.NoError(t, server.Close())
+	})
+
+	t.Run("Delete allocation on spontaneous TCP close", func(t *testing.T) {
+		// Test whether allocation is properly deleted when client spontaneously closes the
+		// TCP connection underlying it
+		tcpListener, err := net.Listen("tcp4", testAddr) // nolint: noctx
+		assert.NoError(t, err)
+
+		server, err := NewServer(ServerConfig{
+			AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+				if pw, ok := credMap[ra.Username]; ok {
+					return ra.Username, pw, true
+				}
+
+				return "", nil, false
+			},
+			ListenerConfigs: []ListenerConfig{
+				{
+					Listener: tcpListener,
+					RelayAddressGenerator: &RelayAddressGeneratorStatic{
+						RelayAddress: net.ParseIP("127.0.0.1"),
+						Address:      "127.0.0.1",
+					},
+				},
+			},
+			Realm:         "pion.ly",
+			LoggerFactory: loggerFactory,
+		})
+		assert.NoError(t, err)
+
+		// make sure we can reuse the client port
+		dialer := &net.Dialer{Control: reuseport.Control}
+		conn, err := dialer.Dial("tcp", testAddr)
+		assert.NoError(t, err)
+
+		clientAddr := conn.LocalAddr()
+
+		serverAddr, err := net.ResolveTCPAddr("tcp4", testAddr)
+		assert.NoError(t, err)
+
+		client, err := NewClient(&ClientConfig{
+			STUNServerAddr: serverAddr.String(),
+			TURNServerAddr: serverAddr.String(),
+			Conn:           NewSTUNConn(conn),
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err)
+		assert.NoError(t, client.Listen())
+
+		_, err = client.SendBindingRequestTo(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3478})
+		assert.NoError(t, err, "should succeed")
+
+		relayConn, err := client.Allocate()
+		assert.NoError(t, err)
+		assert.NotNil(t, relayConn)
+
+		fiveTuple := &allocation.FiveTuple{
+			Protocol: allocation.UDP, // Fixed UDP
+			SrcAddr:  clientAddr,
+			DstAddr:  serverAddr,
+		}
+		// Allocation exists
+		assert.Len(t, server.allocationManagers, 1)
+		assert.NotNil(t, server.allocationManagers[0].GetAllocation(fiveTuple))
+
+		// client.Close()
+		// This should properly close the client and delete the allocation on the server
+		assert.NoError(t, conn.Close())
+
+		// Let connection to properly close
+		time.Sleep(100 * time.Millisecond)
+		// to we still have the allocation on the server?
+		assert.Nil(t, server.allocationManagers[0].GetAllocation(fiveTuple))
+
+		client.Close()
+		// This should err: client connection has gone so we cannot send the Refresh(0)
+		// message
+		assert.Error(t, relayConn.Close())
+		assert.NoError(t, server.Close())
+	})
+
+	t.Run("Filter on client address and peer IP", func(t *testing.T) {
+		udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+		assert.NoError(t, err)
+
+		// Enforce correct client IP and port
+		clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+		assert.NoError(t, err)
+
+		server, err := NewServer(ServerConfig{
+			AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+				if pw, ok := credMap[ra.Username]; ok {
+					return ra.Username, pw, true
+				}
+
+				return "", nil, false
+			},
+			PacketConnConfigs: []PacketConnConfig{
+				{
+					PacketConn: udpListener,
+					RelayAddressGenerator: &RelayAddressGeneratorStatic{
+						RelayAddress: net.IPv4(127, 0, 0, 1),
+						Address:      "127.0.0.1",
+					},
+					PermissionHandler: func(src net.Addr, peer net.IP) bool {
+						return src.String() == clientConn.LocalAddr().String() &&
+							peer.Equal(net.IPv4(127, 0, 0, 4))
+					},
+				},
+			},
+			Realm:         "pion.ly",
+			LoggerFactory: loggerFactory,
+		})
+		assert.NoError(t, err)
+
+		client, err := NewClient(&ClientConfig{
+			STUNServerAddr: testAddr,
+			TURNServerAddr: testAddr,
+			Conn:           clientConn,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err)
+		assert.NoError(t, client.Listen())
+
+		relayConn, err := client.Allocate()
+		assert.NoError(t, err)
+
+		whiteAddr, errA := net.ResolveUDPAddr("udp", "127.0.0.4:12345")
+		assert.NoError(t, errA, "should succeed")
+		blackAddr, errB1 := net.ResolveUDPAddr("udp", "127.0.0.5:12345")
+		assert.NoError(t, errB1, "should succeed")
+
+		// Explicit CreatePermission
+		err = client.CreatePermission(whiteAddr)
+		assert.NoError(t, err, "grant permission for whitelisted peer")
+
+		err = client.CreatePermission(blackAddr)
+		assert.ErrorContains(t, err, "error", "deny permission for blacklisted peer address")
+
+		err = client.CreatePermission(whiteAddr, whiteAddr)
+		assert.NoError(t, err, "grant permission for repeated whitelisted peer addresses")
+
+		err = client.CreatePermission(blackAddr)
+		assert.ErrorContains(t, err, "error", "deny permission for repeated blacklisted peer address")
+
+		// Isn't this a corner case in the spec?
+		err = client.CreatePermission(whiteAddr, blackAddr)
+		assert.ErrorContains(t, err, "error", "deny permission for mixed whitelisted and blacklisted peers")
+
+		// Implicit CreatePermission for ChannelBindRequests: WriteTo always tries to bind a channel
+		_, err = relayConn.WriteTo([]byte("Hello"), whiteAddr)
+		assert.NoError(t, err, "write to whitelisted peer address succeeds - 1")
+
+		_, err = relayConn.WriteTo([]byte("Hello"), blackAddr)
+		assert.ErrorContains(t, err, "error", "write to blacklisted peer address fails - 1")
+
+		_, err = relayConn.WriteTo([]byte("Hello"), whiteAddr)
+		assert.NoError(t, err, "write to whitelisted peer address succeeds - 2")
+
+		_, err = relayConn.WriteTo([]byte("Hello"), blackAddr)
+		assert.ErrorContains(t, err, "error", "write to blacklisted peer address fails - 2")
+
+		_, err = relayConn.WriteTo([]byte("Hello"), whiteAddr)
+		assert.NoError(t, err, "write to whitelisted peer address succeeds - 3")
+
+		_, err = relayConn.WriteTo([]byte("Hello"), blackAddr)
+		assert.ErrorContains(t, err, "error", "write to blacklisted peer address fails - 3")
+
+		// Let the previous transaction terminate
+		time.Sleep(200 * time.Millisecond)
+		assert.NoError(t, relayConn.Close())
+
+		client.Close()
+		assert.NoError(t, clientConn.Close())
+
+		// Enforce filtered source address
+		conn2, err := net.ListenPacket("udp4", "127.0.0.1:12321") // nolint: noctx
+		assert.NoError(t, err)
+
+		client2, err := NewClient(&ClientConfig{
+			STUNServerAddr: testAddr,
+			TURNServerAddr: testAddr,
+			Conn:           conn2,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err)
+		assert.NoError(t, client2.Listen())
+
+		relayConn2, err := client2.Allocate()
+		assert.NoError(t, err)
+
+		// Explicit CreatePermission
+		err = client2.CreatePermission(whiteAddr)
+		assert.ErrorContains(t, err, "error", "deny permission from filtered source to whitelisted peer")
+
+		err = client2.CreatePermission(blackAddr)
+		assert.ErrorContains(t, err, "error", "deny permission from filtered source to blacklisted peer")
+
+		// Implicit CreatePermission for ChannelBindRequests: WriteTo always tries to bind a channel
+		_, err = relayConn2.WriteTo([]byte("Hello"), whiteAddr)
+		assert.ErrorContains(t, err, "error", "write from filtered source to whitelisted peer fails - 1")
+
+		_, err = relayConn2.WriteTo([]byte("Hello"), blackAddr)
+		assert.ErrorContains(t, err, "error", "write from filtered source to blacklisted peer fails - 1")
+
+		_, err = relayConn2.WriteTo([]byte("Hello"), whiteAddr)
+		assert.ErrorContains(t, err, "error", "write from filtered source to whitelisted peer fails - 2")
+
+		_, err = relayConn2.WriteTo([]byte("Hello"), blackAddr)
+		assert.ErrorContains(t, err, "error", "write from filtered source to blacklisted peer fails - 2")
+
+		_, err = relayConn2.WriteTo([]byte("Hello"), whiteAddr)
+		assert.ErrorContains(t, err, "error", "write from filtered source to whitelisted peer fails - 3")
+
+		_, err = relayConn2.WriteTo([]byte("Hello"), blackAddr)
+		assert.ErrorContains(t, err, "error", "write from filtered source to blacklisted peer fails - 3")
+
+		// Let the previous transaction terminate
+		time.Sleep(200 * time.Millisecond)
+		assert.NoError(t, relayConn2.Close())
+
+		client2.Close()
+		assert.NoError(t, conn2.Close())
+
+		assert.NoError(t, server.Close())
+	})
+
+	t.Run("Return error if payload exceeds peer connection MTU", func(t *testing.T) {
+		udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+		assert.NoError(t, err)
+
+		errMessage := atomic.Value{}
+		errMessage.Store("")
+
+		server, err := NewServer(ServerConfig{
+			AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+				if pw, ok := credMap[ra.Username]; ok {
+					return ra.Username, pw, true
+				}
+
+				return "", nil, false
+			},
+			EventHandler: allocation.EventHandler{ // used to report write errors from peer
+				OnAllocationError: func(_, _ net.Addr, _, message string) {
+					errMessage.Store(message)
+				},
+			},
+			PacketConnConfigs: []PacketConnConfig{
+				{
+					PacketConn: udpListener,
+					RelayAddressGenerator: &mtuConnGenerator{
+						RelayAddressGenerator: &RelayAddressGeneratorStatic{
+							RelayAddress: net.IPv4(127, 0, 0, 1),
+							Address:      "127.0.0.1",
+						},
+						mtu: 1, // allow single-byte payload
+					},
+				},
+			},
+			Realm:         "pion.ly",
+			LoggerFactory: loggerFactory,
+		})
+		assert.NoError(t, err)
+
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+		assert.NoError(t, err)
+
+		client, err := NewClient(&ClientConfig{
+			STUNServerAddr: testAddr,
+			TURNServerAddr: testAddr,
+			Conn:           conn,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err)
+		assert.NoError(t, client.Listen())
+
+		relayConn, err := client.Allocate()
+		assert.NoError(t, err)
+
+		peerAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:1")
+		assert.NoError(t, err, "should succeed")
+
+		_, err = relayConn.WriteTo([]byte("Hello"), peerAddr)
+		assert.NoError(t, err, "mtu not enforced in client side")
+		assert.Eventually(t, func() bool { return errMessage.Load() != "" }, timeout, interval)
+		assert.Contains(t, errMessage.Load(), "MTU violation", "allocation error")
+
+		// Let the previous transaction terminate
+		time.Sleep(200 * time.Millisecond)
+		assert.NoError(t, relayConn.Close())
+
+		client.Close()
+		assert.NoError(t, conn.Close())
+		assert.NoError(t, server.Close())
+	})
+
+	t.Run("Return error if peer payload is truncated", func(t *testing.T) {
+		errMessage := atomic.Value{}
+		errMessage.Store("")
+
+		udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+		assert.NoError(t, err)
+
+		server, err := NewServer(ServerConfig{
+			AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+				if pw, ok := credMap[ra.Username]; ok {
+					return ra.Username, pw, true
+				}
+
+				return "", nil, false
+			},
+			EventHandler: allocation.EventHandler{ // used to report write errors from peer
+				OnAllocationError: func(_, _ net.Addr, _, message string) {
+					errMessage.Store(message)
+				},
+			},
+			PacketConnConfigs: []PacketConnConfig{
+				{
+					PacketConn: udpListener,
+					RelayAddressGenerator: &truncConnGenerator{
+						RelayAddressGenerator: &RelayAddressGeneratorStatic{
+							RelayAddress: net.IPv4(127, 0, 0, 1),
+							Address:      "127.0.0.1",
+						},
+						mtu: 1,
+					},
+				},
+			},
+			Realm:         "pion.ly",
+			LoggerFactory: loggerFactory,
+		})
+		assert.NoError(t, err)
+
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+		assert.NoError(t, err)
+
+		client, err := NewClient(&ClientConfig{
+			STUNServerAddr: testAddr,
+			TURNServerAddr: testAddr,
+			Conn:           conn,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err)
+		assert.NoError(t, client.Listen())
+
+		relayConn, err := client.Allocate()
+		assert.NoError(t, err)
+
+		peerAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:1")
+		assert.NoError(t, err, "should succeed")
+
+		_, err = relayConn.WriteTo([]byte("Hello"), peerAddr)
+		assert.NoError(t, err, "mtu not enforced in client side")
+		assert.Eventually(t, func() bool { return errMessage.Load() != "" }, timeout, interval)
+		assert.Contains(t, errMessage.Load(), "packet write smaller than packet 1 != 5 (expected)",
+			"allocation error")
+
+		// Let the previous transaction terminate
+		time.Sleep(200 * time.Millisecond)
+		assert.NoError(t, relayConn.Close())
+
+		client.Close()
+		assert.NoError(t, conn.Close())
+		assert.NoError(t, server.Close())
+	})
+
+	t.Run("Allow empty user-id", func(t *testing.T) {
+		udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+		assert.NoError(t, err)
+		defer udpListener.Close() //nolint:errcheck
+
+		server, err := NewServer(ServerConfig{
+			AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+				if pw, ok := credMap[ra.Username]; ok {
+					// Return empty user-id
+					return "", pw, true
+				}
+
+				return "", nil, false
+			},
+			PacketConnConfigs: []PacketConnConfig{
+				{
+					PacketConn: udpListener,
+					RelayAddressGenerator: &mtuConnGenerator{
+						RelayAddressGenerator: &RelayAddressGeneratorStatic{
+							RelayAddress: net.IPv4(127, 0, 0, 1),
+							Address:      "127.0.0.1",
+						},
+					},
+				},
+			},
+			Realm:         "pion.ly",
+			LoggerFactory: loggerFactory,
+		})
+		assert.NoError(t, err)
+		defer server.Close() //nolint:errcheck
+
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+		assert.NoError(t, err)
+		defer conn.Close() //nolint:errcheck
+
+		client, err := NewClient(&ClientConfig{
+			STUNServerAddr: testAddr,
+			TURNServerAddr: testAddr,
+			Conn:           conn,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err)
+		assert.NoError(t, client.Listen())
+		defer client.Close()
+
+		relayConn, err := client.Allocate()
+		assert.NoError(t, err)
+		defer relayConn.Close() //nolint:errcheck
+	})
+}
+
+func TestServerHandleComprehensionRequiredAttribute(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	loggerFactory := logging.NewDefaultLoggerFactory()
+
+	udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+	assert.NoError(t, err)
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			return "", nil, false
+		},
+		PacketConnConfigs: []PacketConnConfig{
+			{
+				PacketConn: udpListener,
+				RelayAddressGenerator: &truncConnGenerator{
+					RelayAddressGenerator: &RelayAddressGeneratorStatic{
+						RelayAddress: net.IPv4(127, 0, 0, 1),
+						Address:      "127.0.0.1",
+					},
+					mtu: 1,
+				},
+			},
+		},
+		Realm:         "pion.ly",
+		LoggerFactory: loggerFactory,
+	})
+	assert.NoError(t, err)
+
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	invalid, err := stun.Build(
+		stun.BindingRequest,
+		stun.RawAttribute{Type: 0x7AD, Value: []byte{0xBA, 0xAD}},                  // nolint: lll
+		stun.RawAttribute{Type: stun.AttrChannelNumber, Value: []byte{0xBA, 0xAD}}, // nolint: lll
+		stun.RawAttribute{Type: 0x7FFF, Value: []byte{0xBA, 0xAD}},                 // nolint: lll
+		stun.RawAttribute{Type: 0x8000, Value: []byte{0xBA, 0xAD}},                 // nolint: lll
+	)
+	assert.NoError(t, err)
+
+	_, err = conn.WriteTo(invalid.Raw, udpListener.LocalAddr())
+	assert.NoError(t, err)
+
+	pkt := stun.Message{Raw: make([]byte, 1500)}
+	i, _, err := conn.ReadFrom(pkt.Raw)
+	assert.NoError(t, err)
+
+	pkt.Raw = pkt.Raw[:i]
+	assert.NoError(t, pkt.Decode())
+
+	assert.Equal(t, pkt.Attributes[0], stun.RawAttribute{Type: stun.AttrErrorCode, Length: 0x15, Value: []uint8{0x0, 0x0, 0x4, 0x14, 0x55, 0x6e, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x20, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65}}) // nolint: lll
+	assert.Equal(t, pkt.Attributes[1], stun.RawAttribute{Type: stun.AttrUnknownAttributes, Length: 0x8, Value: []uint8{0x7, 0xad, 0x0, 0x0, 0x7f, 0xff, 0x0, 0x0}})                                                                          // nolint: lll
+
+	assert.NoError(t, conn.Close())
+	assert.NoError(t, server.Close())
+}
+
+type VNet struct {
+	wan    *vnet.Router
+	net0   *vnet.Net // net (0) on the WAN
+	net1   *vnet.Net // net (1) on the WAN
+	netL0  *vnet.Net // net (0) on the LAN
+	server *Server
+}
+
+func (v *VNet) Close() error {
+	if err := v.server.Close(); err != nil {
+		return err
+	}
+
+	return v.wan.Stop()
+}
+
+func buildVNet(handler *EventHandler) (*VNet, error) { //nolint:cyclop
+	loggerFactory := logging.NewDefaultLoggerFactory()
+	if handler == nil {
+		handler = &EventHandler{}
+	}
+
+	// WAN
+	wan, err := vnet.NewRouter(&vnet.RouterConfig{
+		CIDR:          "0.0.0.0/0",
+		LoggerFactory: loggerFactory,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	net0, err := vnet.NewNet(&vnet.NetConfig{
+		StaticIPs: []string{"1.2.3.4"}, // Will be assigned to eth0
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = wan.AddNet(net0)
+	if err != nil {
+		return nil, err
+	}
+
+	net1, err := vnet.NewNet(&vnet.NetConfig{
+		StaticIPs: []string{"1.2.3.5"}, // Will be assigned to eth0
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	err = wan.AddNet(net1)
+	if err != nil {
+		return nil, err
+	}
+
+	// LAN
+	lan, err := vnet.NewRouter(&vnet.RouterConfig{
+		StaticIPs: []string{"5.6.7.8"}, // This router's external IP on eth0
+		CIDR:      "192.168.0.0/24",
+		NATType: &vnet.NATType{
+			MappingBehavior:   vnet.EndpointIndependent,
+			FilteringBehavior: vnet.EndpointIndependent,
+		},
+		LoggerFactory: loggerFactory,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	netL0, err := vnet.NewNet(&vnet.NetConfig{})
+	if err != nil {
+		return nil, err
+	}
+
+	if err = lan.AddNet(netL0); err != nil {
+		return nil, err
+	}
+
+	if err = wan.AddRouter(lan); err != nil {
+		return nil, err
+	}
+
+	if err = wan.Start(); err != nil {
+		return nil, err
+	}
+
+	// Start server...
+	credMap := map[string][]byte{testUser: GenerateAuthKey(testUser, "pion.ly", "pass")}
+
+	udpListener, err := net0.ListenPacket("udp4", "1.2.3.4:3478") // nolint: noctx
+	if err != nil {
+		return nil, err
+	}
+
+	if handler == nil {
+		handler = &EventHandler{}
+	}
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			if pw, ok := credMap[ra.Username]; ok {
+				return ra.Username, pw, true
+			}
+
+			return "", nil, false
+		},
+		Realm:        "pion.ly",
+		EventHandler: *handler,
+		PacketConnConfigs: []PacketConnConfig{
+			{
+				PacketConn: udpListener,
+				RelayAddressGenerator: &RelayAddressGeneratorNone{
+					Address: "1.2.3.4",
+					Net:     net0,
+				},
+			},
+		},
+		LoggerFactory: loggerFactory,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Register host names
+	err = wan.AddHost("stun.pion.ly", "1.2.3.4")
+	if err != nil {
+		return nil, err
+	}
+	err = wan.AddHost("turn.pion.ly", "1.2.3.4")
+	if err != nil {
+		return nil, err
+	}
+	err = wan.AddHost("echo.pion.ly", "1.2.3.5")
+	if err != nil {
+		return nil, err
+	}
+
+	return &VNet{
+		wan:    wan,
+		net0:   net0,
+		net1:   net1,
+		netL0:  netL0,
+		server: server,
+	}, nil
+}
+
+func testEventHandler(ch chan eventHandlerArgs, authCounter *atomic.Int32) *EventHandler {
+	return &EventHandler{
+		OnAuth: func(srcAddr, dstAddr net.Addr,
+			protocol, username, realm string,
+			method string,
+			verdict bool,
+		) {
+			if ch != nil {
+				ch <- eventHandlerArgs{
+					Type: onAuth, srcAddr: srcAddr, dstAddr: dstAddr,
+					protocol: protocol, userID: username, realm: realm,
+					method: method, verdict: verdict,
+				}
+			}
+			authCounter.Add(1)
+		},
+		OnAllocationCreated: func(srcAddr, dstAddr net.Addr,
+			protocol, userID, realm string,
+			relayAddr net.Addr,
+			requestedPort int,
+		) {
+			if ch != nil {
+				ch <- eventHandlerArgs{
+					Type: onAllocationCreated, srcAddr: srcAddr, dstAddr: dstAddr,
+					protocol: protocol, userID: userID, realm: realm,
+					relayAddr: relayAddr, requestedPort: requestedPort,
+				}
+			}
+		},
+		OnAllocationDeleted: func(srcAddr, dstAddr net.Addr, protocol, userID, realm string) {
+			if ch != nil {
+				ch <- eventHandlerArgs{
+					Type: onAllocationDeleted, srcAddr: srcAddr, dstAddr: dstAddr,
+					protocol: protocol, userID: userID, realm: realm,
+				}
+			}
+		},
+		OnAllocationError: func(srcAddr, dstAddr net.Addr, protocol, message string) {
+			if ch != nil {
+				ch <- eventHandlerArgs{
+					Type: onAllocationError, srcAddr: srcAddr, dstAddr: dstAddr,
+					protocol: protocol, message: message,
+				}
+			}
+		},
+		OnPermissionCreated: func(srcAddr, dstAddr net.Addr,
+			protocol, userID, realm string,
+			relayAddr net.Addr,
+			peer net.IP,
+		) {
+			if ch != nil {
+				ch <- eventHandlerArgs{
+					Type: onPermissionCreated, srcAddr: srcAddr, dstAddr: dstAddr,
+					protocol: protocol, userID: userID, realm: realm,
+					relayAddr: relayAddr, peer: peer.String(),
+				}
+			}
+		},
+		OnPermissionDeleted: func(srcAddr, dstAddr net.Addr,
+			protocol, userID, realm string,
+			relayAddr net.Addr,
+			peer net.IP,
+		) {
+			if ch != nil {
+				ch <- eventHandlerArgs{
+					Type: onPermissionDeleted, srcAddr: srcAddr, dstAddr: dstAddr,
+					protocol: protocol, userID: userID, realm: realm,
+					relayAddr: relayAddr, peer: peer.String(),
+				}
+			}
+		},
+		OnChannelCreated: func(srcAddr, dstAddr net.Addr,
+			protocol, userID, realm string,
+			relayAddr, peer net.Addr,
+			channelNumber uint16,
+		) {
+			if ch != nil {
+				ch <- eventHandlerArgs{
+					Type: onChannelCreated, srcAddr: srcAddr, dstAddr: dstAddr,
+					protocol: protocol, userID: userID, realm: realm,
+					relayAddr: relayAddr, peer: peer.String(),
+					channelNumber: channelNumber,
+				}
+			}
+		},
+		OnChannelDeleted: func(srcAddr, dstAddr net.Addr,
+			protocol, userID, realm string,
+			relayAddr, peer net.Addr,
+			channelNumber uint16,
+		) {
+			if ch != nil {
+				ch <- eventHandlerArgs{
+					Type: onChannelDeleted, srcAddr: srcAddr, dstAddr: dstAddr,
+					protocol: protocol, userID: userID, realm: realm,
+					relayAddr: relayAddr, peer: peer.String(),
+					channelNumber: channelNumber,
+				}
+			}
+		},
+	}
+}
+
+func expectEvent(ch chan eventHandlerArgs) (eventHandlerArgs, bool) {
+	select {
+	case res := <-ch:
+		return res, true
+	case <-time.After(timeout):
+		return eventHandlerArgs{}, false
+	}
+}
+
+func checkAllocationEvent(t *testing.T, event eventHandlerArgs) {
+	t.Helper()
+	udpAddr, ok := event.srcAddr.(*net.UDPAddr)
+	assert.True(t, ok)
+	assert.Equal(t, udpAddr.IP.String(), "5.6.7.8")
+
+	udpAddr, ok = event.dstAddr.(*net.UDPAddr)
+	assert.True(t, ok)
+	assert.Equal(t, udpAddr.IP.String(), "1.2.3.4")
+
+	assert.Equal(t, "UDP", event.protocol)
+	assert.Equal(t, testUser, event.userID)
+	assert.Equal(t, "pion.ly", event.realm)
+}
+
+func checkAuthEvent(t *testing.T, event eventHandlerArgs, method string, verdict bool) {
+	t.Helper()
+	assert.Equal(t, onAuth, event.Type, "should receive an OnAuth event")
+	checkAllocationEvent(t, event)
+	assert.Equal(t, event.method, method)
+	assert.Equal(t, event.verdict, verdict)
+}
+
+func TestServerVNet(t *testing.T) { //nolint:maintidx
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	loggerFactory := logging.NewDefaultLoggerFactory()
+	log := loggerFactory.NewLogger("test")
+
+	t.Run("SendBindingRequest", func(t *testing.T) {
+		v, err := buildVNet(nil)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, v.Close())
+		}()
+
+		lconn, err := v.netL0.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+		assert.NoError(t, err, "should succeed")
+		defer func() {
+			assert.NoError(t, lconn.Close())
+		}()
+
+		log.Debug("creating a client.")
+		client, err := NewClient(&ClientConfig{
+			STUNServerAddr: stunAddr,
+			Conn:           lconn,
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err, "should succeed")
+		assert.NoError(t, client.Listen(), "should succeed")
+		defer client.Close()
+
+		log.Debug("sending a binding request.")
+		reflAddr, err := client.SendBindingRequest()
+		assert.NoError(t, err)
+		log.Debugf("mapped-address: %s", reflAddr)
+		udpAddr, ok := reflAddr.(*net.UDPAddr)
+		assert.True(t, ok)
+
+		// The mapped-address should have IP address that was assigned
+		// to the LAN router.
+		assert.True(t, udpAddr.IP.Equal(net.IPv4(5, 6, 7, 8)), "should match")
+	})
+
+	t.Run("AllocationLifecycle", func(t *testing.T) {
+		counter := &atomic.Int32{}
+		events := make(chan eventHandlerArgs, 5)
+		defer close(events)
+		virtNet, err := buildVNet(testEventHandler(events, counter))
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, virtNet.Close())
+		}()
+
+		lconn, err := virtNet.netL0.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+		assert.NoError(t, err, "should succeed")
+		defer func() {
+			assert.NoError(t, lconn.Close())
+		}()
+
+		log.Debug("creating a client.")
+		client, err := NewClient(&ClientConfig{
+			TURNServerAddr: turnAddr,
+			Conn:           lconn,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err, "should succeed")
+		assert.NoError(t, client.Listen(), "should succeed")
+		defer client.Close()
+
+		log.Debug("sending an allocate request.")
+		relayConn, err := client.Allocate()
+		assert.NoError(t, err, "should succeed")
+
+		event, ok := expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		checkAuthEvent(t, event, "Allocate", true)
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		assert.Equal(t, onAllocationCreated, event.Type, "should receive an OnAllocationCreated event")
+		checkAllocationEvent(t, event)
+		assert.Equal(t, relayConn.LocalAddr().String(), event.relayAddr.String())
+		assert.Equal(t, 0, event.requestedPort)
+
+		log.Debug("Sending test packet")
+		peerAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 5), Port: 80}
+		_, err = relayConn.WriteTo([]byte("test"), peerAddr)
+		assert.NoError(t, err, "should succeed")
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		checkAuthEvent(t, event, "CreatePermission", true)
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		assert.Equal(t, onPermissionCreated, event.Type, "should receive an OnPermissionCreated event")
+		checkAllocationEvent(t, event)
+		assert.Equal(t, relayConn.LocalAddr().String(), event.relayAddr.String())
+		assert.Equal(t, 0, event.requestedPort)
+		assert.Equal(t, "1.2.3.5", event.peer)
+
+		log.Debug("Forcing the creation of a channel")
+		_, err = relayConn.WriteTo([]byte("test"), peerAddr)
+		assert.NoError(t, err, "should succeed")
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		checkAuthEvent(t, event, "ChannelBind", true)
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		assert.Equal(t, onChannelCreated, event.Type, "should receive an OnChannelCreated event")
+		checkAllocationEvent(t, event)
+		assert.Equal(t, relayConn.LocalAddr().String(), event.relayAddr.String())
+
+		// obtain the channel id
+		a := virtNet.server.allocationManagers[0].GetAllocation(&allocation.FiveTuple{
+			Protocol: allocation.UDP,
+			SrcAddr:  event.srcAddr,
+			DstAddr:  event.dstAddr,
+		})
+		assert.NotNil(t, a)
+		channelBind := a.GetChannelByAddr(peerAddr)
+		assert.NotNil(t, channelBind)
+		assert.Equal(t, channelBind.Number, proto.ChannelNumber(event.channelNumber))
+
+		log.Debug("Closing relay connection")
+		assert.NoError(t, relayConn.Close(), "relay conn close should succeed")
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		assert.Equal(t, onAuth, event.Type, "should receive an OnAuth event")
+		checkAuthEvent(t, event, "Refresh", true)
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		assert.Equal(t, onPermissionDeleted, event.Type, "should receive an OnPermissionDeleted event")
+		checkAllocationEvent(t, event)
+		assert.Equal(t, relayConn.LocalAddr().String(), event.relayAddr.String())
+		assert.Equal(t, "1.2.3.5", event.peer)
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		assert.Equal(t, onChannelDeleted, event.Type, "should receive an OnChannelDeleted event")
+		checkAllocationEvent(t, event)
+		assert.Equal(t, relayConn.LocalAddr().String(), event.relayAddr.String())
+		assert.Equal(t, channelBind.Number, proto.ChannelNumber(event.channelNumber))
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		assert.Equal(t, onAllocationDeleted, event.Type, "should receive an OnAllocationDeleted event")
+		checkAllocationEvent(t, event)
+
+		assert.Eventually(t, func() bool { return counter.Load() == 4 }, timeout, interval)
+	})
+
+	t.Run("AuthEventHandlerSuccess", func(t *testing.T) {
+		counter := &atomic.Int32{}
+		virtNet, err := buildVNet(testEventHandler(nil, counter))
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, virtNet.Close())
+		}()
+
+		lconn, err := virtNet.netL0.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+		assert.NoError(t, err, "should succeed")
+		defer func() {
+			assert.NoError(t, lconn.Close())
+		}()
+
+		log.Debug("creating a client.")
+		client, err := NewClient(&ClientConfig{
+			TURNServerAddr: turnAddr,
+			Conn:           lconn,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err, "should succeed")
+		assert.NoError(t, client.Listen(), "should succeed")
+		defer client.Close()
+
+		log.Debug("sending an allocate request.")
+		relayConn, err := client.Allocate()
+		assert.NoError(t, err, "should succeed")
+
+		log.Debug("Closing relay connection")
+		assert.NoError(t, relayConn.Close(), "relay conn close should succeed")
+
+		assert.Eventually(t, func() bool { return counter.Load() == 2 }, timeout, interval)
+	})
+
+	t.Run("AuthEventHandlerFailure", func(t *testing.T) {
+		counter := &atomic.Int32{}
+		events := make(chan eventHandlerArgs, 5)
+		defer close(events)
+		virtNet, err := buildVNet(testEventHandler(events, counter))
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, virtNet.Close())
+		}()
+
+		lconn, err := virtNet.netL0.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+		assert.NoError(t, err, "should succeed")
+		defer func() {
+			assert.NoError(t, lconn.Close())
+		}()
+
+		log.Debug("creating a client.")
+		client, err := NewClient(&ClientConfig{
+			TURNServerAddr: turnAddr,
+			Conn:           lconn,
+			Username:       testUser,
+			Password:       "wrong-pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		assert.NoError(t, err, "should succeed")
+		assert.NoError(t, client.Listen(), "should succeed")
+		defer client.Close()
+
+		log.Debug("sending an allocate request.")
+		_, err = client.Allocate()
+		assert.Error(t, err, "should not succeed")
+
+		event, ok := expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		checkAuthEvent(t, event, "Allocate", false)
+
+		event, ok = expectEvent(events)
+		assert.True(t, ok, "should receive an event")
+		assert.Equal(t, onAllocationError, event.Type, "should receive an OnAllocationError event")
+		udpAddr, ok := event.srcAddr.(*net.UDPAddr)
+		assert.True(t, ok)
+		assert.Equal(t, udpAddr.IP.String(), "5.6.7.8")
+		assert.Equal(t, "UDP", event.protocol)
+
+		assert.Eventually(t, func() bool { return counter.Load() == 1 }, timeout, interval)
+	})
+}
+
+func TestSTUNOnly(t *testing.T) {
+	serverAddr, err := net.ResolveUDPAddr("udp4", testAddr)
+	assert.NoError(t, err)
+
+	serverConn, err := net.ListenPacket(serverAddr.Network(), serverAddr.String()) // nolint: noctx
+	assert.NoError(t, err)
+
+	defer serverConn.Close() //nolint:errcheck
+
+	server, err := NewServer(ServerConfig{
+		PacketConnConfigs: []PacketConnConfig{{
+			PacketConn: serverConn,
+		}},
+		Realm:         "pion.ly",
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+
+	defer server.Close() //nolint:errcheck
+
+	conn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	client, err := NewClient(&ClientConfig{
+		Conn:           conn,
+		STUNServerAddr: testAddr,
+		TURNServerAddr: testAddr,
+		Username:       testUser,
+		Password:       "pass",
+		Realm:          "pion.ly",
+		LoggerFactory:  logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, client.Listen())
+	defer client.Close()
+
+	reflAddr, err := client.SendBindingRequest()
+	assert.NoError(t, err)
+
+	_, ok := reflAddr.(*net.UDPAddr)
+	assert.True(t, ok)
+
+	_, err = client.Allocate()
+	assert.Equal(t, err.Error(), "Allocate error response (error 400: )")
+
+	assert.NoError(t, conn.Close())
+}
+
+func TestQuotaReached(t *testing.T) {
+	serverAddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3478")
+	assert.NoError(t, err)
+
+	serverConn, err := net.ListenPacket(serverAddr.Network(), serverAddr.String()) // nolint: noctx
+	assert.NoError(t, err)
+
+	defer serverConn.Close() //nolint:errcheck
+
+	credMap := map[string][]byte{
+		"test:1": GenerateAuthKey("test:1", "pion.ly", "pass"),
+		"test:2": GenerateAuthKey("test:2", "pion.ly", "pass"),
+	}
+	allocMap := map[string]int{}
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			if pw, ok := credMap[ra.Username]; ok {
+				return "test", pw, true
+			}
+
+			return "", nil, false
+		},
+		QuotaHandler: func(userID, _ string, _ net.Addr) (ok bool) {
+			if allocMap[userID] > 0 {
+				return false
+			}
+			allocMap[userID]++
+
+			return true
+		},
+		Realm: "pion.ly",
+		PacketConnConfigs: []PacketConnConfig{{
+			PacketConn: serverConn,
+			RelayAddressGenerator: &RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP("127.0.0.1"),
+				Address:      "0.0.0.0",
+			},
+		}},
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+	defer server.Close() //nolint:errcheck
+
+	conn1, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+	defer conn1.Close() //nolint:errcheck
+
+	// First client succeeds
+	client1, err := NewClient(&ClientConfig{
+		Conn:           conn1,
+		STUNServerAddr: testAddr,
+		TURNServerAddr: testAddr,
+		Username:       "test:1",
+		Password:       "pass",
+		Realm:          "pion.ly",
+		LoggerFactory:  logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, client1.Listen())
+	defer client1.Close()
+
+	relayConn, err := client1.Allocate()
+	assert.NoError(t, err)
+	defer relayConn.Close() //nolint:errcheck
+
+	conn2, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+	defer conn2.Close() //nolint:errcheck
+
+	client2, err := NewClient(&ClientConfig{
+		Conn:           conn2,
+		STUNServerAddr: testAddr,
+		TURNServerAddr: testAddr,
+		Username:       "test:2",
+		Password:       "pass",
+		Realm:          "pion.ly",
+		LoggerFactory:  logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, client2.Listen())
+	defer client2.Close()
+
+	_, err = client2.Allocate()
+	assert.Error(t, err)
+	assert.Equal(t, err.Error(), "Allocate error response (error 486: )")
+}
+
+func TestReservation(t *testing.T) {
+	serverAddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3478")
+	assert.NoError(t, err)
+
+	serverConn, err := net.ListenPacket(serverAddr.Network(), serverAddr.String()) // nolint: noctx
+	assert.NoError(t, err)
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			return testUser, GenerateAuthKey(testUser, "pion.ly", "pass"), true
+		},
+		Realm: "pion.ly",
+		PacketConnConfigs: []PacketConnConfig{{
+			PacketConn: serverConn,
+			RelayAddressGenerator: &RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP("127.0.0.1"),
+				Address:      "0.0.0.0",
+			},
+		}},
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+
+	firstConn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	secondConn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	firstClient, err := NewClient(&ClientConfig{
+		Conn:           firstConn,
+		STUNServerAddr: testAddr,
+		TURNServerAddr: testAddr,
+		Username:       testUser,
+		Password:       "pass",
+		Realm:          "pion.ly",
+		LoggerFactory:  logging.NewDefaultLoggerFactory(),
+		evenPort:       true,
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, firstClient.Listen())
+
+	firstAllocation, err := firstClient.Allocate()
+	assert.NoError(t, err)
+
+	firstAllocationAddr, ok := firstAllocation.LocalAddr().(*net.UDPAddr)
+	assert.True(t, ok)
+	assert.Equal(t, firstAllocationAddr.Port%2, 0)
+
+	reservationToken := firstClient.getReservationToken()
+	assert.NotEmpty(t, reservationToken)
+
+	secondClient, err := NewClient(&ClientConfig{
+		Conn:             secondConn,
+		STUNServerAddr:   testAddr,
+		TURNServerAddr:   testAddr,
+		Username:         testUser,
+		Password:         "pass",
+		Realm:            "pion.ly",
+		LoggerFactory:    logging.NewDefaultLoggerFactory(),
+		reservationToken: reservationToken,
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, secondClient.Listen())
+
+	secondAllocation, err := secondClient.Allocate()
+	assert.NoError(t, err)
+
+	secondAllocationAddr, ok := secondAllocation.LocalAddr().(*net.UDPAddr)
+	assert.True(t, ok)
+	assert.Equal(t, firstAllocationAddr.Port+1, secondAllocationAddr.Port)
+
+	firstClient.Close()
+	secondClient.Close()
+	assert.NoError(t, server.Close())
+}
+
+func TestReservation_InvalidToken(t *testing.T) {
+	serverAddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3478")
+	assert.NoError(t, err)
+
+	serverConn, err := net.ListenPacket(serverAddr.Network(), serverAddr.String()) // nolint: noctx
+	assert.NoError(t, err)
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			return testUser, GenerateAuthKey(testUser, "pion.ly", "pass"), true
+		},
+		Realm: "pion.ly",
+		PacketConnConfigs: []PacketConnConfig{{
+			PacketConn: serverConn,
+			RelayAddressGenerator: &RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP("127.0.0.1"),
+				Address:      "0.0.0.0",
+			},
+		}},
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+
+	conn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	client, err := NewClient(&ClientConfig{
+		Conn:             conn,
+		STUNServerAddr:   testAddr,
+		TURNServerAddr:   testAddr,
+		Username:         testUser,
+		Password:         "pass",
+		Realm:            "pion.ly",
+		LoggerFactory:    logging.NewDefaultLoggerFactory(),
+		reservationToken: []byte{105, 99, 86, 84, 103, 97, 108, 112},
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, client.Listen())
+
+	_, err = client.Allocate()
+	assert.Equal(t, err.Error(), "Allocate error response (error 508: )")
+
+	client.Close()
+	assert.NoError(t, server.Close())
+}
+
+func TestReservation_TokenAndEvenPort(t *testing.T) {
+	serverAddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3478")
+	assert.NoError(t, err)
+
+	serverConn, err := net.ListenPacket(serverAddr.Network(), serverAddr.String()) // nolint: noctx
+	assert.NoError(t, err)
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			return testUser, GenerateAuthKey(testUser, "pion.ly", "pass"), true
+		},
+		Realm: "pion.ly",
+		PacketConnConfigs: []PacketConnConfig{{
+			PacketConn: serverConn,
+			RelayAddressGenerator: &RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP("127.0.0.1"),
+				Address:      "0.0.0.0",
+			},
+		}},
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+
+	conn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	client, err := NewClient(&ClientConfig{
+		Conn:             conn,
+		STUNServerAddr:   testAddr,
+		TURNServerAddr:   testAddr,
+		Username:         testUser,
+		Password:         "pass",
+		Realm:            "pion.ly",
+		LoggerFactory:    logging.NewDefaultLoggerFactory(),
+		evenPort:         true,
+		reservationToken: []byte{105, 99, 86, 84, 103, 97, 108, 112},
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, client.Listen())
+
+	_, err = client.Allocate()
+	assert.Equal(t, err.Error(), "Allocate error response (error 400: )")
+
+	client.Close()
+	assert.NoError(t, server.Close())
+}
+
+type dontFragmentConn struct {
+	net.PacketConn
+}
+
+func (c *dontFragmentConn) ReadFrom(buff []byte) (n int, addr net.Addr, err error) {
+	n, addr, err = c.PacketConn.ReadFrom(buff)
+	if err != nil {
+		return
+	}
+
+	stunMsg := &stun.Message{Raw: buff[:n]}
+	if err = stunMsg.Decode(); err != nil {
+		return
+	}
+
+	stunMsg.Attributes = append(stunMsg.Attributes, stun.RawAttribute{Type: stun.AttrDontFragment})
+	stunMsg.Encode()
+
+	copy(buff, stunMsg.Raw)
+	n = len(stunMsg.Raw)
+
+	return
+}
+
+func TestDontFragment(t *testing.T) {
+	serverAddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3478")
+	assert.NoError(t, err)
+
+	serverConn, err := net.ListenPacket(serverAddr.Network(), serverAddr.String()) // nolint: noctx
+	assert.NoError(t, err)
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			return testUser, GenerateAuthKey(testUser, "pion.ly", "pass"), true
+		},
+		Realm: "pion.ly",
+		PacketConnConfigs: []PacketConnConfig{{
+			PacketConn: &dontFragmentConn{serverConn},
+			RelayAddressGenerator: &RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP("127.0.0.1"),
+				Address:      "0.0.0.0",
+			},
+		}},
+		LoggerFactory: logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+
+	conn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	client, err := NewClient(&ClientConfig{
+		Conn:           conn,
+		STUNServerAddr: testAddr,
+		TURNServerAddr: testAddr,
+		Username:       testUser,
+		Password:       "pass",
+		Realm:          "pion.ly",
+		LoggerFactory:  logging.NewDefaultLoggerFactory(),
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, client.Listen())
+
+	_, err = client.Allocate()
+	assert.Equal(t, err.Error(), "Allocate error response (error 420: )")
+
+	client.Close()
+	assert.NoError(t, server.Close())
+}
+
+func TestRelayAddressGeneratorStatic(t *testing.T) {
+	relayAddressGeneratorStatic := &RelayAddressGeneratorStatic{}
+
+	assert.ErrorIs(t, relayAddressGeneratorStatic.Validate(), errRelayAddressInvalid)
+
+	relayAddressGeneratorStatic.RelayAddress = net.ParseIP("127.0.0.1")
+	assert.ErrorIs(t, relayAddressGeneratorStatic.Validate(), errListeningAddressInvalid)
+
+	relayAddressGeneratorStatic.Address = "127.0.0.1"
+	assert.NoError(t, relayAddressGeneratorStatic.Validate())
+}
+
+func TestTLSHandshakeConnectionState(t *testing.T) {
+	loggerFactory := logging.NewDefaultLoggerFactory()
+
+	username := "testuser"
+
+	// Generate CA certificate
+	caCert, caKey, err := generateCACert(t)
+	assert.NoError(t, err)
+
+	// Create CA cert pool for client cert verification
+	caCertPool := x509.NewCertPool()
+	caCertPool.AddCert(caCert)
+
+	// Generate server certificate signed by CA
+	serverCert, err := generateSignedCert(t, "server", caCert, caKey)
+	assert.NoError(t, err)
+
+	// Generate client certificate signed by CA
+	clientCert, err := generateSignedCert(t, username, caCert, caKey)
+	assert.NoError(t, err)
+
+	// Track whether the TLS connection state was received by the auth handler
+	tlsStateReceived := false
+	var receivedCerts []*x509.Certificate
+
+	// Create TLS listener with mTLS (mutual TLS) - server requires client certs
+	tlsListener, err := tls.Listen("tcp4", "127.0.0.1:0", &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    caCertPool,
+	})
+	assert.NoError(t, err)
+	defer tlsListener.Close() //nolint:errcheck
+
+	// Create TURN server with TLS listener and auth handler that validates client certs
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			// Check if TLS connection state is present and has peer certificates
+			if ra.TLS == nil || len(ra.TLS.PeerCertificates) == 0 {
+				return "", nil, false
+			}
+
+			tlsStateReceived = true
+			receivedCerts = ra.TLS.PeerCertificates
+
+			// Validate that the certificate CN matches the username
+			for _, cert := range ra.TLS.PeerCertificates {
+				if cert.Subject.CommonName != ra.Username {
+					continue
+				}
+
+				// Verify the certificate against our CA
+				if _, verifyErr := cert.Verify(x509.VerifyOptions{Roots: caCertPool}); verifyErr != nil {
+					continue
+				}
+
+				// Generate auth key based on the certificate CN
+				return cert.Subject.CommonName, GenerateAuthKey(cert.Subject.CommonName, "pion.ly", ""), true
+			}
+
+			return "", nil, false
+		},
+		ListenerConfigs: []ListenerConfig{
+			{
+				Listener: tlsListener,
+				RelayAddressGenerator: &RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP("127.0.0.1"),
+					Address:      "127.0.0.1",
+				},
+			},
+		},
+		Realm:         "pion.ly",
+		LoggerFactory: loggerFactory,
+	})
+	assert.NoError(t, err)
+	defer server.Close() //nolint:errcheck
+
+	// Connect to the TLS server with a client certificate
+	conn, err := tls.Dial("tcp", tlsListener.Addr().String(), &tls.Config{ // nolint: noctx
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{clientCert},
+		RootCAs:      caCertPool,
+		ServerName:   "server",
+	})
+	assert.NoError(t, err)
+	defer conn.Close() //nolint:errcheck
+
+	// Create TURN client over the TLS connection, using the certificate CN as username
+	client, err := NewClient(&ClientConfig{
+		STUNServerAddr: tlsListener.Addr().String(),
+		TURNServerAddr: tlsListener.Addr().String(),
+		Conn:           NewSTUNConn(conn),
+		Username:       username, // Our test Authhandler requires it matches cert's CN
+		Password:       "",       // Empty password, auth based on certificate
+		Realm:          "pion.ly",
+		LoggerFactory:  loggerFactory,
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, client.Listen())
+	defer client.Close()
+
+	// Make an allocation request which will trigger the auth handler
+	relayConn, err := client.Allocate()
+	assert.NoError(t, err)
+	assert.NotNil(t, relayConn)
+	defer relayConn.Close() //nolint:errcheck
+
+	// Verify that the TLS connection state was properly extracted
+	assert.True(t, tlsStateReceived, "TLS connection state should have been received by auth handler")
+
+	// Verify that peer certificates were received (this validates the fix)
+	assert.NotNil(t, receivedCerts, "Peer certificates should be present in TLS connection state")
+	assert.NotEmpty(t, receivedCerts, "Should have at least one peer certificate")
+
+	// Verify the certificate CN matches what we expect
+	assert.Equal(t, username, receivedCerts[0].Subject.CommonName, "Certificate CN should match")
+}
+
+// generateCACert generates a CA certificate for testing.
+func generateCACert(t *testing.T) (*x509.Certificate, *rsa.PrivateKey, error) {
+	t.Helper()
+
+	// Generate a new RSA private key for CA
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Create a CA certificate template
+	caTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Pion TURN Test CA"},
+			CommonName:   "Test CA",
+		},
+		NotBefore:             time.Now().Add(-5 * time.Minute), // Account for clock skew
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+
+	// Create the CA certificate (self-signed)
+	caCertDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Parse the DER-encoded certificate
+	caCert, err := x509.ParseCertificate(caCertDER)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return caCert, caKey, nil
+}
+
+// generateSignedCert generates a certificate signed by the provided CA.
+func generateSignedCert(
+	t *testing.T,
+	commonName string,
+	caCert *x509.Certificate,
+	caKey *rsa.PrivateKey,
+) (tls.Certificate, error) {
+	t.Helper()
+
+	// Generate a new RSA private key
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Create a certificate template
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject: pkix.Name{
+			Organization: []string{"Pion TURN Test"},
+			CommonName:   commonName,
+		},
+		NotBefore:             time.Now().Add(-5 * time.Minute), // Account for clock skew
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{commonName},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	// Create the certificate signed by the CA
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, caCert, &privateKey.PublicKey, caKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Encode the certificate and private key to PEM format
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+
+	// Create a tls.Certificate
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	return cert, nil
+}
+
+func TestRelayAddressGeneratorPortRange(t *testing.T) {
+	relayAddressGeneratorPortRange := &RelayAddressGeneratorPortRange{}
+
+	t.Run("Validate", func(t *testing.T) {
+		assert.ErrorIs(t, relayAddressGeneratorPortRange.Validate(), errMinPortNotZero)
+
+		relayAddressGeneratorPortRange.MinPort = 5000
+		assert.ErrorIs(t, relayAddressGeneratorPortRange.Validate(), errMaxPortNotZero)
+
+		relayAddressGeneratorPortRange.MaxPort = 6000
+		assert.ErrorIs(t, relayAddressGeneratorPortRange.Validate(), errRelayAddressInvalid)
+
+		relayAddressGeneratorPortRange.RelayAddress = net.ParseIP("127.0.0.1")
+		assert.ErrorIs(t, relayAddressGeneratorPortRange.Validate(), errListeningAddressInvalid)
+
+		relayAddressGeneratorPortRange.Address = "127.0.0.1"
+		assert.NoError(t, relayAddressGeneratorPortRange.Validate())
+	})
+
+	t.Run("One Port", func(t *testing.T) {
+		conn, addr, err := relayAddressGeneratorPortRange.AllocatePacketConn(AllocateListenerConfig{
+			Network:       "udp",
+			RequestedPort: 3478,
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, addr)
+
+		udpAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+		assert.True(t, ok)
+		assert.Equal(t, udpAddr.Port, 3478)
+
+		assert.NoError(t, conn.Close())
+
+		tcpConn, addr, err := relayAddressGeneratorPortRange.AllocateListener(AllocateListenerConfig{
+			Network:       "tcp4",
+			RequestedPort: 3478,
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, addr)
+
+		tcpAddr, ok := tcpConn.Addr().(*net.TCPAddr)
+		assert.True(t, ok)
+		assert.Equal(t, tcpAddr.Port, 3478)
+
+		assert.NoError(t, tcpConn.Close())
+	})
+
+	t.Run("Range", func(t *testing.T) {
+		conns := []net.PacketConn{}
+		listeners := []net.Listener{}
+
+		for i := 0; i < 25; i++ {
+			conn, addr, err := relayAddressGeneratorPortRange.AllocatePacketConn(AllocateListenerConfig{Network: "udp"})
+			assert.NoError(t, err)
+			assert.NotNil(t, addr)
+			conns = append(conns, conn)
+
+			listener, addr, err := relayAddressGeneratorPortRange.AllocateListener(AllocateListenerConfig{Network: "tcp"})
+			assert.NoError(t, err)
+			assert.NotNil(t, addr)
+			listeners = append(listeners, listener)
+		}
+
+		for i := range conns {
+			udpAddr, ok := conns[i].LocalAddr().(*net.UDPAddr)
+			assert.True(t, ok)
+			assert.True(t, udpAddr.Port >= 5000 && udpAddr.Port <= 6000)
+
+			assert.NoError(t, conns[i].Close())
+
+			tcpAddr, ok := listeners[i].Addr().(*net.TCPAddr)
+			assert.True(t, ok)
+			assert.True(t, tcpAddr.Port >= 5000 && tcpAddr.Port <= 6000)
+
+			assert.NoError(t, listeners[i].Close())
+		}
+	})
+}
+
+func TestNilAddressGenerator(t *testing.T) {
+	generator := &nilAddressGenerator{}
+
+	assert.ErrorIs(t, generator.Validate(), errRelayAddressGeneratorNil)
+
+	_, _, err := generator.AllocatePacketConn(AllocateListenerConfig{})
+	assert.ErrorIs(t, err, errRelayAddressGeneratorNil)
+
+	_, _, err = generator.AllocateListener(AllocateListenerConfig{})
+	assert.ErrorIs(t, err, errRelayAddressGeneratorNil)
+}
+
+func RunBenchmarkServer(b *testing.B, clientNum int) { //nolint:cyclop
+	b.Helper()
+
+	loggerFactory := logging.NewDefaultLoggerFactory()
+	credMap := map[string][]byte{
+		testUser: GenerateAuthKey(testUser, "pion.ly", "pass"),
+	}
+
+	testSeq := []byte("benchmark-data")
+
+	// Setup server
+	serverAddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:3478")
+	if err != nil {
+		b.Fatalf("Failed to resolve server address: %s", err)
+	}
+
+	serverConn, err := net.ListenPacket(serverAddr.Network(), serverAddr.String()) // nolint: noctx
+	if err != nil {
+		b.Fatalf("Failed to allocate server listener at %s:%s", serverAddr.Network(), serverAddr.String())
+	}
+	defer serverConn.Close() //nolint:errcheck
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			if pw, ok := credMap[ra.Username]; ok {
+				return ra.Username, pw, true
+			}
+
+			return "", nil, false
+		},
+		PacketConnConfigs: []PacketConnConfig{{
+			PacketConn: serverConn,
+			RelayAddressGenerator: &RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP("127.0.0.1"),
+				Address:      "0.0.0.0",
+			},
+		}},
+		Realm:         "pion.ly",
+		LoggerFactory: loggerFactory,
+	})
+	if err != nil {
+		b.Fatalf("Failed to start server: %s", err)
+	}
+	defer server.Close() //nolint:errcheck
+
+	// Create a sink
+	sinkAddr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:65432")
+	if err != nil {
+		b.Fatalf("Failed to resolve sink address: %s", err)
+	}
+
+	sink, err := net.ListenPacket(sinkAddr.Network(), sinkAddr.String()) // nolint: noctx
+	if err != nil {
+		b.Fatalf("Failed to allocate sink: %s", err)
+	}
+	defer sink.Close() //nolint:errcheck
+
+	go func() {
+		buf := make([]byte, 1600)
+		for {
+			// Ignore "use of closed network connection" errors
+			if _, _, listenErr := sink.ReadFrom(buf); listenErr != nil {
+				return
+			}
+
+			// Do not care about received data
+		}
+	}()
+
+	// Setup client(s)
+	clients := make([]net.PacketConn, clientNum)
+	for i := 0; i < clientNum; i++ {
+		clientConn, listenErr := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+		if listenErr != nil {
+			b.Fatalf("Failed to allocate socket for client %d: %s", i+1, err)
+		}
+		defer clientConn.Close() //nolint:errcheck
+
+		client, err := NewClient(&ClientConfig{
+			STUNServerAddr: testAddr,
+			TURNServerAddr: testAddr,
+			Conn:           clientConn,
+			Username:       testUser,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			LoggerFactory:  loggerFactory,
+		})
+		if err != nil {
+			b.Fatalf("Failed to start client %d: %s", i+1, err)
+		}
+		defer client.Close()
+
+		if listenErr := client.Listen(); listenErr != nil {
+			b.Fatalf("Client %d cannot listen: %s", i+1, listenErr)
+		}
+
+		// Create an allocation
+		turnConn, err := client.Allocate()
+		if err != nil {
+			b.Fatalf("Client %d cannot create allocation: %s", i+1, err)
+		}
+		defer turnConn.Close() //nolint:errcheck
+
+		clients[i] = turnConn
+	}
+
+	// Run benchmark
+	for j := 0; j < b.N; j++ {
+		for i := 0; i < clientNum; i++ {
+			if _, err := clients[i].WriteTo(testSeq, sinkAddr); err != nil {
+				b.Fatalf("Client %d cannot send to TURN server: %s", i+1, err)
+			}
+		}
+	}
+}
+
+// BenchmarkServer will benchmark the server with multiple simultaneous client connections.
+func BenchmarkServer(b *testing.B) {
+	for i := 1; i <= 4; i++ {
+		b.Run(fmt.Sprintf("client_num_%d", i), func(b *testing.B) {
+			RunBenchmarkServer(b, i)
+		})
+	}
+}

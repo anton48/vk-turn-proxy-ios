@@ -1,0 +1,409 @@
+# Examples
+
+- [turn-server](#turn-server)
+	- [add-software-attribute](#add-software-attribute) - Add custom SOFTWARE attribute to STUN packets
+	- [bw-quota](#bw-quota) - TURN server with per-user bandwidth rate-limiting
+	- [log](#log) - Log all inbound/outbound STUN packets
+	- [simple](#simple) - Minimal TURN server implementation
+	- [simple-quota](#simple-quota) - TURN server with per-user allocation limits
+	- [simple-multithreaded](#simple-multithreaded) - Multi-threaded TURN server for multiple CPU cores
+	- [tcp](#tcp-server) - TURN server listening on TCP
+	- [tls](#tls) - TURN server listening on TLS
+	- [lt-creds](#lt-creds) - Long-term credentials with automatic expiration
+	- [lt-cred-turn-rest](#lt-cred-turn-rest) - Ephemeral REST API credentials
+	- [perm-filter](#perm-filter) - Filter connections with permission handler
+- [turn-client](#turn-client)
+	- [tcp](#tcp-client) - Connect to TURN server via TCP
+	- [tcp-alloc](#tcp-alloc) - Create TCP allocations between peers
+	- [tls](#tls-client) - Connect to TURN server via TLS
+	- [udp](#udp) - Connect to TURN server via UDP
+- [mutual-tls-auth](#mutual-tls-auth) - Mutual TLS authentication example
+
+## turn-server
+
+The `turn-server` directory contains examples that show common Pion
+TURN usages.
+
+All of these except `lt-creds` take the following arguments.
+
+- -users : \<username\>=\<password\>\[,\<username\>=\<password\>,...\]
+  pairs
+- -realm : Realm name (defaults to "pion.ly")
+- -port : Listening port (defaults to 3478)
+- -public-ip : IP that your TURN server is reachable on, for local
+  development then can just be your local IP, avoid using `127.0.0.1` as
+  some browsers discard from that IP.
+
+``` sh
+$ cd simple
+$ go build
+$ ./simple -public-ip 127.0.0.1 -users username=password,foo=bar
+```
+
+The example servers are
+
+#### add-software-attribute
+
+This examples adds the SOFTWARE attribute with the value
+"CustomTURNServer" to every outbound STUN packet. This could be useful
+if you want to add debug info to your outbound packets.
+
+You could also use this same pattern to filter/modify packets if needed.
+
+#### bw-quota
+
+This example demonstrates per-user bandwidth rate limiting. Each user
+(identified by username+realm) gets their own token bucket rate limiter
+that caps total bandwidth usage across all their relay connections.
+
+The implementation wraps the relay `PacketConn` with a rate-limited
+connection that silently drops packets when the quota is exceeded. Both
+upload and download traffic share the same rate limit.
+
+``` sh
+$ cd bw-quota
+$ go build
+$ ./bw-quota -public-ip 127.0.0.1 -users user1=pass1 -bw-limit 12500
+```
+
+The `-bw-limit` flag sets bytes/sec per user (default: 12500 = 100 Kbps).
+Use `-test` to start a built-in TURN client and UDP echo server for
+testing with tools like `iperf`.
+
+See the [bw-quota README](turn-server/bw-quota/README.md) for detailed
+testing instructions with parallel iperf sessions.
+
+#### log
+
+This example logs all inbound/outbound STUN packets. This could be
+useful if you want to store all inbound/outbound traffic or generate
+rich logs.
+
+You could also intercept these reads/writes if you want to filter
+traffic going to/from specific peers.
+
+#### simple
+
+This example is the most minimal invocation of a Pion TURN instance
+possible. It has no custom behavior, and could be a good starting place
+for running your own TURN server.
+
+#### simple-quota
+
+This example extends `simple` by adding a quota handler that limits
+concurrent allocations per user.
+
+Run two instances of `examples/turn-client/udp` and you can see the behavior
+of when a quota is exceeded.
+
+```
+go run ./examples/turn-client/udp -host=127.0.0.1 -user foo=bar -ping
+
+2026/01/10 14:28:09 Failed to allocate: Allocate error response (error 486: )
+```
+
+#### simple-multithreaded
+
+A multithreaded version of the `simple` Pion TURN server, demonstrating
+how to scale a Pion UDP TURN server to multiple CPU cores. By default,
+Pion TURN servers use a single UDP socket that is shared across all
+clients, which limits Pion UDP/TURN servers to a single CPU thread. This
+example passes a configurable number of UDP sockets to the TURN server,
+which share the same local `address:port` pair using the `SO_REUSEPORT`
+socket option. This then lets the server to create a separate readloop
+to drain each socket. The OS kernel will distribute packets received on
+the `address:port` pair across the sockets by the IP 5-tuple, which
+makes sure that all packets of a TURN allocation will be correctly
+processed in a single readloop.
+
+#### tcp (server)
+
+This example demonstrates listening on TCP. You could combine this
+example with `simple` and you will have a Pion TURN instance that is
+available via TCP and UDP.
+
+#### tls
+
+This example demonstrates listening on TLS. You could combine this
+example with `simple` and you will have a Pion TURN instance that is
+available via TLS and UDP.
+
+#### ipv6 (server)
+
+This example demonstrates a TURN server with IPv6 support (RFC 6156).
+The server listens on all IPv6 interfaces (`[::]`) and allocates IPv6
+relay addresses to clients that request them.
+
+``` sh
+$ cd ipv6
+$ go build
+$ ./ipv6 -public-ip 2001:db8::1 -users username=password
+```
+
+For local testing with IPv6 localhost:
+
+``` sh
+$ ./ipv6 -public-ip ::1 -users username=password
+```
+
+This example shows how to configure a TURN server for IPv6 clients,
+which is essential for environments where IPv4 addresses are limited or
+IPv6-only networks.
+
+#### lt-creds
+
+This example shows how to use long term credentials. You can issue
+passwords that automatically expire, and you don't have the store them.
+
+The only downside is that you can't revoke a single username/password.
+You need to rotate the shared secret. Instead of `users` it has the
+follow arguments instead
+
+- -authSecret : Shared secret for the Long Term Credential Mechanism
+
+#### lt-cred-turn-rest
+
+This example shows how to use ephemeral credentials, generated by a REST
+API, with the user part formatted as `timestamp:username`.
+
+The REST API and TURN server use the same shared secret to compute the
+credentials.
+
+The timestamp part specifies when the credentials will expire.
+
+This mechanism is described in
+https://datatracker.ietf.org/doc/html/draft-uberti-behave-turn-rest-00
+
+- -authSecret : Shared secret for the ephemeral Credential Mechanism
+
+#### perm-filter
+
+This example demonstrates the use of a permission handler in the PION
+TURN server. The example implements a filtering policy that lets clients
+to connect back to their own host or server-reflexive address but will
+drop everything else. This will let the client ping-test through but
+will block essentially all other peer connection attempts.
+
+## turn-client
+
+The `turn-client` directory contains 3 examples that show common Pion
+TURN usages.
+
+All of these examples except `tcp-alloc` take the following arguments.
+
+- -host : TURN server host
+- -ping : Run ping test
+- -port : Listening port (defaults to 3478)
+- -realm : Realm name (defaults to "pion.ly")
+- -user : \<username\>=\<password\> pair
+
+#### tcp (client)
+
+Dials the requested TURN server via TCP
+
+#### tls (client)
+
+Dials the requested TURN server via TLS
+
+``` sh
+$ cd tls
+$ go build
+$ ./tls -host <turn-server-name> -user=user=pass
+```
+
+If the server uses certificates signed by a private CA, use `-ca` to specify the CA certificate:
+
+``` sh
+$ ./tls -host <turn-server-name> -user=user=pass -ca /path/to/ca.crt
+```
+
+Or skip verification altogether with `-insecure`:
+
+``` sh
+$ ./tls -host <turn-server-name> -user=user=pass -insecure
+```
+
+By adding `-ping`, it will perform a ping test.
+
+``` sh
+$ ./tls -host <turn-server-name> -user=user=pass -insecure -ping
+```
+
+**Note:** This example uses password-based authentication over TLS. For certificate-based authentication (mutual TLS), see the [mutual-tls-auth](#mutual-tls-auth) example.
+
+#### udp
+
+Dials the requested TURN server via UDP
+
+``` sh
+$ cd udp
+$ go build
+$ ./udp -host <turn-server-name> -user=user=pass
+```
+
+By adding `-ping`, it will perform a ping test. (it internally creates a
+'pinger' and send a UDP packet every second, 10 times then exits.
+
+``` sh
+$ go build
+./turn-client -host <turn-server-name> -user=user=pass -ping
+```
+
+#### ipv6 (client)
+
+Dials the requested TURN server via IPv6 (RFC 6156). This example
+demonstrates how to request IPv6 relay allocations from a TURN server.
+
+``` sh
+$ cd ipv6
+$ go build
+$ ./ipv6 -host 2001:db8::1 -user username=password
+```
+
+For local testing with IPv6 localhost:
+
+``` sh
+$ ./ipv6 -host ::1 -user username=password
+```
+
+With `-ping`, it will perform a ping test over IPv6:
+
+``` sh
+$ ./ipv6 -host ::1 -user username=password -ping
+```
+
+This client sets `RequestedAddressFamily` to `proto.RequestedFamilyIPv6`
+to request an IPv6 relay allocation. The server must support IPv6 and be
+configured to listen on IPv6 addresses.
+
+Following diagram shows what turn-client does:
+
+              +----------------+
+              |   TURN Server  |
+              |                |
+              +---o--------o---+
+      TURN port  /^      / ^\
+           3478_/ |     /  | \_relayConn (*1)
+                  |    /   |
+                  |  _/    |
+      mappedAddr_ | /      | ___external IP:port
+           (*2)  \|v       |/    for pingerConn
+              +---o--------o---+     (*3)
+              |   |   NAT  |   |
+              +----------------+
+                  |        |
+      TURN    ___ |        | __pingerConn
+      listen     \|        |/     (sends `ping` to relayConn)
+      port    +---o--------o---+
+      (conn)  |   turn-client  |
+              +----------------+
+
+> (\*1) The relayConn actually lives in the local turn-client, but it
+> acts as if it is listening on the TURN server. In fact,
+> relayConn.LocalAddr() returns a transport address on which the TURN
+> server is listening.
+
+> (*2) For relayConn to send/receive packet to/from (*3), you will need
+> to give relayConn permission to send/receive packet to/from the IP
+> address. In the example code, this is done by sending a packet,
+> "Hello" (content does not matter), to the mappedAddr. (assuming the IP
+> address of mappedAddr and the external IP:port (*3) are the same) This
+> process is known as "UDP hole punching" and TURN server exhibits
+> "Address-restricted" behavior. Once it is done, packets coming from
+> (*3) will be received by relayConn.
+
+#### tcp-alloc
+
+The `tcp-alloc` exemplifies how to create client TCP allocations and use
+them to exchange messages between peers. It simulates two clients and
+creates a TCP allocation for each. Then, both clients exchange their
+relayed addresses with each other through a signaling server. Finally,
+each client uses its TCP allocation and the relayed address of the other
+client to send and receive a single message.
+
+The `tcp-alloc` takes the following arguments:
+
+- -host : TURN server host
+- -port : Listening port (defaults to 3478)
+- -user : \<username\>=\<password\> pair
+- -realm : Realm name (defaults to "pion.ly")
+- -signaling : Run the signaling server
+
+To run the example:
+
+1)  Start one client and the signaling server used to exchange the
+    relayed addresses:
+
+``` sh
+go build
+./tcp-alloc -host <turn-server-name> -port <port> -user=<username=password> -signaling=true
+```
+
+2)  Start the other client without starting the signaling server:
+
+``` sh
+./tcp-alloc -host <turn-server-name> -port <port> -user=<username=password> -signaling=false
+```
+
+A Coturn TURN server can be locally deployed and used for testing with
+the following command (this is a test configuration of the Coturn TURN
+server and should not be used for production):
+
+``` sh
+/bin/turnserver -lt-cred-mech -u <username:password> -r pion.ly --allow-loopback-peers --cli-password=<clipassword>
+```
+
+> If using this Coturn TURN server deployment: \* turn-server-name :
+> 127.0.0.1 \* port : 3478
+
+## mutual-tls-auth
+
+The `mutual-tls-auth` directory contains an end-to-end example of how to use client TLS certificates for authentication of TURN clients. To be precise, the example demonstrates mutual TLS (mTLS) where both the client and server ensure each other present a TLS certificate signed by the same trusted Certificate Authority (CA).
+
+**Authentication Model:** Unlike other examples that use a static list of username/password pairs, this example uses certificate-based authentication. The server trusts any client with a certificate signed by the trusted CA. Normally, the username:password combination is used for message integrity, but this is unnecessary here because TLS itself provides integrity and authentication through the certificate validation.
+
+> In this example, the AuthHandler derives the auth key from the certificate's CommonName (treating it as the username) and an empty string as the password. Note that it doesn't matter which part of the certificate is used to derive the auth key (CommonName, serial number, SANs, etc.), or even if no part of the certificate is used, as long as the client and server agree on the scheme and arrive at the same value.
+
+To run the example:
+
+1) Generate demo certificates (CA, server, and client certificates)
+
+```
+make generate-certs
+```
+
+<details>
+
+<summary>Show step-by-step with `openssl` commands</summary>
+
+- i) Generate CA certificate:
+
+```
+openssl req -new -x509 -days 365 -keyout ca.key -out ca.crt -nodes -subj "/O=pion.ly/CN=Pion Certificate Authority Root"
+```
+
+- ii) Generate client's certificate:
+
+```
+openssl req -new -newkey rsa:2048 -nodes -keyout client.key -subj "/O=pion.ly/CN=turn-client" | openssl x509 -req -CA ca.crt -CAkey ca.key -set_serial $RANDOM -out client.crt -days 1
+```
+
+- iii) Generate server's certificate:
+
+```
+openssl req -new -newkey rsa:2048 -nodes -keyout server.key -subj "/O=pion.ly/CN=turn-server" -addext "subjectAltName=DNS:localhost" | openssl x509 -req -CA ca.crt -CAkey ca.key -set_serial $RANDOM -out server.crt -days 1 -copy_extensions copyall
+```
+
+</details>
+
+2) Run the TURN server
+
+```
+make run-server
+```
+
+3) Run the TURN client
+
+```
+make run-client
+```

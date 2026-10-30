@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
+// SPDX-License-Identifier: MIT
+
+// Package main implements a TURN server with TLS support
+package main
+
+import (
+	"crypto/tls"
+	"flag"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+
+	"github.com/pion/turn/v5"
+)
+
+func main() {
+	publicIP := flag.String("public-ip", "", "IP Address that TURN can be contacted by.")
+	port := flag.Int("port", 5349, "Listening port.")
+	users := flag.String("users", "", "List of username and password (e.g. \"user=pass,user=pass\")")
+	realm := flag.String("realm", "pion.ly", "Realm (defaults to \"pion.ly\")")
+	certFile := flag.String("cert", "server.crt", "Certificate (defaults to \"server.crt\")")
+	keyFile := flag.String("key", "server.key", "Key (defaults to \"server.key\")")
+	flag.Parse()
+
+	if len(*publicIP) == 0 {
+		log.Fatalf("'public-ip' is required")
+	} else if len(*users) == 0 {
+		log.Fatalf("'users' is required")
+	}
+
+	cer, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	if err != nil {
+		log.Println(err)
+
+		return
+	}
+
+	// Create a TLS listener to pass into pion/turn
+	// pion/turn itself doesn't allocate any TLS listeners, but lets the user pass them in
+	// this allows us to add logging, storage or modify inbound/outbound traffic
+	tlsListener, err := tls.Listen("tcp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(*port)), &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cer},
+	})
+	if err != nil {
+		log.Println(err)
+
+		return
+	}
+
+	// Cache -users flag for easy lookup later
+	// If passwords are stored they should be saved to your DB hashed using turn.GenerateAuthKey
+	usersMap := map[string][]byte{}
+	for _, userPass := range strings.Split(*users, ",") {
+		parts := strings.SplitN(userPass, "=", 2)
+		if len(parts) != 2 {
+			log.Fatalf("Invalid user credential format '%s': expected 'username=password'", userPass)
+		}
+		usersMap[parts[0]] = turn.GenerateAuthKey(parts[0], *realm, parts[1])
+	}
+
+	server, err := turn.NewServer(turn.ServerConfig{
+		Realm: *realm,
+		// Set AuthHandler callback
+		// This is called every time a user tries to authenticate with the TURN server
+		// Return the key for that user, or false when no user is found
+		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
+			if key, ok := usersMap[ra.Username]; ok {
+				return ra.Username, key, true
+			}
+
+			return "", nil, false
+		},
+		// ListenerConfig is a list of Listeners and the configuration around them
+		ListenerConfigs: []turn.ListenerConfig{
+			{
+				Listener: tlsListener,
+				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP(*publicIP),
+					Address:      "0.0.0.0",
+				},
+			},
+		},
+	})
+	if err != nil {
+		log.Panic(err)
+	}
+
+	// Block until user sends SIGINT or SIGTERM
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	<-sigs
+
+	if err = server.Close(); err != nil {
+		log.Panic(err)
+	}
+}
