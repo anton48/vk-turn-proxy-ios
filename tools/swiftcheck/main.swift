@@ -4589,6 +4589,14 @@ do {
     check(cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || s.lowercased() == turnServersVK"), "🚨 an override entry may carry the quota field")
     let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
     check(tm.contains("let s = ConfigValidation.turnOverrideQuota(entry)?.hostPort ?? entry"), "🚨 the pre-resolution strips the quota field before it reads the host (else the host would be host:port)")
+    // A list typed without its quota field read as a quota defect: the parsed
+    // list and the resolved one both hide what the field held. The log says the
+    // field's own text, entries the parser dropped included.
+    check(tm.contains("turnServerOverrideText: s.turnServerOverride,"), "the config carries the override field's own text, unparsed")
+    let written = tm.range(of: "TURN relay override as written in the settings:")
+    let resolve = tm.range(of: "let overrideHosts = TunnelConfig.turnOverrideHosts(config.turnServerOverrides)")
+    check(written != nil && resolve != nil && written!.lowerBound < resolve!.lowerBound, "🚨 the connect logs the override as written before anything acts on the list")
+    check(tm.contains("as written in the settings: \\(config.turnServerOverrideText"), "🚨 the line says the field's text, not the parsed list")
 }
 
 print("")

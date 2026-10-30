@@ -172,6 +172,7 @@ extension TunnelConfig {
             numConnections: s.numConnections,
             credPoolCooldownSeconds: s.credPoolCooldownSeconds,
             turnServerOverrides: turnServers,
+            turnServerOverrideText: s.turnServerOverride,
             serverID: s.id,
             serverName: s.serverName
         )
@@ -510,6 +511,9 @@ class TunnelManager: ObservableObject {
             // (EADDRNOTAVAIL) on the VK resolve/dial below can be correlated
             // with whether the device actually has a usable IPv4 source address.
             logNetworkInterfaces()
+            if !config.turnServerOverrideText.isEmpty {
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: TURN relay override as written in the settings: \(config.turnServerOverrideText)")
+            }
             let overrideHosts = TunnelConfig.turnOverrideHosts(config.turnServerOverrides) // the list's DNS names (#105)
             let vkHostIPs = await Task.detached(priority: .userInitiated) { [self] in
                 self.resolveVKHosts(extra: overrideHosts)
@@ -3520,6 +3524,9 @@ struct TunnelConfig {
     /// out — cached credentials included; the relays are tried in order and a
     /// relay that stops answering is marked, the next one taken. Empty = VK's.
     var turnServerOverrides: [String] = []
+    /// The override field as the user wrote it, for the log alone: the parsed
+    /// list drops what it cannot read and the resolved one hides the rest.
+    var turnServerOverrideText: String = ""
     /// WHICH profile this config was built from. Carried so the one place that
     /// starts a tunnel can record what the session is running (SessionServer.swift).
     /// A caller cannot forget to pass it, which is the point: the previous
