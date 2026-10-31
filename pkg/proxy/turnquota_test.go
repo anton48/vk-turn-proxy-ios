@@ -4,7 +4,9 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -239,6 +241,108 @@ func TestCookieModeTheMintForAVKSlotAvoidsARelayInQuarantine(t *testing.T) {
 	for _, f := range []string{"credpool.go", "proxy.go"} {
 		if !strings.Contains(goFile(t, f), ".heldRelaysExcept(slot), ") || !strings.Contains(goFile(t, f), ".quarantinedRelays())") {
 			t.Fatalf("%s: the pool's cookie fetch does not tell cookieCredForSlot the quarantined relays", f)
+		}
+	}
+}
+
+// 2026-10-31, the stand (459, own.parked.log): anonymous mode, a restart within
+// ten minutes of a session through VK with the list `O:0,$vkurls` — every slot
+// of the console's pool of four was pending by VK's clock (lastUsedAt + 10 min)
+// and twenty connections parked for 95 s with "no slot available". Readiness
+// read the entry's clock whatever relay the slot dials; the clock is VK's seats
+// on the credential, and a relay without a quota holds none of them.
+
+// The stand's shape: a pool of four, every slot pending by VK's clock, the list
+// O:0,$vkurls — twenty connections on slot 0's O at once, no mint, no park, and
+// the override says why. The clock is KEPT: once O is marked the slot dials
+// VK's relays, whose seats the credential may still hold — not fresh, VK's cap,
+// nobody seated on it at VK inside the clock.
+func TestAnonModeASlotPendingByVKsClockIsReadyOnARelayWithoutAQuota(t *testing.T) {
+	used := time.Now().Add(-2 * time.Minute).Unix()
+	var entries []credCacheEntry
+	for slot := 0; slot < 4; slot++ {
+		entries = append(entries, credCacheEntry{Slot: slot, Address: relayA, Addresses: []string{relayA, relayB},
+			Username: futureUser(fmt.Sprintf("used-%d", slot)), Password: "p", LastUsedAt: used})
+	}
+	path := writeCache(t, t.TempDir(), entries...)
+	cp, mints, _ := relayPoolN(t, path, 4, relayC)
+	logged := captureLog(t)
+	list, err := ParseTURNServers(relayO + ":0," + TURNServersVK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp.setOverride(turnOverride{servers: list})
+	var held []*TURNCreds
+	for conn := 0; conn < 20; conn++ {
+		addr, creds, slot := mustGet(t, cp, conn)
+		if addr != relayO || slot != 0 {
+			t.Fatalf("conn %d: %q on slot %d — want every connection on slot 0's %s (no quota) although the slot is pending by VK's clock", conn, addr, slot, relayO)
+		}
+		held = append(held, creds)
+	}
+	if mints.Load() != 0 || cp.pool[0].active != 20 {
+		t.Fatalf("mints %d, slot 0 active %d — want no mint, twenty seats on the one credential", mints.Load(), cp.pool[0].active)
+	}
+	cp.mu.Lock()
+	avail, pending := cp.pool[0].availableAt, cp.pendingLocked(0)
+	cp.mu.Unlock()
+	if avail.IsZero() || !time.Now().Before(avail) {
+		t.Fatalf("slot 0's VK clock erased: availableAt %v — want kept for the fallback to VK's relays", avail)
+	}
+	if pending {
+		t.Fatalf("slot 0 is pending to the mint paths while it dials %s (no quota) — it is ready there", relayO)
+	}
+	if !strings.Contains(logged(), "pending by VK's clock") {
+		t.Fatalf("the override does not say the pending slots are ready on %s:\n%s", relayO, logged())
+	}
+	cp.health.answered("", time.Time{})
+	cp.noteRelayUnanswered(0, 0, held[0], relayO, time.Now())
+	cp.mu.Lock()
+	fresh, pending, cap0, after := cp.isFreshLocked(0), cp.pendingLocked(0), cp.capLocked(0), cp.pool[0].availableAt
+	cp.mu.Unlock()
+	if fresh || !pending || cap0 != connsPerSlot || !after.Equal(avail) {
+		t.Fatalf("slot 0 after O is marked: fresh %v, pending %v, cap %d, availableAt %v (was %v) — want VK's clock applied again (pending, not fresh), VK's cap, the clock untouched", fresh, pending, cap0, after, avail)
+	}
+	if _, _, slot, err := cp.get(20, false); err == nil && slot == 0 {
+		t.Fatalf("conn 20 seated on slot 0 at VK inside the credential's clock")
+	}
+}
+
+// Every readiness question about a LIVE slot is asked of the slot — the
+// relay-aware wrappers isFreshLocked / pendingLocked / availableLocked — never
+// of the entry alone: that was the defect's shape (release, Phase 2, tryFill,
+// pickSlotToFill, the counts and the transition log all read entryIsFresh /
+// entryIsPending off cp.pool[...] before 460).
+func TestEveryReadinessQuestionAboutASlotIsAskedOfTheSlot(t *testing.T) {
+	allowed := map[string]bool{
+		"func entryIsFresh(": true, "func entryIsPending(": true, "func entryCredValid(": true,
+		"func (cp *credPool) isFreshLocked(": true, "func (cp *credPool) pendingLocked(": true,
+		"func (cp *credPool) availableLocked(": true, "func (cp *credPool) sayReadyDespiteTheClockLocked(": true,
+	}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		for _, fn := range strings.Split(goFile(t, f), "\nfunc ")[1:] {
+			head := "func " + fn[:strings.Index(fn, "{")+1]
+			ok := false
+			for a := range allowed {
+				if strings.HasPrefix(head, a) {
+					ok = true
+				}
+			}
+			if ok {
+				continue
+			}
+			for _, bare := range []string{"entryIsFresh(", "entryIsPending(", "entryIsAvailable(", "entryCredValid("} {
+				if strings.Contains(fn, bare) {
+					t.Errorf("%s: %s asks %s of the entry — ask the slot (isFreshLocked / pendingLocked / availableLocked): the entry's clock is VK's, not the relay's the slot dials now", f, strings.TrimSpace(head), bare)
+				}
+			}
 		}
 	}
 }

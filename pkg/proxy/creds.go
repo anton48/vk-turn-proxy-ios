@@ -2437,7 +2437,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		if cp.isFreshLocked(slot) {
 			continue // saturated-fresh, must not be replaced
 		}
-		if entryIsPending(cp.pool[slot]) {
+		if cp.pendingLocked(slot) {
 			continue // disk-loaded, waiting on saturation cooldown
 		}
 		if now.Before(cp.pool[slot].cooldownUntil) {
@@ -2711,7 +2711,7 @@ func (cp *credPool) release(slot int, creds *TURNCreds) {
 	//
 	//   1. Slot was at the per-slot cap before this release. Otherwise
 	//      it already had room and conns weren't blocked on it.
-	//   2. entryIsFresh — slot's cred isn't expired/expiring/pending.
+	//   2. isFreshLocked — slot's cred isn't expired/expiring/pending.
 	//      Observed in vpn.wifi.5.log: slot 0's cred crossed the 30m
 	//      expiry buffer ~4 min after startup; without this guard, every
 	//      conn dying on that now-stale slot would wake 10 parked conns
@@ -2719,7 +2719,7 @@ func (cp *credPool) release(slot int, creds *TURNCreds) {
 	//   3. Not VK-saturated — get()'s Phase 1 explicitly skips saturated
 	//      slots even when fresh and below cap.
 	slotBecomesUsable := cp.pool[slot].active == cp.capLocked(slot) &&
-		entryIsFresh(cp.pool[slot]) &&
+		cp.isFreshLocked(slot) &&
 		!time.Now().Before(cp.pool[slot].saturatedUntil)
 	if cp.pool[slot].active > 0 {
 		cp.pool[slot].active--
@@ -3233,7 +3233,7 @@ func (cp *credPool) tryFill(slot int, allowCaptchaBlock bool, abortIfAvailableGT
 	// for the background grower, but a direct tryFill caller (none in
 	// the current code, but harmless future-proofing) shouldn't waste
 	// a VK fetch on a slot that's about to become usable on its own.
-	if entryIsPending(cp.pool[slot]) {
+	if cp.pendingLocked(slot) {
 		cp.mu.Unlock()
 		return true // pending counts as "filled" — the cred is there, just not yet usable
 	}
@@ -3413,10 +3413,10 @@ func (cp *credPool) pickSlotToFill() int {
 	now := time.Now()
 	for i := 0; i < cp.size; i++ {
 		e := cp.pool[i]
-		if entryIsFresh(e) {
+		if cp.isFreshLocked(i) {
 			continue // fresh (cred not yet near expiry)
 		}
-		if entryIsPending(e) {
+		if cp.pendingLocked(i) {
 			continue // loaded from disk, waiting on saturation cooldown
 		}
 		if e.fetching {
@@ -3580,24 +3580,81 @@ func (cp *credPool) distinctRelays() int {
 }
 
 // isFreshLocked assumes cp.mu is held. A slot is fresh iff it holds creds
-// AND those creds will still be valid on VK's TURN server credExpiryBuffer
-// from now (see parseCredExpiry for the expiry source).
+// that will still be valid on the TURN server credExpiryBuffer from now (see
+// parseCredExpiry for the expiry source) AND — on a relay WITH a quota — the
+// entry's clock (availableAt) has run out. That clock is VK's: the seats the
+// credential may still hold at VK's relays after the last session. A slot
+// whose connections dial a relay WITHOUT a quota now (unlimitedRelayLocked)
+// holds no seat there, so it is ready whatever the clock says; the clock is
+// KEPT on the entry — once that relay is marked the slot's first alive
+// candidate is VK's again and the clock applies (2026-10-31, the stand's
+// `O:0,$vkurls` restart within ten minutes of a session through VK: four
+// slots pending, twenty connections parked for 95 s with no slot to mint).
+// Every readiness question about a live slot goes through this, pendingLocked
+// or availableLocked, never through the entry alone (the scan test).
 func (cp *credPool) isFreshLocked(slot int) bool {
 	if slot < 0 || slot >= len(cp.pool) {
 		return false
 	}
+	if cp.unlimitedRelayLocked(slot) != "" {
+		return entryCredValid(cp.pool[slot])
+	}
 	return entryIsFresh(cp.pool[slot])
 }
 
-// entryIsFresh is the slot-agnostic version, used by isFreshLocked /
-// countFreshLocked / pickSlotToFill on already-snapshotted entries.
+// pendingLocked assumes cp.mu is held: the slot holds a valid credential that
+// waits for VK's clock on a relay WITH a quota. get()'s Phase 2, tryFill and
+// pickSlotToFill leave such a slot alone — we'd rather wait ~10 min for the
+// prior session's allocations to expire on VK's side than spend 10-30 min
+// chasing a fresh cred through PoW on a hostile day; once availableAt passes
+// the slot is fresh on its own. On a relay without a quota the same entry is
+// fresh now (isFreshLocked), not pending.
+func (cp *credPool) pendingLocked(slot int) bool {
+	if slot < 0 || slot >= len(cp.pool) {
+		return false
+	}
+	return entryIsPending(cp.pool[slot]) && cp.unlimitedRelayLocked(slot) == ""
+}
+
+// availableLocked assumes cp.mu is held: the slot can hand out new TURN
+// allocations RIGHT NOW — fresh AND no active VK-side saturation cooldown.
+// Used by the StatsView "available" count so the user sees the actual
+// usable-slot count, not a misleading total when all slots are saturated.
+// isFreshLocked alone does NOT check saturatedUntil — it was designed for
+// cred-validity checks, not runtime usability.
 //
-// "Fresh" means the cred is usable RIGHT NOW: it has a valid VK-side
-// expiry far enough in the future, and any saturation cooldown from
-// a prior session has elapsed. Pending-but-loaded creds (creds != nil
-// AND availableAt is in the future) are NOT fresh — get() will skip
-// them so conns don't 486 against still-live allocations.
-func entryIsFresh(e credPoolEntry) bool {
+// Example: build 72 on 2026-05-10 23:03 had pool=8 with all 8 slots
+// holding fresh creds (fresh for all) but all 8 also marked VK-saturated by
+// smart-pause. UI showed "Pool 8/8/8" misleadingly when reality was 0
+// usable. This predicate would have correctly reported 0.
+func (cp *credPool) availableLocked(slot int) bool {
+	if !cp.isFreshLocked(slot) {
+		return false
+	}
+	e := cp.pool[slot]
+	return e.saturatedUntil.IsZero() || !time.Now().Before(e.saturatedUntil)
+}
+
+// sayReadyDespiteTheClockLocked assumes cp.mu is held: a slot pending by VK's
+// clock that dials a relay without a quota now is said so once, at the
+// override (the load precedes it, so the load's own line says "pending"), so
+// the log reads why a "pending" slot seats connections.
+func (cp *credPool) sayReadyDespiteTheClockLocked(slot int, when string) {
+	if slot < 0 || slot >= len(cp.pool) {
+		return
+	}
+	e, relay := cp.pool[slot], cp.unlimitedRelayLocked(slot)
+	if relay == "" || !entryIsPending(e) {
+		return
+	}
+	log.Printf("credpool: %s: slot %d pending by VK's clock (usable at VK in %s) — ready on %s now, which has no quota",
+		when, slot, time.Until(e.availableAt).Round(time.Second), relay)
+}
+
+// entryCredValid: the entry holds a credential still valid on the TURN
+// server credExpiryBuffer from now — the part of "fresh" that is the
+// credential's own, whatever relay the slot dials.
+func entryCredValid(e credPoolEntry) bool {
 	if e.creds == nil {
 		return false
 	}
@@ -3608,7 +3665,20 @@ func entryIsFresh(e credPoolEntry) bool {
 		// cred indefinitely.
 		return false
 	}
-	if !time.Now().Add(credExpiryBuffer).Before(exp) {
+	return time.Now().Add(credExpiryBuffer).Before(exp)
+}
+
+// entryIsFresh is the slot-agnostic predicate behind isFreshLocked — the
+// entry's own view, on a relay with a quota. Never asked of a live slot
+// directly: the slot may dial a relay without a quota (the scan test).
+//
+// "Fresh" means the cred is usable RIGHT NOW: it has a valid VK-side
+// expiry far enough in the future, and any saturation cooldown from
+// a prior session has elapsed. Pending-but-loaded creds (creds != nil
+// AND availableAt is in the future) are NOT fresh — get() will skip
+// them so conns don't 486 against still-live allocations.
+func entryIsFresh(e credPoolEntry) bool {
+	if !entryCredValid(e) {
 		return false
 	}
 	if !e.availableAt.IsZero() && time.Now().Before(e.availableAt) {
@@ -3617,34 +3687,9 @@ func entryIsFresh(e credPoolEntry) bool {
 	return true
 }
 
-// entryIsAvailable reports whether the slot can hand out new TURN
-// allocations RIGHT NOW: cred is fresh AND no active VK-side saturation
-// cooldown. Used by the StatsView "available" count so the user sees the
-// actual usable-slot count, not a misleading total when all slots are
-// saturated. entryIsFresh alone does NOT check saturatedUntil — it was
-// designed for cred-validity checks, not runtime usability.
-//
-// Example: build 72 on 2026-05-10 23:03 had pool=8 with all 8 slots
-// holding fresh creds (entryIsFresh=true for all) but all 8 also marked
-// VK-saturated by smart-pause. UI showed "Pool 8/8/8" misleadingly when
-// reality was 0 usable. entryIsAvailable would have correctly reported 0.
-func entryIsAvailable(e credPoolEntry) bool {
-	if !entryIsFresh(e) {
-		return false
-	}
-	if !e.saturatedUntil.IsZero() && time.Now().Before(e.saturatedUntil) {
-		return false
-	}
-	return true
-}
-
-// entryIsPending reports whether the slot holds a cred that's
-// load-from-disk-pending: present, with a valid expiry, but not yet
-// past its saturation cooldown. pickSlotToFill uses this to leave
-// pending slots alone — we'd rather wait ~10 min for the prior
-// session's allocations to expire on VK's side than spend 10-30 min
-// chasing a fresh cred through PoW on a hostile day. Once availableAt
-// passes the slot transitions to fresh on its own.
+// entryIsPending is the slot-agnostic predicate behind pendingLocked: the
+// entry holds a cred that's load-from-disk-pending — present, with a valid
+// expiry, but not yet past its saturation cooldown.
 func entryIsPending(e credPoolEntry) bool {
 	if e.creds == nil {
 		return false
@@ -3652,18 +3697,14 @@ func entryIsPending(e credPoolEntry) bool {
 	if e.availableAt.IsZero() || !time.Now().Before(e.availableAt) {
 		return false
 	}
-	exp, ok := parseCredExpiry(e.creds.Username)
-	if !ok {
-		return false
-	}
-	return time.Now().Add(credExpiryBuffer).Before(exp)
+	return entryCredValid(e)
 }
 
 // countFreshLocked assumes cp.mu is held.
 func (cp *credPool) countFreshLocked() int {
 	n := 0
-	for _, e := range cp.pool {
-		if entryIsFresh(e) {
+	for i := range cp.pool {
+		if cp.isFreshLocked(i) {
 			n++
 		}
 	}
@@ -3671,12 +3712,12 @@ func (cp *credPool) countFreshLocked() int {
 }
 
 // countAvailableLocked assumes cp.mu is held. Same as countFreshLocked
-// but ALSO excludes saturated slots — see entryIsAvailable. Used for the
+// but ALSO excludes saturated slots — see availableLocked. Used for the
 // UI "available" count.
 func (cp *credPool) countAvailableLocked() int {
 	n := 0
-	for i, e := range cp.pool {
-		if entryIsAvailable(e) && cp.health.hasCandidate(cp.candidatesLocked(i)) {
+	for i := range cp.pool {
+		if cp.availableLocked(i) && cp.health.hasCandidate(cp.candidatesLocked(i)) {
 			n++
 		}
 	}
@@ -3688,7 +3729,7 @@ func (cp *credPool) countAvailableLocked() int {
 // ⚠️ NOT "usable" — this is the Stats UI's MIDDLE number, deliberately the
 // weakest predicate of the three: it ignores both the per-relay cooldown and
 // saturation. Do not use it to decide whether a cred can be handed out; that is
-// entryIsFresh (countFreshLocked) or entryIsAvailable (countAvailableLocked).
+// isFreshLocked (countFreshLocked) or availableLocked (countAvailableLocked).
 // It was called countWithUsableCreds until 2026-07-29, and the cold-start cap
 // above had been reading it as "usable" ever since build 150.
 //
@@ -3728,7 +3769,7 @@ func (cp *credPool) countWithUnexpiredCredsLocked() int {
 	return n
 }
 
-// logFreshTransitionsLocked compares per-slot entryIsFresh against the
+// logFreshTransitionsLocked compares per-slot isFreshLocked against the
 // snapshot stored in freshLastTick from the previous runPeriodicSave
 // tick. For each slot that just transitioned fresh→not-fresh, emits a
 // log line with the inferred reason. Then refreshes freshLastTick for
@@ -3745,8 +3786,8 @@ func (cp *credPool) countWithUnexpiredCredsLocked() int {
 //     in practice)
 //
 // Note: smart-pause / 486 saturation does NOT trigger this log line
-// because entryIsFresh doesn't check saturatedUntil — only
-// entryIsAvailable does. Saturation events have their own log line
+// because isFreshLocked doesn't check saturatedUntil — only
+// availableLocked does. Saturation events have their own log line
 // from markSaturated/applySaturationLocked.
 func (cp *credPool) logFreshTransitionsLocked() {
 	// Resize snapshot on first run or after pool growth. On first run
@@ -3755,14 +3796,14 @@ func (cp *credPool) logFreshTransitionsLocked() {
 	if len(cp.freshLastTick) != len(cp.pool) {
 		cp.freshLastTick = make([]bool, len(cp.pool))
 		for i := range cp.pool {
-			cp.freshLastTick[i] = entryIsFresh(cp.pool[i])
+			cp.freshLastTick[i] = cp.isFreshLocked(i)
 		}
 		return
 	}
 	now := time.Now()
 	for slot := range cp.pool {
 		wasFresh := cp.freshLastTick[slot]
-		nowFresh := entryIsFresh(cp.pool[slot])
+		nowFresh := cp.isFreshLocked(slot)
 		if wasFresh && !nowFresh {
 			e := cp.pool[slot]
 			reason := "unknown"

@@ -36,6 +36,12 @@ func futureUser(tag string) string {
 // minter that hands out credentials naming the given relays.
 func relayPool(t *testing.T, cachePath string, relays ...string) (*credPool, *atomic.Int32, *time.Time) {
 	t.Helper()
+	return relayPoolN(t, cachePath, 12, relays...)
+}
+
+// relayPoolN: relayPool with the pool's size given (the console's four).
+func relayPoolN(t *testing.T, cachePath string, size int, relays ...string) (*credPool, *atomic.Int32, *time.Time) {
+	t.Helper()
 	if cachePath != "" && !strings.HasPrefix(cachePath, os.TempDir()) && !strings.Contains(cachePath, "Test") {
 		t.Fatalf("a cache under a temp dir: %s", cachePath)
 	}
@@ -47,7 +53,7 @@ func relayPool(t *testing.T, cachePath string, relays ...string) (*credPool, *at
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	cp := newCredPool(ctx, 12, 2*time.Minute, cachePath, fetch)
+	cp := newCredPool(ctx, size, 2*time.Minute, cachePath, fetch)
 	if cachePath != "" {
 		t.Cleanup(func() { cancel(); <-cp.saverDone }) // before the temp dir goes
 	}

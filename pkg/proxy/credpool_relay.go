@@ -59,6 +59,7 @@ func (cp *credPool) setOverride(o turnOverride) {
 				cp.relayChangedLocked(i, was[i]) // the history was the old relay's
 			}
 			cp.applyRelayQuarantineLocked(i) // the clock of the relay the slot dials NOW
+			cp.sayReadyDespiteTheClockLocked(i, "TURN relay override")
 			cp.syncMinterLocked(i)
 		}
 	}
