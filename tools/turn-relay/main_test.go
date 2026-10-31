@@ -73,8 +73,8 @@ func TestTheRelayAcceptsCredentialsItCannotVerify(t *testing.T) {
 	if out, err := exec.Command("lsof", "-nP", "-iUDP:"+port).Output(); err == nil && !strings.Contains(string(out), "*:"+port) {
 		t.Fatalf("the relay socket on port %s is not bound on every interface:\n%s", port, out)
 	}
-	if r.active.Load() != 1 {
-		t.Fatalf("allocations held: %d, want 1", r.active.Load())
+	if r.seats.count() != 1 {
+		t.Fatalf("allocations held: %d, want 1", r.seats.count())
 	}
 	// Data goes through to an allowed peer and comes back.
 	peer, err := net.ListenPacket("udp4", "127.0.0.1:0")
@@ -106,11 +106,11 @@ func TestTheRelayAcceptsCredentialsItCannotVerify(t *testing.T) {
 	}
 	relayConn.Close()
 	deadline := time.Now().Add(3 * time.Second)
-	for r.active.Load() != 0 && time.Now().Before(deadline) {
+	for r.seats.count() != 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if r.active.Load() != 0 {
-		t.Fatalf("allocations held after the close: %d", r.active.Load())
+	if r.seats.count() != 0 {
+		t.Fatalf("allocations held after the close: %d", r.seats.count())
 	}
 }
 
@@ -249,4 +249,114 @@ func TestTheConfigIsChecked(t *testing.T) {
 	if !errors.Is(nilErr, nil) {
 		t.Fatal("unreachable")
 	}
+}
+
+// allocateAll: n pion clients over TCP ask the relay for an allocation at the
+// same moment; the allocations granted are returned open (the caller closes them).
+func allocateAll(t *testing.T, r *relay, n int) (granted []net.PacketConn, refused486 int) {
+	t.Helper()
+	type res struct {
+		pc  net.PacketConn
+		err error
+	}
+	results := make(chan res, n)
+	gate := make(chan struct{})
+	for i := 0; i < n; i++ {
+		// Over TCP: the server serves every connection on a goroutine of its
+		// own, so the Allocates really run side by side (one UDP socket is
+		// read by one loop — its requests never overlap).
+		c := tcpClient(t, r.tcp[0].String())
+		go func() {
+			<-gate
+			pc, err := c.Allocate()
+			results <- res{pc, err}
+		}()
+	}
+	close(gate)
+	for i := 0; i < n; i++ {
+		x := <-results
+		switch {
+		case x.err == nil:
+			granted = append(granted, x.pc)
+		case strings.Contains(x.err.Error(), "486"):
+			refused486++
+		default:
+			t.Errorf("an allocation failed with neither success nor 486: %v", x.err)
+		}
+	}
+	return granted, refused486
+}
+
+// The user's review of the tool (2026-10-31): the quota check read the count
+// that OnAllocationCreated moves later — several Allocates in flight all
+// passed the check before any of them was counted, and -max-allocs 1 held
+// 2–6 allocations at once. The seat is reserved where the check is made.
+func TestTheRelayNeverExceedsMaxAllocsUnderParallelAllocates(t *testing.T) {
+	r := testRelay(t, 1)
+	granted, refused := allocateAll(t, r, 12)
+	for _, pc := range granted {
+		defer pc.Close()
+	}
+	if len(granted) != 1 || refused != 11 {
+		t.Fatalf("-max-allocs 1 under 12 parallel Allocates: %d granted, %d refused with 486 — want 1 and 11", len(granted), refused)
+	}
+	if peak := r.seats.highWater(); peak > 1 {
+		t.Fatalf("the relay held %d allocations at once over -max-allocs 1", peak)
+	}
+}
+
+// A reservation whose allocation then FAILED (no relay port left: the one
+// port of the range is held) is given back at once — pion's error event says
+// so, over either transport; a leaked reservation would refuse the next
+// Allocate with 486 although only one allocation is held under -max-allocs 2.
+func TestAFailedAllocationGivesItsSeatBack(t *testing.T) {
+	cfg, err := parseConfig("127.0.0.1:0", "", "127.0.0.1", 2, "40070-40070", "vk-turn-relay", false, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := start(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.close() })
+	var conns []net.PacketConn
+	for i := 0; i < 3; i++ {
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, conn)
+		defer conn.Close()
+	}
+	first, err := vkClient(t, r.udp[0].String(), conns[0]).Allocate()
+	if err != nil {
+		t.Fatalf("the first allocation: %v", err)
+	}
+	if _, err := vkClient(t, r.udp[0].String(), conns[1]).Allocate(); err == nil || strings.Contains(err.Error(), "486") {
+		t.Fatalf("the second allocation with the one relay port held: %v — want a failure that is not 486", err)
+	}
+	if held := r.seats.count(); held != 1 {
+		t.Fatalf("after a failed allocation the relay counts %d held — want 1 (the reservation given back)", held)
+	}
+	first.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for r.seats.count() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	third, err := vkClient(t, r.udp[0].String(), conns[2]).Allocate()
+	if err != nil {
+		t.Fatalf("the third allocation after the first was given back: %v — want granted", err)
+	}
+	third.Close()
+}
+
+// tcpClient: vkClient over a TCP connection to the relay.
+func tcpClient(t *testing.T, addr string) *turn.Client {
+	t.Helper()
+	tcp, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { tcp.Close() })
+	return vkClient(t, addr, turn.NewSTUNConn(tcp))
 }

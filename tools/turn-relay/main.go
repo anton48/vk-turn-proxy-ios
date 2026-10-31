@@ -35,8 +35,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/pion/turn/v5"
 )
@@ -60,8 +60,104 @@ type relay struct {
 	server *turn.Server
 	udp    []net.Addr
 	tcp    []net.Addr
-	active atomic.Int64
+	seats  seats
 	closes []func() error
+}
+
+// seats: the allocations held plus the seats RESERVED for Allocates in flight,
+// one count under one lock. The quota check and the count were two steps —
+// the check read what OnAllocationCreated moved later, so Allocates served
+// side by side (TCP: a goroutine per connection) all passed it before any was
+// counted, and -max-allocs 1 held 2–6 at once (the user's review, 2026-10-31).
+// A seat is taken where the check is made (reserve); the allocation's creation
+// confirms it (created); a creation that failed gives it back at once — pion
+// raises OnAllocationError from the one read loop both transports go through
+// (server.go: a TCP connection is served as a STUN packet conn by the same
+// loop); a deleted allocation frees it.
+type seats struct {
+	mu      sync.Mutex
+	max     int64
+	held    int64                // allocations + reservations
+	peak    int64                // the most held at once
+	pending map[string]time.Time // reservations not yet confirmed, by the client's source address
+}
+
+func newSeats(max int64) seats { return seats{max: max, pending: map[string]time.Time{}} }
+
+func seatKey(src net.Addr) string { return src.Network() + " " + src.String() }
+
+// reserve takes a seat for src's Allocate, or refuses (the limit). A second
+// reservation for the same source (a retransmit) is the same seat.
+func (s *seats) reserve(src net.Addr, now time.Time) (held int64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := seatKey(src)
+	if _, dup := s.pending[k]; dup {
+		s.pending[k] = now
+		return s.held, true
+	}
+	if s.held >= s.max {
+		return s.held, false
+	}
+	s.held++
+	s.pending[k] = now
+	if s.held > s.peak {
+		s.peak = s.held
+	}
+	return s.held, true
+}
+
+// created: src's allocation exists — its reservation is now the allocation.
+// Without a reservation (expired before the creation, or a QuotaHandler-less
+// path) the allocation is counted here.
+func (s *seats) created(src net.Addr) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := seatKey(src)
+	if _, ok := s.pending[k]; ok {
+		delete(s.pending, k)
+		return s.held
+	}
+	s.held++
+	if s.held > s.peak {
+		s.peak = s.held
+	}
+	return s.held
+}
+
+// deleted: an allocation is gone.
+func (s *seats) deleted() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.held > 0 {
+		s.held--
+	}
+	return s.held
+}
+
+// failed: src's Allocate failed after its seat was reserved — given back.
+func (s *seats) failed(src net.Addr) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := seatKey(src)
+	if _, ok := s.pending[k]; !ok {
+		return s.held, false
+	}
+	delete(s.pending, k)
+	s.held--
+	return s.held, true
+}
+
+func (s *seats) count() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.held
+}
+
+func (s *seats) highWater() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peak
 }
 
 func main() {
@@ -176,7 +272,7 @@ func ipList(ips []net.IP) string {
 
 // start binds every listen address (TCP and UDP) and runs the server.
 func start(cfg *config) (*relay, error) {
-	r := &relay{}
+	r := &relay{seats: newSeats(cfg.maxAllocs)}
 	allowed := func(_ net.Addr, peerIP net.IP) bool {
 		for _, p := range cfg.peers {
 			if p.Equal(peerIP) {
@@ -223,24 +319,33 @@ func start(cfg *config) (*relay, error) {
 		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
 			return ra.Username, turn.GenerateAuthKey(ra.Username, cfg.realm, "unverified"), true
 		},
+		// The seat is taken HERE, under the seats' lock — the creation that
+		// follows confirms it, a failure gives it back (seats).
 		QuotaHandler: func(userID, _ string, srcAddr net.Addr) bool {
-			if r.active.Load() >= cfg.maxAllocs {
-				cfg.logf("turn-relay: allocation for %s (%s) REFUSED: %d held, the limit", srcAddr, userID, cfg.maxAllocs)
-				return false
+			held, ok := r.seats.reserve(srcAddr, time.Now())
+			if !ok {
+				cfg.logf("turn-relay: allocation for %s (%s) REFUSED: %d held, the limit", srcAddr, userID, held)
 			}
-			return true
+			return ok
 		},
 		EventHandler: turn.EventHandler{
 			OnAllocationCreated: func(srcAddr, _ net.Addr, protocol, userID, _ string, relayAddr net.Addr, _ int) {
-				n := r.active.Add(1)
+				n := r.seats.created(srcAddr)
 				if cfg.logAllocs {
 					cfg.logf("turn-relay: allocation %s for %s (%s, %s) — %d held", relayAddr, srcAddr, userID, protocol, n)
 				}
 			},
 			OnAllocationDeleted: func(srcAddr, _ net.Addr, protocol, userID, _ string) {
-				n := r.active.Add(-1)
+				n := r.seats.deleted()
 				if cfg.logAllocs {
 					cfg.logf("turn-relay: allocation of %s (%s, %s) gone — %d held", srcAddr, userID, protocol, n)
+				}
+			},
+			// A failed Allocate, over either transport (pion raises it from the
+			// one read loop): its reservation is given back.
+			OnAllocationError: func(srcAddr, _ net.Addr, protocol, message string) {
+				if n, ok := r.seats.failed(srcAddr); ok {
+					cfg.logf("turn-relay: allocation for %s (%s) FAILED: %s — its seat given back, %d held", srcAddr, protocol, message, n)
 				}
 			},
 		},
