@@ -110,7 +110,7 @@ func TestAnUnansweredRelayMovesTheConnectionOnAndIsMarkedByEvidence(t *testing.T
 	if addr != relayA {
 		t.Fatalf("the first attempt dials %q, want VK's first %q", addr, relayA)
 	}
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.noteRelayUnanswered(0, slot, creds, relayA, time.Now().Add(-5*time.Second))
 	if cp.health.isDead(relayA) {
 		t.Fatal("relay A marked with nothing else having answered — the failure may be the network's")
@@ -176,7 +176,7 @@ func TestAPathChangeClearsTheRelayMarks(t *testing.T) {
 func TestACredentialWithEveryRelayMarkedIsKeptNotReadyAndTheMintingPauses(t *testing.T) {
 	cp, mints, clock := relayPool(t, "", relayA, relayB)
 	_, creds, slot := mustGet(t, cp, 0)
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.health.answered("", time.Time{}) // evidence: VK answered just now
 	cp.noteRelayUnanswered(0, slot, creds, relayA, *clock)
 	cp.noteRelayUnanswered(0, slot, creds, relayB, *clock)
@@ -223,7 +223,7 @@ func TestWithTheOverrideListMarkedTheConnectionsWaitAndMintNothing(t *testing.T)
 	if addr != relayO {
 		t.Fatalf("precondition: %q", addr)
 	}
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.health.answered("", time.Time{})
 	cp.noteRelayUnanswered(0, slot, creds, relayO, *clock)
 	_, _, _, err := cp.get(1, false)
@@ -439,7 +439,7 @@ func TestASilentOnlyCandidateMakesThePoolMint(t *testing.T) {
 	if addr != relayA || mints.Load() != 0 {
 		t.Fatalf("precondition: %q mints %d", addr, mints.Load())
 	}
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.noteRelayUnanswered(0, slot, creds, relayA, time.Now().Add(-5*time.Second))
 	if cp.health.isDead(relayA) {
 		t.Fatal("A marked with no evidence")
@@ -463,7 +463,7 @@ func TestTheOverrideListIsCycledAgainWhenEveryEntryWentUnanswered(t *testing.T) 
 	cp, mints, _ := relayPool(t, path, relayC)
 	cp.setOverride(turnOverride{servers: []string{relayO}})
 	addr, creds, slot := mustGet(t, cp, 0)
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.noteRelayUnanswered(0, slot, creds, addr, time.Now())
 	if addr, _, _ := mustGet(t, cp, 0); addr != relayO || mints.Load() != 0 {
 		t.Fatalf("after the list's one entry went unanswered: %q, mints %d — want the entry again, no mint", addr, mints.Load())
@@ -493,7 +493,7 @@ func TestTheSeedTakesItsDiskTwinsRelays(t *testing.T) {
 	if addr != relayA || slot != 0 {
 		t.Fatalf("precondition: %q slot %d", addr, slot)
 	}
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.noteRelayUnanswered(0, slot, creds, relayA, time.Now())
 	if addr, _, _ := mustGet(t, cp, 0); addr != relayB {
 		t.Fatalf("after A went unanswered the seed slot dials %q, want %s", addr, relayB)
@@ -724,7 +724,7 @@ func TestARunOutClaimNeverYieldsAnEmptyAddress(t *testing.T) {
 	cp, _, pclock := relayPool(t, path, relayC)
 	cp.setOverride(turnOverride{servers: []string{relayO}})
 	_, creds, slot := mustGet(t, cp, 0)
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.mu.Lock()
 	cp.health.answered("", time.Time{})
 	cp.health.unanswered(relayO, *pclock)

@@ -175,17 +175,17 @@ func returnAllocation(relayConn io.Closer, release func() deallocVerdict, gave *
 // releaseLease gives a session's lease back to the pool — the ONE way a session
 // does: at once if it gave no allocation back, behind the relay's second if it
 // did.
-func (p *Proxy) releaseLease(slot int, creds *TURNCreds, gave *gaveBack) {
+func (p *Proxy) releaseLease(slot int, creds *TURNCreds, addr string, gave *gaveBack) {
 	if until, ok := gave.takeHold(); ok {
 		gave.take() // an allocation out of reach outlasts any second
-		p.credPool.holdSeatUntil(slot, creds, until)
+		p.credPool.holdSeatUntil(slot, creds, addr, until)
 		return
 	}
 	if at, ok := gave.take(); ok {
-		p.credPool.releaseGivenBack(slot, creds, at)
+		p.credPool.releaseGivenBack(slot, creds, addr, at)
 		return
 	}
-	p.credPool.release(slot, creds)
+	p.credPool.release(slot, creds, addr)
 }
 
 // seatStats counts what the relay's second cost and saved since the start.
@@ -212,7 +212,7 @@ var wallClock = func() time.Time { return time.Now().Round(0) }
 // mapping — until `until`, the wall-clock moment the allocation can have expired
 // at the latest. 🚫 No give-back is noted: a 486 behind it is not the relay's
 // second, and benches the slot as any other.
-func (cp *credPool) holdSeatUntil(slot int, creds *TURNCreds, until time.Time) {
+func (cp *credPool) holdSeatUntil(slot int, creds *TURNCreds, addr string, until time.Time) {
 	if cp == nil || slot < 0 || creds == nil {
 		return
 	}
@@ -229,31 +229,31 @@ func (cp *credPool) holdSeatUntil(slot int, creds *TURNCreds, until time.Time) {
 		log.Printf("credpool: slot %d keeps a seat counted for %s more — its deallocate was answered 437: if the allocation lives on under another mapping it holds the seat until it expires (%d such seat(s) since the start)",
 			slot, until.Sub(now).Round(time.Second), n)
 	}
-	cp.releaseAt(slot, creds, until.Round(0))
+	cp.releaseAt(slot, creds, addr, until.Round(0))
 }
 
 // releaseAt releases a lease at a WALL-clock moment (seatHoldStep). A pool whose
 // context has ended counts for nobody: the steps stop with it.
-func (cp *credPool) releaseAt(slot int, creds *TURNCreds, until time.Time) {
+func (cp *credPool) releaseAt(slot int, creds *TURNCreds, addr string, until time.Time) {
 	if cp.ctx != nil && cp.ctx.Err() != nil {
 		return
 	}
 	left := until.Sub(wallClock())
 	if left <= 0 {
-		cp.release(slot, creds)
+		cp.release(slot, creds, addr)
 		return
 	}
 	if left > seatHoldStep {
 		left = seatHoldStep
 	}
-	time.AfterFunc(left, func() { cp.releaseAt(slot, creds, until) })
+	time.AfterFunc(left, func() { cp.releaseAt(slot, creds, addr, until) })
 }
 
 // releaseGivenBack releases a lease whose session gave its allocation back at
 // `at`: the seat stays counted — in the entry and in the record of leases still
 // out alike, so that no publish of the credential restarts the count — until
 // at+seatCoolFor, and release does the rest.
-func (cp *credPool) releaseGivenBack(slot int, creds *TURNCreds, at time.Time) {
+func (cp *credPool) releaseGivenBack(slot int, creds *TURNCreds, addr string, at time.Time) {
 	if cp == nil || slot < 0 || creds == nil {
 		return
 	}
@@ -274,14 +274,14 @@ func (cp *credPool) releaseGivenBack(slot int, creds *TURNCreds, at time.Time) {
 	cooled, lag := cp.seat.cooled, cp.seat.lagRefusals
 	cp.mu.Unlock()
 	if wait <= 0 {
-		cp.release(slot, creds)
+		cp.release(slot, creds, addr)
 		return
 	}
 	if say {
 		log.Printf("credpool: slot %d keeps a seat counted for %s more — the relay holds a seat for a second behind its deallocate (%d seat(s) cooled, %d refusal(s) read as that second, since the start)",
 			slot, wait.Round(time.Millisecond), cooled, lag)
 	}
-	time.AfterFunc(wait, func() { cp.release(slot, creds) })
+	time.AfterFunc(wait, func() { cp.release(slot, creds, addr) })
 }
 
 // noteGiveBackLocked remembers the latest give-back on (slot, credential) — what

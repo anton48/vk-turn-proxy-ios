@@ -339,10 +339,10 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 				Release: func() {
 					once.Do(func() {
 						if allocated.Load() {
-							a.pool.ReleaseGivenBack(slot, creds, time.Now())
+							a.pool.ReleaseGivenBack(slot, creds, addr, time.Now())
 							return
 						}
-						a.pool.Release(slot, creds)
+						a.pool.Release(slot, creds, addr)
 					})
 				},
 				Failed:    func(err error) { a.refused(workerID, idx, slot, creds, addr, attempt, err) },
@@ -382,7 +382,7 @@ func (a *csqttPoolAdapter) refused(workerID, connIdx, slot int, creds *proxy.TUR
 	case proxy.IsRelayUnanswered(err):
 		a.pool.NoteRelayUnanswered(connIdx, slot, creds, addr, attempt)
 	case proxy.IsQuotaError(err):
-		cd := a.pool.MarkSaturated(slot, creds)
+		cd := a.pool.MarkSaturated(slot, creds, addr)
 		log.Printf("csqtt: worker %d: TURN allocate quota error (486) on slot %d (cooldown %s) — the next credential comes from another slot",
 			workerID, slot, cd.Round(time.Second))
 	case proxy.IsAuthError(err):

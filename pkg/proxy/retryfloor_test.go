@@ -195,7 +195,7 @@ func TestAHerdOfInstantFailuresIsBoundedByTheFloor(t *testing.T) {
 		}
 		dials.Add(1)
 		time.Sleep(time.Millisecond) // the seat is held for the length of a failing connect()
-		p.credPool.release(slot, creds)
+		p.credPool.release(slot, creds, "")
 		return errors.New("SRTP setup: TURN dial: dial tcp 203.0.113.11:19302: connect: no route to host")
 	}
 

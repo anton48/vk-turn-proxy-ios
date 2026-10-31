@@ -109,7 +109,7 @@ func TestAReleaseCountsOnlyAgainstTheCredentialItNames(t *testing.T) {
 	}
 
 	wake := cp.slotAvailableChannel()
-	cp.release(0, old) // an OLD session ends
+	cp.release(0, old, "") // an OLD session ends
 	if active, live, _ := leaseCounts(cp, 0); active != connsPerSlot {
 		t.Fatalf("an old session's release took a seat off the NEW identity: active %d, want %d — the pool would seat an eleventh holder and earn a 486", active, connsPerSlot)
 	} else if live != 2*connsPerSlot-1 {
@@ -119,7 +119,7 @@ func TestAReleaseCountsOnlyAgainstTheCredentialItNames(t *testing.T) {
 		t.Fatal("an old session's release announced room on the refilled slot — it is full")
 	}
 	for i := 1; i < connsPerSlot; i++ {
-		cp.release(0, old)
+		cp.release(0, old, "")
 	}
 	if active, live, _ := leaseCounts(cp, 0); active != connsPerSlot || live != connsPerSlot {
 		t.Fatalf("after all ten old releases: active %d, leases out %d — want %d, %d", active, live, connsPerSlot, connsPerSlot)
@@ -129,7 +129,7 @@ func TestAReleaseCountsOnlyAgainstTheCredentialItNames(t *testing.T) {
 	}
 
 	// The arm that must go THROUGH: a holder of the credential the slot holds.
-	cp.release(0, fresh[0])
+	cp.release(0, fresh[0], "")
 	if active, live, _ := leaseCounts(cp, 0); active != connsPerSlot-1 || live != connsPerSlot-1 {
 		t.Fatalf("after a new holder's own release: active %d, leases out %d — want %d, %d", active, live, connsPerSlot-1, connsPerSlot-1)
 	}
@@ -154,7 +154,7 @@ func TestAPathEventAfterARefillStillFindsTheSessions(t *testing.T) {
 		t.Fatal("a path event with ten sessions up read \"nothing live\" after their slot was refilled — the cascade detector stays unarmed")
 	}
 	cp.mu.Lock()
-	benched := cp.pool[0].saturatedUntil.After(time.Now())
+	benched := cp.markLocked(0, cp.dialNowLocked(0)).After(time.Now())
 	cp.mu.Unlock()
 	if benched {
 		t.Fatal("the refilled slot was marked saturated — it holds a new identity with no allocation at the relay")
@@ -187,19 +187,19 @@ func TestLateReleasesAfterAnInvalidateLeaveTheNewHolderCounted(t *testing.T) {
 		t.Fatalf("the next get = slot %d, %v, same identity %v — want a new identity in slot 0", slot, err, b != nil && b.Username == a.Username)
 	}
 	for i := 0; i < connsPerSlot; i++ {
-		cp.release(0, a)
+		cp.release(0, a, "")
 	}
 	if active, live, _ := leaseCounts(cp, 0); active != 1 || live != 1 {
 		t.Fatalf("after A's ten late releases: active %d, leases out %d — want 1, 1 (B's holder is up)", active, live)
 	}
-	cp.release(0, b)
+	cp.release(0, b, "")
 	cp.mu.Lock()
 	active, live, stamped := cp.pool[0].active, cp.liveLeasesLocked(), !cp.pool[0].lastUsedAt.IsZero()
 	cp.mu.Unlock()
 	if active != 0 || live != 0 || !stamped {
 		t.Fatalf("after B's own release: active %d, leases out %d, lastUsedAt stamped %v — want 0, 0, true", active, live, stamped)
 	}
-	cp.release(0, b) // a stray second release
+	cp.release(0, b, "") // a stray second release
 	if _, live, _ := leaseCounts(cp, 0); live != 0 {
 		t.Fatalf("leases out after a stray release = %d, want 0", live)
 	}
@@ -226,12 +226,12 @@ func TestARefusalNamesTheCredentialItWasFor(t *testing.T) {
 		t.Fatalf("the refill = slot %d, %v — want a new identity in slot 0", slot, err)
 	}
 
-	if cd := cp.markSaturated(0, a); cd != 0 {
+	if cd := cp.markSaturated(0, a, ""); cd != 0 {
 		t.Fatalf("a 486 for the OLD credential chose a cooldown of %s, want 0 — nothing to mark", cd)
 	}
-	cp.markSaturated(0, a)
+	cp.markSaturated(0, a, "")
 	cp.mu.Lock()
-	benched := cp.pool[0].saturatedUntil.After(time.Now())
+	benched := cp.markLocked(0, cp.dialNowLocked(0)).After(time.Now())
 	cp.mu.Unlock()
 	if benched {
 		t.Fatal("a 486 for the OLD credential benched the new identity in its slot")
@@ -245,7 +245,7 @@ func TestARefusalNamesTheCredentialItWasFor(t *testing.T) {
 	}
 
 	// The arms that must go THROUGH.
-	if cd := cp.markSaturated(0, b); cd <= 0 {
+	if cd := cp.markSaturated(0, b, ""); cd <= 0 {
 		t.Fatal("a 486 for the credential the slot holds marked nothing")
 	}
 	cp.invalidateEntry(0, b)
@@ -285,28 +285,28 @@ func TestEveryLeaseHolderNamesItsCredential(t *testing.T) {
 		t.Errorf("proxy.go: %d deferred releases of (currentSlot, currentCreds), want 4 — one per session function", n)
 	}
 	seatCool := code("seatcool.go")
-	for _, call := range []string{"p.credPool.releaseGivenBack(slot, creds, at)", "p.credPool.release(slot, creds)", "cp.release(slot, creds)"} {
+	for _, call := range []string{"p.credPool.releaseGivenBack(slot, creds, addr, at)", "p.credPool.release(slot, creds, addr)", "cp.release(slot, creds, addr)"} {
 		if !strings.Contains(seatCool, call) {
 			t.Errorf("seatcool.go lacks %q — releaseLease and the cooled release hand the PAIR on", call)
 		}
 	}
 	for _, call := range []string{
-		"p.credPool.release(probeSlot, probeCreds)",
-		"p.releaseLease(credSlot, currentCreds, &leg.gave)", // the direct session's re-lease
-		"currentSlot, currentCreds = newSlot, newCreds",     // … which takes a new pair
-		"currentSlot, currentCreds = -1, nil",               // … after giving the old one back
+		"p.credPool.release(probeSlot, probeCreds, probeAddr)",
+		"p.releaseLease(credSlot, currentCreds, currentAddr, &leg.gave)",      // the direct session's re-lease
+		"currentSlot, currentCreds, currentAddr = newSlot, newCreds, newAddr", // … which takes a new pair
+		"currentSlot, currentCreds, currentAddr = -1, nil, \"\"",              // … after giving the old one back
 	} {
 		if !strings.Contains(proxySrc, call) {
 			t.Errorf("proxy.go lacks %q", call)
 		}
 	}
-	if n := strings.Count(proxySrc, "markSaturated(credSlot, creds)"); n != 3 {
-		t.Errorf("proxy.go: %d markSaturated(credSlot, creds) calls, want 3", n)
+	if n := strings.Count(proxySrc, "markSaturated(credSlot, creds, turnAddr)"); n != 3 {
+		t.Errorf("proxy.go: %d markSaturated(credSlot, creds, turnAddr) calls, want 3 — a 486 names the relay it came from", n)
 	}
 	if n := strings.Count(proxySrc, "invalidateEntry(credSlot, creds)"); n != 3 {
 		t.Errorf("proxy.go: %d invalidateEntry(credSlot, creds) calls, want 3", n)
 	}
-	for _, call := range []string{"a.pool.Release(slot, creds)", "a.pool.MarkSaturated(slot, creds)", "a.pool.InvalidateSlot(slot, creds)", "a.refused(workerID, idx, slot, creds, addr, attempt, err)"} {
+	for _, call := range []string{"a.pool.Release(slot, creds, addr)", "a.pool.MarkSaturated(slot, creds, addr)", "a.pool.InvalidateSlot(slot, creds)", "a.refused(workerID, idx, slot, creds, addr, attempt, err)"} {
 		if !strings.Contains(bridge, call) {
 			t.Errorf("csqtt_bridge.go lacks %q — the adapter must hand the leased credential on", call)
 		}
@@ -321,8 +321,8 @@ func TestEveryLeaseHolderNamesItsCredential(t *testing.T) {
 		t.Errorf("creds.go raises an entry's active in %d places, want 1 — seatLocked alone, or a seat is taken without its record", len(raises))
 	}
 	seat := goFuncBody(t, "creds.go", "func (cp *credPool) seatLocked(")
-	if !strings.Contains(seat, "cp.pool[slot].active++") || !strings.Contains(seat, "cp.holders[leaseKeyOf(slot, cp.pool[slot].creds)]++") {
-		t.Error("seatLocked does not move the entry's count and the record together")
+	if !strings.Contains(seat, "cp.pool[slot].active++") || !strings.Contains(seat, "cp.holders[k]++") || !strings.Contains(seat, "cp.seats[k][relay]++") {
+		t.Error("seatLocked does not move the entry's count, the record and the record by relay together")
 	}
 	get := goFuncBody(t, "creds.go", "func (cp *credPool) get(")
 	if n := strings.Count(get, "cp.seatLocked("); n != 3 {
@@ -349,9 +349,10 @@ func TestEveryLeaseHolderNamesItsCredential(t *testing.T) {
 			t.Errorf("creds.go publishes a credential without taking its count from the record: %q", strings.Join(strings.Fields(lit), " "))
 		}
 	}
-	// The cap is the slot's (capLocked, 2026-10-30: the relay's quota, VK's
-	// ten by default), read after the credential is placed.
-	if !regexp.MustCompile(`held := cp\.outstandingLocked\(target, creds\)`).MatchString(get) || !strings.Contains(get, "if held >= cp.capLocked(target) {") {
+	// The cap is the RELAY's the connection dials (roomOnLocked, 2026-10-31:
+	// the relay's quota, VK's ten by default, against the seats on it), read
+	// after the credential is placed and the address picked.
+	if !regexp.MustCompile(`held := cp\.outstandingLocked\(target, creds\)`).MatchString(get) || !strings.Contains(get, "if !cp.roomOnLocked(got, dial) {") {
 		t.Error("get(): the fetched credential's count is not read from the record, or a credential issued again with all its previous holders still out still seats the fetching conn — an eleventh lease")
 	}
 	rel := goFuncBody(t, "creds.go", "func (cp *credPool) release(")
@@ -445,7 +446,7 @@ func TestTheSameCredentialIssuedAgainKeepsItsHolders(t *testing.T) {
 		t.Fatalf("a second conn was seated on slot %d with ten leases out on its credential", slot)
 	}
 
-	cp.release(0, first) // the first old session ends: a seat that was really taken is free
+	cp.release(0, first, "") // the first old session ends: a seat that was really taken is free
 	if active, live, _ := leaseCounts(cp, 0); active != connsPerSlot-1 || live != connsPerSlot-1 {
 		t.Fatalf("after one old release: active %d, leases out %d — want %d, %d", active, live, connsPerSlot-1, connsPerSlot-1)
 	}
@@ -462,13 +463,13 @@ func TestTheSameCredentialIssuedAgainKeepsItsHolders(t *testing.T) {
 	countsMatchTheRecord(t, cp, "nine old holders and one new")
 
 	for i := 1; i < connsPerSlot; i++ {
-		cp.release(0, first)
+		cp.release(0, first, "")
 	}
 	if active, live, _ := leaseCounts(cp, 0); active != 1 || live != 1 {
 		t.Fatalf("after every old release: active %d, leases out %d — want 1, 1 (the new holder)", active, live)
 	}
-	cp.release(0, again)
-	cp.release(0, again) // and a stray one
+	cp.release(0, again, "")
+	cp.release(0, again, "") // and a stray one
 	if active, live, _ := leaseCounts(cp, 0); active != 0 || live != 0 {
 		t.Fatalf("after the new holder's release: active %d, leases out %d — want 0, 0", active, live)
 	}
@@ -492,7 +493,7 @@ func TestTwoSlotsWithOneUsernameCountTheirHoldersApart(t *testing.T) {
 	if err != nil || slot != 1 || c1.Username != c0.Username {
 		t.Fatalf("get(10) = slot %d, %v, same username %v — want slot 1 with the call's username", slot, err, c1 != nil && c1.Username == c0.Username)
 	}
-	cp.release(1, c1)
+	cp.release(1, c1, "")
 	if a0, live, _ := leaseCounts(cp, 0); a0 != 1 || live != 1 {
 		t.Fatalf("after slot 1's release: slot 0 active %d, leases out %d — want 1, 1: slot 0's holder is still up", a0, live)
 	}

@@ -36,6 +36,15 @@ struct CredCacheEntry: Codable {
     let username: String
     let password: String
     let last_used_at: Int64?
+    /// Relay → the last moment a seat of this credential on THAT relay was
+    /// held (Unix seconds) — Go's `used_on`, 2026-10-31: VK's quota is per
+    /// (identity, relay), so the pool keeps the history per relay and asks
+    /// the clock of the relay a slot dials. HERE for the same reason as
+    /// `addresses`: BackupManager encodes this struct into the backup and back
+    /// into creds-pool.json on a restore, and a mirror without the field
+    /// would drop every relay's clock on the way. Absent in files from before
+    /// it (the pool then reads `last_used_at` as every relay's).
+    let used_on: [String: Int64]?
 }
 
 /// On-disk JSON shape. Mirrors the Go-side credCacheFile.

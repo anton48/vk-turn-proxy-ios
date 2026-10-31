@@ -897,68 +897,18 @@ type credPoolEntry struct {
 	// the relay's refusal, with some its quota.
 	allocated int
 
-	// availableAt is the earliest moment this slot's cred is safe to
-	// hand out. Set by loadFromDisk when the on-disk lastUsedAt falls
-	// within credSaturationCooldown of now: instead of dropping the
-	// cred (forcing an expensive fresh VK fetch via PoW that can take
-	// 10-30+ minutes when VK is hostile), we keep it in the pool but
-	// mark it not-yet-usable until availableAt. entryIsFresh returns
-	// false while now < availableAt, so get() Phase 1 ignores the slot
-	// and pickSlotToFill skips it (background grower won't overwrite a
-	// soon-available cred with a new fetch).
-	//
-	// Once availableAt passes (~10 min after the previous session's
-	// last release), VK's lingering allocations have timed out
-	// server-side and the cred is safe again. The slot becomes "fresh"
-	// without any VK API call.
-	//
-	// Zero value means the cred is immediately usable (no pending
-	// cooldown). Cleared on any successful fetch into this slot.
-	availableAt time.Time
-
-	// lastUsedAt is the most recent moment when this slot's `active`
-	// count transitioned from >0 to 0 — i.e. the last conn to hold a
-	// TURN allocation against this cred just released it. While `active`
-	// is still >0 we don't update this field; saveToDisk substitutes
-	// time.Now() in the persisted record so an in-flight session always
-	// looks "active" to the next load even if no one called release()
-	// yet (e.g. iOS jetsam'd the extension mid-session).
-	//
-	// Persisted to disk so loadFromDisk can decide per-entry whether
-	// the cred is still potentially saturated by lingering VK-side
-	// allocations: if (now - lastUsedAt) > ~10 min, all allocations
-	// have timed out server-side and the cred is safe to reuse. If
-	// lastUsedAt is the zero value (slot was filled by background
-	// grower but no conn ever took it), the slot is safe regardless
-	// of how recently the file was saved — this is the typical state
-	// of the "+1 reserve" slot in the pool.
-	lastUsedAt time.Time
-
-	// saturatedUntil: VK-side quota saturation marker. When a runTURN
-	// allocation fails with 486 Allocation Quota Reached, the cred is
-	// marked as saturated by the proxy: VK still considers prior client-
-	// side-killed allocations alive on this cred for the remainder of
-	// their TURN lifetime (~600s default). Our local active count says 0
-	// after we release them, but VK's count is still 10 → next Allocate
-	// gets 486 immediately. Without this marker the proxy would loop on
-	// the same cred forever; with it, get() Phase 1 skips saturated
-	// slots and the conn falls through to Phase 2 (fetch a fresh cred
-	// in another slot) or returns "no slot available" so the caller
-	// backs off. Cleared automatically when the slot is replaced via
-	// fresh fetch (since the new cred has a clean VK quota).
-	saturatedUntil time.Time
-
-	// saturationTimer fires broadcastSlotAvailable when saturatedUntil
-	// passes, waking any conn currently parked in runConnection's
-	// "no slot available" backoff so it can immediately retry on the
-	// just-recovered slot. Without this, parked conns sleep through
-	// their randomised 30s-3min dormancy regardless of when the
-	// saturation actually expires — vpn.wifi.2.log on 2026-05-06
-	// showed conn 0 idling 5 minutes past slot 0's expiry before its
-	// next retry naturally fired. Set/Stopped+replaced by markSaturated;
-	// nil for never-saturated slots and harmlessly-leaked-then-GC'd for
-	// slots whose entry gets replaced before the timer fires.
-	saturationTimer *time.Timer
+	// relayHist is the credential's history whose relay is not known — a
+	// cache file from before `used_on`, a seed, a mark that named no relay:
+	// availableAt (VK's clock, set by loadFromDisk — the cred is KEPT, not
+	// dropped, while VK's lingering allocations time out: a fresh fetch
+	// through PoW can take 10-30 min on a hostile day), lastUsedAt (the last
+	// moment `active` fell to 0; saveToDisk writes "now" for a slot in use),
+	// saturatedUntil (a 486 or a path change's smart-pause) and its timer.
+	// The history of a relay the credential was dialled on lives in `on`
+	// (relayhist.go): the quota is per (identity, relay), and so are the
+	// seats, the clock and the marks.
+	relayHist
+	on map[string]*relayHist
 }
 
 // credCacheVersion is the on-disk JSON schema version. Loaders that find
@@ -1205,6 +1155,12 @@ type credCacheEntry struct {
 	// that are currently active so a kill mid-session still records
 	// "this slot was alive" rather than the last release time.
 	LastUsedAt int64 `json:"last_used_at,omitempty"`
+	// UsedOn (anonymous mode, since 2026-10-31): relay → the last moment a
+	// seat of this credential on THAT relay was held (Unix seconds; "now"
+	// for a relay with seats at the save) — the clock is per (identity,
+	// relay), so the history is kept per relay (relayhist.go). A file without
+	// it has the one last_used_at, read as every relay's.
+	UsedOn map[string]int64 `json:"used_on,omitempty"`
 }
 
 // credPool holds up to `size` independent TURN credential slots, one per
@@ -1278,6 +1234,12 @@ type credPool struct {
 	// holders[{slot, its username}]; seatLocked and release move both
 	// together. A key is deleted when its count reaches zero. Under cp.mu.
 	holders map[leaseKey]int
+
+	// seats is the same record BY RELAY: for each lease out, the relay it was
+	// handed out for (get's pick) — what roomOnLocked compares with that
+	// relay's quota, what a path change marks, what saveToDisk writes as
+	// `used_on`. holders[k] == the sum of seats[k]. Under cp.mu.
+	seats map[leaseKey]map[string]int
 
 	// authErrors counts pion-reported 401/403 errors per slot since the
 	// slot was last (re)filled. Reset to 0 on seedSlot, tryFill success,
@@ -1633,7 +1595,7 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 			}
 		}
 	}
-	seedWait := cp.pool[slot].availableAt
+	seedWait := cp.clockLocked(slot, cp.dialNowLocked(slot))
 	// Relocate the pre-seed pending cred (if any) into the first now-
 	// empty slot. We'd rather keep it pending and have it become
 	// usable in 10 min than discard a perfectly good cred and pay
@@ -1893,13 +1855,38 @@ func (cp *credPool) loadFromDisk() {
 		// preserving a usable cred we'd otherwise discard — VK's PoW
 		// fetch path takes 10-30+ min on hostile days, far longer than
 		// the 10-min cooldown.
+		// The clock per relay (used_on) when the file has it; else the one
+		// last_used_at as every relay's (the entry's own history).
 		var lastUsed, availableAt time.Time
-		if entry.LastUsedAt > 0 {
+		on := map[string]*relayHist{}
+		for relay, unix := range entry.UsedOn {
+			if relay == "" || unix <= 0 {
+				continue
+			}
+			h := &relayHist{lastUsedAt: time.Unix(unix, 0)}
+			if ready := h.lastUsedAt.Add(credSaturationCooldown); now.Before(ready) {
+				h.availableAt = ready
+			}
+			on[relay] = h
+			if h.lastUsedAt.After(lastUsed) {
+				lastUsed = h.lastUsedAt
+			}
+		}
+		if len(on) == 0 && entry.LastUsedAt > 0 {
 			lastUsed = time.Unix(entry.LastUsedAt, 0)
 			ready := lastUsed.Add(credSaturationCooldown)
 			if now.Before(ready) {
 				availableAt = ready
 			}
+		}
+		// Cookie mode: the quota history is the RELAY's (relayUsedAt, fed
+		// below from the file), never a slot's — the entry starts with none,
+		// so a slot the list re-points dials its new relay with neither a
+		// clock nor a mark of the old one's (the user's reviews of 450 and
+		// 459's run 6).
+		lastUsedSaid := lastUsed
+		if cp.mode == credCacheModeCookie {
+			lastUsed, availableAt, on = time.Time{}, time.Time{}, nil
 		}
 		for len(cp.pool) <= entry.Slot {
 			cp.pool = append(cp.pool, credPoolEntry{})
@@ -1926,28 +1913,29 @@ func (cp *credPool) loadFromDisk() {
 			skipped++
 		}
 		cp.placeLocked(entry.Slot, credPoolEntry{
-			addr:        entry.Address,
-			addrs:       cp.candidatesForSlot(entry.Slot, creds),
-			creds:       creds,
-			ts:          now,
-			active:      cp.outstandingLocked(entry.Slot, creds), // the record's count — see credPool.holders
-			lastUsedAt:  lastUsed,
-			availableAt: availableAt,
+			addr:      entry.Address,
+			addrs:     cp.candidatesForSlot(entry.Slot, creds),
+			creds:     creds,
+			ts:        now,
+			active:    cp.outstandingLocked(entry.Slot, creds), // the record's count — see credPool.holders
+			relayHist: relayHist{lastUsedAt: lastUsed, availableAt: availableAt},
+			on:        on,
 		})
 		loaded++
+		until := cp.clockLocked(entry.Slot, cp.dialNowLocked(entry.Slot))
 		switch {
-		case entry.LastUsedAt == 0:
+		case lastUsedSaid.IsZero():
 			log.Printf("credpool: load: slot %d ready (addr=%s, expires in %s, never used in last session)",
 				entry.Slot, entry.Address, time.Until(exp).Round(time.Second))
-		case availableAt.IsZero():
+		case until.IsZero():
 			log.Printf("credpool: load: slot %d ready (addr=%s, expires in %s, last used %s ago — outside saturation window)",
 				entry.Slot, entry.Address, time.Until(exp).Round(time.Second),
-				now.Sub(lastUsed).Round(time.Second))
+				now.Sub(lastUsedSaid).Round(time.Second))
 		default:
 			log.Printf("credpool: load: slot %d pending (addr=%s, expires in %s, last used %s ago — usable in %s once VK allocations expire)",
 				entry.Slot, entry.Address, time.Until(exp).Round(time.Second),
-				now.Sub(lastUsed).Round(time.Second),
-				availableAt.Sub(now).Round(time.Second))
+				now.Sub(lastUsedSaid).Round(time.Second),
+				until.Sub(now).Round(time.Second))
 		}
 	}
 	// Cookie mode: the relays' quota clocks — from the file's own map and from
@@ -2039,6 +2027,32 @@ func (cp *credPool) saveToDisk() {
 		} else if !entry.lastUsedAt.IsZero() {
 			lastUsed = entry.lastUsedAt.Unix()
 		}
+		// Per relay (relayhist.go): "now" for a relay with seats out, else
+		// the last seat's give-back when within the cooldown; last_used_at
+		// stays the latest of them all (the Swift seed reads it).
+		var usedOn map[string]int64
+		note := func(relay string, at time.Time) {
+			if relay == "" || at.IsZero() || now.Sub(at) >= credSaturationCooldown {
+				return
+			}
+			if usedOn == nil {
+				usedOn = map[string]int64{}
+			}
+			if at.Unix() > usedOn[relay] {
+				usedOn[relay] = at.Unix()
+			}
+			if at.Unix() > lastUsed {
+				lastUsed = at.Unix()
+			}
+		}
+		for relay, n := range cp.seats[leaseKeyOf(slot, entry.creds)] {
+			if n > 0 {
+				note(relay, now)
+			}
+		}
+		for relay, h := range entry.on {
+			note(relay, h.lastUsedAt)
+		}
 		f.Creds = append(f.Creds, credCacheEntry{
 			Slot:       slot,
 			Address:    entry.addr,
@@ -2046,6 +2060,7 @@ func (cp *credPool) saveToDisk() {
 			Username:   entry.creds.Username,
 			Password:   entry.creds.Password,
 			LastUsedAt: lastUsed,
+			UsedOn:     usedOn,
 		})
 	}
 	// Cookie mode: the relays' quota clocks — a slot in use holds seats NOW on
@@ -2160,7 +2175,7 @@ const connsPerSlot = 10
 // ceil(NumConns/connsPerSlot), so the pool survives more back-to-back
 // cascades before all-saturated. See open_improvement_compact_fill in
 // memory for the empirical context (build 87, 2026-05-14).
-func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (int, string) {
+func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (int, string, string) {
 	now := time.Now()
 
 	// Priority 1: ownSlot, unconditionally preferred when usable.
@@ -2172,41 +2187,54 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 				connIdx, ownSlot, cp.health.deadList(cp.candidatesLocked(ownSlot)))
 		}
 	}
+	// eligible: the slot's credential may seat THIS connection — on the relay
+	// the connection would dial (peekAddrLocked: its cursor's), by that
+	// relay's clock, its marks and its quota (relayhist.go). The user's
+	// review of 2026-10-31: the cap and the marks were read off the FIRST
+	// unmarked candidate while the connection dialled the second.
+	eligible := func(i int) (string, bool) {
+		if i < 0 || i >= len(cp.pool) || !cp.hasRelayLocked(i) {
+			return "", false
+		}
+		addr := cp.peekAddrLocked(i, connIdx)
+		if addr == "" || !cp.freshOnLocked(i, addr) {
+			return "", false
+		}
+		if until := cp.markLocked(i, addr); now.Before(until) {
+			if logSkips {
+				log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
+					connIdx, i, until.Sub(now).Round(time.Second))
+			}
+			return "", false
+		}
+		if !cp.roomOnLocked(i, addr) {
+			return "", false
+		}
+		return addr, true
+	}
 	// Priority 0: a slot whose relay has no quota (the list's host:port:0 —
 	// the user's own relay) takes every connection while it answers, in both
 	// modes (2026-10-30, the user's design).
 	for i := 0; i < cp.size && i < len(cp.pool); i++ {
-		if cp.usableLocked(i) && cp.unlimitedRelayLocked(i) != "" && !now.Before(cp.pool[i].saturatedUntil) {
-			return i, "unlimited relay"
+		if addr, ok := eligible(i); ok && cp.override.unlimited(addr) {
+			return i, addr, "unlimited relay"
 		}
 	}
-	if cp.usableLocked(ownSlot) && cp.pool[ownSlot].active < cp.capLocked(ownSlot) {
-		if now.Before(cp.pool[ownSlot].saturatedUntil) {
-			if logSkips {
-				log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
-					connIdx, ownSlot, cp.pool[ownSlot].saturatedUntil.Sub(now).Round(time.Second))
-			}
-		} else {
-			return ownSlot, "own"
-		}
+	if addr, ok := eligible(ownSlot); ok {
+		return ownSlot, addr, "own"
 	}
 
 	// Priority 2/3: scan other slots, picking max-active (compact-fill)
 	// or the lowest-index idle slot when all candidates have active=0.
 	bestSlot := -1
 	bestActive := -1
+	bestAddr := ""
 	for i := 0; i < cp.size; i++ {
 		if i == ownSlot {
 			continue
 		}
-		if !cp.usableLocked(i) || cp.pool[i].active >= cp.capLocked(i) {
-			continue
-		}
-		if now.Before(cp.pool[i].saturatedUntil) {
-			if logSkips {
-				log.Printf("credpool: conn %d skipping slot %d (VK-saturated for %s more)",
-					connIdx, i, cp.pool[i].saturatedUntil.Sub(now).Round(time.Second))
-			}
+		addr, ok := eligible(i)
+		if !ok {
 			continue
 		}
 		// Strict > keeps the lowest-index slot when active counts tie
@@ -2214,15 +2242,16 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 		if cp.pool[i].active > bestActive {
 			bestSlot = i
 			bestActive = cp.pool[i].active
+			bestAddr = addr
 		}
 	}
 	if bestSlot < 0 {
-		return -1, ""
+		return -1, "", ""
 	}
 	if bestActive > 0 {
-		return bestSlot, "compact"
+		return bestSlot, bestAddr, "compact"
 	}
-	return bestSlot, "fresh"
+	return bestSlot, bestAddr, "fresh"
 }
 
 // poolParkError is get()'s "not now" answer — a path-change pause, the
@@ -2298,18 +2327,20 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// onto already-active slots) instead of first-by-index. See
 	// pickAcquireSlotLocked for the selection logic + rationale (each
 	// path event marks fewer slots when conns cluster).
-	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, true); slot >= 0 {
+	if slot, _, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, true); slot >= 0 {
 		// The ADDRESS is chosen now, for this connection (credpool_relay.go):
-		// the override list's or VK's, the first not marked unreachable.
+		// the override list's or VK's, the one the pick was judged on — the
+		// unmarked candidate at the connection's cursor (or a re-try's claim).
 		addr, ok := cp.pickAddrLocked(slot, connIdx)
 		if !ok { // no address after all (a re-try's claim ran out between the two looks): no seat, a park
 			park := cp.relayParkLocked(connIdx, slot)
 			cp.mu.Unlock()
 			return "", nil, -1, park
 		}
-		cp.seatLocked(slot)
+		cp.seatLocked(slot, addr)
 		e := cp.pool[slot]
-		capacity := cp.capLocked(slot)
+		capacity := cp.capOnLocked(addr)
+		seats := cp.seatsOnLocked(slot, addr)
 		cp.mu.Unlock()
 		var tag string
 		switch kind {
@@ -2323,7 +2354,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			tag = "fallback fresh slot"
 		}
 		log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%s, age %s) — relay %s",
-			connIdx, slot, tag, e.active, capText(capacity), time.Since(e.ts).Round(time.Second), addr)
+			connIdx, slot, tag, seats, capText(capacity), time.Since(e.ts).Round(time.Second), addr)
 		return addr, e.creds, slot, nil
 	}
 
@@ -2462,7 +2493,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		for _, slot := range candidatesOrdered() {
 			e := cp.pool[slot]
 			blocked := e.creds != nil && !cp.health.hasCandidate(cp.candidatesLocked(slot)) // every relay it names is marked: a fresh mint may bring others
-			if e.creds != nil && (now.Before(e.saturatedUntil) || blocked) && e.active == 0 && !e.fetching && !now.Before(e.cooldownUntil) {
+			if e.creds != nil && (now.Before(cp.markLocked(slot, cp.dialNowLocked(slot))) || blocked) && e.active == 0 && !e.fetching && !now.Before(e.cooldownUntil) {
 				target = slot
 				break
 			}
@@ -2515,17 +2546,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				cp.saveToDisk()
 				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", target), wake: wake}
 			}
-			if held >= cp.capLocked(target) {
-				wake := cp.slotAvailableCh
-				cp.mu.Unlock()
-				if target < len(cp.authErrors) {
-					cp.authErrors[target].Store(0)
-				}
-				cp.saveToDisk()
-				log.Printf("credpool: conn %d: slot %d's credential was issued again with its %d previous holders still out — kept, no seat until they release", connIdx, target, held)
-				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's credential was issued again with its %d previous holders still out — parking until they release", target, held), wake: wake}
-			}
-			// The seat is taken below, after the address is picked.
+			// The seat is taken below, after the address is picked — and
+			// judged against THAT relay's quota and the holders still out on
+			// it (roomOnLocked).
 		} else {
 			cp.noteVKAnsweredLocked(fetchStart)
 			if !cp.health.hasCandidate(cp.candidatesForSlot(-1, creds)) {
@@ -2553,9 +2576,16 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			// its relay's seats may still be held by leases that ended a
 			// minute ago (the relay's clock made it pending at placement; the
 			// user's review of 451: handed out with fresh=false, active=1).
-			if e := cp.pool[got]; !e.availableAt.IsZero() && time.Now().Before(e.availableAt) {
-				wait := time.Until(e.availableAt).Round(time.Second)
-				cp.armHealthWakeLocked(e.availableAt)
+			dial, ok := cp.pickAddrLocked(got, connIdx)
+			if !ok {
+				park := cp.relayParkLocked(connIdx, got)
+				cp.mu.Unlock()
+				cp.saveToDisk()
+				return "", nil, -1, park
+			}
+			if until := cp.clockLocked(got, dial); time.Now().Before(until) {
+				wait := time.Until(until).Round(time.Second)
+				cp.armHealthWakeLocked(until)
 				wake := cp.slotAvailableCh
 				cp.mu.Unlock()
 				if got < len(cp.authErrors) {
@@ -2565,14 +2595,24 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				log.Printf("credpool: conn %d: the fresh credential in slot %d dials a relay whose seats may still be held — pending, usable in %s — parking", connIdx, got, wait)
 				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's fresh credential is pending (its relay's seats may still be held) — parking, usable in %s", got, wait), wake: wake}
 			}
-			dial, ok := cp.pickAddrLocked(got, connIdx)
-			if !ok {
-				park := cp.relayParkLocked(connIdx, got)
+			// A credential issued AGAIN into its slot (cookie mode after a
+			// Resume's invalidate()) starts with its previous holders still
+			// seated; with every seat on this relay out there is none for us
+			// — an eleventh lease on one credential is what earns a 486 — so
+			// the credential is kept and we park: those holders' releases
+			// announce the room.
+			if !cp.roomOnLocked(got, dial) {
+				held := cp.seatsOnLocked(got, dial)
+				wake := cp.slotAvailableCh
 				cp.mu.Unlock()
+				if got < len(cp.authErrors) {
+					cp.authErrors[got].Store(0)
+				}
 				cp.saveToDisk()
-				return "", nil, -1, park
+				log.Printf("credpool: conn %d: slot %d's credential was issued again with its %d previous holders still out — kept, no seat until they release", connIdx, got, held)
+				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's credential was issued again with its %d previous holders still out — parking until they release", got, held), wake: wake}
 			}
-			cp.seatLocked(got)
+			cp.seatLocked(got, dial)
 			filled := cp.countFreshLocked()
 			cp.mu.Unlock()
 			if got == target {
@@ -2606,14 +2646,14 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	// filled a slot during our fetch window, prefer the most-active
 	// one. logSkips=false because Phase 1's initial scan already
 	// emitted any per-slot "VK-saturated" lines for these slots.
-	if slot, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, false); slot >= 0 {
+	if slot, _, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, false); slot >= 0 {
 		dial, ok := cp.pickAddrLocked(slot, connIdx) // the same choice as every hand-out: the override's, the health's
 		if !ok {
 			park := cp.relayParkLocked(connIdx, slot)
 			cp.mu.Unlock()
 			return "", nil, -1, park
 		}
-		cp.seatLocked(slot)
+		cp.seatLocked(slot, dial)
 		e := cp.pool[slot]
 		cp.mu.Unlock()
 		var tag string
@@ -2668,7 +2708,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 // username alone, with the count restarted at 0, such a release made ten new
 // holders look like nine, announced room and let an eleventh onto the
 // credential (the user's review of build 409).
-func (cp *credPool) release(slot int, creds *TURNCreds) {
+func (cp *credPool) release(slot int, creds *TURNCreds, addr string) {
 	if slot < 0 {
 		return
 	}
@@ -2693,6 +2733,24 @@ func (cp *credPool) release(slot int, creds *TURNCreds) {
 	default:
 		cp.holders[k] = out - 1
 	}
+	// ...and off the record BY RELAY: the relay this lease was handed out for.
+	// A release that names no relay (or one the record does not know) comes
+	// off the one relay the lease can have been on when there is one, else
+	// counts against the entry's own history alone.
+	if cp.seats[k][addr] == 0 {
+		addr = cp.oneRelayWithSeatsLocked(k)
+	}
+	on := addr != "" && cp.seats[k][addr] > 0
+	seatsBefore := cp.seats[k][addr]
+	if on {
+		cp.seats[k][addr]--
+		if cp.seats[k][addr] == 0 {
+			delete(cp.seats[k], addr)
+		}
+		if len(cp.seats[k]) == 0 {
+			delete(cp.seats, k)
+		}
+	}
 	if !cp.holdsLocked(slot, creds) {
 		refilled := cp.pool[slot].creds != nil
 		live := cp.liveLeasesLocked()
@@ -2704,33 +2762,44 @@ func (cp *credPool) release(slot int, creds *TURNCreds) {
 		}
 		return
 	}
+	now := time.Now()
 	// Decide whether this release will genuinely open a usable slot for
 	// a parked conn. Three conditions must all hold; if any fails the
 	// broadcast is a thundering-herd waste because get()'s Phase 1 would
 	// skip the slot for the same reason that made the broadcast useless:
 	//
-	//   1. Slot was at the per-slot cap before this release. Otherwise
-	//      it already had room and conns weren't blocked on it.
-	//   2. isFreshLocked — slot's cred isn't expired/expiring/pending.
-	//      Observed in vpn.wifi.5.log: slot 0's cred crossed the 30m
-	//      expiry buffer ~4 min after startup; without this guard, every
-	//      conn dying on that now-stale slot would wake 10 parked conns
-	//      just to have them re-park (slot 0 not fresh → skipped).
-	//   3. Not VK-saturated — get()'s Phase 1 explicitly skips saturated
-	//      slots even when fresh and below cap.
-	slotBecomesUsable := cp.pool[slot].active == cp.capLocked(slot) &&
-		cp.isFreshLocked(slot) &&
-		!time.Now().Before(cp.pool[slot].saturatedUntil)
+	//   1. The relay this seat was on was at its cap before this release.
+	//      Otherwise it already had room and conns weren't blocked on it.
+	//   2. freshOnLocked — the credential isn't expired/expiring, and the
+	//      clock on that relay has run out. Observed in vpn.wifi.5.log:
+	//      slot 0's cred crossed the 30m expiry buffer ~4 min after
+	//      startup; without this guard, every conn dying on that now-stale
+	//      slot would wake 10 parked conns just to have them re-park.
+	//   3. Not VK-saturated on that relay — get()'s Phase 1 explicitly
+	//      skips a benched relay even when fresh and below cap.
+	var slotBecomesUsable bool
+	if on {
+		slotBecomesUsable = seatsBefore == cp.capOnLocked(addr) &&
+			cp.freshOnLocked(slot, addr) &&
+			!now.Before(cp.markLocked(slot, addr))
+	} else {
+		slotBecomesUsable = cp.pool[slot].active == cp.capLocked(slot) &&
+			cp.isFreshLocked(slot) &&
+			!now.Before(cp.pool[slot].saturatedUntil)
+	}
+	if on && cp.seats[k][addr] == 0 {
+		cp.histPtrLocked(slot, addr).lastUsedAt = now // the last seat on this relay given back
+	}
 	if cp.pool[slot].active > 0 {
 		cp.pool[slot].active--
 		if cp.pool[slot].active == 0 {
-			cp.pool[slot].lastUsedAt = time.Now()
+			cp.pool[slot].lastUsedAt = now
 			cp.noteRelayUsedLocked(slot, cp.pool[slot].lastUsedAt) // the relay's clock (cookie mode)
 			if cp.configuredOffLocked(slot) {
 				// The last seat of a slot whose relay the TURN override list
 				// dropped (cookie mode): the slot may take a free entry now.
 				cp.rebindOverrideSlotsLocked("the last lease on the dropped relay ended")
-				slotBecomesUsable = cp.usableLocked(slot) && !time.Now().Before(cp.pool[slot].saturatedUntil)
+				slotBecomesUsable = cp.usableLocked(slot) && !now.Before(cp.markLocked(slot, cp.dialNowLocked(slot)))
 			}
 		}
 	}
@@ -2753,12 +2822,20 @@ func (cp *credPool) outstandingLocked(slot int, creds *TURNCreds) int {
 // seatLocked takes one more seat on the credential slot holds: the entry's
 // count and the record move together — the one way a seat is taken. Caller
 // holds cp.mu; the slot holds a credential.
-func (cp *credPool) seatLocked(slot int) {
+func (cp *credPool) seatLocked(slot int, relay string) {
 	cp.pool[slot].active++
 	if cp.holders == nil {
 		cp.holders = make(map[leaseKey]int)
 	}
-	cp.holders[leaseKeyOf(slot, cp.pool[slot].creds)]++
+	if cp.seats == nil {
+		cp.seats = make(map[leaseKey]map[string]int)
+	}
+	k := leaseKeyOf(slot, cp.pool[slot].creds)
+	cp.holders[k]++
+	if cp.seats[k] == nil {
+		cp.seats[k] = map[string]int{}
+	}
+	cp.seats[k][relay]++
 }
 
 // liveLeasesLocked is the number of leases still out, on whatever credential.
@@ -2816,7 +2893,7 @@ func (cp *credPool) saturationSnapshot() (saturated, total int, longest time.Dur
 	now := time.Now()
 	total = cp.size
 	for i := 0; i < cp.size && i < len(cp.pool); i++ {
-		until := cp.pool[i].saturatedUntil
+		until := cp.markLocked(i, cp.dialNowLocked(i))
 		if until.After(now) {
 			saturated++
 			remaining := until.Sub(now)
@@ -2856,7 +2933,7 @@ func (cp *credPool) saturationSnapshot() (saturated, total int, longest time.Dur
 // a fresh identity for minutes, and the breaker would read the refusal against
 // the NEW entry's age and success count — a false "the relay refuses fresh
 // credentials". It is counted as a 486 the pool was told of, and dropped.
-func (cp *credPool) markSaturated(slot int, creds *TURNCreds) time.Duration {
+func (cp *credPool) markSaturated(slot int, creds *TURNCreds, addr string) time.Duration {
 	if slot < 0 {
 		return 0
 	}
@@ -2881,24 +2958,35 @@ func (cp *credPool) markSaturated(slot int, creds *TURNCreds) time.Duration {
 		return 0
 	}
 
+	// The 486 is the RELAY's — the credential's seats there, its clock there
+	// (relayhist.go): a refusal names no relay only from a caller that does
+	// not know it, and is then read against the entry's own history.
 	entry := cp.pool[slot]
+	if addr == "" {
+		addr = cp.oneRelayWithSeatsLocked(leaseKeyOf(slot, creds)) // a caller that does not know: where the seats are
+	}
+	hist := cp.histLocked(slot, addr)
+	active := entry.active
+	if addr != "" {
+		active = cp.seatsOnLocked(slot, addr)
+	}
 	// The relay-refusal breaker hears of every 486 here, native and csqtt
 	// alike, before the slot's own cooldown is chosen — quotabreaker.go.
 	cp.noteQuotaRefusalLocked(slot, time.Now())
-	age := time.Since(entry.lastUsedAt)
-	hasRecentLastUsed := !entry.lastUsedAt.IsZero() && age < activeAllocationsWindow
+	age := time.Since(hist.lastUsedAt)
+	hasRecentLastUsed := !hist.lastUsedAt.IsZero() && age < activeAllocationsWindow
 
 	cooldown := vkSaturationCooldown
 	reason := "ghost-likely (no active conns and lastUsedAt not in active window)"
-	if entry.active > 0 {
+	if active > 0 {
 		cooldown = vkActiveAllocationsCooldown
-		reason = fmt.Sprintf("active-now (active=%d/%d, conns still hold slot)", entry.active, connsPerSlot)
+		reason = fmt.Sprintf("active-now (active=%d/%d, conns still hold slot)", active, cp.capOnLocked(addr))
 	} else if hasRecentLastUsed {
 		cooldown = vkActiveAllocationsCooldown
 		reason = fmt.Sprintf("active-recent (lastUsedAt %s ago)", age.Round(time.Second))
 	}
 
-	cp.applySaturationLocked(slot, cooldown, reason)
+	cp.applySaturationLocked(slot, addr, cooldown, reason)
 	return cooldown
 }
 
@@ -2907,14 +2995,20 @@ func (cp *credPool) markSaturated(slot int, creds *TURNCreds) time.Duration {
 // state — 11m active or 3m ghost) and MarkInUseSlotsForPathChange
 // (which computes a precise per-slot cooldown based on lastUsedAt +
 // VK allocation lifetime). Caller MUST hold cp.mu.
-func (cp *credPool) applySaturationLocked(slot int, cooldown time.Duration, reason string) {
-	log.Printf("credpool: slot %d marked VK-saturated for %s — %s",
-		slot, cooldown.Round(time.Second), reason)
-	if cp.pool[slot].saturationTimer != nil {
-		cp.pool[slot].saturationTimer.Stop()
+func (cp *credPool) applySaturationLocked(slot int, relay string, cooldown time.Duration, reason string) {
+	if relay != "" {
+		log.Printf("credpool: slot %d marked VK-saturated for %s — %s (on %s)",
+			slot, cooldown.Round(time.Second), reason, relay)
+	} else {
+		log.Printf("credpool: slot %d marked VK-saturated for %s — %s",
+			slot, cooldown.Round(time.Second), reason)
 	}
-	cp.pool[slot].saturatedUntil = time.Now().Add(cooldown)
-	cp.pool[slot].saturationTimer = time.AfterFunc(cooldown, cp.broadcastSlotAvailable)
+	h := cp.histPtrLocked(slot, relay)
+	if h.saturationTimer != nil {
+		h.saturationTimer.Stop()
+	}
+	h.saturatedUntil = time.Now().Add(cooldown)
+	h.saturationTimer = time.AfterFunc(cooldown, cp.broadcastSlotAvailable)
 }
 
 // MarkInUseSlotsForPathChange is called from Swift's NWPathMonitor on every
@@ -3000,70 +3094,86 @@ func (cp *credPool) MarkInUseSlotsForPathChange() {
 	live := len(cp.holders) > 0
 	for slot := 0; slot < cp.size && slot < len(cp.pool); slot++ {
 		e := cp.pool[slot]
-		// Skip already-saturated (re-marking is no-op but spams logs)
-		if !e.saturatedUntil.IsZero() && e.saturatedUntil.After(now) {
-			continue
-		}
-		// A relay without a quota (the list's host:port:0) holds no seats —
-		// nothing to bench.
-		if cp.unlimitedRelayLocked(slot) != "" {
-			continue
-		}
 		// Skip empty/never-filled slots (no creds, no VK state)
 		if e.creds == nil {
 			continue
 		}
+		// The seats are the RELAY's they were created on (relayhist.go): a
+		// slot is marked per relay it holds or held seats on — never by the
+		// relay its connections would dial next (the user's review of
+		// 2026-10-31: with the own relay first again after the path change,
+		// the slot's ten seats on VK's relay went unmarked, and the own relay
+		// dead again, the credential went back to VK into a 486 cascade).
+		for _, relay := range cp.relaysWithHistoryLocked(slot) {
+			// A relay without a quota (the list's host:port:0) holds no seats —
+			// nothing to bench. A history whose relay is not known stands for
+			// the relay the slot dials now.
+			if relay != "" && cp.override.unlimited(relay) {
+				continue
+			}
+			if d := cp.dialNowLocked(slot); relay == "" && d != "" && cp.override.unlimited(d) {
+				continue
+			}
+			h := cp.histLocked(slot, relay)
+			// Skip already-saturated (re-marking is no-op but spams logs)
+			if !h.saturatedUntil.IsZero() && h.saturatedUntil.After(now) {
+				continue
+			}
+			// Skip a relay already in load-from-disk pending state. Its
+			// clock was set by loadFromDisk from a PRIOR session's last use +
+			// credSaturationCooldown — VK's lingering allocations from before
+			// this session are already correctly accounted for. Smart-pause
+			// would re-mark it on the same last use, only extending the wait
+			// by safetyBuffer (~30s) and confusing the log. Trust the clock.
+			//
+			// Observed in vpn.wifi-lte-wifi.3.log on 2026-05-10 23:52: pool
+			// loaded from disk had slots 8/9/11 with lastUsedAt 36s ago →
+			// pending until 23:58:25 (load-cooldown). Smart-pause at 23:52:21
+			// re-marked them saturated until 23:58:56 (~30s later than load-
+			// cooldown's natural expiry). No real harm but no real benefit
+			// either, and it makes the saturation count misleading.
+			if until := cp.clockLocked(slot, relay); !until.IsZero() && until.After(now) {
+				continue
+			}
+			active := e.active
+			if relay != "" {
+				active = cp.seatsOnLocked(slot, relay)
+			}
 
-		// Skip slots already in load-from-disk pending state. availableAt
-		// was set by loadFromDisk based on a PRIOR session's lastUsedAt
-		// + credSaturationCooldown — VK's lingering allocations from
-		// before this session are already correctly accounted for. Smart-
-		// pause would re-mark these slots based on the same lastUsedAt,
-		// only extending the wait by safetyBuffer (~30s) and confusing
-		// the log. Trust the load-cooldown.
-		//
-		// Observed in vpn.wifi-lte-wifi.3.log on 2026-05-10 23:52: pool
-		// loaded from disk had slots 8/9/11 with lastUsedAt 36s ago →
-		// pending until 23:58:25 (load-cooldown). Smart-pause at 23:52:21
-		// re-marked them saturated until 23:58:56 (~30s later than load-
-		// cooldown's natural expiry). No real harm but no real benefit
-		// either, and it makes the saturation count misleading.
-		if !e.availableAt.IsZero() && e.availableAt.After(now) {
-			continue
+			// Smart-pause anchor selection:
+			//   active>0  → conns alive right now, refreshes every ~5m, so the
+			//               latest allocation expires no later than now + 600s.
+			//   active=0  → lastUsedAt is when the last seat on the relay was
+			//               given back; VK still holds allocations for the
+			//               remainder of 600s after the last refresh, bounded
+			//               above by lastUsedAt + 600s.
+			var anchor time.Time
+			var reason string
+			if active > 0 {
+				anchor = now
+				reason = fmt.Sprintf("path-change active-now (active=%d/%d, smart-pause)", active, cp.capOnLocked(relay))
+			} else if !h.lastUsedAt.IsZero() &&
+				now.Sub(h.lastUsedAt) > minRealUseAge &&
+				now.Sub(h.lastUsedAt) < activeAllocationsWindow {
+				anchor = h.lastUsedAt
+				age := now.Sub(h.lastUsedAt).Round(time.Second)
+				reason = fmt.Sprintf("path-change active-recent (lastUsedAt %s ago, smart-pause)", age)
+			} else {
+				// Ghost-likely-expired (lastUsedAt > 10m), never-used,
+				// OR just-released-during-this-path-cascade (lastUsedAt
+				// within minRealUseAge — see comment on that constant).
+				continue
+			}
+
+			// remaining = (anchor + vkAllocLifetime + safetyBuffer) - now
+			remaining := vkAllocLifetime - now.Sub(anchor) + safetyBuffer
+			if remaining <= 0 {
+				continue
+			}
+
+			cp.applySaturationLocked(slot, relay, remaining, reason)
+			markedSlots = append(markedSlots, slot)
 		}
-
-		// Smart-pause anchor selection:
-		//   active>0  → conns alive right now, refreshes every ~5m, so the
-		//               latest allocation expires no later than now + 600s.
-		//   active=0  → lastUsedAt is when active dropped to 0; VK still
-		//               holds allocations for the remainder of 600s after
-		//               last refresh, bounded above by lastUsedAt + 600s.
-		var anchor time.Time
-		var reason string
-		if e.active > 0 {
-			anchor = now
-			reason = fmt.Sprintf("path-change active-now (active=%d/%d, smart-pause)", e.active, connsPerSlot)
-		} else if !e.lastUsedAt.IsZero() &&
-			now.Sub(e.lastUsedAt) > minRealUseAge &&
-			now.Sub(e.lastUsedAt) < activeAllocationsWindow {
-			anchor = e.lastUsedAt
-			age := now.Sub(e.lastUsedAt).Round(time.Second)
-			reason = fmt.Sprintf("path-change active-recent (lastUsedAt %s ago, smart-pause)", age)
-		} else {
-			// Ghost-likely-expired (lastUsedAt > 10m), never-used,
-			// OR just-released-during-this-path-cascade (lastUsedAt
-			// within minRealUseAge — see comment on that constant).
-			continue
-		}
-
-		// remaining = (anchor + vkAllocLifetime + safetyBuffer) - now
-		remaining := vkAllocLifetime - now.Sub(anchor) + safetyBuffer
-		if remaining <= 0 {
-			continue
-		}
-
-		cp.applySaturationLocked(slot, remaining, reason)
-		markedSlots = append(markedSlots, slot)
 	}
 
 	if len(markedSlots) > 0 {
@@ -3387,7 +3497,7 @@ func (cp *credPool) placeIntoEmptySlotLocked(addr string, creds *TURNCreds, acti
 			cp.nextGen++
 			cp.placeLocked(i, credPoolEntry{addr: addr, addrs: cp.candidatesForSlot(i, creds), creds: creds, ts: time.Now(), active: cp.outstandingLocked(i, creds), gen: cp.nextGen})
 			for n := 0; n < active; n++ {
-				cp.seatLocked(i) // the caller's own seat(s) — `active` of them
+				cp.seatLocked(i, cp.dialNowLocked(i)) // the caller's own seat(s) — `active` of them
 			}
 			return i, ""
 		}
@@ -3581,39 +3691,33 @@ func (cp *credPool) distinctRelays() int {
 
 // isFreshLocked assumes cp.mu is held. A slot is fresh iff it holds creds
 // that will still be valid on the TURN server credExpiryBuffer from now (see
-// parseCredExpiry for the expiry source) AND — on a relay WITH a quota — the
-// entry's clock (availableAt) has run out. That clock is VK's: the seats the
-// credential may still hold at VK's relays after the last session. A slot
-// whose connections dial a relay WITHOUT a quota now (unlimitedRelayLocked)
-// holds no seat there, so it is ready whatever the clock says; the clock is
-// KEPT on the entry — once that relay is marked the slot's first alive
-// candidate is VK's again and the clock applies (2026-10-31, the stand's
-// `O:0,$vkurls` restart within ten minutes of a session through VK: four
-// slots pending, twenty connections parked for 95 s with no slot to mint).
-// Every readiness question about a live slot goes through this, pendingLocked
+// parseCredExpiry for the expiry source) AND VK's clock on the relay the
+// slot's connections dial NOW (dialNowLocked) has run out — the clock is the
+// relay's: the seats the credential may still hold at THAT relay after the
+// last session (relayhist.go; a relay without a quota has none). A hand-out
+// asks the same of the relay picked for the connection (freshOnLocked);
+// every readiness question about a live slot goes through this, pendingLocked
 // or availableLocked, never through the entry alone (the scan test).
 func (cp *credPool) isFreshLocked(slot int) bool {
 	if slot < 0 || slot >= len(cp.pool) {
 		return false
 	}
-	if cp.unlimitedRelayLocked(slot) != "" {
-		return entryCredValid(cp.pool[slot])
-	}
-	return entryIsFresh(cp.pool[slot])
+	return cp.freshOnLocked(slot, cp.dialNowLocked(slot))
 }
 
 // pendingLocked assumes cp.mu is held: the slot holds a valid credential that
-// waits for VK's clock on a relay WITH a quota. get()'s Phase 2, tryFill and
-// pickSlotToFill leave such a slot alone — we'd rather wait ~10 min for the
-// prior session's allocations to expire on VK's side than spend 10-30 min
-// chasing a fresh cred through PoW on a hostile day; once availableAt passes
-// the slot is fresh on its own. On a relay without a quota the same entry is
-// fresh now (isFreshLocked), not pending.
+// waits for VK's clock on the relay its connections dial now. get()'s Phase 2,
+// tryFill and pickSlotToFill leave such a slot alone — we'd rather wait ~10
+// min for the prior session's allocations to expire on VK's side than spend
+// 10-30 min chasing a fresh cred through PoW on a hostile day; once the
+// clock passes the slot is fresh on its own. On a relay without a quota, or
+// one the credential never held seats on, the same entry is fresh now
+// (isFreshLocked), not pending.
 func (cp *credPool) pendingLocked(slot int) bool {
-	if slot < 0 || slot >= len(cp.pool) {
+	if slot < 0 || slot >= len(cp.pool) || !entryCredValid(cp.pool[slot]) {
 		return false
 	}
-	return entryIsPending(cp.pool[slot]) && cp.unlimitedRelayLocked(slot) == ""
+	return time.Now().Before(cp.clockLocked(slot, cp.dialNowLocked(slot)))
 }
 
 // availableLocked assumes cp.mu is held: the slot can hand out new TURN
@@ -3631,24 +3735,7 @@ func (cp *credPool) availableLocked(slot int) bool {
 	if !cp.isFreshLocked(slot) {
 		return false
 	}
-	e := cp.pool[slot]
-	return e.saturatedUntil.IsZero() || !time.Now().Before(e.saturatedUntil)
-}
-
-// sayReadyDespiteTheClockLocked assumes cp.mu is held: a slot pending by VK's
-// clock that dials a relay without a quota now is said so once, at the
-// override (the load precedes it, so the load's own line says "pending"), so
-// the log reads why a "pending" slot seats connections.
-func (cp *credPool) sayReadyDespiteTheClockLocked(slot int, when string) {
-	if slot < 0 || slot >= len(cp.pool) {
-		return
-	}
-	e, relay := cp.pool[slot], cp.unlimitedRelayLocked(slot)
-	if relay == "" || !entryIsPending(e) {
-		return
-	}
-	log.Printf("credpool: %s: slot %d pending by VK's clock (usable at VK in %s) — ready on %s now, which has no quota",
-		when, slot, time.Until(e.availableAt).Round(time.Second), relay)
+	return !time.Now().Before(cp.markLocked(slot, cp.dialNowLocked(slot)))
 }
 
 // entryCredValid: the entry holds a credential still valid on the TURN
@@ -3806,13 +3893,14 @@ func (cp *credPool) logFreshTransitionsLocked() {
 		nowFresh := cp.isFreshLocked(slot)
 		if wasFresh && !nowFresh {
 			e := cp.pool[slot]
+			until := cp.clockLocked(slot, cp.dialNowLocked(slot))
 			reason := "unknown"
 			switch {
 			case e.creds == nil:
 				reason = "cred removed"
-			case !e.availableAt.IsZero() && now.Before(e.availableAt):
+			case !until.IsZero() && now.Before(until):
 				reason = fmt.Sprintf("moved to load-pending state (usable in %s)",
-					time.Until(e.availableAt).Round(time.Second))
+					time.Until(until).Round(time.Second))
 			default:
 				if exp, ok := parseCredExpiry(e.creds.Username); !ok {
 					reason = "unparseable cred expiry"
@@ -3832,12 +3920,13 @@ func (cp *credPool) logFreshTransitionsLocked() {
 			// line, so this is mildly redundant for them — accepted as
 			// "all transitions visible" beats "guess from absence").
 			e := cp.pool[slot]
+			until := cp.histLocked(slot, cp.dialNowLocked(slot)).availableAt
 			reason := "unknown"
 			switch {
 			case e.creds == nil:
 				reason = "creds appeared (race; check seedSlot/background fill log)"
-			case !e.availableAt.IsZero() && !now.Before(e.availableAt):
-				elapsed := now.Sub(e.availableAt).Round(time.Second)
+			case !until.IsZero() && !now.Before(until):
+				elapsed := now.Sub(until).Round(time.Second)
 				reason = fmt.Sprintf("load-cooldown elapsed (became usable %s ago)", elapsed)
 			default:
 				reason = "creds became valid (seeded or background-filled)"

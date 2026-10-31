@@ -72,8 +72,8 @@ func TestALateSuccessOfTheOldCredentialDoesNotCertifyTheNew(t *testing.T) {
 			if a := allocatedOn(cp, slot); a != 0 {
 				t.Fatalf("allocated on the refilled slot = %d after the OLD credential's late success, want 0 — a slot number is not a credential", a)
 			}
-			cp.markSaturated(slot, fresh) // B's own 486s: fresh, and nothing ever succeeded on B
-			cp.markSaturated(slot, fresh)
+			cp.markSaturated(slot, fresh, "") // B's own 486s: fresh, and nothing ever succeeded on B
+			cp.markSaturated(slot, fresh, "")
 			if refusals, paused := cp.quotaSnapshot(); refusals != 2 || paused <= 0 {
 				t.Fatalf("after two fresh 486s on the refilled credential: (%d, paused %s), want (2, > 0) — the breaker took the new credential for an accepted one", refusals, paused)
 			}

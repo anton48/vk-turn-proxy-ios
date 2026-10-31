@@ -37,7 +37,7 @@ func shortSecond(t *testing.T, cool, grace time.Duration) {
 func slotSaturated(cp *credPool, slot int) bool {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
-	return time.Now().Before(cp.pool[slot].saturatedUntil)
+	return time.Now().Before(cp.markLocked(slot, cp.dialNowLocked(slot)))
 }
 
 // fullSlot0 is a lease pool whose slot 0 holds one credential with ten leases out.
@@ -62,7 +62,7 @@ func TestASeatGivenBackStaysCountedForTheRelaysSecond(t *testing.T) {
 	t.Run("counted while the relay holds it, let go after", func(t *testing.T) {
 		var mints atomic.Int32
 		cp, creds := fullSlot0(t, &mints)
-		cp.releaseGivenBack(0, creds, time.Now())
+		cp.releaseGivenBack(0, creds, "", time.Now())
 		if active, live, _ := leaseCounts(cp, 0); active != connsPerSlot || live != connsPerSlot {
 			t.Fatalf("right behind the give-back: active %d, leases out %d, want %d and %d — the seat the relay still holds is handed out again", active, live, connsPerSlot, connsPerSlot)
 		}
@@ -91,7 +91,7 @@ func TestASeatGivenBackStaysCountedForTheRelaysSecond(t *testing.T) {
 		cp.mu.Unlock()
 		wake := cp.slotAvailableChannel()
 		t0 := time.Now()
-		cp.releaseGivenBack(0, creds, t0)
+		cp.releaseGivenBack(0, creds, "", t0)
 		if _, _, slot, err := cp.get(0, false); err == nil {
 			t.Fatalf("the re-dial was seated (slot %d) although the only identity is full by the relay's count", slot)
 		}
@@ -110,7 +110,7 @@ func TestASeatGivenBackStaysCountedForTheRelaysSecond(t *testing.T) {
 	t.Run("a give-back older than the second holds nothing", func(t *testing.T) {
 		var mints atomic.Int32
 		cp, creds := fullSlot0(t, &mints)
-		cp.releaseGivenBack(0, creds, time.Now().Add(-time.Second))
+		cp.releaseGivenBack(0, creds, "", time.Now().Add(-time.Second))
 		if active, _, _ := leaseCounts(cp, 0); active != connsPerSlot-1 {
 			t.Errorf("active %d, want %d at once", active, connsPerSlot-1)
 		}
@@ -120,12 +120,12 @@ func TestASeatGivenBackStaysCountedForTheRelaysSecond(t *testing.T) {
 		cp, creds := fullSlot0(t, &mints)
 		p := &Proxy{credPool: cp}
 		var gave gaveBack // nothing noted: no allocation was made, or the relay holds none
-		p.releaseLease(0, creds, &gave)
+		p.releaseLease(0, creds, "", &gave)
 		if active, _, _ := leaseCounts(cp, 0); active != connsPerSlot-1 {
 			t.Errorf("active %d, want %d: a seat nobody holds was cooled", active, connsPerSlot-1)
 		}
 		gave.note(time.Now())
-		p.releaseLease(0, creds, &gave)
+		p.releaseLease(0, creds, "", &gave)
 		if active, _, _ := leaseCounts(cp, 0); active != connsPerSlot-1 {
 			t.Errorf("active %d, want %d: a lease whose allocation WAS given back must stay counted", active, connsPerSlot-1)
 		}
@@ -149,7 +149,7 @@ func TestA486BehindOurOwnGiveBackIsTheRelaysSecond(t *testing.T) {
 		cp.noteGiveBackLocked(0, creds, time.Now()) // the note alone — no seat cooling here, so that the wake below can only be this rule's own
 		cp.mu.Unlock()
 		wake := cp.slotAvailableChannel()
-		if cd := cp.markSaturated(0, creds); cd != 0 {
+		if cd := cp.markSaturated(0, creds, ""); cd != 0 {
 			t.Errorf("cooldown %s, want 0: the slot was benched over the relay's own second", cd)
 		}
 		if slotSaturated(cp, 0) {
@@ -170,15 +170,15 @@ func TestA486BehindOurOwnGiveBackIsTheRelaysSecond(t *testing.T) {
 	t.Run("the control: no give-back behind it — benched", func(t *testing.T) {
 		var mints atomic.Int32
 		cp, creds := fullSlot0(t, &mints)
-		if cd := cp.markSaturated(0, creds); cd != vkActiveAllocationsCooldown || !slotSaturated(cp, 0) {
+		if cd := cp.markSaturated(0, creds, ""); cd != vkActiveAllocationsCooldown || !slotSaturated(cp, 0) {
 			t.Errorf("cooldown %s, saturated %v — a 486 nothing of ours explains must bench the slot (%s)", cd, slotSaturated(cp, 0), vkActiveAllocationsCooldown)
 		}
 	})
 	t.Run("the control: a give-back older than the grace — benched", func(t *testing.T) {
 		var mints atomic.Int32
 		cp, creds := fullSlot0(t, &mints)
-		cp.releaseGivenBack(0, creds, time.Now().Add(-401*time.Millisecond))
-		if cd := cp.markSaturated(0, creds); cd == 0 || !slotSaturated(cp, 0) {
+		cp.releaseGivenBack(0, creds, "", time.Now().Add(-401*time.Millisecond))
+		if cd := cp.markSaturated(0, creds, ""); cd == 0 || !slotSaturated(cp, 0) {
 			t.Errorf("cooldown %s, saturated %v — a give-back 401ms old (grace 400ms) explains no refusal", cd, slotSaturated(cp, 0))
 		}
 	})
@@ -189,7 +189,7 @@ func TestA486BehindOurOwnGiveBackIsTheRelaysSecond(t *testing.T) {
 		cp.mu.Lock()
 		cp.noteGiveBackLocked(0, other, time.Now())
 		cp.mu.Unlock()
-		if cd := cp.markSaturated(0, creds); cd == 0 {
+		if cd := cp.markSaturated(0, creds, ""); cd == 0 {
 			t.Error("a give-back of ANOTHER identity was taken for this one's: the quota is per identity")
 		}
 	})
@@ -199,7 +199,7 @@ func TestA486BehindOurOwnGiveBackIsTheRelaysSecond(t *testing.T) {
 		cp.mu.Lock()
 		cp.noteGiveBackLocked(1, creds, time.Now())
 		cp.mu.Unlock()
-		if cd := cp.markSaturated(0, creds); cd == 0 {
+		if cd := cp.markSaturated(0, creds, ""); cd == 0 {
 			t.Error("a give-back on ANOTHER slot was taken for this one's")
 		}
 	})
@@ -224,7 +224,7 @@ func TestA486BehindOurOwnGiveBackIsTheRelaysSecond(t *testing.T) {
 		cp.mu.Lock()
 		delete(cp.gaveBackAt, leaseKeyOf(0, creds))
 		cp.mu.Unlock()
-		cp.releaseGivenBack(0, creds, time.Now()) // a time WITH a monotonic reading, as csqtt's lease hands in
+		cp.releaseGivenBack(0, creds, "", time.Now()) // a time WITH a monotonic reading, as csqtt's lease hands in
 		cp.mu.Lock()
 		at, noted := cp.gaveBackAt[leaseKeyOf(0, creds)]
 		cp.mu.Unlock()
@@ -244,8 +244,8 @@ func TestA486BehindOurOwnGiveBackIsTheRelaysSecond(t *testing.T) {
 		seatHolders(cp, 0, 2)
 		cp.mu.Unlock()
 		for i := 0; i < quotaRefusalTrip+1; i++ {
-			cp.releaseGivenBack(0, fresh, time.Now())
-			cp.markSaturated(0, fresh)
+			cp.releaseGivenBack(0, fresh, "", time.Now())
+			cp.markSaturated(0, fresh, "")
 		}
 		if _, paused := cp.quotaSnapshot(); paused != 0 {
 			t.Errorf("minting paused for %s: the relay's second was read as the relay refusing fresh credentials", paused)
@@ -877,14 +877,14 @@ func TestEverySessionReleasesItsLeaseBehindTheRelaysSecond(t *testing.T) {
 		if strings.Contains(b, "p.credPool.release(") {
 			t.Errorf("%s releases its lease on the pool directly — a seat the relay still holds is handed out again; it goes through p.releaseLease", fn)
 		}
-		if n := strings.Count(b, "p.releaseLease(currentSlot, currentCreds, "+note+")"); n != 1 {
-			t.Errorf("%s: %d deferred releaseLease(currentSlot, currentCreds, %s), want 1", fn, n, note)
+		if n := strings.Count(b, "p.releaseLease(currentSlot, currentCreds, currentAddr, "+note+")"); n != 1 {
+			t.Errorf("%s: %d deferred releaseLease(currentSlot, currentCreds, currentAddr, %s), want 1", fn, n, note)
 		}
 	}
 	if b := body(src, "func (p *Proxy) runSRTPSession("); !strings.Contains(b, "p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx, &gave)") {
 		t.Error("runSRTPSession does not hand ITS note to setupSRTPSession — the teardown would write a note the lease never reads")
 	}
-	if b := body(src, "func (p *Proxy) runDirectSession("); !strings.Contains(b, "p.releaseLease(credSlot, currentCreds, &leg.gave)") {
+	if b := body(src, "func (p *Proxy) runDirectSession("); !strings.Contains(b, "p.releaseLease(credSlot, currentCreds, currentAddr, &leg.gave)") {
 		t.Error("runDirectSession's reconnect loop does not release the ended leg's lease through releaseLease")
 	}
 	if b := body(src, "func (p *Proxy) setupSRTPSession("); !regexp.MustCompile(`gave:\s+gave,`).MatchString(b) {
@@ -910,7 +910,7 @@ func TestEverySessionReleasesItsLeaseBehindTheRelaysSecond(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b := stripComments(string(bridge)); !strings.Contains(b, "a.pool.ReleaseGivenBack(slot, creds, time.Now())") || !strings.Contains(b, "allocated.Load()") {
+	if b := stripComments(string(bridge)); !strings.Contains(b, "a.pool.ReleaseGivenBack(slot, creds, addr, time.Now())") || !strings.Contains(b, "allocated.Load()") {
 		t.Error("csqtt's lease does not go back behind the relay's second when it held an allocation")
 	}
 }

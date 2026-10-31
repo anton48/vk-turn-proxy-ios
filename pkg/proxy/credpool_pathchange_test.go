@@ -44,15 +44,15 @@ func pathChangedPool(t *testing.T, slot3Empty bool) (*credPool, *atomic.Int32) {
 			Address: "203.0.113.11:19302", Addresses: []string{"203.0.113.11:19302"}}
 		switch i {
 		case 0, 4, 5:
-			cp.pool[i] = credPoolEntry{addr: creds.Address, creds: creds, ts: now.Add(-3 * time.Minute), saturatedUntil: now.Add(10 * time.Minute)}
+			cp.pool[i] = credPoolEntry{addr: creds.Address, creds: creds, ts: now.Add(-3 * time.Minute), relayHist: relayHist{saturatedUntil: now.Add(10 * time.Minute)}}
 		case 3:
 			if slot3Empty {
 				cp.pool[i] = credPoolEntry{}
 			} else {
-				cp.pool[i] = credPoolEntry{addr: creds.Address, creds: creds, ts: now.Add(-5 * time.Minute), availableAt: now.Add(5 * time.Minute)}
+				cp.pool[i] = credPoolEntry{addr: creds.Address, creds: creds, ts: now.Add(-5 * time.Minute), relayHist: relayHist{availableAt: now.Add(5 * time.Minute)}}
 			}
 		default:
-			cp.pool[i] = credPoolEntry{addr: creds.Address, creds: creds, ts: now.Add(-5 * time.Minute), availableAt: now.Add(5 * time.Minute)}
+			cp.pool[i] = credPoolEntry{addr: creds.Address, creds: creds, ts: now.Add(-5 * time.Minute), relayHist: relayHist{availableAt: now.Add(5 * time.Minute)}}
 		}
 	}
 	cp.mu.Unlock()

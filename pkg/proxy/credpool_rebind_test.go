@@ -96,7 +96,7 @@ func TestCookieModeAReorderedListKeepsEachSlotOnItsRelay(t *testing.T) {
 	if err != nil || addr != r2 || slot != 1 {
 		t.Fatalf("conn 10: %q slot %d %v — want slot 1 on %s", addr, slot, err, r2)
 	}
-	cp.Release(1, creds1)
+	cp.Release(1, creds1, "")
 	cp.cp.health.answered("", time.Time{})
 	cp.NoteRelayUnanswered(10, 1, creds1, r2, time.Now())
 	// DNS answers in the other order; the exhaustion (slot 0 full, slot 1
@@ -104,7 +104,7 @@ func TestCookieModeAReorderedListKeepsEachSlotOnItsRelay(t *testing.T) {
 	answer.Store([]string{ipR2, ipR1})
 	for i := 0; i < 20 && strings.Join(cp.cp.overrideServers(), ",") != ipR2+":19302,"+r1; i++ {
 		if a, c, s, err := cp.Acquire(11); err == nil {
-			cp.Release(s, c)
+			cp.Release(s, c, "")
 			if a == r1 {
 				t.Fatalf("conn 11 was handed %s — an eleventh seat on R1 (slot %d)", a, s)
 			}
@@ -117,7 +117,7 @@ func TestCookieModeAReorderedListKeepsEachSlotOnItsRelay(t *testing.T) {
 	}
 	for i := 0; i < 5; i++ {
 		if a, c, s, err := cp.Acquire(11); err == nil {
-			cp.Release(s, c)
+			cp.Release(s, c, "")
 			if a == r1 {
 				t.Fatalf("conn 11 was handed %s on slot %d — an eleventh seat on R1 (slot 0 holds ten)", a, s)
 			}
@@ -131,13 +131,13 @@ func TestCookieModeAReorderedListKeepsEachSlotOnItsRelay(t *testing.T) {
 	cp.cp.mu.Unlock()
 	a, c, s, err := cp.Acquire(10)
 	if err == nil {
-		cp.Release(s, c)
+		cp.Release(s, c, "")
 	}
 	if a1 := slotAddrs(cp, 1); err == nil && a == r1 || strings.Join(a1, ",") == r1 {
 		t.Fatalf("slot 1 refilled under the list [R2, R1] with R1 held by slot 0: handed %q (slot %d, %v), slot 1 dials %v — want R2", a, s, err, a1)
 	}
 	for _, c := range held {
-		cp.Release(0, c)
+		cp.Release(0, c, "")
 	}
 }
 
@@ -159,10 +159,10 @@ func TestCookieModeARelayDroppedFromTheListKeepsItsLeasesSeats(t *testing.T) {
 	if addr, creds, slot, err := cp.Acquire(10); err != nil || addr != r2 || slot != 1 {
 		t.Fatalf("conn 10: %q slot %d %v — want slot 1 on %s", addr, slot, err, r2)
 	} else {
-		cp.Release(slot, creds)
+		cp.Release(slot, creds, "")
 	}
 	for _, c := range held[3:] {
-		cp.Release(0, c)
+		cp.Release(0, c, "")
 	}
 	held = held[:3]
 	// DNS drops R1 and adds R3; the path change has the list resolved again.
@@ -184,7 +184,7 @@ func TestCookieModeARelayDroppedFromTheListKeepsItsLeasesSeats(t *testing.T) {
 	for {
 		addr, creds, slot, err := cp.Acquire(0)
 		if err == nil {
-			cp.Release(slot, creds)
+			cp.Release(slot, creds, "")
 			if addr == r1 || slot == 0 {
 				t.Fatalf("conn 0 after R1 left the list: %q on slot %d — want another slot, not R1", addr, slot)
 			}
@@ -199,7 +199,7 @@ func TestCookieModeARelayDroppedFromTheListKeepsItsLeasesSeats(t *testing.T) {
 	// entry R3 at the release that frees the last seat.
 	before := time.Now()
 	for i, c := range held {
-		cp.Release(0, c)
+		cp.Release(0, c, "")
 		if i < len(held)-1 {
 			if a0 := slotAddrs(cp, 0); strings.Join(a0, ",") != r1 {
 				t.Fatalf("after %d of 3 releases slot 0 dials %v — want still %s (leases live)", i+1, a0, r1)
@@ -355,7 +355,7 @@ func TestCookieModeAMintPlacedAfterTheListChangedAsksTheListAgain(t *testing.T) 
 		t.Fatalf("the minter for slot 2 under [R2, R3, R1] with R3 and R1 held: %+v %v — want R2 (slot 1 dials R3, its old reservation of R2 must not stand)", c, err)
 	}
 	for _, c := range held {
-		cp.Release(0, c)
+		cp.Release(0, c, "")
 	}
 }
 
@@ -383,10 +383,10 @@ func TestCookieModeAShrunkListHandsTheFreedEntryOn(t *testing.T) {
 	if addr, creds, slot, err := cp.Acquire(10); err != nil || addr != r2 || slot != 1 {
 		t.Fatalf("conn 10: %q slot %d %v — want slot 1 on %s", addr, slot, err, r2)
 	} else {
-		cp.Release(slot, creds)
+		cp.Release(slot, creds, "")
 	}
 	for _, c := range held {
-		cp.Release(0, c)
+		cp.Release(0, c, "")
 	}
 	answer.Store([]string{ipR2})
 	cp.OnPathChange()
@@ -412,7 +412,7 @@ func TestCookieModeAShrunkListHandsTheFreedEntryOn(t *testing.T) {
 	for {
 		addr, creds, slot, err := cp.Acquire(0)
 		if err == nil {
-			cp.Release(slot, creds)
+			cp.Release(slot, creds, "")
 			if addr != r2 || slot != 0 {
 				t.Fatalf("conn 0 after the shrink: %q on slot %d — want %s on slot 0", addr, slot, r2)
 			}

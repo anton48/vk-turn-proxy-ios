@@ -89,7 +89,7 @@ func TestASeatOutOfReachStaysCountedUntilItsAllocationCanHaveExpired(t *testing.
 		cp, creds := fullSlot0(t, &mints)
 		wake := cp.slotAvailableChannel()
 		t0 := time.Now()
-		cp.holdSeatUntil(0, creds, t0.Add(150*time.Millisecond))
+		cp.holdSeatUntil(0, creds, "", t0.Add(150*time.Millisecond))
 		if active, live, _ := leaseCounts(cp, 0); active != connsPerSlot || live != connsPerSlot {
 			t.Fatalf("right behind the hold: active %d, leases out %d, want %d and %d — a seat the relay may still hold is handed out again", active, live, connsPerSlot, connsPerSlot)
 		}
@@ -108,7 +108,7 @@ func TestASeatOutOfReachStaysCountedUntilItsAllocationCanHaveExpired(t *testing.
 	t.Run("a time that has run out by the wall clock: at once", func(t *testing.T) {
 		var mints atomic.Int32
 		cp, creds := fullSlot0(t, &mints)
-		cp.holdSeatUntil(0, creds, time.Now().Add(-time.Second))
+		cp.holdSeatUntil(0, creds, "", time.Now().Add(-time.Second))
 		if active, _, _ := leaseCounts(cp, 0); active != connsPerSlot-1 {
 			t.Errorf("active %d, want %d at once: the allocation has expired, nothing holds the seat", active, connsPerSlot-1)
 		}
@@ -125,7 +125,7 @@ func TestASeatOutOfReachStaysCountedUntilItsAllocationCanHaveExpired(t *testing.
 			return time.Now().Round(0)
 		}
 		t.Cleanup(func() { wallClock = clock })
-		cp.releaseAt(0, creds, time.Now().Add(time.Hour))
+		cp.releaseAt(0, creds, "", time.Now().Add(time.Hour))
 		time.Sleep(100 * time.Millisecond) // five steps: each looked, none let go
 		if active, _, _ := leaseCounts(cp, 0); active != connsPerSlot {
 			t.Fatalf("active %d, want %d: a step let the seat go an hour ahead of its time", active, connsPerSlot)
@@ -146,7 +146,7 @@ func TestASeatOutOfReachStaysCountedUntilItsAllocationCanHaveExpired(t *testing.
 			}
 			return time.Now().Round(0)
 		}
-		cp.releaseAt(0, creds, time.Now().Add(time.Hour))
+		cp.releaseAt(0, creds, "", time.Now().Add(time.Hour))
 		cancel()
 		time.Sleep(60 * time.Millisecond) // the step that finds the context ended is the last one
 		thawed.Store(true)
@@ -161,8 +161,8 @@ func TestASeatOutOfReachStaysCountedUntilItsAllocationCanHaveExpired(t *testing.
 		var mints atomic.Int32
 		cp, creds := fullSlot0(t, &mints)
 		thawAtCleanup(t, cp, 0, connsPerSlot-1)
-		cp.holdSeatUntil(0, creds, time.Now().Add(time.Minute))
-		if cd := cp.markSaturated(0, creds); cd == 0 || !slotSaturated(cp, 0) {
+		cp.holdSeatUntil(0, creds, "", time.Now().Add(time.Minute))
+		if cd := cp.markSaturated(0, creds, ""); cd == 0 || !slotSaturated(cp, 0) {
 			t.Errorf("cooldown %s, saturated %v — a held seat is no give-back: the 486 behind it is not the relay's second", cd, slotSaturated(cp, 0))
 		}
 	})
@@ -175,7 +175,7 @@ func TestASeatOutOfReachStaysCountedUntilItsAllocationCanHaveExpired(t *testing.
 		gave.note(time.Now())
 		gave.life.granted(time.Minute)
 		gave.noteOutOfReach(time.Now())
-		p.releaseLease(0, creds, &gave)
+		p.releaseLease(0, creds, "", &gave)
 		time.Sleep(60 * time.Millisecond)
 		if active, _, _ := leaseCounts(cp, 0); active != connsPerSlot {
 			t.Errorf("active %d, want %d: the lease went back by the second although its allocation is out of reach for a minute", active, connsPerSlot)

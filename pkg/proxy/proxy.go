@@ -642,7 +642,8 @@ func NewProxy(cfg Config) *Proxy {
 	if cookieAuthEnabled.Load() {
 		// Cookie (VKAuth) mode: one slot per relay (2 per call link), no 4×
 		// reserve — the relays are a finite set, so extra slots would just
-		// duplicate a relay and 486. See cookieCredForSlot.
+		// duplicate a relay and 486. See cookieCredForSlot. The list's fixed
+		// entries are added by setOverride below (growForListLocked).
 		if n := len(cookieLinks()); n > 0 {
 			poolSize = 2 * n
 		}
@@ -1181,11 +1182,11 @@ func (p *Proxy) waitCaptchaAndRestart() {
 			// creating a self-amplifying decay loop. credPool.get below
 			// returns cached cred if available, otherwise fetches with
 			// allowCaptchaBlock=false (surfaces captcha as error w/o blocking).
-			_, probeCreds, probeSlot, probeErr := p.resolveTURNAddr(-1, false)
+			probeAddr, probeCreds, probeSlot, probeErr := p.resolveTURNAddr(-1, false)
 			// Probe is non-consuming; release whatever slot got acquired so
 			// it doesn't leak quota count for a cred we never used.
 			if probeErr == nil {
-				p.credPool.release(probeSlot, probeCreds)
+				p.credPool.release(probeSlot, probeCreds, probeAddr)
 				log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 				p.captchaImageURL.Store("")
 				p.Resume()
@@ -2450,13 +2451,13 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// the PAIR — the slot and the credential it handed out: the slot may be
 	// refilled under us, and the pool counts a release only against the
 	// credential it names (credPool.release).
-	currentSlot, currentCreds := credSlot, creds
+	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// The relay leg this session starts below. It also carries the note of the
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
 	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
-	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
+	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave) }()
 
 	// Start TURN relay FIRST — DTLS handshake goes through it.
 	// TURN runs until it fails naturally (no forced lifetime).
@@ -2515,7 +2516,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// path-change like vpn.wifi-lte-wifi.1.log). It logs
 					// its own decision; here we only log the proxy-side
 					// context (which conn, which slot).
-					cooldown := p.credPool.markSaturated(credSlot, creds)
+					cooldown := p.credPool.markSaturated(credSlot, creds, turnAddr)
 					log.Printf("proxy: [conn %d] TURN allocate quota error (486) on slot %d (cooldown %s)",
 						connIdx, credSlot, cooldown.Round(time.Second))
 				} else if isAuthError(turnErr) {
@@ -2973,13 +2974,13 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 		return err
 	}
 	// The lease is the pair (slot, credential) — see runDTLSSession.
-	currentSlot, currentCreds := credSlot, creds
+	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// The relay leg this session starts below. It also carries the note of the
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
 	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
-	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
+	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave) }()
 
 	// The relay leg IS this session's transport; it is JOINED before the session
 	// returns — behind the credential's release above, so ahead of it
@@ -3025,9 +3026,9 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			// Release before retry loop — see runDTLSSession for full
 			// rationale. Same pattern: avoid stale active counts during
 			// reconnect storm.
-			p.releaseLease(credSlot, currentCreds, &leg.gave) // behind the relay's second, if the leg that ended gave its allocation back
+			p.releaseLease(credSlot, currentCreds, currentAddr, &leg.gave) // behind the relay's second, if the leg that ended gave its allocation back
 			credSlot = -1
-			currentSlot, currentCreds = -1, nil
+			currentSlot, currentCreds, currentAddr = -1, nil, ""
 			retries := 0
 			for retries < 5 {
 				if connCtx.Err() != nil {
@@ -3045,7 +3046,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 					continue
 				}
 				credSlot = newSlot
-				currentSlot, currentCreds = newSlot, newCreds
+				currentSlot, currentCreds, currentAddr = newSlot, newCreds, newAddr
 				next, started := p.goRunTURN(connCtx, &leg, newAddr, newCreds, conn2, connIdx, newSlot, nil)
 				if !started {
 					return // the session is ending: nothing is started behind its join
@@ -3153,13 +3154,13 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 		return err
 	}
 	// The lease is the pair (slot, credential) — see runDTLSSession.
-	currentSlot, currentCreds := credSlot, creds
+	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// The relay leg this session starts below. It also carries the note of the
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
 	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
-	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
+	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave) }()
 
 	// TURN relay underneath (conn2 ↔ VK relay). Same pattern as
 	// runDTLSSession: any TURN exit cancels the conn so the outer loop
@@ -3185,7 +3186,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 				// Mirror runDTLSSession's error attribution so quota / auth
 				// failures land on the slot that actually carried the cred.
 				if isQuotaError(turnErr) {
-					cooldown := p.credPool.markSaturated(credSlot, creds)
+					cooldown := p.credPool.markSaturated(credSlot, creds, turnAddr)
 					log.Printf("proxy: [conn %d] WRAP-A TURN allocate quota error (486) on slot %d (cooldown %s)",
 						connIdx, credSlot, cooldown.Round(time.Second))
 				} else if isAuthError(turnErr) {
@@ -5220,13 +5221,13 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		return err
 	}
 	// The lease is the pair (slot, credential) — see runDTLSSession.
-	currentSlot, currentCreds := credSlot, creds
+	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// When this session's allocation is given back — by its live Close or by the
 	// abort of its setup — the lease is released behind the relay's second
 	// (seatcool.go).
 	var gave gaveBack
 	gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
-	defer func() { p.releaseLease(currentSlot, currentCreds, &gave) }()
+	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &gave) }()
 
 	// Set up TURN allocation and DTLS-SRTP handshake to the peer.
 	sessStart := time.Now()
@@ -5235,7 +5236,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		// Mirror runDTLSSession's error attribution so quota / auth
 		// failures land on the correct slot.
 		if isQuotaError(err) {
-			cooldown := p.credPool.markSaturated(credSlot, creds)
+			cooldown := p.credPool.markSaturated(credSlot, creds, turnAddr)
 			log.Printf("proxy: [conn %d] SRTP TURN allocate quota error (486) on slot %d (cooldown %s)",
 				connIdx, credSlot, cooldown.Round(time.Second))
 		} else if isAuthError(err) {

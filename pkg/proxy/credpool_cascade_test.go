@@ -15,7 +15,7 @@ const cascadeTestRelay = "203.0.113.11:19302"
 // marking the entry). Caller holds cp.mu; the slot holds a credential.
 func seatHolders(cp *credPool, slot, n int) {
 	for i := 0; i < n; i++ {
-		cp.seatLocked(slot)
+		cp.seatLocked(slot, cp.dialNowLocked(slot))
 	}
 }
 
@@ -85,7 +85,7 @@ func TestStartReportOnAnIdlePoolDoesNotArmTheCascadeDetector(t *testing.T) {
 	cp.mu.Lock()
 	marked := 0
 	for i := 0; i < 3; i++ {
-		if cp.pool[i].saturatedUntil.After(time.Now()) {
+		if cp.markLocked(i, cp.dialNowLocked(i)).After(time.Now()) {
 			marked++
 		}
 	}
@@ -112,7 +112,7 @@ func TestWarmCacheStartReportMarksSlotsButDoesNotArm(t *testing.T) {
 	cp.mu.Lock()
 	marked := 0
 	for i := 0; i < 3; i++ {
-		if cp.pool[i].saturatedUntil.After(time.Now()) {
+		if cp.markLocked(i, cp.dialNowLocked(i)).After(time.Now()) {
 			marked++
 		}
 	}

@@ -183,7 +183,7 @@ func TestTheOverrideIsReResolvedWhenItsRelaysAreExhausted(t *testing.T) {
 	// DNS moves the name; the old relay goes silent with evidence → marked →
 	// every relay of the list marked → the list is resolved again.
 	answer.Store("203.0.113.42")
-	cp.Release(slot, creds)
+	cp.Release(slot, creds, "")
 	cp.cp.health.answered("", time.Time{})
 	cp.NoteRelayUnanswered(0, slot, creds, "203.0.113.41:19302", time.Now())
 	// The resolution runs off the lock (DNS I/O): the list follows within a
@@ -195,7 +195,7 @@ func TestTheOverrideIsReResolvedWhenItsRelaysAreExhausted(t *testing.T) {
 		for {
 			a, c, s, err := cp.Acquire(1)
 			if err == nil {
-				cp.Release(s, c)
+				cp.Release(s, c, "")
 				if a == want {
 					return
 				}
@@ -226,7 +226,7 @@ func TestTheOverrideIsReResolvedWhenItsRelaysAreExhausted(t *testing.T) {
 	for {
 		a, c, s, err := cp.Acquire(1)
 		if err == nil {
-			cp.Release(s, c)
+			cp.Release(s, c, "")
 			if a != "203.0.113.44:19302" {
 				t.Fatalf("a failed lookup must keep the list: handed out %q", a)
 			}

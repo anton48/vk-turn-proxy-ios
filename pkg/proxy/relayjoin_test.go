@@ -510,7 +510,7 @@ func TestEverySessionJoinsItsRelayLegBeforeItGivesItsCredentialBack(t *testing.T
 		sessions++
 		first := strings.Index(b, "p.goRunTURN(")
 		joinAt := strings.Index(b, "defer p.joinRelayLeg(&leg, connCancel, connIdx)")
-		release := strings.Index(b, "p.releaseLease(currentSlot, currentCreds, &leg.gave)") // the lease's release — behind the relay's second since 430, seatcool.go
+		release := strings.Index(b, "p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave)") // the lease's release — behind the relay's second since 430, seatcool.go
 		switch {
 		case strings.Count(b, "defer p.joinRelayLeg(") != 1 || joinAt < 0:
 			t.Errorf("%s starts a relay leg and does not defer joinRelayLeg(&leg, connCancel, connIdx) exactly once", fn)

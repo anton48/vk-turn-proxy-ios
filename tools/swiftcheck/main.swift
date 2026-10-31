@@ -4478,7 +4478,7 @@ do {
 do {
     func file(_ mode: String?, _ user: String = "\(Int(Date().timeIntervalSince1970) + 8 * 3600):u") -> CredCacheFile {
         CredCacheFile(version: CredCache.supportedVersion, saved_at: Int64(Date().timeIntervalSince1970), mode: mode,
-                      creds: [CredCacheEntry(slot: 0, address: "203.0.113.11:19302", addresses: nil, username: user, password: "pw", last_used_at: 0)], relay_used_at: nil)
+                      creds: [CredCacheEntry(slot: 0, address: "203.0.113.11:19302", addresses: nil, username: user, password: "pw", last_used_at: 0, used_on: nil)], relay_used_at: nil)
     }
     // 2026-10-19: every relay VK returned with the credential rides in `addresses`
     // (Go's cache field); the mirror has to carry it through a backup round trip,
@@ -4508,6 +4508,22 @@ do {
                 check(text.contains("relay_used_at") && text.contains("1760000000"), "🚨 the cache mirror writes the relays' quota clocks back (a backup round trip keeps them)")
             } else { check(false, "the cache mirror re-encodes a file with `relay_used_at`") }
         } else { check(false, "the cache mirror decodes a file with `relay_used_at`") }
+    }
+    // 2026-10-31: the last use BY RELAY — Go's `used_on` (relay → Unix seconds)
+    // on every entry: VK's quota is per (identity, relay), the pool keeps the
+    // history per relay and asks the clock of the relay a slot dials; the
+    // mirror has to carry it through a backup round trip, or a restore reads
+    // the one `last_used_at` as every relay's (the user's review of 460).
+    do {
+        let json = Data("""
+        {"version": \(CredCache.supportedVersion), "saved_at": 1, "mode": "anon", "creds": [{"slot": 0, "address": "203.0.113.11:19302", "username": "1:u", "password": "pw", "last_used_at": 1760000000, "used_on": {"203.0.113.12:19302": 1760000000}}]}
+        """.utf8)
+        if let f = try? JSONDecoder().decode(CredCacheFile.self, from: json) {
+            check(f.creds.first?.used_on?["203.0.113.12:19302"] == 1760000000, "the cache mirror reads a credential's last use by relay (`used_on`)")
+            if let back = try? JSONEncoder().encode(f), let text = String(data: back, encoding: .utf8) {
+                check(text.contains("used_on") && text.contains("203.0.113.12:19302"), "🚨 the cache mirror writes the last use by relay back (a backup round trip keeps it)")
+            } else { check(false, "the cache mirror re-encodes a file with `used_on`") }
+        } else { check(false, "the cache mirror decodes a file with `used_on`") }
     }
     let now = Date().timeIntervalSince1970
     let cookie = file(CredCache.modeCookie), anon = file(CredCache.modeAnon), old = file(nil)

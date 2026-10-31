@@ -105,7 +105,7 @@ func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 	size := poolSizeForNumConns(cfg.NumConns)
 	if cookieAuthEnabled.Load() {
 		if n := len(cookieLinks()); n > 0 {
-			size = 2 * n
+			size = 2 * n // two per link; the list's fixed entries are added by setOverride (growForListLocked)
 		}
 	}
 	p.cp = newCredPool(ctx, size, cfg.Cooldown, cfg.CachePath, fetch)
@@ -209,10 +209,11 @@ func (p *CredPool) Acquire(connIdx int) (addr string, creds *TURNCreds, slot int
 }
 
 // Release returns a connection's hold on its slot (call when the allocation
-// is gone). creds is the credential Acquire handed out with that slot: the
-// slot may have been refilled since, and a release counts only against the
-// credential it names (credPool.release).
-func (p *CredPool) Release(slot int, creds *TURNCreds) { p.cp.release(slot, creds) }
+// is gone). creds is the credential Acquire handed out with that slot, addr
+// the relay it handed out: the slot may have been refilled since, and a
+// release counts only against the credential it names (credPool.release) —
+// and off the seats of the relay it names (relayhist.go).
+func (p *CredPool) Release(slot int, creds *TURNCreds, addr string) { p.cp.release(slot, creds, addr) }
 
 // ReleaseGivenBack is Release for a lease whose ALLOCATION was given back to the
 // relay at `at` (the deallocate written, as far as the caller can tell): the VK
@@ -220,17 +221,17 @@ func (p *CredPool) Release(slot int, creds *TURNCreds) { p.cp.release(slot, cred
 // the pool keeps counting it that long — a re-dial is seated elsewhere, or
 // parks, instead of being refused with 486 (seatcool.go). A lease that never
 // held an allocation goes through Release.
-func (p *CredPool) ReleaseGivenBack(slot int, creds *TURNCreds, at time.Time) {
-	p.cp.releaseGivenBack(slot, creds, at)
+func (p *CredPool) ReleaseGivenBack(slot int, creds *TURNCreds, addr string, at time.Time) {
+	p.cp.releaseGivenBack(slot, creds, addr, at)
 }
 
-// MarkSaturated records a 486 (allocation quota reached) on creds, the
-// credential the caller leased from slot, and returns the cooldown applied —
-// zero when the slot no longer holds that credential, or when the refusal is
-// the relay's second behind a seat this side has just given back (nothing is
-// marked either way — seatcool.go).
-func (p *CredPool) MarkSaturated(slot int, creds *TURNCreds) time.Duration {
-	return p.cp.markSaturated(slot, creds)
+// MarkSaturated records a 486 (allocation quota reached) from relay addr on
+// creds, the credential the caller leased from slot, and returns the cooldown
+// applied — on THAT relay (relayhist.go); zero when the slot no longer holds
+// that credential, or when the refusal is the relay's second behind a seat
+// this side has just given back (nothing is marked either way — seatcool.go).
+func (p *CredPool) MarkSaturated(slot int, creds *TURNCreds, addr string) time.Duration {
+	return p.cp.markSaturated(slot, creds, addr)
 }
 
 // NoteAllocated reports that the relay ACCEPTED an allocation on creds, the

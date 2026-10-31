@@ -263,7 +263,7 @@ func TestCookieModeTheKeptTwinInheritsTheQuotaHistory(t *testing.T) {
 		used := time.Now().Add(-time.Minute)
 		c := &TURNCreds{Username: futureUser("old-seed-on-A"), Password: "p", Address: relayA, Addresses: []string{relayA}}
 		cp.mu.Lock()
-		cp.pool[4] = credPoolEntry{addr: relayA, addrs: cp.candidatesForSlot(4, c), creds: c, ts: time.Now(), lastUsedAt: used, availableAt: used.Add(credSaturationCooldown)}
+		cp.pool[4] = credPoolEntry{addr: relayA, addrs: cp.candidatesForSlot(4, c), creds: c, ts: time.Now(), relayHist: relayHist{lastUsedAt: used, availableAt: used.Add(credSaturationCooldown)}}
 		cp.relayUsedAt[relayA] = used // what release() stamps when the last lease on A goes
 		cp.mu.Unlock()
 		cp.seedSlot(0, relayA, &TURNCreds{Username: futureUser("seed-on-A"), Password: "p", Address: relayA, Addresses: []string{relayA}})
@@ -364,7 +364,7 @@ func TestCookieModeTheRelayQuotaClockIsSaved(t *testing.T) {
 	// save stamps it meanwhile).
 	cp0, _, _ := relayPool(t, "", relayA)
 	_, creds0, slot0 := mustGet(t, cp0, 0)
-	cp0.release(slot0, creds0) // the last lease on A goes
+	cp0.release(slot0, creds0, "") // the last lease on A goes
 	cp0.mu.Lock()
 	active, stamped := cp0.pool[slot0].active, cp0.relayUsedAt[relayA]
 	cp0.mu.Unlock()

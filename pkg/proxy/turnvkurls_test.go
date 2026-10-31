@@ -40,7 +40,7 @@ func TestTheVKPlaceholderExpandsToTheCredentialsRelays(t *testing.T) {
 		t.Fatalf("the first hand-out: %q, want the user's relay first", addr)
 	}
 	// The user's relay silent with evidence → marked → VK's next, no mint.
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.health.answered("", time.Time{})
 	cp.noteRelayUnanswered(0, slot, creds, relayO, time.Now())
 	if addr, _, _ := mustGet(t, cp, 1); addr != relayA || mints.Load() != 0 {
@@ -67,7 +67,7 @@ func TestWithTheVKPlaceholderAnExhaustedListMints(t *testing.T) {
 	if addr != relayO {
 		t.Fatalf("precondition: %q", addr)
 	}
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.health.answered("", time.Time{})
 	cp.noteRelayUnanswered(0, slot, creds, relayO, time.Now())
 	cp.noteRelayUnanswered(0, slot, creds, relayA, time.Now())
@@ -173,7 +173,7 @@ func TestWithTheVKPlaceholderASilentOnlyCredentialMints(t *testing.T) {
 	if addr != relayO || mints.Load() != 0 {
 		t.Fatalf("precondition: %q mints %d", addr, mints.Load())
 	}
-	cp.release(slot, creds)
+	cp.release(slot, creds, "")
 	cp.noteRelayUnanswered(0, slot, creds, relayO, time.Now().Add(-5*time.Second))
 	cp.noteRelayUnanswered(0, slot, creds, relayA, time.Now().Add(-5*time.Second))
 	if cp.health.isDead(relayO) || cp.health.isDead(relayA) {

@@ -35,18 +35,13 @@ func (cp *credPool) setOverride(o turnOverride) {
 		log.Printf("credpool: TURN relay override: cookie mode — %s takes every slot after the %d fixed entr(ies); the %d entr(ies) after it are not used", TURNServersVK, len(fixed), len(o.servers)-len(fixed)-1)
 	}
 	cp.override = o
+	cp.growForListLocked() // the fixed entries add to the VK slots
 	// Cookie mode under a list: every slot asks the list afresh, in order —
 	// its stored address when the list names it and no slot holds it, else a
 	// free entry (candidatesForSlot). Cleared first: a slot BEYOND the list
 	// whose stored address is a list entry would otherwise hold that entry
 	// from the slot whose index it is while that slot is computed, and the
 	// entry sat idle (the user's review of 455).
-	was := make([]string, len(cp.pool)) // each slot's relay before (cookie mode: one)
-	for i := range cp.pool {
-		if c := cp.pool[i].addrs; len(c) == 1 {
-			was[i] = c[0]
-		}
-	}
 	if cp.mode == credCacheModeCookie && len(o.servers) > 0 {
 		for i := range cp.pool {
 			cp.pool[i].addrs = nil
@@ -55,10 +50,10 @@ func (cp *credPool) setOverride(o turnOverride) {
 	for i := range cp.pool {
 		if cp.pool[i].creds != nil {
 			cp.pool[i].addrs = cp.candidatesForSlot(i, cp.pool[i].creds)
-			if cp.mode == credCacheModeCookie {
-				cp.relayChangedLocked(i, was[i]) // the history was the old relay's
-			}
-			cp.applyRelayQuarantineLocked(i) // the clock of the relay the slot dials NOW
+			// The marks and the last use are the RELAY's the seats were on
+			// (relayhist.go): a slot re-pointed to another relay starts there
+			// with neither, and keeps the old relay's for the fallback.
+			cp.applyRelayQuarantineLocked(i) // the clock of the relay the slot dials NOW (cookie mode)
 			cp.sayReadyDespiteTheClockLocked(i, "TURN relay override")
 			cp.syncMinterLocked(i)
 		}
@@ -163,7 +158,14 @@ func (cp *credPool) candidatesLocked(slot int) []string {
 // marks are cleared at the path change. With the override LIST there is no
 // other relay to mint for: its unmarked entries are cycled through again.
 func (cp *credPool) usableLocked(slot int) bool {
-	if !cp.isFreshLocked(slot) {
+	return cp.isFreshLocked(slot) && cp.hasRelayLocked(slot)
+}
+
+// hasRelayLocked: the slot's credential has a relay to dial — the second half
+// of usableLocked, asked on its own by a hand-out that judges the freshness
+// on the relay picked for the connection (pickAcquireSlotLocked).
+func (cp *credPool) hasRelayLocked(slot int) bool {
+	if slot < 0 || slot >= len(cp.pool) || cp.pool[slot].creds == nil {
 		return false
 	}
 	if cp.configuredOffLocked(slot) { // no relay by configuration: the list dropped its own, or gives it none
@@ -430,6 +432,7 @@ func (cp *credPool) reresolveOverride(reason string, limited bool) {
 	cp.override.servers, cp.override.quotas = next.servers, next.quotas
 	servers = next.servers
 	if cp.mode == credCacheModeCookie {
+		cp.growForListLocked()               // more fixed entries: more slots, VK's kept
 		cp.rebindOverrideSlotsLocked(reason) // the slot's relay is its own, not the list's i-th
 	}
 	for i := range cp.pool {
@@ -444,49 +447,56 @@ func (cp *credPool) reresolveOverride(reason string, limited bool) {
 	cp.broadcastSlotAvailable()
 }
 
+// cookiePoolSize: the cookie pool's slots — two per call link (one per VK
+// relay of the link's answer) PLUS the list's fixed entries: a fixed entry
+// took one of the link's two slots and the VK fallback lost a relay for each
+// (the user's review, 2026-10-31: three links, six VK relays, one own relay —
+// sixty connections on it, fifty found a VK slot when it died). The ONE rule,
+// applied by setOverride at the pool's creation and at every later list
+// (growForListLocked); the constructors size two per link.
+func cookiePoolSize(links int, o turnOverride) int {
+	fixed, _ := o.cookieShape()
+	return 2*links + len(fixed)
+}
+
+// growForListLocked (cookie mode): the pool has at least cookiePoolSize slots
+// for the list it holds now — a list that gained fixed entries (a name
+// resolving to more IPs, a changed setting) takes none of VK's slots. The pool
+// never shrinks: a slot beyond the list dials nothing (candidatesForSlot).
+func (cp *credPool) growForListLocked() {
+	if cp.mode != credCacheModeCookie {
+		return
+	}
+	want := cookiePoolSize(len(cookieLinks()), cp.override)
+	for len(cp.pool) < want {
+		cp.pool = append(cp.pool, credPoolEntry{})
+	}
+	if want > cp.size {
+		log.Printf("credpool: cookie mode — the pool grows %d → %d slots for the list's %d fixed entr(ies)", cp.size, want, want-2*len(cookieLinks()))
+		cp.size = want
+	}
+}
+
 // unlimitedCap: a slot's cap on a relay without a quota.
 const unlimitedCap = math.MaxInt32
 
 // unlimitedRelayLocked: the relay slot's connections dial now, when the list
-// says it has no quota — the first candidate not marked (pickAddrLocked hands
-// it out ahead of the cursor), else the slot's one relay (cookie mode) while
-// marked. "" otherwise.
+// says it has no quota (pickAddrLocked hands it out ahead of the cursor), ""
+// otherwise.
 func (cp *credPool) unlimitedRelayLocked(slot int) string {
-	cands := cp.candidatesLocked(slot)
-	if len(cands) == 0 {
-		return ""
-	}
-	first := cands[0]
-	if alive := cp.health.alive(cands); len(alive) > 0 {
-		first = alive[0]
-	}
-	if cp.override.unlimited(first) {
-		return first
+	if relay := cp.dialNowLocked(slot); relay != "" && cp.override.unlimited(relay) {
+		return relay
 	}
 	return ""
 }
 
-// capLocked is how many connections slot's credential may seat: the relay's
-// configured quota when the relay its connections dial now has one (0 = no
-// limit — the user's own relay), else VK's ten (connsPerSlot). Asked at the
-// hand-out, so once a relay without a quota is marked the cap is the next
-// relay's: the seats already out stay out until their sessions end.
+// capLocked is how many connections slot's credential may seat on the relay
+// its connections dial now: the relay's configured quota when it has one (0 =
+// no limit — the user's own relay), else VK's ten (connsPerSlot). For the
+// logs and the counts; a hand-out asks of the relay picked for the connection
+// (capOnLocked, roomOnLocked).
 func (cp *credPool) capLocked(slot int) int {
-	cands := cp.candidatesLocked(slot)
-	if len(cands) == 0 {
-		return connsPerSlot
-	}
-	first := cands[0]
-	if alive := cp.health.alive(cands); len(alive) > 0 {
-		first = alive[0]
-	}
-	if q, ok := cp.override.quota(first); ok {
-		if q == 0 {
-			return unlimitedCap
-		}
-		return q
-	}
-	return connsPerSlot
+	return cp.capOnLocked(cp.dialNowLocked(slot))
 }
 
 // quarantinedRelays: the relays whose quota clock is running (cookie mode) —
@@ -505,32 +515,6 @@ func (cp *credPool) quarantinedRelays() []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// relayChangedLocked (cookie mode): slot dials another relay than `was` —
-// the entry's history (lastUsedAt) and its smart-pause mark were about the
-// old relay's seats, and the relay clock has that history already; carried
-// over, they marked a slot re-pointed to a relay never used for six minutes
-// (the user's run 6 of 2026-10-30: the bootstrap timed out). The slot starts
-// its new relay with neither.
-func (cp *credPool) relayChangedLocked(slot int, was string) {
-	if slot < 0 || slot >= len(cp.pool) {
-		return
-	}
-	now := ""
-	if c := cp.pool[slot].addrs; len(c) == 1 {
-		now = c[0]
-	}
-	if now == was {
-		return
-	}
-	e := &cp.pool[slot]
-	e.lastUsedAt = time.Time{}
-	if e.saturationTimer != nil {
-		e.saturationTimer.Stop()
-		e.saturationTimer = nil
-	}
-	e.saturatedUntil = time.Time{}
 }
 
 // heldRelaysExcept lists the relays the pool's slots hold — every filled
@@ -688,7 +672,6 @@ func (cp *credPool) releaseStaleRelayLocked(slot int, reason string) {
 		return // the list still names it
 	}
 	e.addrs = nil
-	cp.relayChangedLocked(slot, cur)
 	cp.applyRelayQuarantineLocked(slot)
 	cp.syncMinterLocked(slot)
 	if slot >= len(fixed) {
@@ -712,7 +695,6 @@ func (cp *credPool) takeFreeEntryLocked(slot int, reason string) {
 	}
 	cp.pool[slot].addrs = []string{next}
 	cp.pool[slot].addr = next
-	cp.relayChangedLocked(slot, "")
 	cp.applyRelayQuarantineLocked(slot)
 	cp.syncMinterLocked(slot)
 	log.Printf("credpool: slot %d: the TURN override list (%s) has a free entry — the slot dials %s", slot, reason, next)
@@ -784,6 +766,7 @@ func (cp *credPool) placeLocked(slot int, e credPoolEntry) {
 	for len(cp.pool) <= slot {
 		cp.pool = append(cp.pool, credPoolEntry{})
 	}
+	cp.pool[slot].stopSaturationTimers()
 	cp.pool[slot] = e
 	cp.applyRelayQuarantineLocked(slot)
 	cp.syncMinterLocked(slot)
