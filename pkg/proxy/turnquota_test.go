@@ -943,8 +943,40 @@ func TestCookieModeASilentRelayWithoutAQuotaIsNotTakenFirst(t *testing.T) {
 	cp2.mu.Unlock()
 	cp2.health.unanswered(relayO, cp2.health.now())
 	cp2.health.unanswered(relayE, cp2.health.now())
-	if addr, _, slot := mustGet(t, cp2, 0); slot != 0 || addr != relayO {
+	addr, c, slot := mustGet(t, cp2, 0)
+	if slot != 0 || addr != relayO {
 		t.Fatalf("conn 0 with O and E both silent: %q on slot %d — want its own slot's O (nothing untried is left; the list is cycled)", addr, slot)
+	}
+	// CYCLED: the user's review of ddb1fc1 — the own slot preferred for ever
+	// dialled O, O, O while E had come back. Every unanswered attempt moves the
+	// connection's cursor, and the cursor walks the silent slots: O, E, O, E.
+	cp2.release(0, c, relayO)
+	cp2.noteRelayUnanswered(0, 0, c, relayO, time.Now())
+	addr, c, slot = mustGet(t, cp2, 0)
+	if slot != 1 || addr != relayE {
+		t.Fatalf("conn 0 after another silent attempt on O: %q on slot %d — want E's slot next (the silent slots are cycled)", addr, slot)
+	}
+	cp2.release(1, c, relayE)
+	cp2.noteRelayUnanswered(0, 1, c, relayE, time.Now())
+	addr, c, slot = mustGet(t, cp2, 0)
+	if slot != 0 || addr != relayO {
+		t.Fatalf("conn 0 after a silent attempt on E: %q on slot %d — want O's slot again", addr, slot)
+	}
+	// E back: its answer to the next attempt clears its record (untried — the
+	// first round) and marks O.
+	cp2.release(0, c, relayO)
+	cp2.noteRelayUnanswered(0, 0, c, relayO, time.Now())
+	addr, c, slot = mustGet(t, cp2, 0)
+	if slot != 1 || addr != relayE {
+		t.Fatalf("conn 0: %q on slot %d — want E's slot", addr, slot)
+	}
+	cp2.noteAllocatedAt(1, c, relayE, time.Now())
+	if !cp2.health.isDead(relayO) {
+		t.Fatalf("O not marked after E answered")
+	}
+	cp2.release(1, c, relayE)
+	if addr, _, slot := mustGet(t, cp2, 0); slot != 1 || addr != relayE {
+		t.Fatalf("conn 0 with E back and O marked: %q on slot %d — want E", addr, slot)
 	}
 }
 
