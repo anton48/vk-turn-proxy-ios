@@ -457,25 +457,45 @@ func (g *sourceGate) unlock(key string) {
 // loop asks for the next one — the handling of a packet lies between two
 // ReadFrom calls on one loop. The previous source is let go BEFORE the next
 // read blocks, so an idle loop holds nothing, and a loop that ends (its read
-// failed — the socket closed) holds nothing either. `held` belongs to the
-// loop's goroutine alone; Close is the inner socket's.
+// failed — the socket closed) holds nothing either; the Close lets go
+// whatever is held, under a lock of its own (another goroutine closes).
 type gatedPacketConn struct {
 	net.PacketConn
 	gate *sourceGate
+	mu   sync.Mutex
 	held string
 }
 
-func (c *gatedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+// letGoLocked lets the held source go, if any. Caller holds c.mu.
+func (c *gatedPacketConn) letGoLocked() {
 	if c.held != "" {
 		c.gate.unlock(c.held)
 		c.held = ""
 	}
+}
+
+func (c *gatedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	c.mu.Lock()
+	c.letGoLocked()
+	c.mu.Unlock()
 	n, addr, err := c.PacketConn.ReadFrom(p)
 	if err == nil && addr != nil {
-		c.held = seatKey(addr)
-		c.gate.lock(c.held)
+		key := seatKey(addr)
+		c.gate.lock(key)
+		c.mu.Lock()
+		c.held = key
+		c.mu.Unlock()
 	}
 	return n, addr, err
+}
+
+// Close lets the held source go and closes the socket (the server's Close
+// runs on another goroutine than the read loop — hence the lock).
+func (c *gatedPacketConn) Close() error {
+	c.mu.Lock()
+	c.letGoLocked()
+	c.mu.Unlock()
+	return c.PacketConn.Close()
 }
 
 // gatedListener hands pion each accepted TCP connection gated (gatedConn).
@@ -499,25 +519,50 @@ func (l *gatedListener) Accept() (net.Conn, error) {
 // message read in parts holds and lets go at every part: no handling runs
 // while a part is awaited, and the last part's read holds the source through
 // the handling. The key is the client's address alone — two connections from
-// one client port to two listeners are one source to pion's events.
+// one client port to two listeners are one source to pion's events. The
+// CLOSE lets the source go too: pion's STUN conn ends a connection on a bad
+// frame without another read, and a source held by a closed connection
+// held every other connection of that client for good (the user's review of
+// f9a4740 — on their loopback stand the next connection got no Binding
+// answer). `held` is under its own lock: the loop reads, another goroutine
+// may close.
 type gatedConn struct {
 	net.Conn
 	gate *sourceGate
 	key  string
+	mu   sync.Mutex
 	held bool
 }
 
-func (c *gatedConn) Read(p []byte) (int, error) {
+// letGo lets the held source go, if held. Caller holds c.mu.
+func (c *gatedConn) letGoLocked() {
 	if c.held {
 		c.gate.unlock(c.key)
 		c.held = false
 	}
+}
+
+func (c *gatedConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	c.letGoLocked()
+	c.mu.Unlock()
 	n, err := c.Conn.Read(p)
 	if err == nil && n > 0 {
 		c.gate.lock(c.key)
+		c.mu.Lock()
 		c.held = true
+		c.mu.Unlock()
 	}
 	return n, err
+}
+
+// Close lets the source go and closes the connection: a connection pion ends
+// on a bad frame makes no further read.
+func (c *gatedConn) Close() error {
+	c.mu.Lock()
+	c.letGoLocked()
+	c.mu.Unlock()
+	return c.Conn.Close()
 }
 
 func (r *relay) close() error {

@@ -765,6 +765,8 @@ func (f *fakeConn) Read(p []byte) (int, error) {
 
 func (f *fakeConn) RemoteAddr() net.Addr { return f.remote }
 
+func (f *fakeConn) Close() error { return nil }
+
 // The gate is on the listeners pion accepts from too, the ONE gate of the
 // relay: a source held on a UDP listener is held for a TCP connection as well.
 func TestTheTCPListenersPionAcceptsAreGated(t *testing.T) {
@@ -799,5 +801,92 @@ func TestTheTCPListenersPionAcceptsAreGated(t *testing.T) {
 	_ = c
 	if _, err := rawAllocateWith(t, turn.NewSTUNConn(tcp), r.tcp[0], requestedTCP); err != 0 && false {
 		t.Fatal("unreachable")
+	}
+}
+
+// The user's review of f9a4740: pion's STUN conn ends a connection on a bad
+// frame without another read, and the gated connection let its source go
+// only at the next read — a closed connection held its client's source for
+// good, and the next connection of that client got no Binding answer. The
+// close lets the source go.
+func TestAClosedTCPConnectionLetsItsSourceGo(t *testing.T) {
+	src := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40600}
+	gate := &sourceGate{}
+	a := &gatedConn{Conn: &fakeConn{in: make(chan int, 4), remote: src}, gate: gate, key: seatKey(src)}
+	b := &gatedConn{Conn: &fakeConn{in: make(chan int, 4), remote: src}, gate: gate, key: seatKey(src)}
+	a.Conn.(*fakeConn).in <- 20
+	b.Conn.(*fakeConn).in <- 20
+	buf := make([]byte, 64)
+	if n, err := a.Read(buf); err != nil || n != 20 {
+		t.Fatalf("connection A's read: %d %v", n, err)
+	}
+	got := make(chan int, 1)
+	go func() { n, _ := b.Read(buf); got <- n }()
+	select {
+	case n := <-got:
+		t.Fatalf("connection B read %d bytes while connection A held the source", n)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// A is closed on a bad frame — no further read.
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case n := <-got:
+		if n != 20 {
+			t.Fatalf("connection B read %d bytes, want 20", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection B still waits after connection A was closed: the closed connection holds the source for good")
+	}
+	b.Close()
+}
+
+// The same on the wire: connection A from a client port sends a bad TURN
+// frame to listener 1 and is closed by pion; connection B from the SAME
+// client port (SO_REUSEPORT on both) to listener 2 asks a STUN Binding and
+// must be answered.
+func TestAConnectionEndedOnABadFrameDoesNotHoldItsClientsNextConnection(t *testing.T) {
+	cfg, err := parseConfig("127.0.0.1:0,127.0.0.1:0", "", "127.0.0.1", 4, "40260-40270", "vk-turn-relay", false, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := start(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.close() })
+	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40280}
+	dial := func(to net.Addr) net.Conn {
+		d := net.Dialer{LocalAddr: local, Control: reusePort}
+		c, err := d.Dial("tcp", to.String())
+		if err != nil {
+			t.Skipf("two connections from one client port need SO_REUSEPORT here: %v", err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	a := dial(r.tcp[0])
+	if _, err := a.Write([]byte{0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4}); err != nil { // not a STUN or ChannelData frame
+		t.Fatal(err)
+	}
+	_ = a.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := a.Read(make([]byte, 16)); err == nil {
+		t.Fatal("connection A was not ended on the bad frame")
+	}
+	b := dial(r.tcp[1])
+	req := stun.MustBuild(stun.TransactionID, stun.BindingRequest, stun.Fingerprint)
+	if _, err := b.Write(req.Raw); err != nil {
+		t.Fatal(err)
+	}
+	_ = b.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 1500)
+	n, err := b.Read(buf)
+	if err != nil {
+		t.Fatalf("connection B, from the client port of the closed connection A, got no Binding answer: %v", err)
+	}
+	res := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+	if err := res.Decode(); err != nil || res.Type.Class != stun.ClassSuccessResponse {
+		t.Fatalf("connection B's answer: %v %v", res.Type, err)
 	}
 }
