@@ -8,6 +8,7 @@ go 1.24
 require (
 	github.com/pion/stun/v3 v3.1.1
 	github.com/pion/turn/v5 v5.0.2
+	golang.org/x/sys v0.30.0
 )
 
 require (
@@ -17,7 +18,6 @@ require (
 	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.32.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
 )
 
 replace github.com/pion/turn/v5 => ../../third_party/pion-turn

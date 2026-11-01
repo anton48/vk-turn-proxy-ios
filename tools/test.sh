@@ -104,6 +104,10 @@ relay_targets() {
         env -C tools/turn-relay CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} go build -trimpath -o /dev/null . \
             || { echo "   build $t failed"; ok=1; }
     done
+    # The tool's TESTS compile for the Linux stands too: a socket option the
+    # Mac's syscall package has and Linux's lacks broke them once (2026-11-01).
+    env -C tools/turn-relay CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o /dev/null . \
+        || { echo "   test build linux/amd64 failed"; ok=1; }
     return $ok
 }
 run "turn-relay — built for the stands" \

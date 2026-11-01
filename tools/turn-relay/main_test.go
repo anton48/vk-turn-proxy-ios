@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -867,12 +868,25 @@ func TestAConnectionEndedOnABadFrameDoesNotHoldItsClientsNextConnection(t *testi
 		return c
 	}
 	a := dial(r.tcp[0])
-	if _, err := a.Write([]byte{0xff, 0xff, 0xff, 0xff, 1, 2, 3, 4}); err != nil { // not a STUN or ChannelData frame
+	// A COMPLETE bad frame: twenty bytes (pion's STUN conn waits for a header's
+	// worth before it judges — eight bytes were an INCOMPLETE frame, waited
+	// for with the source let go, and a read timeout read as the close passed
+	// the test on the leaking code; the user's review of 8052720) that are
+	// neither STUN (the first two bits) nor ChannelData — pion ends the
+	// connection on them.
+	bad := make([]byte, 20)
+	for i := range bad {
+		bad[i] = 0xff
+	}
+	if _, err := a.Write(bad); err != nil {
 		t.Fatal(err)
 	}
 	_ = a.SetReadDeadline(time.Now().Add(3 * time.Second))
-	if _, err := a.Read(make([]byte, 16)); err == nil {
+	switch _, err := a.Read(make([]byte, 16)); {
+	case err == nil:
 		t.Fatal("connection A was not ended on the bad frame")
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		t.Fatalf("connection A is still open 3 s after the bad frame: %v — pion waits for more, the frame was not judged bad", err)
 	}
 	b := dial(r.tcp[1])
 	req := stun.MustBuild(stun.TransactionID, stun.BindingRequest, stun.Fingerprint)
