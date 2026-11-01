@@ -472,24 +472,222 @@ func TestTwoAllocatesInFlightFromOneSourceAreTwoSeats(t *testing.T) {
 	}
 }
 
-// The user's review of 462 (2): pion raises OnAllocationError for EVERY
-// handling error of a source — a malformed packet on another listener from
-// the same socket — and the handler gave back any pending reservation of that
-// source, freeing the limit under an Allocate still in flight. Only a failed
-// creation (this relay's port generator) gives a seat back.
-func TestAnErrorOfAnotherPacketDoesNotGiveAReservationBack(t *testing.T) {
-	src := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40300}
-	r := &relay{seats: newSeats(1)}
-	if _, ok := r.seats.reserve(src, time.Now()); !ok {
-		t.Fatal("the reservation")
+// The user's reviews of 462 and 463: pion raises OnAllocationError for EVERY
+// handling error of a source, and after the quota check an Allocate can fail
+// in more places than the port generator (LIFETIME 0 — the manager; a TCP
+// allocation — the inherited generator). The packets of one source are
+// handled ONE AT A TIME across the listeners (sourceGate): a second listener's
+// read of the same source waits until the first loop asks for its next
+// packet, so an error during a handling is that request's own.
+func TestPacketsOfOneSourceAreHandledOneAtATime(t *testing.T) {
+	src := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40400}
+	other := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40401}
+	third := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40402}
+	gate := &sourceGate{}
+	a := &gatedPacketConn{PacketConn: &fakePacketConn{in: make(chan net.Addr, 4)}, gate: gate}
+	b := &gatedPacketConn{PacketConn: &fakePacketConn{in: make(chan net.Addr, 4)}, gate: gate}
+	a.PacketConn.(*fakePacketConn).in <- src
+	b.PacketConn.(*fakePacketConn).in <- src
+	b.PacketConn.(*fakePacketConn).in <- third
+	buf := make([]byte, 64)
+	if _, addr, err := a.ReadFrom(buf); err != nil || addr != src {
+		t.Fatalf("loop A's first read: %v %v", addr, err)
 	}
-	if held, back := r.allocationError(src, "failed to decode STUN message: unexpected EOF"); back || held != 1 {
-		t.Fatalf("an error of another packet from the same source: given back %v, held %d — want the reservation kept, 1", back, held)
+	// Loop B's packet from the same source waits for loop A's handling.
+	got := make(chan net.Addr, 1)
+	go func() { _, addr, _ := b.ReadFrom(buf); got <- addr }()
+	select {
+	case addr := <-got:
+		t.Fatalf("loop B read a packet from %v while loop A was handling one from the same source", addr)
+	case <-time.After(300 * time.Millisecond):
 	}
-	if held, back := r.allocationError(src, "allocation mismatch: 127.0.0.1:40300"); back || held != 1 {
-		t.Fatalf("an Allocate refused before the quota check: given back %v, held %d — want the reservation kept, 1", back, held)
+	// A's next read ends its handling: B gets its packet.
+	a.PacketConn.(*fakePacketConn).in <- other
+	if _, addr, err := a.ReadFrom(buf); err != nil || addr != other {
+		t.Fatalf("loop A's second read: %v %v", addr, err)
 	}
-	if held, back := r.allocationError(src, relayPortErr+" in 40000-40000: bind: address already in use"); !back || held != 0 {
-		t.Fatalf("the creation failed in the port generator: given back %v, held %d — want the seat back, 0", back, held)
+	select {
+	case addr := <-got:
+		if addr != src {
+			t.Fatalf("loop B read %v, want the waiting packet from %v", addr, src)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("loop B still waits after loop A asked for its next packet")
+	}
+	// A source nobody handles is never held up (loop A holds `other` now).
+	go func() { _, addr, _ := b.ReadFrom(buf); got <- addr }()
+	select {
+	case addr := <-got:
+		if addr != third {
+			t.Fatalf("loop B read %v, want %v", addr, third)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("loop B's packet from a source nobody handles waited for nothing")
+	}
+}
+
+// waitHeld waits up to three seconds for the relay's held count to reach want
+// (pion sends the answer before it raises the event that moves the count) and
+// returns the count as it stands then.
+func waitHeld(r *relay, want int64) int64 {
+	deadline := time.Now().Add(3 * time.Second)
+	for r.seats.count() != want && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	return r.seats.count()
+}
+
+// fakePacketConn hands out packets from the sources queued on `in`.
+type fakePacketConn struct {
+	net.PacketConn
+	in chan net.Addr
+}
+
+func (f *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	addr, ok := <-f.in
+	if !ok {
+		return 0, nil, net.ErrClosed
+	}
+	return 1, addr, nil
+}
+
+// lifetimeZero is the LIFETIME attribute (RFC 5766 §14.2) asking for 0 s —
+// pion's manager refuses it AFTER the quota check, before any generator.
+var lifetimeZero = stun.RawAttribute{Type: stun.AttrType(0x000D), Value: []byte{0, 0, 0, 0}}
+
+// requestedTCP is REQUESTED-TRANSPORT for TCP (protocol 6): the inherited
+// generator's AllocateListener answers it, with an error of its own text.
+var requestedTCP = stun.RawAttribute{Type: stun.AttrType(0x0019), Value: []byte{6, 0, 0, 0}}
+
+// rawAllocateWith is rawAllocate with extra attributes on the authenticated ask.
+func rawAllocateWith(t *testing.T, conn net.PacketConn, to net.Addr, transport stun.Setter, extra ...stun.Setter) (granted bool, code stun.ErrorCode) {
+	t.Helper()
+	ask := func(m *stun.Message) *stun.Message {
+		if _, err := conn.WriteTo(m.Raw, to); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1500)
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("no answer from %s: %v", to, err)
+		}
+		res := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+		if err := res.Decode(); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	res := ask(stun.MustBuild(stun.TransactionID, stun.NewType(stun.MethodAllocate, stun.ClassRequest), transport, stun.Fingerprint))
+	var realm stun.Realm
+	var nonce stun.Nonce
+	if err := realm.GetFrom(res); err != nil {
+		t.Fatalf("the first answer carries no realm: %v", err)
+	}
+	if err := nonce.GetFrom(res); err != nil {
+		t.Fatalf("the first answer carries no nonce: %v", err)
+	}
+	const user = "1793400000:1125900188966338"
+	setters := []stun.Setter{stun.TransactionID, stun.NewType(stun.MethodAllocate, stun.ClassRequest), transport,
+		stun.NewUsername(user), realm, nonce}
+	setters = append(setters, extra...)
+	setters = append(setters, stun.NewLongTermIntegrity(user, realm.String(), "a-password-the-relay-never-saw"), stun.Fingerprint)
+	res = ask(stun.MustBuild(setters...))
+	if res.Type.Class == stun.ClassSuccessResponse {
+		return true, 0
+	}
+	var ec stun.ErrorCodeAttribute
+	if err := ec.GetFrom(res); err != nil {
+		t.Fatalf("an answer that is neither a success nor an error: %v", res.Type)
+	}
+	return false, ec.Code
+}
+
+// The user's review of 463: an Allocate refused AFTER the quota check — by
+// the manager (LIFETIME 0) or by the inherited generator (a TCP allocation)
+// — left its reservation held for good when only the port generator's error
+// text gave a seat back; under -max-allocs 1 the next Allocate drew 486 with
+// no allocation held. Every error that ends the handling gives the seat back.
+func TestAnAllocateRefusedAfterTheQuotaCheckGivesItsSeatBack(t *testing.T) {
+	r := testRelay(t, 1)
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if granted, code := rawAllocateWith(t, conn, r.udp[0], requestedUDP, lifetimeZero); granted || code == stun.CodeAllocQuotaReached {
+		t.Fatalf("an Allocate asking for a lifetime of 0: granted %v, code %d — want refused, not with 486", granted, code)
+	}
+	// pion answers the client BEFORE it raises the error event — the count
+	// is read after the event.
+	if held := waitHeld(r, 0); held != 0 {
+		t.Fatalf("after the refused Allocate (lifetime 0): %d held, want 0 — the reservation leaked", held)
+	}
+	// The limit is whole again: an ordinary Allocate is granted.
+	if granted, code := rawAllocate(t, conn, r.udp[0]); !granted {
+		t.Fatalf("an ordinary Allocate after the refusal: %d — want granted (the seat is free)", code)
+	}
+	// A TCP allocation refused by the INHERITED generator — the one relay
+	// port of the range is held by a plain listener (no SO_REUSEPORT, so the
+	// generator's bind fails every retry; its error carries no text of ours):
+	// the seat comes back too, and the limit is whole.
+	busy, err := net.Listen("tcp", "0.0.0.0:40071")
+	if err != nil {
+		t.Skipf("port 40071 not free for the test: %v", err)
+	}
+	defer busy.Close()
+	cfg, err := parseConfig("127.0.0.1:0", "", "127.0.0.1", 1, "40071-40071", "vk-turn-relay", false, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := start(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r2.close() })
+	tcp, err := net.Dial("tcp", r2.tcp[0].String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcp.Close()
+	if granted, code := rawAllocateWith(t, turn.NewSTUNConn(tcp), r2.tcp[0], requestedTCP); granted || code == stun.CodeAllocQuotaReached {
+		t.Fatalf("a TCP allocation with the one relay port held by another process: granted %v, code %d — want refused by the generator, not with 486", granted, code)
+	}
+	if held := waitHeld(r2, 0); held != 0 {
+		t.Fatalf("after the refused TCP allocation: %d held, want 0 — the reservation leaked", held)
+	}
+	conn2, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	if granted, code := rawAllocate(t, conn2, r2.udp[0]); !granted {
+		t.Fatalf("a UDP Allocate after the refused TCP one under -max-allocs 1: %d — want granted (the seat is free)", code)
+	}
+}
+
+// The gate is on the socket pion reads, and it is ONE gate for every
+// listener: a source held on listener A is held for listener B too.
+func TestTheUDPListenersPionReadsAreGated(t *testing.T) {
+	cfg, err := parseConfig("127.0.0.1:0,127.0.0.1:0", "", "127.0.0.1", 4, "40140-40160", "vk-turn-relay", false, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := start(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.close() })
+	if len(r.pcs) != 2 || r.gate == nil {
+		t.Fatalf("%d UDP listeners handed to pion, gate %v — want 2 and a gate", len(r.pcs), r.gate)
+	}
+	for i, pc := range r.pcs {
+		g, ok := pc.PacketConn.(*gatedPacketConn)
+		if !ok {
+			t.Fatalf("listener %d is handed to pion ungated (%T): a second listener's packet from a source in handling is not held", i, pc.PacketConn)
+		}
+		if g.gate != r.gate {
+			t.Fatalf("listener %d has a gate of its own — the sources must be held across every listener", i)
+		}
 	}
 }

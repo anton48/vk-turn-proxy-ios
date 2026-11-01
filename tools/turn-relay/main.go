@@ -61,6 +61,8 @@ type relay struct {
 	udp    []net.Addr
 	tcp    []net.Addr
 	seats  seats
+	gate   *sourceGate             // the packets of one source handled one at a time (sourceGate)
+	pcs    []turn.PacketConnConfig // the UDP listeners as handed to pion — gated sockets (a test reads them)
 	closes []func() error
 }
 
@@ -70,10 +72,11 @@ type relay struct {
 // side by side (TCP: a goroutine per connection) all passed it before any was
 // counted, and -max-allocs 1 held 2–6 at once (the user's review, 2026-10-31).
 // A seat is taken where the check is made (reserve); the allocation's creation
-// confirms it (created); a creation that failed gives it back at once — pion
-// raises OnAllocationError from the one read loop both transports go through
-// (server.go: a TCP connection is served as a STUN packet conn by the same
-// loop); a deleted allocation frees it.
+// confirms it (created); a handling that ended in an error gives it back at
+// once — pion raises OnAllocationError from the one read loop both transports
+// go through (server.go: a TCP connection is served as a STUN packet conn by
+// the same loop), and the gate makes that error the handled request's own
+// (sourceGate); a deleted allocation frees it.
 type seats struct {
 	mu      sync.Mutex
 	max     int64          // the limit
@@ -279,7 +282,7 @@ func ipList(ips []net.IP) string {
 
 // start binds every listen address (TCP and UDP) and runs the server.
 func start(cfg *config) (*relay, error) {
-	r := &relay{seats: newSeats(cfg.maxAllocs)}
+	r := &relay{seats: newSeats(cfg.maxAllocs), gate: &sourceGate{}}
 	allowed := func(_ net.Addr, peerIP net.IP) bool {
 		for _, p := range cfg.peers {
 			if p.Equal(peerIP) {
@@ -309,7 +312,7 @@ func start(cfg *config) (*relay, error) {
 		}
 		r.closes = append(r.closes, udp.Close)
 		r.udp = append(r.udp, udp.LocalAddr())
-		pcs = append(pcs, turn.PacketConnConfig{PacketConn: udp, RelayAddressGenerator: ports, PermissionHandler: allowed})
+		pcs = append(pcs, turn.PacketConnConfig{PacketConn: &gatedPacketConn{PacketConn: udp, gate: r.gate}, RelayAddressGenerator: ports, PermissionHandler: allowed})
 		tcp, err := net.Listen("tcp", a)
 		if err != nil {
 			return fail(fmt.Errorf("tcp %s: %w", a, err))
@@ -348,11 +351,13 @@ func start(cfg *config) (*relay, error) {
 					cfg.logf("turn-relay: allocation of %s (%s, %s) gone — %d held", srcAddr, userID, protocol, n)
 				}
 			},
-			// A failed Allocate, over either transport (pion raises it from the
-			// one read loop) — and only a failed CREATION gives its reservation
-			// back (allocationError).
+			// An error that ended a handling of this source — pion raises it
+			// from the one read loop, over either transport, on every path
+			// after the quota check (and before it, when no seat was taken):
+			// the handled request's reservation, if any, is given back. Under
+			// the gate it can be no other request's (sourceGate).
 			OnAllocationError: func(srcAddr, _ net.Addr, protocol, message string) {
-				if n, ok := r.allocationError(srcAddr, message); ok {
+				if n, ok := r.seats.failed(srcAddr); ok {
 					cfg.logf("turn-relay: allocation for %s (%s) FAILED: %s — its seat given back, %d held", srcAddr, protocol, message, n)
 				}
 			},
@@ -364,6 +369,7 @@ func start(cfg *config) (*relay, error) {
 		return fail(err)
 	}
 	r.server = server
+	r.pcs = pcs
 	return r, nil
 }
 
@@ -405,27 +411,62 @@ func (w *portWalk) AllocatePacketConn(conf turn.AllocateListenerConfig) (net.Pac
 			return conn, addr, nil
 		}
 	}
-	return nil, nil, fmt.Errorf("%s in %d-%d: %w", relayPortErr, w.MinPort, w.MaxPort, err)
+	return nil, nil, fmt.Errorf("no free relay port in %d-%d: %w", w.MinPort, w.MaxPort, err)
 }
 
-// relayPortErr opens the one error that can end an Allocate AFTER its seat was
-// reserved: this relay's own port generator (pion's manager checks the
-// five-tuple before the quota and fails after it only in the generator). The
-// error event names it in its message, and the seat is given back on that
-// message alone — pion raises the same event for EVERY handling error of a
-// source (a malformed packet on another listener from the same socket), and
-// such an error must not give back a seat an Allocate still in flight holds
-// (the user's review of 462).
-const relayPortErr = "turn-relay: no free relay port"
+// sourceGate: the packets of ONE source are handled one at a time, across
+// every listener. pion serves each listener on a read loop of its own and
+// raises OnAllocationError for EVERY handling error of a source, naming the
+// source alone — so a malformed packet on listener B from the same socket
+// whose Allocate listener A was still handling gave back A's reservation
+// (the user's review of 462), and a seat given back on one error text alone
+// leaked on every other failure after the quota check — LIFETIME 0, a TCP
+// allocation the inherited generator refuses (the user's review of 463). With
+// the gate, the only reservation of a source during a handling is the
+// handled request's own: whatever ends that handling with an error — pion
+// raises the event on every such path, after the quota check or before it —
+// gives the request's seat back, and an error of another packet cannot come
+// in between. A TCP connection is a source of its own (one loop per
+// connection) and needs no gate.
+type sourceGate struct {
+	m sync.Map // the source's key → *sync.Mutex; a mutex per source seen, kept (a test relay)
+}
 
-// allocationError is what pion's OnAllocationError does with a seat: a
-// reservation is given back only for a failed CREATION — the generator's
-// error — never for an error of another packet from the same source.
-func (r *relay) allocationError(src net.Addr, message string) (held int64, givenBack bool) {
-	if !strings.Contains(message, relayPortErr) {
-		return r.seats.count(), false
+func (g *sourceGate) lock(key string) {
+	mu, _ := g.m.LoadOrStore(key, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+}
+
+func (g *sourceGate) unlock(key string) {
+	if mu, ok := g.m.Load(key); ok {
+		mu.(*sync.Mutex).Unlock()
 	}
-	return r.seats.failed(src)
+}
+
+// gatedPacketConn is a listener's socket as pion reads it: a packet's source
+// is held from the moment the packet is handed to the read loop until the
+// loop asks for the next one — the handling of a packet lies between two
+// ReadFrom calls on one loop. The previous source is let go BEFORE the next
+// read blocks, so an idle loop holds nothing, and a loop that ends (its read
+// failed — the socket closed) holds nothing either. `held` belongs to the
+// loop's goroutine alone; Close is the inner socket's.
+type gatedPacketConn struct {
+	net.PacketConn
+	gate *sourceGate
+	held string
+}
+
+func (c *gatedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if c.held != "" {
+		c.gate.unlock(c.held)
+		c.held = ""
+	}
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if err == nil && addr != nil {
+		c.held = seatKey(addr)
+		c.gate.lock(c.held)
+	}
+	return n, addr, err
 }
 
 func (r *relay) close() error {
