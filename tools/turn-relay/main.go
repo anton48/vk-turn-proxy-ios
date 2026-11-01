@@ -63,6 +63,7 @@ type relay struct {
 	seats  seats
 	gate   *sourceGate             // the packets of one source handled one at a time (sourceGate)
 	pcs    []turn.PacketConnConfig // the UDP listeners as handed to pion — gated sockets (a test reads them)
+	lcs    []turn.ListenerConfig   // the TCP listeners as handed to pion — gated listeners (a test reads them)
 	closes []func() error
 }
 
@@ -319,7 +320,7 @@ func start(cfg *config) (*relay, error) {
 		}
 		r.closes = append(r.closes, tcp.Close)
 		r.tcp = append(r.tcp, tcp.Addr())
-		lcs = append(lcs, turn.ListenerConfig{Listener: tcp, RelayAddressGenerator: ports, PermissionHandler: allowed})
+		lcs = append(lcs, turn.ListenerConfig{Listener: &gatedListener{Listener: tcp, gate: r.gate}, RelayAddressGenerator: ports, PermissionHandler: allowed})
 	}
 	server, err := turn.NewServer(turn.ServerConfig{
 		Realm: cfg.realm,
@@ -369,7 +370,7 @@ func start(cfg *config) (*relay, error) {
 		return fail(err)
 	}
 	r.server = server
-	r.pcs = pcs
+	r.pcs, r.lcs = pcs, lcs
 	return r, nil
 }
 
@@ -426,20 +427,28 @@ func (w *portWalk) AllocatePacketConn(conf turn.AllocateListenerConfig) (net.Pac
 // handled request's own: whatever ends that handling with an error — pion
 // raises the event on every such path, after the quota check or before it —
 // gives the request's seat back, and an error of another packet cannot come
-// in between. A TCP connection is a source of its own (one loop per
-// connection) and needs no gate.
+// in between. TCP is gated the same way (gatedListener, gatedConn): two TCP
+// connections from ONE client port to two listeners share the source the
+// event names — a packet's error on the connection to B gave back the
+// reservation of A's Allocate, and B's next Allocate passed the check (the
+// user's review of 014b4f5).
 type sourceGate struct {
-	m sync.Map // the source's key → *sync.Mutex; a mutex per source seen, kept (a test relay)
+	m sync.Map // the source's key → chan struct{} of one: a lock per source seen, kept (a test relay)
 }
 
+// lock holds the source. A channel of one, not a sync.Mutex: a loop lets its
+// source go and may hold it again at once (a TCP connection with a message
+// already waiting), and a mutex in normal mode lets the running goroutine win
+// that race — the other loop's wait, however old, starved. A channel serves
+// its blocked senders in order: the waiter goes next.
 func (g *sourceGate) lock(key string) {
-	mu, _ := g.m.LoadOrStore(key, &sync.Mutex{})
-	mu.(*sync.Mutex).Lock()
+	ch, _ := g.m.LoadOrStore(key, make(chan struct{}, 1))
+	ch.(chan struct{}) <- struct{}{}
 }
 
 func (g *sourceGate) unlock(key string) {
-	if mu, ok := g.m.Load(key); ok {
-		mu.(*sync.Mutex).Unlock()
+	if ch, ok := g.m.Load(key); ok {
+		<-ch.(chan struct{})
 	}
 }
 
@@ -467,6 +476,48 @@ func (c *gatedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		c.gate.lock(c.held)
 	}
 	return n, addr, err
+}
+
+// gatedListener hands pion each accepted TCP connection gated (gatedConn).
+type gatedListener struct {
+	net.Listener
+	gate *sourceGate
+}
+
+func (l *gatedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &gatedConn{Conn: c, gate: l.gate, key: seatKey(c.RemoteAddr())}, nil
+}
+
+// gatedConn is an accepted TCP connection as pion reads it (a STUN packet
+// conn over it, one read loop per connection): the connection's source is
+// held from a read that returned bytes until the next read, and let go
+// before that read blocks — a message's handling lies between two reads. A
+// message read in parts holds and lets go at every part: no handling runs
+// while a part is awaited, and the last part's read holds the source through
+// the handling. The key is the client's address alone — two connections from
+// one client port to two listeners are one source to pion's events.
+type gatedConn struct {
+	net.Conn
+	gate *sourceGate
+	key  string
+	held bool
+}
+
+func (c *gatedConn) Read(p []byte) (int, error) {
+	if c.held {
+		c.gate.unlock(c.key)
+		c.held = false
+	}
+	n, err := c.Conn.Read(p)
+	if err == nil && n > 0 {
+		c.gate.lock(c.key)
+		c.held = true
+	}
+	return n, err
 }
 
 func (r *relay) close() error {

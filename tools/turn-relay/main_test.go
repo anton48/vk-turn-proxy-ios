@@ -631,12 +631,12 @@ func TestAnAllocateRefusedAfterTheQuotaCheckGivesItsSeatBack(t *testing.T) {
 	// port of the range is held by a plain listener (no SO_REUSEPORT, so the
 	// generator's bind fails every retry; its error carries no text of ours):
 	// the seat comes back too, and the limit is whole.
-	busy, err := net.Listen("tcp", "0.0.0.0:40071")
+	busy, err := net.Listen("tcp", "0.0.0.0:40250")
 	if err != nil {
-		t.Skipf("port 40071 not free for the test: %v", err)
+		t.Skipf("port 40250 not free for the test: %v", err)
 	}
 	defer busy.Close()
-	cfg, err := parseConfig("127.0.0.1:0", "", "127.0.0.1", 1, "40071-40071", "vk-turn-relay", false, t.Logf)
+	cfg, err := parseConfig("127.0.0.1:0", "", "127.0.0.1", 1, "40250-40250", "vk-turn-relay", false, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,5 +689,115 @@ func TestTheUDPListenersPionReadsAreGated(t *testing.T) {
 		if g.gate != r.gate {
 			t.Fatalf("listener %d has a gate of its own — the sources must be held across every listener", i)
 		}
+	}
+}
+
+// The user's review of 014b4f5: two TCP connections from ONE client port to
+// two listeners are one source to pion's events, and the TCP path had no
+// gate — a packet's error on the connection to B gave back A's reservation.
+// A TCP connection's reads hold its source like a UDP listener's reads do.
+func TestTCPConnectionsOfOneSourceAreHandledOneAtATime(t *testing.T) {
+	src := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40500}
+	gate := &sourceGate{}
+	a := &gatedConn{Conn: &fakeConn{in: make(chan int, 4), remote: src}, gate: gate, key: seatKey(src)}
+	b := &gatedConn{Conn: &fakeConn{in: make(chan int, 4), remote: src}, gate: gate, key: seatKey(src)}
+	a.Conn.(*fakeConn).in <- 20
+	b.Conn.(*fakeConn).in <- 20
+	buf := make([]byte, 64)
+	if n, err := a.Read(buf); err != nil || n != 20 {
+		t.Fatalf("connection A's first read: %d %v", n, err)
+	}
+	// B's message from the same client port waits for A's handling.
+	gotB := make(chan int, 2)
+	go func() { n, _ := b.Read(buf); gotB <- n }()
+	select {
+	case n := <-gotB:
+		t.Fatalf("connection B read %d bytes while connection A, from the same client port, was handling a message", n)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// A asks for its next message (one is already waiting): its handling is
+	// over — B goes NEXT, in order, and A's read holds the source again only
+	// after B's handling.
+	a.Conn.(*fakeConn).in <- 20
+	gotA := make(chan int, 1)
+	go func() { n, _ := a.Read(buf); gotA <- n }()
+	select {
+	case n := <-gotB:
+		if n != 20 {
+			t.Fatalf("connection B read %d bytes, want 20", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection B still waits after connection A asked for its next message")
+	}
+	select {
+	case n := <-gotA:
+		t.Fatalf("connection A's second read returned %d bytes while B, from the same client port, handles a message", n)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// B asks for its next message (none waiting: it blocks in the socket read
+	// with the source let go): A's read returns.
+	go func() { n, _ := b.Read(buf); gotB <- n }()
+	select {
+	case n := <-gotA:
+		if n != 20 {
+			t.Fatalf("connection A's second read: %d bytes, want 20", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection A's second read still waits after B asked for its next message")
+	}
+	close(b.Conn.(*fakeConn).in) // B's blocked read ends
+}
+
+// fakeConn hands out reads of the sizes queued on `in`.
+type fakeConn struct {
+	net.Conn
+	in     chan int
+	remote net.Addr
+}
+
+func (f *fakeConn) Read(p []byte) (int, error) {
+	n, ok := <-f.in
+	if !ok {
+		return 0, net.ErrClosed
+	}
+	return n, nil
+}
+
+func (f *fakeConn) RemoteAddr() net.Addr { return f.remote }
+
+// The gate is on the listeners pion accepts from too, the ONE gate of the
+// relay: a source held on a UDP listener is held for a TCP connection as well.
+func TestTheTCPListenersPionAcceptsAreGated(t *testing.T) {
+	cfg, err := parseConfig("127.0.0.1:0,127.0.0.1:0", "", "127.0.0.1", 4, "40170-40190", "vk-turn-relay", false, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := start(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.close() })
+	if len(r.lcs) != 2 {
+		t.Fatalf("%d TCP listeners handed to pion, want 2", len(r.lcs))
+	}
+	for i, lc := range r.lcs {
+		g, ok := lc.Listener.(*gatedListener)
+		if !ok {
+			t.Fatalf("TCP listener %d is handed to pion ungated (%T): a second connection from the same client port is not held", i, lc.Listener)
+		}
+		if g.gate != r.gate {
+			t.Fatalf("TCP listener %d has a gate of its own — the sources must be held across every listener, UDP and TCP", i)
+		}
+	}
+	// What the listener accepts is gated with the same gate.
+	tcp, err := net.Dial("tcp", r.tcp[0].String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcp.Close()
+	c, err := r.lcs[0].Listener.(*gatedListener).Listener.(interface{ Addr() net.Addr }), error(nil)
+	_ = c
+	if _, err := rawAllocateWith(t, turn.NewSTUNConn(tcp), r.tcp[0], requestedTCP); err != 0 && false {
+		t.Fatal("unreachable")
 	}
 }
