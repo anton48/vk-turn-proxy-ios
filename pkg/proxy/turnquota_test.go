@@ -107,14 +107,16 @@ func TestAnUnlimitedRelayTakesEveryConnection(t *testing.T) {
 	if mints.Load() != 0 || cp.pool[0].active != 40 {
 		t.Fatalf("mints %d, slot 0 active %d — want no mint, forty seats on the one credential", mints.Load(), cp.pool[0].active)
 	}
-	// A connection whose attempt on O went silent without evidence (its
-	// cursor moved on) is handed O again, not VK's next: the relay without a
-	// quota takes everyone while it is not marked.
+	// A connection whose attempt on O went silent without evidence is NOT
+	// handed O again (2026-11-01, Nov 1 §488): the relay without a quota takes
+	// everyone while it ANSWERS — a silent one is passed until it answers or
+	// the path changes; VK's relay on the same slot has room.
 	cp.release(0, held[1], "")
 	cp.noteRelayUnanswered(1, 0, held[1], relayO, time.Now().Add(-5*time.Second))
-	if addr, creds, slot := mustGet(t, cp, 1); addr != relayO || slot != 0 {
-		t.Fatalf("conn 1 after a silent attempt on O: %q on slot %d — want O again", addr, slot)
+	if addr, creds, slot := mustGet(t, cp, 1); addr == relayO || slot != 0 {
+		t.Fatalf("conn 1 after a silent attempt on O: %q on slot %d — want VK's relay on slot 0, not the silent O", addr, slot)
 	} else {
+		cp.release(0, creds, addr) // its seat on VK's relay back: the ten below count from nought there
 		held[1] = creds
 	}
 	cp.mu.Lock()
@@ -762,4 +764,195 @@ func TestASavedRelayHistoryDoesNotBecomeEveryRelays(t *testing.T) {
 	if !onC.IsZero() || !onO.IsZero() {
 		t.Fatalf("the next load: a clock on %s until %v, on %s until %v — want none (the own relay's history is the own relay's)", relayC, onC, relayO, onO)
 	}
+}
+
+// 2026-11-01, the stands (Nov 1 §488, defect 2): a relay without a quota took
+// every connection "while it answers" — read as "while it is not marked", and
+// a mark needs evidence that something ELSE answered. With a ready credential
+// nothing mints and nobody dials VK, so a silent own relay was dialled for
+// ever: a start on a ready cache with `O:0,$vkurls` and O silent had no
+// session in 75 s; a path change with O dead held 0/10 for 150 s. Now "while
+// it answers" is "while no attempt on it went unanswered on this path since
+// the last answer" (relayHealth.untried): a silent O is passed by every
+// connection at once, VK's first answer marks it, its own answer or a path
+// change puts it first again.
+func TestASilentRelayWithoutAQuotaIsPassedUntilItAnswers(t *testing.T) {
+	path := writeCache(t, t.TempDir(), credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA, relayB}, Username: futureUser("cached"), Password: "p"})
+	cp, mints, _ := relayPool(t, path, relayC)
+	list, err := ParseTURNServers(relayO + ":0," + TURNServersVK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp.setOverride(turnOverride{servers: list})
+	addr, c0, slot := mustGet(t, cp, 0)
+	if addr != relayO || slot != 0 {
+		t.Fatalf("conn 0: %q on slot %d — want the own relay first", addr, slot)
+	}
+	// O silent, NO evidence (nothing else has answered on this path): not
+	// marked — and still passed: by conn 0, whose cursor moved, and by conn 1,
+	// whose cursor did not.
+	cp.release(0, c0, relayO)
+	cp.noteRelayUnanswered(0, 0, c0, relayO, time.Now())
+	if cp.health.isDead(relayO) {
+		t.Fatalf("O marked without evidence")
+	}
+	held := map[int]*TURNCreds{}
+	where := map[int]string{}
+	for conn := 0; conn < 2; conn++ {
+		addr, creds, slot := mustGet(t, cp, conn)
+		if addr == relayO || slot != 0 {
+			t.Fatalf("conn %d after a silent attempt on O: %q on slot %d — want VK's relay on slot 0 (O is passed while it is silent)", conn, addr, slot)
+		}
+		held[conn], where[conn] = creds, addr
+	}
+	if mints.Load() != 0 {
+		t.Fatalf("mints %d — the ready credential has room on VK's relay", mints.Load())
+	}
+	// VK's relay answers: the evidence — O is marked now.
+	cp.noteAllocatedAt(0, held[0], where[0], time.Now())
+	if !cp.health.isDead(relayO) {
+		t.Fatalf("O not marked after VK's relay answered")
+	}
+	// A path change clears the marks and the records: O is first again.
+	for conn := 0; conn < 2; conn++ {
+		cp.release(0, held[conn], where[conn])
+	}
+	cp.MarkInUseSlotsForPathChange()
+	cp.mu.Lock()
+	cp.pauseAcquireUntil = time.Time{}
+	cp.mu.Unlock()
+	addr, c2, slot := mustGet(t, cp, 2)
+	if addr != relayO || slot != 0 {
+		t.Fatalf("conn 2 after the path change: %q on slot %d — want the own relay first again", addr, slot)
+	}
+	// Silent again without evidence: passed; then O ANSWERS: its record is
+	// cleared and it takes everyone again.
+	cp.release(0, c2, relayO)
+	cp.noteRelayUnanswered(2, 0, c2, relayO, time.Now())
+	if addr, creds, _ := mustGet(t, cp, 3); addr == relayO {
+		t.Fatalf("conn 3 handed the silent O again")
+	} else {
+		cp.release(0, creds, addr)
+	}
+	cp.health.answered(relayO, time.Time{})
+	if addr, _, slot := mustGet(t, cp, 4); addr != relayO || slot != 0 {
+		t.Fatalf("conn 4 after O answered: %q on slot %d — want the own relay first again", addr, slot)
+	}
+}
+
+// Cookie mode, the same silence: the slot on the own relay is passed (its one
+// candidate went unanswered, nothing is marked) and the sixty find the six VK
+// slots; VK's answer then marks O. Green on the 463 code too — a cookie slot
+// with `$vkurls` fell out through hasCandidate already; the guard stays for the
+// one rule.
+func TestCookieModeASilentRelayWithoutAQuotaIsPassedUntilItAnswers(t *testing.T) {
+	cookieTestMode(t, "https://vk.ru/call/join/aaa", "https://vk.ru/call/join/bbb", "https://vk.ru/call/join/ccc")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	list, _ := ParseTURNServers(relayO + ":0," + TURNServersVK)
+	o := turnOverride{servers: list}
+	cp := newCredPool(ctx, cookiePoolSize(3, o), 2*time.Minute, "", nil)
+	cp.setOverride(o)
+	vk := []string{"203.0.113.21:19302", "203.0.113.22:19302", "203.0.113.23:19302", "203.0.113.24:19302", "203.0.113.25:19302", "203.0.113.26:19302"}
+	cp.mu.Lock()
+	own := &TURNCreds{Username: futureUser("own"), Password: "p", Address: relayO, Addresses: []string{relayO}}
+	cp.placeLocked(0, credPoolEntry{addr: relayO, addrs: cp.candidatesForSlot(0, own), creds: own, ts: time.Now()})
+	for i, r := range vk {
+		c := &TURNCreds{Username: futureUser("vk"), Password: "p", Address: r, Addresses: []string{r}}
+		cp.placeLocked(1+i, credPoolEntry{addr: r, addrs: cp.candidatesForSlot(1+i, c), creds: c, ts: time.Now()})
+	}
+	cp.mu.Unlock()
+	addr, c0, slot := mustGet(t, cp, 0)
+	if slot != 0 || addr != relayO {
+		t.Fatalf("conn 0: %q on slot %d — want the own relay", addr, slot)
+	}
+	cp.release(0, c0, relayO)
+	cp.noteRelayUnanswered(0, 0, c0, relayO, time.Now()) // no evidence: not marked
+	if cp.health.isDead(relayO) {
+		t.Fatalf("O marked without evidence")
+	}
+	perSlot := map[int]int{}
+	var first *TURNCreds
+	firstSlot, firstAddr := -1, ""
+	for conn := 0; conn < 60; conn++ {
+		addr, creds, slot := mustGet(t, cp, conn)
+		perSlot[slot]++
+		if first == nil {
+			first, firstSlot, firstAddr = creds, slot, addr
+		}
+	}
+	if len(perSlot) != 6 || perSlot[0] != 0 {
+		t.Fatalf("with the own relay silent the sixty sat on slots %v — want ten on each of the six VK slots, none on O", perSlot)
+	}
+	cp.noteAllocatedAt(firstSlot, first, firstAddr, time.Now())
+	if !cp.health.isDead(relayO) {
+		t.Fatalf("O not marked after a VK relay answered")
+	}
+}
+
+// Cookie mode under a FIXED list (no $vkurls): the list is cycled, never
+// minted around — the own relay's slot stays usable (an outage must not strand
+// every connection) but it no longer comes FIRST while silent: a connection
+// whose own slot is the other entry's goes there, and that relay's answer
+// marks O.
+func TestCookieModeASilentRelayWithoutAQuotaIsNotTakenFirst(t *testing.T) {
+	cookieTestMode(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	list, _ := ParseTURNServers(relayO + ":0," + relayE)
+	cp := newCredPool(ctx, 4, 2*time.Minute, "", nil)
+	cp.setOverride(turnOverride{servers: list})
+	cp.mu.Lock()
+	own := &TURNCreds{Username: futureUser("own"), Password: "p", Address: relayO, Addresses: []string{relayO}}
+	cp.placeLocked(0, credPoolEntry{addr: relayO, addrs: cp.candidatesForSlot(0, own), creds: own, ts: time.Now()})
+	e := &TURNCreds{Username: futureUser("e"), Password: "p", Address: relayE, Addresses: []string{relayE}}
+	cp.placeLocked(1, credPoolEntry{addr: relayE, addrs: cp.candidatesForSlot(1, e), creds: e, ts: time.Now()})
+	cp.mu.Unlock()
+	addr, c10, slot := mustGet(t, cp, 10)
+	if slot != 0 || addr != relayO {
+		t.Fatalf("conn 10 with O untried: %q on slot %d — want the own relay first", addr, slot)
+	}
+	cp.release(0, c10, relayO)
+	cp.noteRelayUnanswered(10, 0, c10, relayO, time.Now())
+	if addr, _, slot := mustGet(t, cp, 10); slot != 1 || addr != relayE {
+		t.Fatalf("conn 10 with O silent: %q on slot %d — want its own slot's %s", addr, slot, relayE)
+	}
+	if addr, _, slot := mustGet(t, cp, 0); slot != 0 || addr != relayO {
+		t.Fatalf("conn 0 with O silent under a fixed list: %q on slot %d — want its own slot's O still (the list is cycled, not minted around)", addr, slot)
+	}
+}
+
+// The hand-out's pick and its peek select the relay by ONE rule in every
+// state of the own relay: untried, silent, marked, answered again.
+func TestTheHandOutAndItsPeekSelectTheRelayAlike(t *testing.T) {
+	path := writeCache(t, t.TempDir(), credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA, relayB}, Username: futureUser("cached"), Password: "p"})
+	cp, _, _ := relayPool(t, path, relayC)
+	list, _ := ParseTURNServers(relayO + ":0," + TURNServersVK)
+	cp.setOverride(turnOverride{servers: list})
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	check := func(state string, wantO bool) {
+		t.Helper()
+		for conn := 0; conn < 4; conn++ {
+			cp.cursor[conn] = conn
+			peek := cp.peekAddrLocked(0, conn)
+			pick, ok := cp.pickAddrLocked(0, conn)
+			if !ok || peek != pick {
+				t.Fatalf("%s, conn %d (cursor %d): peek %q, pick %q ok %v — one rule", state, conn, conn, peek, pick, ok)
+			}
+			if (pick == relayO) != wantO {
+				t.Fatalf("%s, conn %d: %q — want O: %v", state, conn, pick, wantO)
+			}
+		}
+	}
+	check("O untried", true)
+	cp.health.unanswered(relayO, cp.health.now())
+	check("O silent, unmarked", false)
+	cp.health.answered(relayA, time.Time{})
+	if !cp.health.isDead(relayO) {
+		t.Fatalf("O not marked by A's answer")
+	}
+	check("O marked", false)
+	cp.health.answered(relayO, time.Time{})
+	check("O answered again", true)
 }

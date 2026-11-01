@@ -179,6 +179,7 @@ func (cp *credPool) hasRelayLocked(slot int) bool {
 }
 
 // pickAddrLocked chooses the address connIdx dials on slot's credential: the
+// relay without a quota while it answers (unlimitedFirstLocked), else the
 // unmarked candidate at the connection's cursor (an unanswered attempt moves
 // the cursor on, so the next attempt takes the next candidate even before any
 // mark), or — with every candidate marked — the one longest due for a re-try,
@@ -186,20 +187,50 @@ func (cp *credPool) hasRelayLocked(slot int) bool {
 func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
-		if cp.override.unlimited(alive[0]) {
-			return alive[0], true // a relay without a quota takes every connection while it answers — no cursor past it
+		if addr, ok := cp.unlimitedFirstLocked(alive); ok {
+			return addr, true
 		}
-		i := cp.cursor[connIdx] % len(alive)
-		if i < 0 {
-			i = -i
-		}
-		return alive[i], true
+		return cp.cursorPickLocked(alive, connIdx), true
 	}
 	addr, ok, _ := cp.health.probe(cands)
 	if ok {
 		log.Printf("credpool: conn %d: every relay of slot %d is marked unreachable (%s) — trying %s again", connIdx, slot, cp.health.deadList(cands), addr)
 	}
 	return addr, ok
+}
+
+// unlimitedFirstLocked: the relay without a quota that takes every connection
+// NOW — the list's first unmarked candidate when it has no quota and no attempt
+// on it went unanswered on this path since the last answer (relayHealth.untried).
+// That is what "while it answers" means: a mark needs evidence that something
+// ELSE answered, and with a ready credential nothing else is dialled (the
+// stands, 2026-11-01: a silent own relay held every connection for good). A
+// silent one is passed by every connection at once; VK's first answer marks it;
+// its own answer, or a path change, puts it first again. ok=false: none. The ONE
+// rule behind pickAddrLocked and peekAddrLocked.
+func (cp *credPool) unlimitedFirstLocked(alive []string) (string, bool) {
+	if len(alive) == 0 || !cp.override.unlimited(alive[0]) {
+		return "", false
+	}
+	if len(cp.health.untried(alive[:1])) == 0 {
+		return "", false
+	}
+	return alive[0], true
+}
+
+// cursorPickLocked: the unmarked candidate at connIdx's cursor — the silent
+// relay without a quota left out while another candidate is left (it is not
+// cycled back to by the cursor: it comes back when it answers or the path
+// changes); alone, it is dialled again (nothing else to dial).
+func (cp *credPool) cursorPickLocked(alive []string, connIdx int) string {
+	if len(alive) > 1 && cp.override.unlimited(alive[0]) {
+		alive = alive[1:]
+	}
+	i := cp.cursor[connIdx] % len(alive)
+	if i < 0 {
+		i = -i
+	}
+	return alive[i]
 }
 
 // relayParkLocked: a hand-out found no address to dial on slot's credential

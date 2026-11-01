@@ -2241,9 +2241,12 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 	}
 	// Priority 0: a slot whose relay has no quota (the list's host:port:0 —
 	// the user's own relay) takes every connection while it answers, in both
-	// modes (2026-10-30, the user's design).
+	// modes (2026-10-30, the user's design). "While it answers" is the
+	// health's untried — a silent one is not taken FIRST (cookie mode under a
+	// fixed list keeps such a slot eligible in its own turn: the list is
+	// cycled, not minted around — hasRelayLocked).
 	for i := 0; i < cp.size && i < len(cp.pool); i++ {
-		if addr, ok := eligible(i); ok && cp.override.unlimited(addr) {
+		if addr, ok := eligible(i); ok && cp.override.unlimited(addr) && len(cp.health.untried([]string{addr})) > 0 {
 			return i, addr, "unlimited relay"
 		}
 	}
