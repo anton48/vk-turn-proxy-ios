@@ -956,3 +956,156 @@ func TestTheHandOutAndItsPeekSelectTheRelayAlike(t *testing.T) {
 	cp.health.answered(relayO, time.Time{})
 	check("O answered again", true)
 }
+
+// 2026-11-01, the stands (Nov 1 §488, defect 1 — a regression of 461): the
+// hand-out judges a slot on the relay the CONNECTION dials (its cursor's),
+// and the cold-start cap counted the slots by the relay the SLOT dials now
+// (the first alive). Under `A:20,B:2` with A silent after a path change —
+// unmarked, no evidence — every slot was benched on B (its seats there) and
+// free on A: "ready" to the cap, refused to the connection; nothing minted, so
+// nothing answered, so A was never marked: 0/6 for two minutes where 460
+// minted in five seconds. The cap counts by the question the hand-out asks,
+// for this connection (the rule of builds 204 / 360, quoted in the cap's own
+// comment); Phase 2's second pass judges the bench on that relay too.
+func TestTheColdStartCapCountsByTheRelayTheConnectionDials(t *testing.T) {
+	for _, size := range []int{2, 3} { // 2: no empty slot (the second pass must take the benched one); 3: the cap alone
+		t.Run(fmt.Sprintf("pool-%d", size), func(t *testing.T) {
+			// A ready cache: a mint would be the evidence that marks A (rule 24
+			// in the pool — the refused arm runs on a cache that needs no mint).
+			path := writeCache(t, t.TempDir(),
+				credCacheEntry{Slot: 0, Address: relayC, Addresses: []string{relayC}, Username: futureUser("cached-0"), Password: "p"},
+				credCacheEntry{Slot: 1, Address: relayC, Addresses: []string{relayC}, Username: futureUser("cached-1"), Password: "p"})
+			cp, mints, _ := relayPoolN(t, path, size, relayC)
+			list, _ := ParseTURNServers(relayA + ":20," + relayB + ":2")
+			cp.setOverride(turnOverride{servers: list})
+			// Two slots, each with its two seats on B: the connections' attempts
+			// on A went unanswered without evidence, their cursors moved to B.
+			held := map[int]*TURNCreds{}
+			for conn := 0; conn < 4; conn++ {
+				addr, creds, slot := mustGet(t, cp, conn)
+				if addr != relayA {
+					t.Fatalf("conn %d: %q — want A first", conn, addr)
+				}
+				cp.release(slot, creds, relayA)
+				cp.noteRelayUnanswered(conn, slot, creds, relayA, time.Now())
+				addr, creds, slot = mustGet(t, cp, conn)
+				if addr != relayB || slot != conn/2 {
+					t.Fatalf("conn %d after A went silent: %q on slot %d — want B on slot %d", conn, addr, slot, conn/2)
+				}
+				held[conn] = creds
+			}
+			if cp.health.isDead(relayA) || mints.Load() != 0 {
+				t.Fatalf("A marked %v, mints %d — want A unmarked (no evidence), the two cached credentials", cp.health.isDead(relayA), mints.Load())
+			}
+			// The path change: both slots benched on B, the cursors and the
+			// evidence cleared; the sessions give their seats back.
+			cp.MarkInUseSlotsForPathChange()
+			cp.mu.Lock()
+			cp.pauseAcquireUntil = time.Time{}
+			benched := cp.markLocked(0, relayB).After(time.Now()) && cp.markLocked(1, relayB).After(time.Now()) && cp.markLocked(0, relayA).IsZero()
+			cp.mu.Unlock()
+			if !benched {
+				t.Fatalf("after the path change the slots are not benched on B alone")
+			}
+			for conn := 0; conn < 4; conn++ {
+				cp.release(conn/2, held[conn], relayB)
+			}
+			// A first again, silent again, still no evidence: conn 0's cursor
+			// moves to B, where the slot is benched — a MINT, not a park.
+			addr, creds, slot := mustGet(t, cp, 0)
+			if addr != relayA {
+				t.Fatalf("conn 0 after the path change: %q — want A first", addr)
+			}
+			cp.release(slot, creds, relayA)
+			cp.noteRelayUnanswered(0, slot, creds, relayA, time.Now())
+			addr, creds, slot, err := cp.get(0, false)
+			if err != nil {
+				t.Fatalf("conn 0 with the slots benched on B and free on silent A: %v — want a fresh credential (the cap counted the slots ready on A)", err)
+			}
+			if mints.Load() != 1 || creds.Username == held[0].Username || creds.Username == held[2].Username {
+				t.Fatalf("conn 0: %q on slot %d, mints %d — want a fresh credential", addr, slot, mints.Load())
+			}
+		})
+	}
+}
+
+// The predicate itself: one slot, benched on B and free on A — ready to the
+// connection whose cursor is on A, not to the one whose cursor is on B; and
+// the slot-level count (the grower, the UI) is the slot's own question.
+func TestASlotCountsAsReadyForTheConnectionItCanSeat(t *testing.T) {
+	cp, _, _ := relayPoolN(t, "", 2, relayC)
+	list, _ := ParseTURNServers(relayA + ":20," + relayB + ":2")
+	cp.setOverride(turnOverride{servers: list})
+	_, creds, _ := mustGet(t, cp, 0)
+	cp.release(0, creds, relayA)
+	cp.markSaturated(0, creds, relayB)
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	cp.cursor[0], cp.cursor[1] = 0, 1
+	if !cp.availableForLocked(0, 0) || cp.availableForLocked(0, 1) {
+		t.Fatalf("slot 0 benched on B: ready for conn 0 (on A) %v, for conn 1 (on B) %v — want true, false", cp.availableForLocked(0, 0), cp.availableForLocked(0, 1))
+	}
+	if cp.countAvailableForLocked(0) != 1 || cp.countAvailableForLocked(1) != 0 || cp.countAvailableLocked() != 1 {
+		t.Fatalf("counts: for conn 0 %d, for conn 1 %d, the slot's own %d — want 1, 0, 1", cp.countAvailableForLocked(0), cp.countAvailableForLocked(1), cp.countAvailableLocked())
+	}
+}
+
+// A FULL slot is provisioned to the cap (room is not its question): with the
+// one credential the target needs holding every seat, the eleventh connection
+// parks to share, it does not mint — the herd's rule.
+func TestAFullSlotIsProvisionedToTheColdStartCap(t *testing.T) {
+	cp, mints, _ := relayPoolN(t, "", 3, relayC)
+	cp.setColdStartTarget(10)
+	for conn := 0; conn < connsPerSlot; conn++ {
+		if _, _, slot := mustGet(t, cp, conn); slot != 0 {
+			t.Fatalf("conn %d on slot %d", conn, slot)
+		}
+	}
+	_, _, _, err := cp.get(10, false)
+	if err == nil || !strings.Contains(err.Error(), "cold-start cap") || mints.Load() != 1 {
+		t.Fatalf("conn 10 with the one credential full: err %v, mints %d — want the cold-start cap's park, one credential", err, mints.Load())
+	}
+}
+
+// Cookie mode: a slot dials one relay — the connection's question and the
+// slot's are one, and the two counts agree.
+func TestCookieModeTheCapsCountIsTheSlotsOwn(t *testing.T) {
+	cookieTestMode(t, "https://vk.ru/call/join/aaa")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cp := newCredPool(ctx, 2, 2*time.Minute, "", nil)
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	for i, r := range []string{relayA, relayB} {
+		c := &TURNCreds{Username: futureUser("vk"), Password: "p", Address: r, Addresses: []string{r}}
+		cp.placeLocked(i, credPoolEntry{addr: r, addrs: cp.candidatesForSlot(i, c), creds: c, ts: time.Now()})
+	}
+	cp.pool[1].saturatedUntil = time.Now().Add(time.Minute)
+	for conn := 0; conn < 3; conn++ {
+		cp.cursor[conn] = conn
+		if cp.countAvailableForLocked(conn) != cp.countAvailableLocked() || cp.countAvailableLocked() != 1 {
+			t.Fatalf("conn %d: the cap's count %d, the slot's own %d — want both 1", conn, cp.countAvailableForLocked(conn), cp.countAvailableLocked())
+		}
+	}
+}
+
+// A slot whose every relay is marked has nothing to dial — not ready to the
+// cap either: with the one credential the target needs in that state the
+// connection mints (a fresh credential may name other relays), it does not
+// park to share what nobody can use.
+func TestASlotWithEveryRelayMarkedIsNotReadyToTheColdStartCap(t *testing.T) {
+	path := writeCache(t, t.TempDir(), credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA, relayB}, Username: futureUser("cached"), Password: "p"})
+	cp, mints, _ := relayPoolN(t, path, 1, relayC)
+	cp.health.answered("", time.Time{}) // the evidence
+	cp.health.unanswered(relayA, cp.health.now())
+	cp.health.unanswered(relayB, cp.health.now())
+	cp.mu.Lock()
+	ready := cp.availableForLocked(0, 0)
+	cp.mu.Unlock()
+	if ready || !cp.health.isDead(relayA) || !cp.health.isDead(relayB) {
+		t.Fatalf("slot 0 with A and B marked (%v, %v): ready for conn 0 %v — want not ready", cp.health.isDead(relayA), cp.health.isDead(relayB), ready)
+	}
+	if addr, _, _, err := cp.get(0, false); err != nil || addr != relayC || mints.Load() != 1 {
+		t.Fatalf("conn 0 with the one slot's relays all marked: %q, %v, mints %d — want a fresh credential on %s", addr, err, mints.Load(), relayC)
+	}
+}

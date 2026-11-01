@@ -2465,8 +2465,14 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		// ready ≥ 3 target — parking", Phase 1 skipped them, and thirty
 		// connections parked for 40 s (then 3 min 20 s on the next switch)
 		// with an EMPTY slot in the pool. A fresh fetch is a new VK identity
-		// with its own quota; the saturated creds' allocations are dead.
-		ready := cp.countAvailableLocked()
+		// with its own quota; the saturated creds' allocations are dead. And
+		// since the marks are the RELAY's (2026-10-31) the question is asked
+		// for THIS connection, on the relay it would dial: a slot benched on
+		// the cursor's relay and free on a silent one ahead of it is not ready
+		// to it (the stands, 2026-11-01: counted by the slot's first relay, two
+		// such slots held six connections parked for two minutes, nothing
+		// minting and the silent relay never marked for want of an answer).
+		ready := cp.countAvailableForLocked(connIdx)
 		inFlight := 0
 		for i := range cp.pool {
 			if cp.pool[i].fetching {
@@ -2519,11 +2525,16 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		// are dead at VK anyway. Replacing the cred forgets it on our side
 		// only; a fresh mint is a new identity with its own quota. Without
 		// this pass a full pool (every slot saturated or pending) has nowhere
-		// to mint and thirty connections wait out a 10-minute cooldown.
+		// to mint and thirty connections wait out a 10-minute cooldown. The
+		// bench is read on the relay THIS connection would dial (the marks are
+		// the relay's): a slot free on a silent relay ahead of the cursor's is
+		// no use to it, and judged by that relay it was no target either (the
+		// stands, 2026-11-01).
 		for _, slot := range candidatesOrdered() {
 			e := cp.pool[slot]
 			blocked := e.creds != nil && !cp.health.hasCandidate(cp.candidatesLocked(slot)) // every relay it names is marked: a fresh mint may bring others
-			if e.creds != nil && (now.Before(cp.markLocked(slot, cp.dialNowLocked(slot))) || blocked) && e.active == 0 && !e.fetching && !now.Before(e.cooldownUntil) {
+			benched := e.creds != nil && now.Before(cp.markLocked(slot, cp.peekAddrLocked(slot, connIdx)))
+			if e.creds != nil && (benched || blocked) && e.active == 0 && !e.fetching && !now.Before(e.cooldownUntil) {
 				target = slot
 				break
 			}
@@ -3768,6 +3779,41 @@ func (cp *credPool) availableLocked(slot int) bool {
 		return false
 	}
 	return !time.Now().Before(cp.markLocked(slot, cp.dialNowLocked(slot)))
+}
+
+// availableForLocked assumes cp.mu is held: the slot can seat THIS connection
+// right now as far as the clock and the marks go — fresh on the relay the
+// connection would dial (peekAddrLocked: its cursor's) and not benched THERE,
+// with a relay to dial. The cold-start cap counts by it (countAvailableForLocked):
+// a connection parks to share only a slot it could share. Room is not its
+// question — a full slot is provisioned, the cap's own rule. The SLOT's own
+// question (the grower, the UI, the logs) stays availableLocked, on the relay
+// the slot dials now; the two parted with the per-relay marks of 2026-10-31
+// (the stands, 2026-11-01: a slot benched on B and free on silent, unmarked A
+// read "ready" to the cap and was refused to the connection on B — nothing
+// minted, nothing answered, A never marked, 0/6 for two minutes). In cookie
+// mode a slot dials one relay and the two are one.
+func (cp *credPool) availableForLocked(slot, connIdx int) bool {
+	if slot < 0 || slot >= len(cp.pool) || !cp.hasRelayLocked(slot) {
+		return false
+	}
+	addr := cp.peekAddrLocked(slot, connIdx)
+	if addr == "" || !cp.freshOnLocked(slot, addr) {
+		return false
+	}
+	return !time.Now().Before(cp.markLocked(slot, addr))
+}
+
+// countAvailableForLocked assumes cp.mu is held: the slots that could seat
+// connIdx now (availableForLocked) — the cold-start cap's count.
+func (cp *credPool) countAvailableForLocked(connIdx int) int {
+	n := 0
+	for i := range cp.pool {
+		if cp.availableForLocked(i, connIdx) {
+			n++
+		}
+	}
+	return n
 }
 
 // entryCredValid: the entry holds a credential still valid on the TURN
