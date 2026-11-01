@@ -894,7 +894,12 @@ func TestCookieModeASilentRelayWithoutAQuotaIsPassedUntilItAnswers(t *testing.T)
 // minted around — the own relay's slot stays usable (an outage must not strand
 // every connection) but it no longer comes FIRST while silent: a connection
 // whose own slot is the other entry's goes there, and that relay's answer
-// marks O.
+// marks O. The user's review of 48ccc45 (2026-11-01): conn 0's OWN slot is
+// O's, and the bootstrap's first connection is alone — the others start only
+// after it — so «conn 10 goes to B» never happened and conn 0 dialled the
+// silent O for ever, B untried, no mint. An eligible slot whose relay is
+// untried beats the own slot whose relay went silent; the silent one is dialled
+// again only when no such alternative is left.
 func TestCookieModeASilentRelayWithoutAQuotaIsNotTakenFirst(t *testing.T) {
 	cookieTestMode(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -917,8 +922,29 @@ func TestCookieModeASilentRelayWithoutAQuotaIsNotTakenFirst(t *testing.T) {
 	if addr, _, slot := mustGet(t, cp, 10); slot != 1 || addr != relayE {
 		t.Fatalf("conn 10 with O silent: %q on slot %d — want its own slot's %s", addr, slot, relayE)
 	}
-	if addr, _, slot := mustGet(t, cp, 0); slot != 0 || addr != relayO {
-		t.Fatalf("conn 0 with O silent under a fixed list: %q on slot %d — want its own slot's O still (the list is cycled, not minted around)", addr, slot)
+	// conn 0, whose OWN slot is O's: B's slot all the same — the bootstrap's
+	// only connection must reach the relay that may answer.
+	addr, c0, slot := mustGet(t, cp, 0)
+	if slot != 1 || addr != relayE {
+		t.Fatalf("conn 0 with O silent under a fixed list: %q on slot %d — want the other entry's slot, its relay untried", addr, slot)
+	}
+	// E's answer is the evidence: O marked; conn 0 stays on E.
+	cp.noteAllocatedAt(1, c0, relayE, time.Now())
+	if !cp.health.isDead(relayO) {
+		t.Fatalf("O not marked after E answered")
+	}
+	// With NO alternative left (E silent too, nothing marked) the silent own
+	// relay is dialled again — the list is cycled, not minted around.
+	cp2 := newCredPool(ctx, 4, 2*time.Minute, "", nil)
+	cp2.setOverride(turnOverride{servers: list})
+	cp2.mu.Lock()
+	cp2.placeLocked(0, credPoolEntry{addr: relayO, addrs: cp2.candidatesForSlot(0, own), creds: own, ts: time.Now()})
+	cp2.placeLocked(1, credPoolEntry{addr: relayE, addrs: cp2.candidatesForSlot(1, e), creds: e, ts: time.Now()})
+	cp2.mu.Unlock()
+	cp2.health.unanswered(relayO, cp2.health.now())
+	cp2.health.unanswered(relayE, cp2.health.now())
+	if addr, _, slot := mustGet(t, cp2, 0); slot != 0 || addr != relayO {
+		t.Fatalf("conn 0 with O and E both silent: %q on slot %d — want its own slot's O (nothing untried is left; the list is cycled)", addr, slot)
 	}
 }
 

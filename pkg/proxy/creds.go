@@ -2250,38 +2250,55 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 			return i, addr, "unlimited relay"
 		}
 	}
-	if addr, ok := eligible(ownSlot); ok {
-		return ownSlot, addr, "own"
-	}
-
-	// Priority 2/3: scan other slots, picking max-active (compact-fill)
-	// or the lowest-index idle slot when all candidates have active=0.
-	bestSlot := -1
-	bestActive := -1
-	bestAddr := ""
-	for i := 0; i < cp.size; i++ {
-		if i == ownSlot {
-			continue
+	// Priorities 1–3 in TWO rounds: first among the slots whose relay for this
+	// connection is UNTRIED (no attempt on it went unanswered on this path
+	// since the last answer), then among the rest — a slot whose relay went
+	// silent is dialled again only when no untried alternative is left (the
+	// user's review of 48ccc45, 2026-11-01: in cookie mode a slot has ONE relay,
+	// so conn 0's own slot was the silent own relay's whatever the cursor did,
+	// and the bootstrap's first connection — alone until it succeeds — dialled
+	// it for ever while the other entry's slot sat untried). In anonymous mode
+	// the cursor already steers a connection past a silent candidate; the
+	// rounds change nothing there.
+	untried := func(addr string) bool { return len(cp.health.untried([]string{addr})) > 0 }
+	pick := func(onlyUntried bool) (int, string, string) {
+		// Priority 1: ownSlot, preferred when usable.
+		if addr, ok := eligible(ownSlot); ok && (!onlyUntried || untried(addr)) {
+			return ownSlot, addr, "own"
 		}
-		addr, ok := eligible(i)
-		if !ok {
-			continue
+		// Priority 2/3: scan other slots, picking max-active (compact-fill)
+		// or the lowest-index idle slot when all candidates have active=0.
+		bestSlot := -1
+		bestActive := -1
+		bestAddr := ""
+		for i := 0; i < cp.size; i++ {
+			if i == ownSlot {
+				continue
+			}
+			addr, ok := eligible(i)
+			if !ok || (onlyUntried && !untried(addr)) {
+				continue
+			}
+			// Strict > keeps the lowest-index slot when active counts tie
+			// (iteration order is ascending).
+			if cp.pool[i].active > bestActive {
+				bestSlot = i
+				bestActive = cp.pool[i].active
+				bestAddr = addr
+			}
 		}
-		// Strict > keeps the lowest-index slot when active counts tie
-		// (iteration order is ascending).
-		if cp.pool[i].active > bestActive {
-			bestSlot = i
-			bestActive = cp.pool[i].active
-			bestAddr = addr
+		if bestSlot < 0 {
+			return -1, "", ""
 		}
+		if bestActive > 0 {
+			return bestSlot, bestAddr, "compact"
+		}
+		return bestSlot, bestAddr, "fresh"
 	}
-	if bestSlot < 0 {
-		return -1, "", ""
+	if slot, addr, kind := pick(true); slot >= 0 {
+		return slot, addr, kind
 	}
-	if bestActive > 0 {
-		return bestSlot, bestAddr, "compact"
-	}
-	return bestSlot, bestAddr, "fresh"
+	return pick(false)
 }
 
 // poolParkError is get()'s "not now" answer — a path-change pause, the
