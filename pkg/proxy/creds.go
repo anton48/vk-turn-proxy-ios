@@ -1862,7 +1862,13 @@ func (cp *credPool) loadFromDisk() {
 		// the 10-min cooldown.
 		// The clock per relay (used_on) when the file has it; else the one
 		// last_used_at as every relay's (the entry's own history).
-		var lastUsed, availableAt time.Time
+		// 🚫 The entry's OWN history (lastUsed, availableAt — every relay's)
+		// comes from "*" or from a file from before used_on ALONE; the latest
+		// moment over every record (said) is for the log line and nothing
+		// else — written onto the entry it was saved back as "*" at the next
+		// save, and a relay never used was quarantined on the own relay's
+		// history (the user's review of 462).
+		var lastUsed, availableAt, said time.Time
 		on := map[string]*relayHist{}
 		star := false
 		for relay, unix := range entry.UsedOn {
@@ -1873,12 +1879,12 @@ func (cp *credPool) loadFromDisk() {
 			if ready := h.lastUsedAt.Add(credSaturationCooldown); now.Before(ready) {
 				h.availableAt = ready
 			}
-			if h.lastUsedAt.After(lastUsed) {
-				lastUsed = h.lastUsedAt
+			if h.lastUsedAt.After(said) {
+				said = h.lastUsedAt
 			}
 			if relay == "*" { // the history whose relay is not known: the entry's own, every relay's
 				star = true
-				availableAt = h.availableAt
+				lastUsed, availableAt = h.lastUsedAt, h.availableAt
 				continue
 			}
 			on[relay] = h
@@ -1890,12 +1896,15 @@ func (cp *credPool) loadFromDisk() {
 				availableAt = ready
 			}
 		}
+		if lastUsed.After(said) {
+			said = lastUsed
+		}
 		// Cookie mode: the quota history is the RELAY's (relayUsedAt, fed
 		// below from the file), never a slot's — the entry starts with none,
 		// so a slot the list re-points dials its new relay with neither a
 		// clock nor a mark of the old one's (the user's reviews of 450 and
 		// 459's run 6).
-		lastUsedSaid := lastUsed
+		lastUsedSaid := said
 		if cp.mode == credCacheModeCookie {
 			lastUsed, availableAt, on = time.Time{}, time.Time{}, nil
 		}

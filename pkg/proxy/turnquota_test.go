@@ -729,3 +729,37 @@ func TestTheReTryIsJudgedOnTheRelayItDials(t *testing.T) {
 		t.Fatalf("conn 2 with both relays marked and B's re-try due: %q on slot %d, slot 0's seats on B %d, mints %d — want the re-try on B from a fresh credential (slot 0's two seats on B are its quota)", addr, slot, onB, mints.Load())
 	}
 }
+
+// The user's review of 462 (1): the load wrote the latest moment over every
+// `used_on` record onto the entry's own history, and the next save wrote it
+// back as "*" — a relay never used was quarantined on the own relay's history.
+// The entry's own history comes from "*" or a legacy file alone; the latest
+// moment is for the log line.
+func TestASavedRelayHistoryDoesNotBecomeEveryRelays(t *testing.T) {
+	dir := t.TempDir()
+	used := time.Now().Add(-time.Minute).Unix()
+	path := writeCache(t, dir, credCacheEntry{Slot: 0, Address: relayC, Addresses: []string{relayC}, Username: futureUser("own-only"), Password: "p", LastUsedAt: used, UsedOn: map[string]int64{relayO: used}})
+	list, _ := ParseTURNServers(relayO + ":0," + TURNServersVK)
+	cp, _, _ := relayPoolN(t, path, 4, relayC)
+	cp.setOverride(turnOverride{servers: list})
+	cp.saveToDisk()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f credCacheFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Creds) != 1 || f.Creds[0].UsedOn["*"] != 0 || f.Creds[0].UsedOn[relayO] == 0 || f.Creds[0].LastUsedAt != used {
+		t.Fatalf("after a load and a save: %+v — want used_on with %s alone (no \"*\" out of the own relay's history), last_used_at kept", f.Creds, relayO)
+	}
+	cp2, _, _ := relayPoolN(t, path, 4, relayC)
+	cp2.setOverride(turnOverride{servers: list})
+	cp2.mu.Lock()
+	onC, onO := cp2.clockLocked(0, relayC), cp2.clockLocked(0, relayO)
+	cp2.mu.Unlock()
+	if !onC.IsZero() || !onO.IsZero() {
+		t.Fatalf("the next load: a clock on %s until %v, on %s until %v — want none (the own relay's history is the own relay's)", relayC, onC, relayO, onO)
+	}
+}

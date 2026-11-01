@@ -349,9 +349,10 @@ func start(cfg *config) (*relay, error) {
 				}
 			},
 			// A failed Allocate, over either transport (pion raises it from the
-			// one read loop): its reservation is given back.
+			// one read loop) — and only a failed CREATION gives its reservation
+			// back (allocationError).
 			OnAllocationError: func(srcAddr, _ net.Addr, protocol, message string) {
-				if n, ok := r.seats.failed(srcAddr); ok {
+				if n, ok := r.allocationError(srcAddr, message); ok {
 					cfg.logf("turn-relay: allocation for %s (%s) FAILED: %s — its seat given back, %d held", srcAddr, protocol, message, n)
 				}
 			},
@@ -404,7 +405,27 @@ func (w *portWalk) AllocatePacketConn(conf turn.AllocateListenerConfig) (net.Pac
 			return conn, addr, nil
 		}
 	}
-	return nil, nil, fmt.Errorf("no free relay port in %d-%d: %w", w.MinPort, w.MaxPort, err)
+	return nil, nil, fmt.Errorf("%s in %d-%d: %w", relayPortErr, w.MinPort, w.MaxPort, err)
+}
+
+// relayPortErr opens the one error that can end an Allocate AFTER its seat was
+// reserved: this relay's own port generator (pion's manager checks the
+// five-tuple before the quota and fails after it only in the generator). The
+// error event names it in its message, and the seat is given back on that
+// message alone — pion raises the same event for EVERY handling error of a
+// source (a malformed packet on another listener from the same socket), and
+// such an error must not give back a seat an Allocate still in flight holds
+// (the user's review of 462).
+const relayPortErr = "turn-relay: no free relay port"
+
+// allocationError is what pion's OnAllocationError does with a seat: a
+// reservation is given back only for a failed CREATION — the generator's
+// error — never for an error of another packet from the same source.
+func (r *relay) allocationError(src net.Addr, message string) (held int64, givenBack bool) {
+	if !strings.Contains(message, relayPortErr) {
+		return r.seats.count(), false
+	}
+	return r.seats.failed(src)
 }
 
 func (r *relay) close() error {

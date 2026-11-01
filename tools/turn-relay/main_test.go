@@ -471,3 +471,25 @@ func TestTwoAllocatesInFlightFromOneSourceAreTwoSeats(t *testing.T) {
 		t.Fatalf("after the allocation is gone: held %d, want 0", held)
 	}
 }
+
+// The user's review of 462 (2): pion raises OnAllocationError for EVERY
+// handling error of a source — a malformed packet on another listener from
+// the same socket — and the handler gave back any pending reservation of that
+// source, freeing the limit under an Allocate still in flight. Only a failed
+// creation (this relay's port generator) gives a seat back.
+func TestAnErrorOfAnotherPacketDoesNotGiveAReservationBack(t *testing.T) {
+	src := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40300}
+	r := &relay{seats: newSeats(1)}
+	if _, ok := r.seats.reserve(src, time.Now()); !ok {
+		t.Fatal("the reservation")
+	}
+	if held, back := r.allocationError(src, "failed to decode STUN message: unexpected EOF"); back || held != 1 {
+		t.Fatalf("an error of another packet from the same source: given back %v, held %d — want the reservation kept, 1", back, held)
+	}
+	if held, back := r.allocationError(src, "allocation mismatch: 127.0.0.1:40300"); back || held != 1 {
+		t.Fatalf("an Allocate refused before the quota check: given back %v, held %d — want the reservation kept, 1", back, held)
+	}
+	if held, back := r.allocationError(src, relayPortErr+" in 40000-40000: bind: address already in use"); !back || held != 0 {
+		t.Fatalf("the creation failed in the port generator: given back %v, held %d — want the seat back, 0", back, held)
+	}
+}
