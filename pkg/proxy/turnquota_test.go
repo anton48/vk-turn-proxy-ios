@@ -652,3 +652,80 @@ func TestTheSwiftMirrorCarriesEveryCacheField(t *testing.T) {
 		}
 	}
 }
+
+// The user's review of 461 (1): a file from before `used_on` was loaded with
+// its one last use as every relay's; the credential then ran on the own relay
+// and the save wrote `used_on` with that relay alone — the next load, seeing
+// the field, dropped the old clock with nine minutes still on it. The history
+// whose relay is not known is saved under "*" and applies to every relay.
+func TestAFileFromBeforeUsedOnKeepsItsClockAcrossASave(t *testing.T) {
+	dir := t.TempDir()
+	old := writeCache(t, dir, credCacheEntry{Slot: 0, Address: relayC, Addresses: []string{relayC}, Username: futureUser("old"), Password: "p", LastUsedAt: time.Now().Add(-time.Minute).Unix()})
+	cp, _, _ := relayPoolN(t, old, 4, relayC)
+	list, _ := ParseTURNServers(relayO + ":0," + TURNServersVK)
+	cp.setOverride(turnOverride{servers: list})
+	addr, creds, slot := mustGet(t, cp, 0)
+	if addr != relayO || slot != 0 {
+		t.Fatalf("conn 0: %q on slot %d — want the own relay on slot 0", addr, slot)
+	}
+	cp.release(0, creds, relayO)
+	cp.saveToDisk()
+	raw, err := os.ReadFile(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f credCacheFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Creds) != 1 || f.Creds[0].UsedOn["*"] == 0 || f.Creds[0].UsedOn[relayO] == 0 {
+		t.Fatalf("the saved file: %+v — want used_on with \"*\" (the old history) beside %s", f.Creds, relayO)
+	}
+	cp2, _, _ := relayPoolN(t, old, 4, relayC)
+	cp2.setOverride(turnOverride{servers: list})
+	cp2.mu.Lock()
+	onC, onO := cp2.clockLocked(0, relayC), cp2.clockLocked(0, relayO)
+	cp2.mu.Unlock()
+	left := time.Until(onC)
+	if left < 8*time.Minute || left > 9*time.Minute+30*time.Second || !onO.IsZero() {
+		t.Fatalf("after the save the clock on %s has %v left (want ≈9 min: the old history), on %s %v (want none)", relayC, left.Round(time.Second), relayO, onO)
+	}
+}
+
+// The user's review of 461 (2): with every candidate marked, the hand-out
+// judged the slot on the list's first candidate while the probe handed out
+// the relay longest due for a re-try — a third seat on B under A's quota.
+// The slot is judged on the relay the re-try would dial.
+func TestTheReTryIsJudgedOnTheRelayItDials(t *testing.T) {
+	cp, mints, clock := relayPoolN(t, "", 4, relayC)
+	list, _ := ParseTURNServers(relayA + ":20," + relayB + ":2")
+	cp.setOverride(turnOverride{servers: list})
+	cp.setColdStartTarget(30)
+	// Two seats on B (the connections' cursors stand on it).
+	cp.mu.Lock()
+	cp.cursor[0], cp.cursor[1] = 1, 1
+	cp.mu.Unlock()
+	var creds0 *TURNCreds
+	for conn := 0; conn < 2; conn++ {
+		addr, creds, slot := mustGet(t, cp, conn)
+		if addr != relayB || slot != 0 {
+			t.Fatalf("conn %d: %q on slot %d — want B on slot 0", conn, addr, slot)
+		}
+		creds0 = creds
+	}
+	// B marked first, A a second later (both with evidence): B's re-try comes
+	// due first. Then both are due.
+	cp.health.answered("", time.Time{})
+	cp.noteRelayUnanswered(5, 0, creds0, relayB, *clock)
+	*clock = clock.Add(time.Second)
+	cp.health.answered("", time.Time{})
+	cp.noteRelayUnanswered(6, 0, creds0, relayA, *clock)
+	*clock = clock.Add(probeBackoff(0) + 2*time.Second)
+	addr, _, slot := mustGet(t, cp, 2)
+	cp.mu.Lock()
+	onB := cp.seatsOnLocked(0, relayB)
+	cp.mu.Unlock()
+	if onB != 2 || slot == 0 || addr != relayB || mints.Load() != 2 {
+		t.Fatalf("conn 2 with both relays marked and B's re-try due: %q on slot %d, slot 0's seats on B %d, mints %d — want the re-try on B from a fresh credential (slot 0's two seats on B are its quota)", addr, slot, onB, mints.Load())
+	}
+}

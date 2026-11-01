@@ -1158,8 +1158,13 @@ type credCacheEntry struct {
 	// UsedOn (anonymous mode, since 2026-10-31): relay → the last moment a
 	// seat of this credential on THAT relay was held (Unix seconds; "now"
 	// for a relay with seats at the save) — the clock is per (identity,
-	// relay), so the history is kept per relay (relayhist.go). A file without
-	// it has the one last_used_at, read as every relay's.
+	// relay), so the history is kept per relay (relayhist.go). The key "*"
+	// is the history whose relay is not known (a file from before this
+	// field, seats the record could not place): it applies to EVERY relay
+	// and survives a save beside the relays' own (the user's review of 461:
+	// a legacy clock with nine minutes left was dropped by the first save
+	// that wrote a relay of its own). A file without the field has the one
+	// last_used_at, read as every relay's.
 	UsedOn map[string]int64 `json:"used_on,omitempty"`
 }
 
@@ -1859,6 +1864,7 @@ func (cp *credPool) loadFromDisk() {
 		// last_used_at as every relay's (the entry's own history).
 		var lastUsed, availableAt time.Time
 		on := map[string]*relayHist{}
+		star := false
 		for relay, unix := range entry.UsedOn {
 			if relay == "" || unix <= 0 {
 				continue
@@ -1867,12 +1873,17 @@ func (cp *credPool) loadFromDisk() {
 			if ready := h.lastUsedAt.Add(credSaturationCooldown); now.Before(ready) {
 				h.availableAt = ready
 			}
-			on[relay] = h
 			if h.lastUsedAt.After(lastUsed) {
 				lastUsed = h.lastUsedAt
 			}
+			if relay == "*" { // the history whose relay is not known: the entry's own, every relay's
+				star = true
+				availableAt = h.availableAt
+				continue
+			}
+			on[relay] = h
 		}
-		if len(on) == 0 && entry.LastUsedAt > 0 {
+		if len(on) == 0 && !star && entry.LastUsedAt > 0 {
 			lastUsed = time.Unix(entry.LastUsedAt, 0)
 			ready := lastUsed.Add(credSaturationCooldown)
 			if now.Before(ready) {
@@ -2052,6 +2063,13 @@ func (cp *credPool) saveToDisk() {
 		}
 		for relay, h := range entry.on {
 			note(relay, h.lastUsedAt)
+		}
+		// The entry's own history (relay not known — a file from before
+		// used_on, seats the record could not place): kept under "*", every
+		// relay's, so a relay of its own written beside it does not end it.
+		note("*", entry.lastUsedAt)
+		if cp.unattributedLocked(slot) > 0 {
+			note("*", now)
 		}
 		f.Creds = append(f.Creds, credCacheEntry{
 			Slot:       slot,
@@ -2792,9 +2810,11 @@ func (cp *credPool) release(slot int, creds *TURNCreds, addr string) {
 	}
 	if cp.pool[slot].active > 0 {
 		cp.pool[slot].active--
+		if !on {
+			cp.pool[slot].lastUsedAt = now // a seat whose relay is not known: the entry's own history, every relay's
+		}
 		if cp.pool[slot].active == 0 {
-			cp.pool[slot].lastUsedAt = now
-			cp.noteRelayUsedLocked(slot, cp.pool[slot].lastUsedAt) // the relay's clock (cookie mode)
+			cp.noteRelayUsedLocked(slot, now) // the relay's clock (cookie mode)
 			if cp.configuredOffLocked(slot) {
 				// The last seat of a slot whose relay the TURN override list
 				// dropped (cookie mode): the slot may take a free entry now.

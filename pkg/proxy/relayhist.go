@@ -117,8 +117,9 @@ func (cp *credPool) dialNowLocked(slot int) string {
 
 // peekAddrLocked is the relay connIdx would be handed on slot's credential —
 // pickAddrLocked's choice without its side effect (a re-try's claim): the
-// unmarked candidate at the connection's cursor, else the relay the slot
-// dials now (the re-try path decides later). Caller holds cp.mu.
+// unmarked candidate at the connection's cursor; every candidate marked, the
+// one the re-try would dial (probePeek — the same selection the claim is
+// taken by); else the relay the slot dials now. Caller holds cp.mu.
 func (cp *credPool) peekAddrLocked(slot, connIdx int) string {
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
@@ -130,6 +131,9 @@ func (cp *credPool) peekAddrLocked(slot, connIdx int) string {
 			i = -i
 		}
 		return alive[i]
+	}
+	if addr, ok := cp.health.probePeek(cands); ok {
+		return addr
 	}
 	return cp.dialNowLocked(slot)
 }

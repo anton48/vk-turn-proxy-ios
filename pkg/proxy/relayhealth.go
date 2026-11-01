@@ -213,6 +213,29 @@ func (r *relayRecord) dueAt() time.Time {
 // and reserves it for the caller; ok=false when none is due. nextDue is the
 // earliest moment one will be (zero when nothing is marked).
 func (h *relayHealth) probe(cands []string) (addr string, ok bool, nextDue time.Time) {
+	addr, ok, nextDue = h.dueCandidate(cands)
+	if ok {
+		now := h.now()
+		h.rec[addr].claimedUntil, h.rec[addr].claimedAt = now.Add(relayProbeClaim), now
+	}
+	return addr, ok, nextDue
+}
+
+// probePeek is probe's choice without the claim: the relay a re-try WOULD
+// dial — what a hand-out judges the slot on before the claim is taken
+// (the user's review of 461: the room was checked on the list's first
+// candidate while the probe handed out the one longest due — a third seat on
+// a relay with a quota of two).
+func (h *relayHealth) probePeek(cands []string) (addr string, ok bool) {
+	addr, ok, _ = h.dueCandidate(cands)
+	return addr, ok
+}
+
+// dueCandidate: among marked candidates, the one longest due for a re-try —
+// the ONE selection behind probe and probePeek (a run-out claim is settled
+// here, as a fact, whichever asks). Not ok with a re-try already out on one of
+// them (nextDue: when its claim runs out) or none due yet (nextDue: the first).
+func (h *relayHealth) dueCandidate(cands []string) (addr string, ok bool, nextDue time.Time) {
 	now := h.now()
 	type due struct {
 		addr string
@@ -239,7 +262,6 @@ func (h *relayHealth) probe(cands []string) (addr string, ok bool, nextDue time.
 	if dues[0].at.After(now) {
 		return "", false, dues[0].at
 	}
-	h.rec[dues[0].addr].claimedUntil, h.rec[dues[0].addr].claimedAt = now.Add(relayProbeClaim), now
 	return dues[0].addr, true, time.Time{}
 }
 

@@ -76,46 +76,49 @@ type relay struct {
 // loop); a deleted allocation frees it.
 type seats struct {
 	mu      sync.Mutex
-	max     int64
-	held    int64                // allocations + reservations
-	peak    int64                // the most held at once
-	pending map[string]time.Time // reservations not yet confirmed, by the client's source address
+	max     int64          // the limit
+	held    int64          // allocations + reservations
+	peak    int64          // the most held at once
+	pending map[string]int // reservations not yet confirmed, by the client's source address — a COUNT: one per Allocate
 }
 
-func newSeats(max int64) seats { return seats{max: max, pending: map[string]time.Time{}} }
+func newSeats(max int64) seats { return seats{max: max, pending: map[string]int{}} }
 
 func seatKey(src net.Addr) string { return src.Network() + " " + src.String() }
 
-// reserve takes a seat for src's Allocate, or refuses (the limit). A second
-// reservation for the same source (a retransmit) is the same seat.
+// reserve takes a seat for src's Allocate, or refuses (the limit). Every
+// Allocate is its own seat — the QuotaHandler sees the source alone, and one
+// socket's Allocates to two listeners are two allocations (the user's review
+// of 461: sixteen listeners under -max-allocs 1 held up to fifteen when a
+// second ask from the same source was read as a retransmit sharing one
+// reservation). A real retransmit cannot be in flight beside its first on one
+// socket (one read loop serves it in order); one that arrives after the
+// allocation exists is answered with an error and gives its seat back (failed).
 func (s *seats) reserve(src net.Addr, now time.Time) (held int64, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := seatKey(src)
-	if _, dup := s.pending[k]; dup {
-		s.pending[k] = now
-		return s.held, true
-	}
 	if s.held >= s.max {
 		return s.held, false
 	}
 	s.held++
-	s.pending[k] = now
+	s.pending[seatKey(src)]++
 	if s.held > s.peak {
 		s.peak = s.held
 	}
 	return s.held, true
 }
 
-// created: src's allocation exists — its reservation is now the allocation.
-// Without a reservation (expired before the creation, or a QuotaHandler-less
-// path) the allocation is counted here.
+// created: src's allocation exists — one of its reservations is now the
+// allocation. Without one (a QuotaHandler-less path) the allocation is
+// counted here.
 func (s *seats) created(src net.Addr) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k := seatKey(src)
-	if _, ok := s.pending[k]; ok {
-		delete(s.pending, k)
+	if k := seatKey(src); s.pending[k] > 0 {
+		s.pending[k]--
+		if s.pending[k] == 0 {
+			delete(s.pending, k)
+		}
 		return s.held
 	}
 	s.held++
@@ -135,15 +138,19 @@ func (s *seats) deleted() int64 {
 	return s.held
 }
 
-// failed: src's Allocate failed after its seat was reserved — given back.
+// failed: one of src's Allocates failed after its seat was reserved — given
+// back.
 func (s *seats) failed(src net.Addr) (int64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := seatKey(src)
-	if _, ok := s.pending[k]; !ok {
+	if s.pending[k] == 0 {
 		return s.held, false
 	}
-	delete(s.pending, k)
+	s.pending[k]--
+	if s.pending[k] == 0 {
+		delete(s.pending, k)
+	}
 	s.held--
 	return s.held, true
 }

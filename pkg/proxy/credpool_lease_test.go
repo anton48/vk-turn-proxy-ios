@@ -194,7 +194,7 @@ func TestLateReleasesAfterAnInvalidateLeaveTheNewHolderCounted(t *testing.T) {
 	}
 	cp.release(0, b, "")
 	cp.mu.Lock()
-	active, live, stamped := cp.pool[0].active, cp.liveLeasesLocked(), !cp.pool[0].lastUsedAt.IsZero()
+	active, live, stamped := cp.pool[0].active, cp.liveLeasesLocked(), !cp.histLocked(0, cp.dialNowLocked(0)).lastUsedAt.IsZero() // the stamp is the relay's the seat was on (relayhist.go)
 	cp.mu.Unlock()
 	if active != 0 || live != 0 || !stamped {
 		t.Fatalf("after B's own release: active %d, leases out %d, lastUsedAt stamped %v — want 0, 0, true", active, live, stamped)

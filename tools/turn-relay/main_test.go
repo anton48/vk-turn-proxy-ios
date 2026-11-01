@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/stun/v3"
 	"github.com/pion/turn/v5"
 )
 
@@ -359,4 +360,114 @@ func tcpClient(t *testing.T, addr string) *turn.Client {
 	}
 	t.Cleanup(func() { tcp.Close() })
 	return vkClient(t, addr, turn.NewSTUNConn(tcp))
+}
+
+// requestedUDP is the REQUESTED-TRANSPORT attribute for UDP (RFC 5766 §14.7:
+// the protocol number, three bytes reserved) — pion keeps its type internal.
+var requestedUDP = stun.RawAttribute{Type: stun.AttrType(0x0019), Value: []byte{17, 0, 0, 0}}
+
+// rawAllocate asks `to` for an allocation from conn the way the client does —
+// an unauthenticated ask, then the ask with the realm and nonce answered — and
+// says whether it was granted, else the error code. One socket, any listener.
+func rawAllocate(t *testing.T, conn net.PacketConn, to net.Addr) (granted bool, code stun.ErrorCode) {
+	t.Helper()
+	ask := func(m *stun.Message) *stun.Message {
+		if _, err := conn.WriteTo(m.Raw, to); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 1500)
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("no answer from %s: %v", to, err)
+		}
+		res := &stun.Message{Raw: append([]byte(nil), buf[:n]...)}
+		if err := res.Decode(); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	first := stun.MustBuild(stun.TransactionID, stun.NewType(stun.MethodAllocate, stun.ClassRequest), requestedUDP, stun.Fingerprint)
+	res := ask(first)
+	var realm stun.Realm
+	var nonce stun.Nonce
+	if err := realm.GetFrom(res); err != nil {
+		t.Fatalf("the first answer carries no realm: %v", err)
+	}
+	if err := nonce.GetFrom(res); err != nil {
+		t.Fatalf("the first answer carries no nonce: %v", err)
+	}
+	const user = "1793400000:1125900188966338"
+	second := stun.MustBuild(stun.TransactionID, stun.NewType(stun.MethodAllocate, stun.ClassRequest), requestedUDP,
+		stun.NewUsername(user), realm, nonce, stun.NewLongTermIntegrity(user, realm.String(), "a-password-the-relay-never-saw"), stun.Fingerprint)
+	res = ask(second)
+	if res.Type.Class == stun.ClassSuccessResponse {
+		return true, 0
+	}
+	var ec stun.ErrorCodeAttribute
+	if err := ec.GetFrom(res); err != nil {
+		t.Fatalf("an answer that is neither a success nor an error: %v", res.Type)
+	}
+	return false, ec.Code
+}
+
+// The user's review of 461 (3): a reservation keyed by the client's source
+// let one socket's Allocates to two listeners share ONE seat — sixteen
+// listeners under -max-allocs 1 held up to fifteen allocations. Every
+// Allocate is its own seat: the second listener answers 486.
+func TestTheLimitHoldsAcrossListeners(t *testing.T) {
+	cfg, err := parseConfig("127.0.0.1:0,127.0.0.1:0", "", "127.0.0.1", 1, "40110-40130", "vk-turn-relay", false, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := start(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.close() })
+	if len(r.udp) != 2 {
+		t.Fatalf("%d UDP listeners, want 2", len(r.udp))
+	}
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if granted, code := rawAllocate(t, conn, r.udp[0]); !granted {
+		t.Fatalf("the first listener refused the first allocation: %d", code)
+	}
+	granted, code := rawAllocate(t, conn, r.udp[1])
+	if granted || code != stun.CodeAllocQuotaReached {
+		t.Fatalf("the second listener under -max-allocs 1, the same source: granted %v, code %d — want 486 (one seat, not shared by source)", granted, code)
+	}
+	if held, peak := r.seats.count(), r.seats.highWater(); held != 1 || peak != 1 {
+		t.Fatalf("held %d, high-water %d — want 1 and 1", held, peak)
+	}
+}
+
+// The seats themselves: two Allocates in flight from ONE source — one socket
+// asking two listeners, served by two read loops at once — are two seats, not
+// a retransmit sharing one (the user's review of 461: sixteen listeners under
+// -max-allocs 1 held up to fifteen allocations).
+func TestTwoAllocatesInFlightFromOneSourceAreTwoSeats(t *testing.T) {
+	src := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40200}
+	s := newSeats(1)
+	if held, ok := s.reserve(src, time.Now()); !ok || held != 1 {
+		t.Fatalf("the first reservation: ok %v, held %d — want granted, 1", ok, held)
+	}
+	if held, ok := s.reserve(src, time.Now()); ok || held != 1 {
+		t.Fatalf("a second reservation from the same source with the first still in flight under -max-allocs 1: ok %v, held %d — want refused, 1 (its own seat, not the first's)", ok, held)
+	}
+	s2 := newSeats(2)
+	s2.reserve(src, time.Now())
+	s2.reserve(src, time.Now())
+	if held := s2.created(src); held != 2 {
+		t.Fatalf("after the first creation: held %d, want 2 (two reservations, one confirmed)", held)
+	}
+	if held, ok := s2.failed(src); !ok || held != 1 {
+		t.Fatalf("the second Allocate failed: ok %v, held %d — want its seat given back, 1", ok, held)
+	}
+	if held := s2.deleted(); held != 0 {
+		t.Fatalf("after the allocation is gone: held %d, want 0", held)
+	}
 }
