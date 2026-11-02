@@ -65,6 +65,7 @@ var (
 	wakeProbeFreezeStep  = time.Second            // a poll step longer than this was a freeze, not listening
 	wakeProbeAdopt       = time.Second            // a ping sent this recently is the probe's first ping
 	wakeProbeJitter      = 300 * time.Millisecond // the pool's probes are spread over this much
+	wakeProbeRetry       = time.Second            // the pause before an OWED probe is tried again (build 470)
 	wakeProbeClock       = time.Now
 )
 
@@ -196,6 +197,16 @@ var closedWakeCh = func() chan struct{} {
 type wakeWatch struct {
 	p      *Proxy
 	served uint64
+	// owed: a probe begun for the pending wake did not FINISH — its write failed
+	// for a reason that is not the connection's (ENOBUFS, the write's own
+	// deadline; pingWriteFailed let the goroutine go on). The wake stays
+	// pending, and the probe's 30-s throttle does not apply to it: the throttle
+	// is stamped at the probe's start (lastActiveProbeAt), so without this flag
+	// the next turn served the wake without a ping — swallowed (the review of
+	// 815137e, build 470). An owed probe is tried again after wakeProbeRetry,
+	// not at once. Cleared by a verdict; never set by the goroutine's own
+	// context ending.
+	owed bool
 }
 
 // newWakeWatch starts from the present: a wake that came before this session
@@ -214,16 +225,23 @@ func (w *wakeWatch) pending() bool { return w.p.wakeEpoch.Load() != w.served }
 // session kinds. probed = false when this wake needed no probe.
 func (w *wakeWatch) serve(ctx context.Context, connIdx, credSlot int, label string, seq *uint64, lastPingAt *time.Time, send func(seq uint64, now time.Time) error) (alive, probed bool, err error) {
 	epoch := w.p.wakeEpoch.Load()
-	if !w.p.wakeProbeDue(connIdx) {
+	// An OWED probe is made whatever the throttle says: the throttle's stamp is
+	// the unfinished probe's own.
+	if !w.owed && !w.p.wakeProbeDue(connIdx) {
 		w.served = epoch
 		return true, false, nil
 	}
 	// Spread the pool's probes over 0–300 ms: forty Write + SRTP-encrypt bursts
 	// in the same instant once pushed the extension over its memory limit
-	// (2026-05-25).
-	if jitter := mathrand.Int63n(int64(wakeProbeJitter)); jitter > 0 {
+	// (2026-05-25). An owed probe waits the retry pause instead — a refusal a
+	// moment ago is not asked again a moment later.
+	wait := time.Duration(mathrand.Int63n(int64(wakeProbeJitter)))
+	if w.owed {
+		wait = wakeProbeRetry
+	}
+	if wait > 0 {
 		select {
-		case <-time.After(time.Duration(jitter)):
+		case <-time.After(wait):
 		case <-ctx.Done():
 			return true, false, ctx.Err()
 		}
@@ -232,10 +250,16 @@ func (w *wakeWatch) serve(ctx context.Context, connIdx, credSlot int, label stri
 	// The probe asks again at every thaw inside its wait, so whatever woke the
 	// phone while it ran is served by it — UP TO the epoch its verdict read
 	// beside the pong mark, and not one wake further (build 425).
-	if err == nil {
-		w.served = covered
+	if err != nil {
+		// Not finished. The goroutine's own context ending owes nothing (the
+		// goroutine returns at its next turn); any other failure of the probe's
+		// write leaves the wake pending and the probe OWED.
+		w.owed = !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+		return alive, true, err
 	}
-	return alive, true, err
+	w.owed = false
+	w.served = covered
+	return alive, true, nil
 }
 
 // wakeProbeDue: is this wake to be probed on this connection at all?

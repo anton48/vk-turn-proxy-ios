@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/pion/dtls/v3"
 )
@@ -36,12 +37,14 @@ func TestAPingWriteThatFindsTheConnectionGoneEndsTheSession(t *testing.T) {
 		err   error
 		cause string
 	}{
-		{"EPIPE", syscall.EPIPE, "broken pipe"},
-		{"EPIPE inside a net.OpError (what a socket write returns)", &net.OpError{Op: "write", Net: "tcp", Err: os.NewSyscallError("write", syscall.EPIPE)}, "broken pipe"},
-		{"ECONNRESET", syscall.ECONNRESET, "connection reset by peer"},
-		{"ECONNABORTED", syscall.ECONNABORTED, ""},
-		{"ENOTCONN", syscall.ENOTCONN, ""},
-		{"ETIMEDOUT (the kernel's own give-up)", syscall.ETIMEDOUT, "operation timed out"},
+		// The cause is the errno's OWN words — the kernel's, not Darwin's: Linux
+		// says "connection timed out" where Darwin says "operation timed out".
+		{"EPIPE", syscall.EPIPE, syscall.EPIPE.Error()},
+		{"EPIPE inside a net.OpError (what a socket write returns)", &net.OpError{Op: "write", Net: "tcp", Err: os.NewSyscallError("write", syscall.EPIPE)}, syscall.EPIPE.Error()},
+		{"ECONNRESET", syscall.ECONNRESET, syscall.ECONNRESET.Error()},
+		{"ECONNABORTED", syscall.ECONNABORTED, syscall.ECONNABORTED.Error()},
+		{"ENOTCONN", syscall.ENOTCONN, syscall.ENOTCONN.Error()},
+		{"ETIMEDOUT (the kernel's own give-up)", syscall.ETIMEDOUT, syscall.ETIMEDOUT.Error()},
 		{"a closed socket", net.ErrClosed, "use of closed network connection"},
 		{"a closed pipe", io.ErrClosedPipe, ""},
 		{"pion/dtls's closed connection", dtls.ErrConnClosed, ""},
@@ -85,8 +88,8 @@ func TestAPingWriteThatMerelyFailsKeepsTheDetectorAlive(t *testing.T) {
 	}{
 		{"the write's own deadline", os.ErrDeadlineExceeded, true, "i/o timeout"},
 		{"the deadline inside a net.OpError", &net.OpError{Op: "write", Net: "udp", Err: os.ErrDeadlineExceeded}, true, "i/o timeout"},
-		{"EAGAIN — a moment's refusal", syscall.EAGAIN, true, ""},
-		{"ENOBUFS — a full UDP socket", syscall.ENOBUFS, true, ""},
+		{"EAGAIN — a moment's refusal", syscall.EAGAIN, true, syscall.EAGAIN.Error()},
+		{"ENOBUFS — a full UDP socket", syscall.ENOBUFS, true, syscall.ENOBUFS.Error()},
 		{"EHOSTUNREACH — a route away for now, the path hook's business", syscall.EHOSTUNREACH, true, ""},
 		{"ENETUNREACH", syscall.ENETUNREACH, true, ""},
 		{"a plain error", errors.New("something else"), true, ""},
@@ -183,5 +186,85 @@ func TestBothSessionKindsJudgeAFailedPingByTheOneRule(t *testing.T) {
 	}
 	if got := strings.Count(stripComments(string(w)), "func (p *Proxy) pingWriteFailed("); got != 1 {
 		t.Errorf("wakeprobe.go defines pingWriteFailed %d times, want 1", got)
+	}
+}
+
+// The review of 815137e: a wake probe whose FIRST write failed for a reason
+// that is not the connection's (ENOBUFS, the write's own deadline) left the
+// goroutine through `continue` — and the next turn met the probe's 30-s
+// throttle (lastActiveProbeAt is stamped before the send): serve marked the
+// wake served without a ping, and the wake was swallowed. A probe that did not
+// finish is OWED: the wake stays pending, the throttle does not apply to it,
+// and it is retried after a pause, not at once.
+func TestAWakeProbeWhoseWriteFailedIsOwedAndRetriedAfterAPause(t *testing.T) {
+	shrinkWakeProbe(t)
+	r := wakeProbeRetry
+	wakeProbeRetry = 40 * time.Millisecond
+	t.Cleanup(func() { wakeProbeRetry = r })
+	p := probeProxy()
+	p.serverProbeable.Store(true)
+	w := p.newWakeWatch()
+	p.broadcastWake()
+	var seq uint64
+	var lastPingAt time.Time
+	sent := 0
+	send := func(s uint64, _ time.Time) error {
+		sent++
+		if sent == 1 {
+			return syscall.ENOBUFS // a moment's refusal on the probe's first write
+		}
+		go func() { time.Sleep(time.Millisecond); p.notePongSeq(0, s) }()
+		return nil
+	}
+	alive, probed, err := w.serve(context.Background(), 0, 0, "", &seq, &lastPingAt, send)
+	if err == nil || !errors.Is(err, syscall.ENOBUFS) || !probed || !alive {
+		t.Fatalf("the first serve: alive %v probed %v err %v, want the write's own error back, alive, probed", alive, probed, err)
+	}
+	if !w.pending() {
+		t.Fatal("after the failed write the wake is not pending: nothing will probe it")
+	}
+	// The next turn of the goroutine serves the wake again: within the throttle
+	// (the stamp is seconds old), yet the OWED probe is made — after the pause.
+	t0 := time.Now()
+	alive, probed, err = w.serve(context.Background(), 0, 0, "", &seq, &lastPingAt, send)
+	if err != nil || !alive || !probed {
+		t.Fatalf("the second serve: alive %v probed %v err %v, want the owed probe made", alive, probed, err)
+	}
+	if sent < 2 {
+		t.Errorf("the owed probe sent nothing (sends %d): the throttle swallowed the wake", sent)
+	}
+	if waited := time.Since(t0); waited < wakeProbeRetry {
+		t.Errorf("the owed probe was retried after %s, want a pause of at least %s", waited, wakeProbeRetry)
+	}
+	if w.pending() {
+		t.Error("the wake is still pending after the owed probe's verdict")
+	}
+	// Served now: the next wake inside the throttle needs no probe (as before).
+	p.broadcastWake()
+	if _, probed, _ = w.serve(context.Background(), 0, 0, "", &seq, &lastPingAt, nil); probed || w.pending() {
+		t.Errorf("probed %v pending %v, want a throttled wake served without a probe", probed, w.pending())
+	}
+}
+
+// The goroutine's own context ending inside a probe owes nothing: the
+// goroutine returns at its next turn, and a watch that outlived it would not
+// probe on a cancelled context's account.
+func TestAProbeEndedByItsOwnContextOwesNothing(t *testing.T) {
+	shrinkWakeProbe(t)
+	p := probeProxy()
+	p.serverProbeable.Store(true)
+	w := p.newWakeWatch()
+	p.broadcastWake()
+	ctx, cancel := context.WithCancel(context.Background())
+	var seq uint64
+	var lastPingAt time.Time
+	// The probe has begun (its first ping written) when the context ends: the
+	// error comes out of the probe's own wait, where an owed probe is decided.
+	_, _, err := w.serve(ctx, 0, 0, "", &seq, &lastPingAt, func(uint64, time.Time) error { cancel(); return nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want the context's", err)
+	}
+	if w.owed {
+		t.Error("a probe ended by its own context is owed")
 	}
 }
