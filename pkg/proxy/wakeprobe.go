@@ -43,10 +43,18 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	mathrand "math/rand"
+	"net"
+	"os"
+	"strings"
+	"syscall"
 	"time"
+
+	"github.com/pion/dtls/v3"
 )
 
 // Vars so that a test can shrink them; nothing else writes them.
@@ -425,4 +433,102 @@ func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send
 	}
 	*lastPingAt = pingStamp(p.wakeEpoch.Load() != epoch, now, wakeProbeClock())
 	return nil
+}
+
+// pingWriteFailed is the ONE verdict on a failed ping write, for both session
+// kinds and for both pings — the periodic tick's and the wake probe's (build
+// 469). It answers whether the probe goroutine is to END: true when the write
+// found the CONNECTION gone — the session is ended here and now, through
+// connCancel — and false for every other error, when the goroutine goes on.
+//
+// Up to 468 the goroutine returned on ANY error of the write, and took the
+// zombie detector — which lives in it — with it: nobody was left to judge the
+// connection. The comment there said the other goroutines would handle the
+// teardown; they do not. The recv goroutine's read timeout is judged by the
+// GLOBAL receive clock (one live neighbour hides a dead connection), and the
+// writer waits in the shared send queue for a packet, which it then loses —
+// one packet per dead session. On an idle phone that is a packet every few
+// seconds: behind a relay's loss the forty dead sessions went one by one,
+// ≈ 2.5 min with no uplink and 40/40 on the screen (2026-11-02, the user's
+// run on 467). On iOS the kernel gives up on a dead TCP connection within
+// ≈ 2 min and the ping's write — 12 bytes every 30 s — is usually the FIRST
+// write to meet it (EPIPE), ahead of the zombie detector's 120 s.
+//
+// The rule: the connection gone (a broken pipe, a reset, the kernel's own
+// give-up, a closed socket) ends the session at once, whatever the traffic —
+// every dead session is gone within one tick of the kernel's give-up. The
+// write's own deadline, a moment's refusal, a route away for now (the path
+// hook's business) end NOTHING: the ping is counted as not sent, the goroutine
+// goes on, and the zombie detector judges the connection by its pongs. The
+// goroutine's own context ending is no verdict and no line. 🚫 Never a bare
+// return on a ping's write error, in either session kind, at either ping —
+// the scan test pins the four sites; and the line names the cause, never an
+// address (the socket's error carries both ends).
+func (p *Proxy) pingWriteFailed(connIdx, credSlot int, label string, err error, connCancel func()) (stop bool) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false // the goroutine's own end: the loop meets connCtx.Done at its next turn
+	}
+	if pingWriteGone(err) {
+		log.Printf("proxy: [conn %d on slot %d] %sthe ping's write found the connection gone (%s) — the session ends", connIdx, credSlot, label, pingWriteCause(err))
+		connCancel()
+		return true
+	}
+	log.Printf("proxy: [conn %d] %sthe ping's write failed (%s) — the probe goes on, the zombie detector judges the connection", connIdx, label, pingWriteCause(err))
+	return false
+}
+
+// pingWriteGone says whether a ping write's error means the CONNECTION is gone
+// — a reset, a broken pipe, the kernel's own give-up, a closed socket (the
+// socket's, pion/dtls's) — as opposed to the write's own deadline, a moment's
+// refusal (EAGAIN, ENOBUFS) or a route away for now (unreachable). The errno
+// is asked first; a library that wraps without %w is read by the words a
+// socket's error carries (the recv loops judge their read deadline the same
+// way).
+func pingWriteGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, dtls.ErrConnClosed) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNABORTED, syscall.ENOTCONN, syscall.ETIMEDOUT:
+			return true
+		}
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "broken pipe") || strings.Contains(s, "connection reset") || strings.Contains(s, "use of closed network connection")
+}
+
+// pingWriteCause is what the line says about the error: the errno's own words,
+// the deadline's, a closed socket's — never the error's full text, which for a
+// socket's write names both ends of the connection.
+func pingWriteCause(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno.Error()
+	}
+	switch {
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return os.ErrDeadlineExceeded.Error()
+	case errors.Is(err, net.ErrClosed):
+		return net.ErrClosed.Error()
+	case errors.Is(err, io.ErrClosedPipe):
+		return io.ErrClosedPipe.Error()
+	case errors.Is(err, dtls.ErrConnClosed):
+		return "the DTLS connection is closed"
+	}
+	s := err.Error()
+	for _, w := range []string{"broken pipe", "connection reset by peer", "use of closed network connection"} {
+		if strings.Contains(s, w) {
+			return w
+		}
+	}
+	return "a write error"
 }

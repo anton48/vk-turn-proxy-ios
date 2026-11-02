@@ -2687,11 +2687,14 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// The tick's ping is ONE body for both session kinds — seq and the stamp a
 				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
 				if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil {
-					// Write failure means the conn is already broken.
-					// Other goroutines (DTLS recv timeout, TURN reconnect
-					// loop) will handle the actual teardown — we just
-					// stop sending probes.
-					return
+					// ONE verdict for both session kinds (pingWriteFailed, wakeprobe.go,
+					// build 469): the connection gone ends the session here; any other
+					// error leaves the goroutine — and the zombie detector below — alive.
+					// 🚫 Never a bare return here: up to 468 it took the detector with
+					// it, and nobody else ends a dead connection on an idle phone.
+					if p.pingWriteFailed(connIdx, credSlot, "", err, connCancel) {
+						return
+					}
 				}
 				// Zombie check: if no pong for probeStaleThreshold (default
 				// 120s) AND the server has been observed responding to at
@@ -2762,7 +2765,13 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// both session kinds — wakeWatch.serve, wakeprobe.go (builds 422–424).
 				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "", &seq, &lastPingAt, sendPing)
 				if err != nil {
-					return
+					// The probe's own ping failed: the one verdict (pingWriteFailed). A
+					// failure that is not the connection's leaves the wake pending — the
+					// next turn of the loop serves it again, under the probe's own throttle.
+					if p.pingWriteFailed(connIdx, credSlot, "", err, connCancel) {
+						return
+					}
+					continue
 				}
 				if !alive {
 					connCancel()
@@ -5383,7 +5392,10 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				// The tick's ping is ONE body for both session kinds — seq and the stamp a
 				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
 				if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil {
-					return
+					// The one verdict — see the DTLS session's tick (pingWriteFailed).
+					if p.pingWriteFailed(connIdx, credSlot, "SRTP ", err, connCancel) {
+						return
+					}
 				}
 				if p.serverProbeable.Load() && connIdx >= 0 && connIdx < len(p.lastPongTimes) {
 					lastPong := time.Unix(p.lastPongTimes[connIdx].Load(), 0)
@@ -5413,7 +5425,11 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				// both session kinds — wakeWatch.serve, wakeprobe.go (builds 422–424).
 				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "SRTP ", &seq, &lastPingAt, sendPing)
 				if err != nil {
-					return
+					// The one verdict — see the DTLS session's wake branch.
+					if p.pingWriteFailed(connIdx, credSlot, "SRTP ", err, connCancel) {
+						return
+					}
+					continue
 				}
 				if !alive {
 					connCancel()
