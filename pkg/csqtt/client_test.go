@@ -220,7 +220,7 @@ func (l *lease) creds(ctx context.Context, workerID int) (Credential, error) {
 			l.releases++
 			l.mu.Unlock()
 		},
-		Allocated: func() {
+		Allocated: func(time.Time) {
 			l.mu.Lock()
 			l.allocated++
 			l.mu.Unlock()
@@ -334,6 +334,80 @@ func TestCredentialsAreTakenOutsideTheStartGate(t *testing.T) {
 	mu.Unlock()
 	if gap >= 500*time.Millisecond {
 		t.Fatalf("third allocation %s after the first — the slow mints serialized behind the start gate", gap)
+	}
+}
+
+// A lease hears when its DIAL began, behind the start gate: a credential can
+// wait there for every allocation ahead of it, and a relay's answer given
+// meanwhile says nothing about a dial that had not begun. Told the moment the
+// credential was handed, the pool read a fresh failure as older than that
+// answer and a silent relay kept its place.
+func TestALeaseIsToldWhenItsDialBeganBehindTheStartGate(t *testing.T) {
+	const hold = 200 * time.Millisecond
+	unanswered := errors.New("dial tcp 203.0.113.1:19302: i/o timeout")
+	for _, tc := range []struct {
+		name       string
+		firstFails bool
+	}{{"a failure behind the gate", false}, {"an answer behind the gate", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newFakeServer(t)
+			var mu sync.Mutex
+			var dials int
+			var firstEnded time.Time
+			var failed, allocated []time.Time
+			loopbackRelay(t, func(TURNCredentials) error {
+				mu.Lock()
+				dials++
+				n := dials
+				mu.Unlock()
+				switch n {
+				case 2: // worker 1 runs alone; of the other two one holds the gate, the other waits with its credential
+					time.Sleep(hold)
+					mu.Lock()
+					firstEnded = time.Now()
+					mu.Unlock()
+					if tc.firstFails {
+						return unanswered
+					}
+				case 3:
+					if !tc.firstFails {
+						return unanswered
+					}
+				}
+				return nil
+			})
+			creds := func(ctx context.Context, id int) (Credential, error) {
+				return Credential{
+					TURNCredentials: TURNCredentials{Username: "u", Password: "p", Address: "127.0.0.1:19302"},
+					Failed: func(_ error, began time.Time) {
+						mu.Lock()
+						failed = append(failed, began)
+						mu.Unlock()
+					},
+					Allocated: func(began time.Time) {
+						mu.Lock()
+						allocated = append(allocated, began)
+						mu.Unlock()
+					},
+				}, nil
+			}
+			c := dialReady(t, testConfig(srv, 3, creds))
+			defer c.Close()
+			mu.Lock()
+			defer mu.Unlock()
+			if firstEnded.IsZero() || len(failed) == 0 || len(allocated) < 2 {
+				t.Fatalf("fixture: first ended %v, failed %d, allocated %d", firstEnded, len(failed), len(allocated))
+			}
+			if tc.firstFails {
+				if !allocated[1].After(firstEnded) { // [0] is worker 1's
+					t.Fatalf("Allocated began %s before the first dial ended — the moment the credential was handed, not the dial", firstEnded.Sub(allocated[1]))
+				}
+				return
+			}
+			if !failed[0].After(firstEnded) {
+				t.Fatalf("Failed began %s before the first dial ended — the moment the credential was handed, not the dial", firstEnded.Sub(failed[0]))
+			}
+		})
 	}
 }
 
@@ -857,7 +931,7 @@ func TestRefusedAllocationReachesTheLeaseBeforeRelease(t *testing.T) {
 		mu.Unlock()
 		return Credential{
 			TURNCredentials: TURNCredentials{Username: name, Password: "p", Address: "127.0.0.1:19302"},
-			Failed: func(err error) {
+			Failed: func(err error, _ time.Time) {
 				mu.Lock()
 				events = append(events, "failed: "+err.Error())
 				mu.Unlock()

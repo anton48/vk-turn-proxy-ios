@@ -198,10 +198,16 @@ type Client struct {
 // every retry (the user's review, 2026-09-06: two 486s, one mint, zero
 // saturated slots). nil callbacks mean no bookkeeping (a manual
 // credential).
+//
+// began, in Failed and Allocated, is when the relay dial itself began: behind
+// the start gate, where a credential can wait for every allocation ahead of
+// it. The moment a credential was handed says nothing about the path at the
+// dial: a relay's answer given while it waited would make its failure look
+// older than that answer (relayhealth.go).
 type Credential struct {
 	TURNCredentials
 	Release func()
-	Failed  func(err error)
+	Failed  func(err error, began time.Time)
 	// Allocated, when set, is called once the relay ACCEPTED the allocation
 	// — at that moment, before the permission: the pool's evidence that this
 	// identity works, so a later 486 on it is its quota rather than the relay
@@ -210,7 +216,7 @@ type Credential struct {
 	// ends, however early, and the relay holds it for a second more. At most
 	// once per Creds; before READY, and before Failed if the session fails
 	// behind its Allocate.
-	Allocated func()
+	Allocated func(began time.Time)
 }
 
 // dialRelay is DialRelay, replaceable by tests with a loopback relay.
@@ -1350,7 +1356,7 @@ func (w *worker) session() error {
 	case <-w.dead:
 	default:
 	}
-	t0 := time.Now()
+	t0 := time.Now() // the dial begins here, behind the gate: what the lease is told (Credential)
 	// The lease hears of the allocation from DialRelay itself, the moment the
 	// relay accepts it — not from a successful return: a permission that fails
 	// behind the Allocate has still used the seat (DialRelay's doc).
@@ -1358,7 +1364,7 @@ func (w *worker) session() error {
 	relay, err := dialRelay(cred.TURNCredentials, w.c.cfg.Server, w.c.cfg.TURNTransport, w.c.cfg.TURNLogLevel, func() {
 		seatUsed = true // called on this goroutine, inside the dial
 		if cred.Allocated != nil {
-			cred.Allocated()
+			cred.Allocated(t0)
 		}
 	})
 	startDone()
@@ -1371,7 +1377,7 @@ func (w *worker) session() error {
 		// the slot — a 486 must not come back to this worker as the same
 		// credential on the next attempt.
 		if cred.Failed != nil {
-			cred.Failed(err)
+			cred.Failed(err, t0)
 		}
 		return err
 	}

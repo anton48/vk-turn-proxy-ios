@@ -141,8 +141,14 @@ func TestCsqttASeatUsedBehindAFailedPermissionStaysCountedForTheRelaysSecond(t *
 		}
 		close(leased)
 		allocated, failed, release := c.Allocated, c.Failed, c.Release
-		c.Allocated = func() { note("allocated"); allocated() }
-		c.Failed = func(err error) { note("failed"); mu.Lock(); failure = err; mu.Unlock(); failed(err) }
+		c.Allocated = func(began time.Time) { note("allocated"); allocated(began) }
+		c.Failed = func(err error, began time.Time) {
+			note("failed")
+			mu.Lock()
+			failure = err
+			mu.Unlock()
+			failed(err, began)
+		}
 		c.Release = func() {
 			note("release")
 			release()
@@ -232,8 +238,8 @@ func TestCsqttASeatUsedBehindAFailedPermissionStaysCountedForTheRelaysSecond(t *
 	}
 	// …and what the next taker then meets at the relay, as its worker would: the
 	// Allocate (the permission fails behind it here too — that is not the point).
-	if r, err := csqtt.DialRelay(next.lease.TURNCredentials, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, "udp", logging.LogLevelError, next.lease.Allocated); err != nil {
-		next.lease.Failed(err)
+	if r, err := csqtt.DialRelay(next.lease.TURNCredentials, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, "udp", logging.LogLevelError, func() { next.lease.Allocated(time.Now()) }); err != nil {
+		next.lease.Failed(err, time.Now())
 	} else {
 		r.Close()
 	}

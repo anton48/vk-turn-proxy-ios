@@ -326,7 +326,6 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 		avail := a.pool.SlotAvailable()
 		addr, creds, slot, err := a.pool.Acquire(idx)
 		if err == nil {
-			attempt := time.Now() // the worker dials right behind this — the relay health's window
 			var once sync.Once
 			var allocated atomic.Bool
 			return csqtt.Credential{
@@ -345,8 +344,8 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 						a.pool.Release(slot, creds, addr)
 					})
 				},
-				Failed:    func(err error) { a.refused(workerID, idx, slot, creds, addr, attempt, err) },
-				Allocated: func() { allocated.Store(true); a.pool.NoteAllocatedAt(slot, creds, addr, attempt) },
+				Failed:    func(err error, began time.Time) { a.refused(workerID, idx, slot, creds, addr, began, err) },
+				Allocated: func(began time.Time) { allocated.Store(true); a.pool.NoteAllocatedAt(slot, creds, addr, began) },
 			}, nil
 		}
 		if terminal := csqttTerminalCredError(err); terminal != nil {

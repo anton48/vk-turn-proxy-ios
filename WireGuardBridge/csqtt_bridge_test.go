@@ -593,7 +593,7 @@ func TestCsqttLeaseGoesBackBehindTheRelaysSecondOnlyIfItHeldAnAllocation(t *test
 		t.Fatal("worker 11 still parked")
 	}
 	// A lease that held an allocation: the relay keeps its seat for a second.
-	leases[1].Allocated()
+	leases[1].Allocated(time.Now())
 	done, _ = seated(12)
 	time.Sleep(100 * time.Millisecond)
 	released := time.Now()

@@ -113,7 +113,7 @@ func TestCsqttPoolAdapterReportsARefusalAsTheProxyDoes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first.Failed(errors.New("turn allocate: Allocate error response (error 486: Allocation Quota Reached)"))
+	first.Failed(errors.New("turn allocate: Allocate error response (error 486: Allocation Quota Reached)"), time.Now())
 	first.Release()
 	if s := pool.Stats(); s.Saturated != 1 {
 		t.Fatalf("saturated %d after a 486, want 1 — the pool never heard of the refusal", s.Saturated)
@@ -127,7 +127,7 @@ func TestCsqttPoolAdapterReportsARefusalAsTheProxyDoes(t *testing.T) {
 	}
 
 	before := pool.Stats().WithCreds
-	second.Failed(errors.New("turn allocate: Allocate error response (error 401: Unauthorized)"))
+	second.Failed(errors.New("turn allocate: Allocate error response (error 401: Unauthorized)"), time.Now())
 	second.Release()
 	if after := pool.Stats().WithCreds; after != before-1 {
 		t.Fatalf("with-creds %d → %d after a 401, want the slot emptied", before, after)
@@ -138,10 +138,68 @@ func TestCsqttPoolAdapterReportsARefusalAsTheProxyDoes(t *testing.T) {
 		t.Fatal(err)
 	}
 	s0 := pool.Stats()
-	third.Failed(errors.New("turn allocate: all retransmissions failed for 8f2c"))
+	third.Failed(errors.New("turn allocate: all retransmissions failed for 8f2c"), time.Now())
 	third.Release()
 	if s1 := pool.Stats(); s1.Saturated != s0.Saturated || s1.WithCreds != s0.WithCreds {
 		t.Fatalf("a timeout changed the pool (%+v → %+v) — only a refusal is the pool's business", s0, s1)
+	}
+}
+
+// A lease reports the moment its dial began, and the adapter hands THAT moment
+// to the pool, never the moment of the hand-out: a credential waits at the
+// start gate behind the allocations ahead of it. Worker 3 holds its lease while
+// worker 2 is answered; its own dial begins after that answer and times out.
+// That is a verdict on the relay: a silent relay without a quota keeps no
+// place. A dial begun BEFORE the answer stays no verdict.
+func TestTheAdapterJudgesARelayByWhenTheDialBegan(t *testing.T) {
+	const own = "203.0.113.50:19302"
+	timeout := errors.New("dial tcp 203.0.113.50:19302: i/o timeout")
+	for _, tc := range []struct {
+		name          string
+		beganBehind   bool
+		wantOwnStands bool
+	}{
+		{"a dial begun behind the answer is a verdict", true, false},
+		{"a dial begun before the answer is none", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mints atomic.Int32
+			installFakePool(t, mintingFetch(&mints))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			pool := csqttNewPool(ctx, proxy.CredPoolConfig{VKLink: "https://vk.ru/call/join/abc", NumConns: 30, Cooldown: 150 * time.Millisecond,
+				TurnServers: []string{own + ":0", proxy.TURNServersVK}})
+			defer pool.Close()
+			a := &csqttPoolAdapter{pool: pool, fatal: func(err error) { t.Errorf("fatal: %v", err) }}
+			w2, err := a.creds(ctx, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w3, err := a.creds(ctx, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w2.Address != own || w3.Address != own {
+				t.Fatalf("precondition: the leases dial %q and %q, want the relay without a quota", w2.Address, w3.Address)
+			}
+			before := time.Now()
+			time.Sleep(time.Millisecond)
+			w2.Allocated(time.Now())
+			time.Sleep(time.Millisecond)
+			began := before
+			if tc.beganBehind {
+				began = time.Now()
+			}
+			w3.Failed(timeout, began)
+			w3.Release()
+			next, err := a.creds(ctx, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (next.Address == own) != tc.wantOwnStands {
+				t.Fatalf("worker 3's next lease dials %q; the relay without a quota should stand: %v", next.Address, tc.wantOwnStands)
+			}
+		})
 	}
 }
 
@@ -292,9 +350,9 @@ func TestCsqttOverlappingHerdRefusalsTripTheBreakerUnlessTheIdentityWasAccepted(
 	for round := 0; round < 2; round++ {
 		leases := seat(1 + 10*round)
 		for _, cred := range leases[:9] {
-			cred.Allocated()
+			cred.Allocated(time.Now())
 		}
-		leases[9].Failed(refused)
+		leases[9].Failed(refused, time.Now())
 		release(leases)
 	}
 	if s := pool.Stats(); s.QuotaRefusals != 2 || s.MintPaused != 0 || mints.Load() != 2 {
@@ -306,7 +364,7 @@ func TestCsqttOverlappingHerdRefusalsTripTheBreakerUnlessTheIdentityWasAccepted(
 	// Release between the failures.
 	leases := seat(21)
 	for _, cred := range leases {
-		cred.Failed(refused)
+		cred.Failed(refused, time.Now())
 	}
 	s := pool.Stats()
 	if s.MintPaused <= 0 {

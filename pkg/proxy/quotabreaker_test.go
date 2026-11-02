@@ -336,7 +336,7 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(bridge), "NoteAllocatedAt(slot, creds, addr, attempt)") {
+	if !strings.Contains(string(bridge), "NoteAllocatedAt(slot, creds, addr, began)") {
 		t.Error("csqtt_bridge.go: the adapter's Allocated callback does not hand the leased credential and its relay to NoteAllocatedAt")
 	}
 	for _, lit := range []string{"DTLS+TURN session established", "direct TURN session established", "WRAP-A+TURN session established", "SRTP+TURN session established"} {
@@ -353,7 +353,7 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := string(csq)
-	if !strings.Contains(c, "Allocated func()") {
+	if !strings.Contains(c, "Allocated func(began time.Time)") {
 		t.Error("pkg/csqtt: Credential has no Allocated callback")
 	}
 	// csqtt's mark is the allocation too: DialRelay itself reports it, between the
@@ -383,8 +383,8 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	if dial < 0 || gate < 0 {
 		t.Fatal("pkg/csqtt: the worker's relay dial not found")
 	}
-	if n := strings.Count(w, "cred.Allocated()"); n != 1 || !strings.Contains(w[dial:dial+gate], "cred.Allocated()") {
-		t.Errorf("pkg/csqtt: the worker calls cred.Allocated() %d time(s), want once — inside the callback it hands to the relay dial, not behind the dial's return", n)
+	if n := strings.Count(w, "cred.Allocated("); n != 1 || !strings.Contains(w[dial:dial+gate], "cred.Allocated(") {
+		t.Errorf("pkg/csqtt: the worker calls cred.Allocated %d time(s), want once — inside the callback it hands to the relay dial, not behind the dial's return", n)
 	}
 }
 
