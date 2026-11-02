@@ -744,3 +744,122 @@ func TestARunOutClaimNeverYieldsAnEmptyAddress(t *testing.T) {
 		t.Fatalf("a seat was taken for nothing: active %d → %d", before, cp.pool[slot].active)
 	}
 }
+
+// An attempt begun before a relay's OWN answer says nothing about that relay:
+// it set out while the relay was out of reach, and its failure, arriving a
+// moment after the answer, found the record cleared and the evidence fresh —
+// the stand's whole-network outage (2026-11-02): O answered at +234.4 s and
+// four attempts begun in the outage marked it at +234.7–235.2 s, driving seven
+// connections off a healthy relay.
+func TestAnAttemptBegunBeforeARelaysOwnAnswerIsNoVerdictOnIt(t *testing.T) {
+	h := newRelayHealth()
+	clock := time.Now()
+	h.now = func() time.Time { return clock }
+	h.answered("", time.Time{}) // the evidence: fresh for every attempt below
+	begun := clock
+	clock = clock.Add(4 * time.Second)
+	answeredBegun := clock
+	clock = clock.Add(800 * time.Millisecond)
+	h.answered(relayA, answeredBegun) // A has no record yet: the late attempt has not failed
+	clock = clock.Add(200 * time.Millisecond)
+	if h.unanswered(relayA, begun) || h.isDead(relayA) {
+		t.Fatal("a failure of an attempt begun before A's own answer marked A")
+	}
+	// Begun after the ANSWERED attempt began and before the answer came: the
+	// line is the answer's moment.
+	if h.unanswered(relayA, answeredBegun.Add(400*time.Millisecond)) || h.isDead(relayA) {
+		t.Fatal("a failure of an attempt begun before the answer's moment marked A")
+	}
+	if len(h.untried([]string{relayA})) != 1 {
+		t.Fatal("a failure that is no verdict began a streak: A is no longer untried")
+	}
+	// Another relay's answer voids nothing: it is the evidence.
+	begunC := clock
+	clock = clock.Add(time.Second)
+	h.answered(relayB, clock)
+	clock = clock.Add(time.Second)
+	if !h.unanswered(relayC, begunC) {
+		t.Fatal("an attempt on C begun before B's answer is a verdict on C — not marked")
+	}
+	// An attempt begun AFTER A's answer is a verdict as any.
+	if !h.unanswered(relayA, clock) || !h.isDead(relayA) {
+		t.Fatal("a failure of an attempt begun after A's answer is a verdict — not marked")
+	}
+}
+
+// The field's shape: a streak from the outage with no evidence, the relay's
+// own answer, then the late failure of an attempt of that outage.
+func TestAStreakEndedByARelaysOwnAnswerIsNotResumedByALateFailure(t *testing.T) {
+	h := newRelayHealth()
+	clock := time.Now()
+	h.now = func() time.Time { return clock }
+	if h.unanswered(relayA, clock) {
+		t.Fatal("precondition: no evidence, no mark")
+	}
+	clock = clock.Add(3 * time.Second)
+	begun := clock // in the outage
+	clock = clock.Add(2 * time.Second)
+	h.answered(relayA, clock.Add(-100*time.Millisecond))
+	clock = clock.Add(300 * time.Millisecond)
+	if h.unanswered(relayA, begun) || h.isDead(relayA) {
+		t.Fatal("a late failure of the outage marked the relay that had just answered")
+	}
+	if len(h.untried([]string{relayA})) != 1 {
+		t.Fatal("A is no longer untried after its own answer")
+	}
+}
+
+// A marked relay that answers its re-try is not marked again by the late
+// failure of an attempt begun before that answer.
+func TestARelayThatAnsweredItsReTryIsNotMarkedAgainByALateFailure(t *testing.T) {
+	h := newRelayHealth()
+	clock := time.Now()
+	h.now = func() time.Time { return clock }
+	h.answered("", time.Time{})
+	if !h.unanswered(relayA, clock) {
+		t.Fatal("precondition: A marked")
+	}
+	clock = clock.Add(probeBackoff(0) + time.Second)
+	addr, ok, _ := h.probe([]string{relayA})
+	if !ok || addr != relayA {
+		t.Fatalf("precondition: the re-try on A: %q %v", addr, ok)
+	}
+	begun := clock.Add(-time.Second)
+	clock = clock.Add(time.Second)
+	h.answered(relayA, clock.Add(-500*time.Millisecond))
+	clock = clock.Add(time.Second)
+	if h.unanswered(relayA, begun) || h.isDead(relayA) {
+		t.Fatal("A answered its re-try and a late failure marked it again")
+	}
+}
+
+// Through the pool: the connection's cursor moves as for any failed attempt,
+// the relay keeps its standing, the next connection dials it, and the log
+// says why nothing was marked.
+func TestALateFailureBehindARelaysOwnAnswerLeavesTheRelayStanding(t *testing.T) {
+	say := captureLog(t)
+	cp, _, _ := relayPool(t, "", relayA, relayB)
+	addr, creds, slot := mustGet(t, cp, 0)
+	if addr != relayA {
+		t.Fatalf("precondition: conn 0 dials %q, want A", addr)
+	}
+	begun := time.Now().Add(-5 * time.Second)
+	cp.noteAllocatedAt(slot, creds, relayA, time.Now())
+	cp.noteRelayUnanswered(1, slot, creds, relayA, begun)
+	if cp.health.isDead(relayA) {
+		t.Fatal("a failure begun before A's own answer marked A")
+	}
+	if cp.cursor[1] != 1 {
+		t.Fatalf("conn 1's cursor %d, want 1: the attempt failed, the connection moves on", cp.cursor[1])
+	}
+	if addr, _, _ = mustGet(t, cp, 2); addr != relayA {
+		t.Fatalf("conn 2 dials %q after the late failure, want A", addr)
+	}
+	if !strings.Contains(say(), "answered after this attempt began — no verdict") {
+		t.Fatal("the log does not say why A was not marked")
+	}
+	cp.noteRelayUnanswered(3, slot, creds, relayA, time.Now())
+	if !cp.health.isDead(relayA) {
+		t.Fatal("an attempt begun after A's answer failed, with the answer as evidence — not marked")
+	}
+}

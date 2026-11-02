@@ -19,6 +19,7 @@ package proxy
 //     failure for all we know: the connection's own CURSOR moves to the next
 //     candidate, nothing is marked. When an answer comes later, every address
 //     left unanswered on this path since the previous answer is marked then.
+//     An attempt begun before the relay's OWN last answer is no verdict on it.
 //   - A mark does not expire. A marked address is tried again only when a
 //     credential has no unmarked candidate left — the oldest mark first, one
 //     connection at a time, at growing intervals — at a path change (every
@@ -71,6 +72,7 @@ type relayRecord struct {
 	retries         int       // re-tries since the mark
 	claimedUntil    time.Time // a re-try is out on this address until then
 	claimedAt       time.Time // when that re-try was handed out: a result belongs to it only if its attempt began after
+	answeredAt      time.Time // the relay's own last answer: an attempt begun before it says nothing about the relay
 }
 
 type relayHealth struct {
@@ -100,7 +102,11 @@ func (h *relayHealth) record(addr string) *relayRecord {
 
 // unanswered records an attempt on addr that got no answer, begun at start.
 // It reports whether the address is marked now (evidence inside the window).
-// An attempt begun before the last path change says nothing. On a marked
+// An attempt begun before the last path change, or before the address's own
+// last answer, says nothing: it set out while the relay was out of reach, and
+// its failure arrives a moment after the relay answered, with the evidence
+// fresh and the record clear (a stand's whole-network outage, 2026-11-02: four
+// such failures marked a relay 0.3–0.8 s after its answer). On a marked
 // address only a RE-TRY that was handed out (probe) moves the backoff — not
 // the late failures of attempts begun before the mark, which arrive by the
 // dozen from parallel connections (the user's review: thirty of them had put
@@ -124,6 +130,9 @@ func (h *relayHealth) unanswered(addr string, start time.Time) bool {
 		}
 		return true
 	}
+	if h.answeredAfter(addr, start) {
+		return false
+	}
 	if r.unanswered == 0 {
 		r.unansweredSince = start
 	}
@@ -133,6 +142,14 @@ func (h *relayHealth) unanswered(addr string, start time.Time) bool {
 		return true
 	}
 	return false
+}
+
+// answeredAfter: addr answered after an attempt begun at start set out — the
+// attempt's failure is no verdict on it. The line is the answer's moment, not
+// the start of the attempt that was answered.
+func (h *relayHealth) answeredAfter(addr string, start time.Time) bool {
+	r := h.rec[addr]
+	return r != nil && start.Before(r.answeredAt)
 }
 
 func (h *relayHealth) markLocked(r *relayRecord, now time.Time) {
@@ -152,9 +169,9 @@ func (h *relayHealth) answered(addr string, start time.Time) {
 	prev := h.lastAnswer
 	h.lastAnswer = now
 	if addr != "" {
-		if r := h.rec[addr]; r != nil {
-			*r = relayRecord{}
-		}
+		// A record is made if there was none: the late failure may still be
+		// on its way.
+		*h.record(addr) = relayRecord{answeredAt: now}
 	}
 	for a, r := range h.rec {
 		if a == addr || r.dead || r.unanswered == 0 {
