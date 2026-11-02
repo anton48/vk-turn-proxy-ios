@@ -12,6 +12,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -55,7 +56,7 @@ func TestAPingWriteThatFindsTheConnectionGoneEndsTheSession(t *testing.T) {
 				logs := captureLog(t)
 				p := pingFailProxy()
 				cancelled := 0
-				stop := p.pingWriteFailed(3, 7, label, tc.err, func() { cancelled++ })
+				stop := p.pingWriteFailed(context.Background(), 3, 7, label, tc.err, func() { cancelled++ })
 				if !stop {
 					t.Errorf("stop = false: the goroutine would go on probing a connection that is gone")
 				}
@@ -93,15 +94,18 @@ func TestAPingWriteThatMerelyFailsKeepsTheDetectorAlive(t *testing.T) {
 		{"EHOSTUNREACH — a route away for now, the path hook's business", syscall.EHOSTUNREACH, true, ""},
 		{"ENETUNREACH", syscall.ENETUNREACH, true, ""},
 		{"a plain error", errors.New("something else"), true, ""},
-		{"the goroutine's own context cancelled", context.Canceled, false, ""},
-		{"the goroutine's own context past its deadline", context.DeadlineExceeded, false, ""},
+		// pion/dtls reports an expired WRITE deadline as an error that wraps
+		// context.DeadlineExceeded — the goroutine's context is alive: a mere
+		// failure, said, never «the goroutine's own end» (the review of 7cca145).
+		{"a DTLS write timeout (pion wraps context.DeadlineExceeded) under a live context", &dtls.TimeoutError{Err: fmt.Errorf("read/write timeout: %w", context.DeadlineExceeded)}, true, context.DeadlineExceeded.Error()},
+		{"context.Canceled as a write error under a live context", context.Canceled, true, ""},
 	} {
 		for _, label := range []string{"", "SRTP "} {
 			t.Run(tc.name+"/"+strings.TrimSpace(label), func(t *testing.T) {
 				logs := captureLog(t)
 				p := pingFailProxy()
 				cancelled := 0
-				stop := p.pingWriteFailed(3, 7, label, tc.err, func() { cancelled++ })
+				stop := p.pingWriteFailed(context.Background(), 3, 7, label, tc.err, func() { cancelled++ })
 				if stop {
 					t.Errorf("stop = true: the goroutine ends on an error that says nothing about the connection — the zombie detector dies with it")
 				}
@@ -109,22 +113,48 @@ func TestAPingWriteThatMerelyFailsKeepsTheDetectorAlive(t *testing.T) {
 					t.Errorf("connCancel called %d times, want 0: a session ended on an error that is not the connection's", cancelled)
 				}
 				out := logs()
-				if tc.said {
-					want := "[conn 3] " + label + "the ping's write failed ("
-					if !strings.Contains(out, want) || !strings.Contains(out, "— the probe goes on") {
-						t.Errorf("the log does not say the probe goes on — want %q … %q, got %q", want, "— the probe goes on", out)
-					}
-					if tc.cause != "" && !strings.Contains(out, "("+tc.cause+")") {
-						t.Errorf("the log names %q, want the cause (%s)", out, tc.cause)
-					}
-				} else if strings.Contains(out, "ping's write") {
-					t.Errorf("a context's end is logged as a failed ping: %q", out)
+				want := "[conn 3] " + label + "the ping's write failed ("
+				if !strings.Contains(out, want) || !strings.Contains(out, "— the probe goes on") {
+					t.Errorf("the log does not say the probe goes on — want %q … %q, got %q", want, "— the probe goes on", out)
 				}
+				if tc.cause != "" && !strings.Contains(out, "("+tc.cause+")") {
+					t.Errorf("the log names %q, want the cause (%s)", out, tc.cause)
+				}
+				_ = tc.said
 				if strings.Contains(out, "the session ends") {
 					t.Errorf("the log says the session ends: %q", out)
 				}
 			})
 		}
+	}
+}
+
+// The goroutine's own context has ended: whatever the write's error says —
+// a broken pipe, a DTLS timeout — the goroutine returns at its next turn; no
+// verdict, no line. Judged by the CONTEXT, never by the error's type: a DTLS
+// write timeout wraps context.DeadlineExceeded with the context alive.
+func TestAPingWriteUnderAnEndedContextIsNoVerdictAndNoLine(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"EPIPE", syscall.EPIPE},
+		{"a DTLS write timeout", &dtls.TimeoutError{Err: fmt.Errorf("read/write timeout: %w", context.DeadlineExceeded)}},
+		{"the context's own error", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			p := pingFailProxy()
+			cancelled := 0
+			if stop := p.pingWriteFailed(ctx, 3, 7, "", tc.err, func() { cancelled++ }); stop || cancelled != 0 {
+				t.Errorf("stop %v cancelled %d under an ended context, want false / 0", stop, cancelled)
+			}
+			if out := logs(); strings.Contains(out, "ping's write") {
+				t.Errorf("a write under an ended context is logged: %q", out)
+			}
+		})
 	}
 }
 
@@ -144,7 +174,7 @@ func TestAFailedPingsLineNamesTheCauseAndNoAddress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := captureLog(t)
 			p := pingFailProxy()
-			p.pingWriteFailed(0, 0, "", tc.err, func() {})
+			p.pingWriteFailed(context.Background(), 0, 0, "", tc.err, func() {})
 			out := logs()
 			if !strings.Contains(out, "ping's write") {
 				t.Fatalf("no line: %q", out)
@@ -168,11 +198,11 @@ func TestBothSessionKindsJudgeAFailedPingByTheOneRule(t *testing.T) {
 	}
 	src := strings.Join(strings.Fields(stripComments(string(b))), " ")
 	for _, label := range []string{`""`, `"SRTP "`} {
-		tick := `if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil { if p.pingWriteFailed(connIdx, credSlot, ` + label + `, err, connCancel) { return } }`
+		tick := `if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil { if p.pingWriteFailed(connCtx, connIdx, credSlot, ` + label + `, err, connCancel) { return } }`
 		if got := strings.Count(src, tick); got != 1 {
 			t.Errorf("proxy.go holds %d × the tick's exit through the one rule for the %s session kind, want 1:\n%s", got, label, tick)
 		}
-		wake := `alive, probed, err := wake.serve(connCtx, connIdx, credSlot, ` + label + `, &seq, &lastPingAt, sendPing) if err != nil { if p.pingWriteFailed(connIdx, credSlot, ` + label + `, err, connCancel) { return } continue } if !alive { connCancel() return }`
+		wake := `alive, probed, err := wake.serve(connCtx, connIdx, credSlot, ` + label + `, &seq, &lastPingAt, sendPing) if err != nil { if p.pingWriteFailed(connCtx, connIdx, credSlot, ` + label + `, err, connCancel) { return } continue } if !alive { connCancel() return }`
 		if got := strings.Count(src, wake); got != 1 {
 			t.Errorf("proxy.go holds %d × the wake branch's exit through the one rule for the %s session kind, want 1:\n%s", got, label, wake)
 		}
@@ -197,6 +227,21 @@ func TestBothSessionKindsJudgeAFailedPingByTheOneRule(t *testing.T) {
 // finish is OWED: the wake stays pending, the throttle does not apply to it,
 // and it is retried after a pause, not at once.
 func TestAWakeProbeWhoseWriteFailedIsOwedAndRetriedAfterAPause(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"ENOBUFS — a moment's refusal", syscall.ENOBUFS},
+		// pion/dtls's expired write deadline wraps context.DeadlineExceeded while
+		// the goroutine's context is alive — owed all the same (the review of 7cca145).
+		{"a DTLS write timeout", &dtls.TimeoutError{Err: fmt.Errorf("read/write timeout: %w", context.DeadlineExceeded)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { owedProbeRetried(t, tc.err) })
+	}
+}
+
+func owedProbeRetried(t *testing.T, first error) {
+	t.Helper()
 	shrinkWakeProbe(t)
 	r := wakeProbeRetry
 	wakeProbeRetry = 40 * time.Millisecond
@@ -211,13 +256,13 @@ func TestAWakeProbeWhoseWriteFailedIsOwedAndRetriedAfterAPause(t *testing.T) {
 	send := func(s uint64, _ time.Time) error {
 		sent++
 		if sent == 1 {
-			return syscall.ENOBUFS // a moment's refusal on the probe's first write
+			return first // a failure on the probe's first write that is not the connection's
 		}
 		go func() { time.Sleep(time.Millisecond); p.notePongSeq(0, s) }()
 		return nil
 	}
 	alive, probed, err := w.serve(context.Background(), 0, 0, "", &seq, &lastPingAt, send)
-	if err == nil || !errors.Is(err, syscall.ENOBUFS) || !probed || !alive {
+	if err == nil || !errors.Is(err, first) || !probed || !alive {
 		t.Fatalf("the first serve: alive %v probed %v err %v, want the write's own error back, alive, probed", alive, probed, err)
 	}
 	if !w.pending() {

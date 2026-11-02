@@ -254,7 +254,10 @@ func (w *wakeWatch) serve(ctx context.Context, connIdx, credSlot int, label stri
 		// Not finished. The goroutine's own context ending owes nothing (the
 		// goroutine returns at its next turn); any other failure of the probe's
 		// write leaves the wake pending and the probe OWED.
-		w.owed = !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+		// — the context's end read off the context, never off the error's type:
+		// a DTLS write timeout wraps context.DeadlineExceeded with the context
+		// alive, and owed it is (the review of 7cca145).
+		w.owed = ctx.Err() == nil
 		return alive, true, err
 	}
 	w.owed = false
@@ -484,13 +487,18 @@ func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send
 // write's own deadline, a moment's refusal, a route away for now (the path
 // hook's business) end NOTHING: the ping is counted as not sent, the goroutine
 // goes on, and the zombie detector judges the connection by its pongs. The
-// goroutine's own context ending is no verdict and no line. 🚫 Never a bare
+// goroutine's own context having ended (ctx.Err()) is no verdict and no line. 🚫 Never a bare
 // return on a ping's write error, in either session kind, at either ping —
 // the scan test pins the four sites; and the line names the cause, never an
 // address (the socket's error carries both ends).
-func (p *Proxy) pingWriteFailed(connIdx, credSlot int, label string, err error, connCancel func()) (stop bool) {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false // the goroutine's own end: the loop meets connCtx.Done at its next turn
+func (p *Proxy) pingWriteFailed(ctx context.Context, connIdx, credSlot int, label string, err error, connCancel func()) (stop bool) {
+	// The goroutine's own end is read off ITS CONTEXT, never off the error's
+	// type: pion/dtls reports an expired write deadline as an error that wraps
+	// context.DeadlineExceeded while the context is alive (the review of
+	// 7cca145) — that is a mere failure, said below; and under an ended
+	// context nothing is judged, whatever the write said.
+	if ctx.Err() != nil {
+		return false // the loop meets connCtx.Done at its next turn
 	}
 	if pingWriteGone(err) {
 		log.Printf("proxy: [conn %d on slot %d] %sthe ping's write found the connection gone (%s) — the session ends", connIdx, credSlot, label, pingWriteCause(err))
@@ -541,6 +549,8 @@ func pingWriteCause(err error) string {
 	switch {
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		return os.ErrDeadlineExceeded.Error()
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded.Error() // pion/dtls's write timeout wraps it
 	case errors.Is(err, net.ErrClosed):
 		return net.ErrClosed.Error()
 	case errors.Is(err, io.ErrClosedPipe):
