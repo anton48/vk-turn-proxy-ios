@@ -4328,6 +4328,35 @@ do {
     check(provider.components(separatedBy: "generation == self.pathEventGeneration").count - 1 == 2,
           "the generation is checked in exactly two places — the retry and the fetch answer")
 
+    // (b4) THE LOSS OF THE NETWORK IS JUDGED AT ONCE, NEVER DEFERRED FOR AN
+    //      SSID (the review of 1bd32b0, 2026-11-03): an unsatisfied wifi event
+    //      deferred for the SSID retry and then superseded by the restore on
+    //      the same SSID inside 1.5 s left the restore equal to the state
+    //      before the loss — a flag-only flip, no pathChanged, no pathUp, the
+    //      bridge never told. The fetch, its retry and the carry belong to a
+    //      SATISFIED wifi path; anything else goes straight to process() with
+    //      the SSID cleared.
+    if let handler = provider.range(of: "monitor.pathUpdateHandler = { [weak self] path in"),
+       let started = provider.range(of: "monitor.start(queue: pathMonitorQueue)", range: handler.upperBound..<provider.endIndex) {
+        // The handler's body alone — describePath and pathEssentialIdentity
+        // test the interface the same way, for a different purpose.
+        let body = String(provider[handler.upperBound..<started.lowerBound])
+        check(body.contains("if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi), path.status == .satisfied {"),
+              "🚨 the SSID fetch is entered only on a SATISFIED wifi path — a loss is judged at once")
+        check(!body.contains("if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) {"),
+              "🚨 no bare wifi test guards the fetch — an unsatisfied wifi event must not wait for an SSID")
+        if let branch = body.range(of: "path.status == .satisfied {"),
+           let elseAt = body.range(of: "} else {", range: branch.upperBound..<body.endIndex) {
+            let tail = String(body[elseAt.upperBound...].prefix(400))
+            check(inOrder(tail, ["self.currentWiFiSSID = nil", "self.carriedWiFiSSID = false", "process()"]),
+                  "🚨 the other branch clears the SSID and the carry and judges the event now")
+        } else {
+            check(false, "could not find the fetch branch's else in the handler")
+        }
+    } else {
+        check(false, "could not find the path update handler's bounds (b4)")
+    }
+
     // (c) A STOP DURING THE START IS THE STOP'S OUTCOME, NOT A FAILURE — for
     //     the whole start and both backends, not for the native attach's -7
     //     window alone (the review of 2026-09-14: the common window is the

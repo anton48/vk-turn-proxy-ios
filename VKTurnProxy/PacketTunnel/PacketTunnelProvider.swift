@@ -1037,11 +1037,24 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
 
-            // SSID enrichment for wifi paths. NEHotspotNetwork.fetchCurrent
+            // SSID enrichment for SATISFIED wifi paths. NEHotspotNetwork.fetchCurrent
             // is async and may return nil if iOS denies our context (e.g.
             // missing entitlement) — we still proceed in either case so
             // path event logging never blocks on the SSID lookup.
-            if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) {
+            //
+            // 🚨 THE LOSS OF THE NETWORK IS JUDGED AT ONCE, NEVER DEFERRED FOR
+            // AN SSID (the review of 1bd32b0, 2026-11-03): an unsatisfied wifi
+            // event deferred for the retry and then superseded by the restore
+            // on the same SSID — satisfied(X) → unsatisfied → satisfied(X)
+            // inside 1.5 s — left the restore equal to the state before the
+            // loss: a flag-only flip, no pathChanged, no pathUp, the bridge
+            // never told of a loss that may have taken the sockets or the
+            // NAT state with it. A path that is not satisfied has no SSID
+            // worth waiting for (its identity differs by STATUS already), so
+            // it goes straight to the judgement with the SSID cleared, as an
+            // off-wifi path does; the fetch, its retry and the carry belong to
+            // a satisfied wifi path alone.
+            if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi), path.status == .satisfied {
                 // asks: a nil from the first ask is asked again once, after
                 // the pause, before the event is judged (see currentWiFiSSID).
                 var asks = 0
@@ -1100,6 +1113,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 askSSID()
             } else {
+                // Off wifi, or wifi without a satisfied path: judged now.
                 self.currentWiFiSSID = nil
                 self.carriedWiFiSSID = false
                 process()
