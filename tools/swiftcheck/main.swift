@@ -4200,7 +4200,7 @@ do {
     //     stores the SSID and runs the event; the path state is written on
     //     that queue alone.
     if let fetch = provider.range(of: "NEHotspotNetwork.fetchCurrent {") {
-        let body = String(provider[fetch.upperBound...].prefix(1600))
+        let body = String(provider[fetch.upperBound...].prefix(2400))
         check(inOrder(body, ["pathMonitorQueue.async {", "currentWiFiSSID = ", "process()"]),
               "🚨 the fetchCurrent callback must hop onto pathMonitorQueue BEFORE it writes currentWiFiSSID and runs process() — fetchCurrent answers on its own queue")
         if let hop = body.range(of: "pathMonitorQueue.async {") {
@@ -4244,7 +4244,7 @@ do {
     check(provider.contains("private let wifiSSIDRetryDelay: TimeInterval = "),
           "the pause before a nil SSID is asked again is a named constant")
     if let fetch = provider.range(of: "NEHotspotNetwork.fetchCurrent {") {
-        let body = String(provider[fetch.upperBound...].prefix(2200))
+        let body = String(provider[fetch.upperBound...].prefix(3000))
         check(inOrder(body, ["pathMonitorQueue.async {", "network?.ssid", "self.carriedWiFiSSID = false",
                              "asyncAfter(deadline: .now() + self.wifiSSIDRetryDelay)", "self.carriedWiFiSSID = true", "process()"]),
               "🚨 a nil SSID on wifi is asked again once after the pause, and a nil that stands on a satisfied path carries the last known SSID — before process() judges the event")
@@ -4272,6 +4272,61 @@ do {
         check(inOrder(body, ["self.currentWiFiSSID = nil", "self.carriedWiFiSSID = false"]),
               "stopPathMonitoring clears the carried flag with the SSID, on the queue")
     }
+
+    // (b3) A LATE ANSWER FOR A SUPERSEDED PATH EVENT IS DROPPED (the review of
+    //      603721b, 2026-11-03): the SSID fetch and its 1.5-s retry complete
+    //      later than the event they belong to, with that event's path
+    //      captured — a cellular event handled in between, then the old
+    //      answer judged the OLD wifi path: the state rolled back, pathChanged
+    //      and pathUp ran again, slots were marked and sessions restarted for
+    //      a network the phone had left; a deferred unsatisfied landing after
+    //      a newer satisfied left the gate on a path that was gone. Pinned by
+    //      shape: every event bumps a generation at the top of the handler;
+    //      the retry and the fetch answer act only while their event is the
+    //      latest — the answer's check sits between the hop onto the queue
+    //      and the first store; the stop bumps the generation before it
+    //      clears, so nothing in flight lands after it.
+    check(provider.contains("private var pathEventGeneration: UInt64 = 0"),
+          "the path event generation is declared")
+    if let handler = provider.range(of: "monitor.pathUpdateHandler = { [weak self] path in") {
+        let body = String(provider[handler.upperBound...].prefix(600))
+        check(inOrder(body, ["guard let self = self else { return }", "self.pathEventGeneration &+= 1",
+                             "let generation = self.pathEventGeneration", "let process = {"]),
+              "🚨 the handler bumps the generation and takes its own copy BEFORE anything else — every event supersedes every earlier one")
+    } else {
+        check(false, "could not find the path update handler in the provider")
+    }
+    if let ask = provider.range(of: "func askSSID() {") {
+        let body = String(provider[ask.upperBound...].prefix(500))
+        check(inOrder(body, ["guard generation == self.pathEventGeneration else {", "return", "asks += 1",
+                             "NEHotspotNetwork.fetchCurrent {"]),
+              "🚨 a retry for a superseded event asks nothing — the check comes before the fetch")
+    } else {
+        check(false, "could not find askSSID in the provider")
+    }
+    if let fetch = provider.range(of: "NEHotspotNetwork.fetchCurrent {") {
+        let body = String(provider[fetch.upperBound...].prefix(3200))
+        check(inOrder(body, ["pathMonitorQueue.async {", "guard generation == self.pathEventGeneration else {", "return",
+                             "network?.ssid"]),
+              "🚨 the fetch answer is judged against the generation right after the hop and before any store")
+        if let hop = body.range(of: "pathMonitorQueue.async {"),
+           let gate = body.range(of: "guard generation == self.pathEventGeneration", range: hop.upperBound..<body.endIndex) {
+            let between = String(body[hop.upperBound..<gate.lowerBound])
+            check(!between.contains("currentWiFiSSID =") && !between.contains("carriedWiFiSSID =") && !between.contains("process()"),
+                  "🚨 nothing is stored and no event is run between the hop and the generation check")
+        }
+    } else {
+        check(false, "could not find NEHotspotNetwork.fetchCurrent in the provider (b3)")
+    }
+    if let stop = provider.range(of: "private func stopPathMonitoring()") {
+        let body = String(provider[stop.upperBound...].prefix(1400))
+        check(inOrder(body, ["pathMonitorQueue.async", "self.pathEventGeneration &+= 1", "self.lastPathDescription = nil"]),
+              "🚨 the stop invalidates every pending fetch and retry — the bump on the queue, before the clear")
+    }
+    check(provider.components(separatedBy: "pathEventGeneration &+= 1").count - 1 == 2,
+          "the generation moves in exactly two places — the handler and the stop (the order pins above are not satisfied by a duplicate)")
+    check(provider.components(separatedBy: "generation == self.pathEventGeneration").count - 1 == 2,
+          "the generation is checked in exactly two places — the retry and the fetch answer")
 
     // (c) A STOP DURING THE START IS THE STOP'S OUTCOME, NOT A FAILURE — for
     //     the whole start and both backends, not for the native attach's -7

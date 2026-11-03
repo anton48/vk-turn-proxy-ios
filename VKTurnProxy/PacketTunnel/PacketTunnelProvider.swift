@@ -138,6 +138,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var currentWiFiSSID: String?
     private var carriedWiFiSSID = false
     private let wifiSSIDRetryDelay: TimeInterval = 1.5
+    // 🚨 EVERY PATH EVENT HAS A GENERATION, AND A LATE ANSWER FOR A SUPERSEDED
+    // EVENT IS DROPPED (the review of 603721b, 2026-11-03). The SSID fetch and
+    // its retry complete LATER than the event they belong to, with that
+    // event's path captured: a wifi event whose nil was deferred 1.5 s, a
+    // cellular event handled meanwhile, then the old answer judged the OLD
+    // wifi path — the state rolled back to wifi, pathChanged/pathUp ran
+    // again, the in-use slots were marked and the sessions restarted for a
+    // network the phone had left (native and csqtt alike); the same with a
+    // deferred unsatisfied landing after a newer satisfied, which left the
+    // gate on a path that was gone. The queue is serial, but it does not
+    // order the COMPLETION of deferred work. So the handler bumps the
+    // generation for every event it is given, a fetch answer or a retry acts
+    // only while its event is still the latest, and the stop invalidates
+    // every pending one. Owned by pathMonitorQueue like the fields above.
+    private var pathEventGeneration: UInt64 = 0
 
     /// Raised by stopTunnel, under backendLock, BEFORE it clears anything or
     /// turns the backend off. It means the stop has BEGUN — nothing about what
@@ -917,6 +932,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self else { return }
+            // This event supersedes every earlier one: whatever an earlier
+            // event's SSID fetch or retry answers from now on is dropped.
+            self.pathEventGeneration &+= 1
+            let generation = self.pathEventGeneration
 
             // Process the path event after the (possibly async) SSID
             // refresh completes — describePath reads currentWiFiSSID.
@@ -1027,6 +1046,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 // the pause, before the event is judged (see currentWiFiSSID).
                 var asks = 0
                 func askSSID() {
+                    // On pathMonitorQueue (the handler's queue; the retry is
+                    // queued there). A superseded event asks nothing more.
+                    guard generation == self.pathEventGeneration else {
+                        self.logMsg("[PathMonitor] the SSID retry of a superseded path event dropped")
+                        return
+                    }
                     asks += 1
                     NEHotspotNetwork.fetchCurrent { [weak self] network in
                         guard let self = self else { return }
@@ -1038,6 +1063,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         // read in describePath / pathEssentialIdentity, is on
                         // pathMonitorQueue now; stopPathMonitoring clears there too.
                         self.pathMonitorQueue.async {
+                            // 🚨 A LATE ANSWER FOR A SUPERSEDED EVENT IS DROPPED
+                            // before any store: a newer event, or the stop, has
+                            // judged the path since, and this answer belongs to
+                            // a path the phone may have left (see
+                            // pathEventGeneration).
+                            guard generation == self.pathEventGeneration else {
+                                self.logMsg("[PathMonitor] a late SSID answer for a superseded path event dropped")
+                                return
+                            }
                             // Sanitize the network-controlled SSID before it
                             // reaches any log sink (describePath → vpn.log, and
                             // describePath → wgLogPathSnapshot → Go pathstats): an
@@ -1086,13 +1120,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // The path state is owned by pathMonitorQueue (see the fetchCurrent
         // hop above): clearing it from stopTunnel's thread was the other half
         // of the §65 race. Queued after the cancel, so it runs after every
-        // event the monitor had already delivered. An SSID fetch still in
-        // flight at the stop lands after this clear and runs its event on
-        // whatever backend is installed by then — nil, this instance having
-        // been stopped (a provider instance serves one session) — and re-seeds
-        // the identity with the network it is on: harmless either way.
+        // event the monitor had already delivered. An SSID fetch or retry
+        // still in flight at the stop is invalidated by the generation bump
+        // below: its answer is dropped before it stores anything or runs its
+        // event (see pathEventGeneration).
         pathMonitorQueue.async { [weak self] in
             guard let self = self else { return }
+            self.pathEventGeneration &+= 1
             self.lastPathDescription = nil
             self.lastPathEssentialIdentity = nil
             self.currentWiFiSSID = nil
