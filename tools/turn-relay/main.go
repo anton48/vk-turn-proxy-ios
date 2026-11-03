@@ -24,6 +24,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -314,7 +315,7 @@ func start(cfg *config) (*relay, error) {
 		r.closes = append(r.closes, udp.Close)
 		r.udp = append(r.udp, udp.LocalAddr())
 		pcs = append(pcs, turn.PacketConnConfig{PacketConn: &gatedPacketConn{PacketConn: udp, gate: r.gate}, RelayAddressGenerator: ports, PermissionHandler: allowed})
-		tcp, err := net.Listen("tcp", a)
+		tcp, err := listenTCP(a)
 		if err != nil {
 			return fail(fmt.Errorf("tcp %s: %w", a, err))
 		}
@@ -576,4 +577,19 @@ func (r *relay) close() error {
 		}
 	}
 	return first
+}
+
+// listenTCP makes the relay's TCP listener as PLAIN TCP, Multipath TCP off,
+// explicitly (2026-11-03, the user's review). Since Go 1.24 a listener on
+// Linux is MPTCP whenever the kernel supports and allows it
+// (net.mptcp.enabled), and up to 471 the relay listened with net.Listen: an
+// MPTCP listener lets the kernel take MPTCP sessions before anything of the
+// relay's own — the request's checks, -peer, -max-allocs — can act, a wider
+// attack surface than a TURN relay needs. The sysctl is the host's; the relay
+// does not rely on it. 🚫 Every TCP listener of the relay is made here (the
+// scan test pins it).
+func listenTCP(addr string) (net.Listener, error) {
+	var lc net.ListenConfig
+	lc.SetMultipathTCP(false)
+	return lc.Listen(context.Background(), "tcp", addr)
 }
