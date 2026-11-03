@@ -121,7 +121,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // log line. nil → either not on wifi, or fetchCurrent returned nil
     // (which can happen if iOS denies the API for our context — e.g.
     // missing entitlement, or extension lifecycle quirks).
+    //
+    // 🚨 A NIL FROM fetchCurrent ON A WIFI PATH IS UNKNOWN, NOT ANOTHER
+    // NETWORK (2026-11-03, a 25-minute sleep on one Wi-Fi: the wake's path
+    // event came without an SSID, the next one three minutes later with it
+    // again — the essential identity changed twice and every healthy session
+    // was restarted twice, 40/120 on the screen). So a nil is asked AGAIN
+    // once, after wifiSSIDRetryDelay (a wake's nil is usually a late answer),
+    // and a nil that stands on a SATISFIED wifi path keeps the last known
+    // SSID — carriedWiFiSSID says so, describePath marks it "(carried)", the
+    // identity keeps the SSID itself: the same network until the interface
+    // leaves wifi or the status falls. A direct Wi-Fi → Wi-Fi roam whose
+    // first event has no SSID is then caught when the SSID arrives, or by the
+    // sessions' own detectors; such a roam goes through an unsatisfied or
+    // iface=other event almost always, which the status component catches.
     private var currentWiFiSSID: String?
+    private var carriedWiFiSSID = false
+    private let wifiSSIDRetryDelay: TimeInterval = 1.5
 
     /// Raised by stopTunnel, under backendLock, BEFORE it clears anything or
     /// turns the backend off. It means the stop has BEGUN — nothing about what
@@ -1007,31 +1023,51 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // missing entitlement) — we still proceed in either case so
             // path event logging never blocks on the SSID lookup.
             if path.usesInterfaceType(Network.NWInterface.InterfaceType.wifi) {
-                NEHotspotNetwork.fetchCurrent { [weak self] network in
-                    guard let self = self else { return }
-                    // 🚨 BACK ONTO THE PATH QUEUE FIRST. fetchCurrent answers on
-                    // a queue of its own, so without this hop the SSID, the
-                    // dedup key and the identity gate were written from that
-                    // queue on wifi and from pathMonitorQueue on everything
-                    // else (§65 of 2026-09-07). Every store below, and every
-                    // read in describePath / pathEssentialIdentity, is on
-                    // pathMonitorQueue now; stopPathMonitoring clears there too.
-                    self.pathMonitorQueue.async {
-                        // Sanitize the network-controlled SSID before it
-                        // reaches any log sink (describePath → vpn.log, and
-                        // describePath → wgLogPathSnapshot → Go pathstats): an
-                        // AP named with embedded CR/LF could otherwise forge
-                        // log lines.
-                        if let rawSSID = network?.ssid {
-                            self.currentWiFiSSID = SharedLogger.sanitizeField(rawSSID, maxLength: 64)
-                        } else {
-                            self.currentWiFiSSID = nil
+                // asks: a nil from the first ask is asked again once, after
+                // the pause, before the event is judged (see currentWiFiSSID).
+                var asks = 0
+                func askSSID() {
+                    asks += 1
+                    NEHotspotNetwork.fetchCurrent { [weak self] network in
+                        guard let self = self else { return }
+                        // 🚨 BACK ONTO THE PATH QUEUE FIRST. fetchCurrent answers on
+                        // a queue of its own, so without this hop the SSID, the
+                        // dedup key and the identity gate were written from that
+                        // queue on wifi and from pathMonitorQueue on everything
+                        // else (§65 of 2026-09-07). Every store below, and every
+                        // read in describePath / pathEssentialIdentity, is on
+                        // pathMonitorQueue now; stopPathMonitoring clears there too.
+                        self.pathMonitorQueue.async {
+                            // Sanitize the network-controlled SSID before it
+                            // reaches any log sink (describePath → vpn.log, and
+                            // describePath → wgLogPathSnapshot → Go pathstats): an
+                            // AP named with embedded CR/LF could otherwise forge
+                            // log lines.
+                            if let rawSSID = network?.ssid {
+                                self.currentWiFiSSID = SharedLogger.sanitizeField(rawSSID, maxLength: 64)
+                                self.carriedWiFiSSID = false
+                            } else if asks < 2 {
+                                // A nil: ask once more after the pause — the
+                                // wake's answer is usually late, not absent.
+                                self.pathMonitorQueue.asyncAfter(deadline: .now() + self.wifiSSIDRetryDelay) { askSSID() }
+                                return
+                            } else if path.status == .satisfied, self.currentWiFiSSID != nil {
+                                // A nil that stands, on a satisfied wifi path:
+                                // the last known SSID is carried forward — the
+                                // identity stays, the log line says "(carried)".
+                                self.carriedWiFiSSID = true
+                            } else {
+                                self.currentWiFiSSID = nil
+                                self.carriedWiFiSSID = false
+                            }
+                            process()
                         }
-                        process()
                     }
                 }
+                askSSID()
             } else {
                 self.currentWiFiSSID = nil
+                self.carriedWiFiSSID = false
                 process()
             }
         }
@@ -1060,6 +1096,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self.lastPathDescription = nil
             self.lastPathEssentialIdentity = nil
             self.currentWiFiSSID = nil
+            self.carriedWiFiSSID = false
         }
     }
 
@@ -1133,7 +1170,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // [expensive,constrained] WiFi" diagnosis. Quoted because SSIDs
         // can contain spaces / special chars.
         if iface == "wifi", let ssid = currentWiFiSSID {
-            attrs.append("ssid=\"\(ssid)\"")
+            attrs.append("ssid=\"\(ssid)\"" + (carriedWiFiSSID ? " (carried)" : ""))
         }
         // For unsatisfied paths, include Apple's machine-readable reason
         // so post-mortem can distinguish "user denied cellular" from

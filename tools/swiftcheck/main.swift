@@ -4230,6 +4230,49 @@ do {
           && provider.components(separatedBy: "lastPathEssentialIdentity = nil").count - 1 == 1,
           "the path state is cleared in exactly one place — the order pin above is not satisfied by a duplicate")
 
+    // (b2) A NIL SSID IS UNKNOWN, NOT ANOTHER NETWORK (2026-11-03, the user's
+    //      25-minute sleep run on 471: the wake's path event came without an
+    //      SSID — fetchCurrent answered nil — and the next event three minutes
+    //      later had it again; the essential identity changed twice and every
+    //      healthy session was restarted twice, 40/120 on the screen). Two
+    //      rules, pinned by shape: a nil from fetchCurrent on a wifi path is
+    //      asked AGAIN once, after a pause, before the event is judged; and a
+    //      nil that stands on a satisfied wifi path CARRIES the last known SSID
+    //      forward — the identity keeps it, the log line says it is carried.
+    check(provider.contains("private var carriedWiFiSSID = false"),
+          "the carried-SSID flag is declared (a nil on wifi carries the last known SSID forward)")
+    check(provider.contains("private let wifiSSIDRetryDelay: TimeInterval = "),
+          "the pause before a nil SSID is asked again is a named constant")
+    if let fetch = provider.range(of: "NEHotspotNetwork.fetchCurrent {") {
+        let body = String(provider[fetch.upperBound...].prefix(2200))
+        check(inOrder(body, ["pathMonitorQueue.async {", "network?.ssid", "self.carriedWiFiSSID = false",
+                             "asyncAfter(deadline: .now() + self.wifiSSIDRetryDelay)", "self.carriedWiFiSSID = true", "process()"]),
+              "🚨 a nil SSID on wifi is asked again once after the pause, and a nil that stands on a satisfied path carries the last known SSID — before process() judges the event")
+        check(body.contains("path.status == .satisfied, self.currentWiFiSSID != nil"),
+              "🚨 the carry needs a SATISFIED wifi path and a last known SSID — anything else clears the SSID as before")
+    } else {
+        check(false, "could not find NEHotspotNetwork.fetchCurrent in the provider (b2)")
+    }
+    if let ident = provider.range(of: "private func pathEssentialIdentity(") {
+        let body = String(provider[ident.upperBound...].prefix(1800))
+        check(body.contains("components.append(\"ssid=\\\"\\(ssid)\\\"\")") && !body.contains("carried"),
+              "🚨 the essential identity carries the SSID itself and never the carried marker — a carried SSID is the same network")
+    } else {
+        check(false, "could not find pathEssentialIdentity in the provider")
+    }
+    if let desc = provider.range(of: "private func describePath(") {
+        let body = String(provider[desc.upperBound...].prefix(2600))
+        check(body.contains("carriedWiFiSSID ? \" (carried)\" : \"\""),
+              "the log line says when the SSID is carried, not fetched")
+    } else {
+        check(false, "could not find describePath in the provider")
+    }
+    if let stop = provider.range(of: "private func stopPathMonitoring()") {
+        let body = String(provider[stop.upperBound...].prefix(1200))
+        check(inOrder(body, ["self.currentWiFiSSID = nil", "self.carriedWiFiSSID = false"]),
+              "stopPathMonitoring clears the carried flag with the SSID, on the queue")
+    }
+
     // (c) A STOP DURING THE START IS THE STOP'S OUTCOME, NOT A FAILURE — for
     //     the whole start and both backends, not for the native attach's -7
     //     window alone (the review of 2026-09-14: the common window is the
