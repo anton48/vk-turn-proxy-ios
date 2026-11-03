@@ -556,8 +556,10 @@ func (f *fakePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 // pion's manager refuses it AFTER the quota check, before any generator.
 var lifetimeZero = stun.RawAttribute{Type: stun.AttrType(0x000D), Value: []byte{0, 0, 0, 0}}
 
-// requestedTCP is REQUESTED-TRANSPORT for TCP (protocol 6): the inherited
-// generator's AllocateListener answers it, with an error of its own text.
+// requestedTCP is REQUESTED-TRANSPORT for TCP (protocol 6): portWalk refuses
+// it (errTCPAllocation) — since 2026-11-03; before, the inherited generator's
+// AllocateListener answered it with an error of its own text, or opened a
+// second TCP listener.
 var requestedTCP = stun.RawAttribute{Type: stun.AttrType(0x0019), Value: []byte{6, 0, 0, 0}}
 
 // rawAllocateWith is rawAllocate with extra attributes on the authenticated ask.
@@ -628,15 +630,9 @@ func TestAnAllocateRefusedAfterTheQuotaCheckGivesItsSeatBack(t *testing.T) {
 	if granted, code := rawAllocate(t, conn, r.udp[0]); !granted {
 		t.Fatalf("an ordinary Allocate after the refusal: %d — want granted (the seat is free)", code)
 	}
-	// A TCP allocation refused by the INHERITED generator — the one relay
-	// port of the range is held by a plain listener (no SO_REUSEPORT, so the
-	// generator's bind fails every retry; its error carries no text of ours):
-	// the seat comes back too, and the limit is whole.
-	busy, err := net.Listen("tcp", "0.0.0.0:40250")
-	if err != nil {
-		t.Skipf("port 40250 not free for the test: %v", err)
-	}
-	defer busy.Close()
+	// A TCP allocation refused by portWalk (errTCPAllocation; before 11-03 by
+	// the inherited generator on a held port — its error carried no text of
+	// ours): the seat comes back too, and the limit is whole.
 	cfg, err := parseConfig("127.0.0.1:0", "", "127.0.0.1", 1, "40250-40250", "vk-turn-relay", false, t.Logf)
 	if err != nil {
 		t.Fatal(err)
@@ -652,7 +648,7 @@ func TestAnAllocateRefusedAfterTheQuotaCheckGivesItsSeatBack(t *testing.T) {
 	}
 	defer tcp.Close()
 	if granted, code := rawAllocateWith(t, turn.NewSTUNConn(tcp), r2.tcp[0], requestedTCP); granted || code == stun.CodeAllocQuotaReached {
-		t.Fatalf("a TCP allocation with the one relay port held by another process: granted %v, code %d — want refused by the generator, not with 486", granted, code)
+		t.Fatalf("a TCP allocation: granted %v, code %d — want refused by portWalk, not with 486", granted, code)
 	}
 	if held := waitHeld(r2, 0); held != 0 {
 		t.Fatalf("after the refused TCP allocation: %d held, want 0 — the reservation leaked", held)

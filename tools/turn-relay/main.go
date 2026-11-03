@@ -393,6 +393,22 @@ func newPortWalk(cfg *config) *portWalk {
 	}
 }
 
+// errTCPAllocation: a TCP allocation (RFC 6062, REQUESTED-TRANSPORT 6) is not
+// served. The app's allocations are UDP (RFC 5766; the TCP transport is the
+// client's connection TO the relay, not the allocation's), and a TCP
+// allocation would make the inherited generator open a SECOND TCP listener in
+// the relay port range through its own ListenConfig — Multipath TCP by Go
+// 1.24's Linux default, which listenTCP's setting never reaches (the user's
+// second finding, 2026-11-03: 3 of 3 such listeners MultipathTCP on their
+// stand). Refused outright, no listener exists to configure; pion answers the
+// Allocate with an error and the source gate gives the seat back.
+var errTCPAllocation = errors.New("turn-relay: TCP allocations (RFC 6062) are not served — the app's allocations are UDP")
+
+// AllocateListener refuses every TCP allocation (errTCPAllocation).
+func (w *portWalk) AllocateListener(turn.AllocateListenerConfig) (net.Listener, net.Addr, error) {
+	return nil, nil, errTCPAllocation
+}
+
 // AllocatePacketConn takes the next free port of the range; a port something
 // else holds is passed over.
 func (w *portWalk) AllocatePacketConn(conf turn.AllocateListenerConfig) (net.PacketConn, net.Addr, error) {
