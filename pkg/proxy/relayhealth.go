@@ -20,6 +20,17 @@ package proxy
 //     candidate, nothing is marked. When an answer comes later, every address
 //     left unanswered on this path since the previous answer is marked then.
 //     An attempt begun before the relay's OWN last answer is no verdict on it.
+//     🚨 The evidence is SOMEONE ELSE's answer — another relay's or VK's —
+//     never the accused relay's own (the overnight run of 2026-11-03: at the
+//     tunnel's start one connection's dial failed at once with ENETUNREACH,
+//     the routes still settling, and the own relay's answer to a neighbour 94
+//     ms earlier served as the evidence that marked it); and a failure that
+//     arrives while the relay is answering its neighbours — its own answer
+//     inside relayAnswerGrace before the attempt began, or after it — is no
+//     verdict either: no packet of that attempt can have reached a relay that
+//     answers. A route errno stays «no answer» (a null route for one relay
+//     reads so on the stand, 2026-10-19) — what tells the local transient
+//     from the network's verdict is the relay's own answers around it.
 //   - A mark does not expire. A marked address is tried again only when a
 //     credential has no unmarked candidate left — the oldest mark first, one
 //     connection at a time, at growing intervals — at a path change (every
@@ -46,6 +57,15 @@ const (
 	// one UDP Allocate's retransmissions (≈ 25–40 s), shorter than a conn's
 	// dormancy (30–60 s).
 	relayEvidenceWindow = 60 * time.Second
+	// relayAnswerGrace: a relay's own answer this close BEFORE an attempt began
+	// voids the attempt's failure as a verdict on it (an answer AFTER the
+	// attempt began always does) — the relay was answering its neighbours
+	// while this attempt failed, so the failure was not the relay's silence
+	// (a tunnel start's route transient, 2026-11-03: the dial failed in 0 s,
+	// the relay's answers 94 ms before and 11 ms after). Short, so that a
+	// relay that dies seconds after its last answer is still marked by the
+	// next failed attempt without a wait (the blackhole of Nov 3 §529).
+	relayAnswerGrace = 2 * time.Second
 	// relayProbeBackoffMin / Max: the growing interval between re-tries of a
 	// marked address once a credential has no other candidate.
 	relayProbeBackoffMin = time.Minute
@@ -76,8 +96,9 @@ type relayRecord struct {
 }
 
 type relayHealth struct {
-	rec        map[string]*relayRecord
-	lastAnswer time.Time // the latest answer on this path — a relay's or VK's API
+	rec          map[string]*relayRecord
+	lastAnswer   time.Time // the latest answer on this path — a relay's or VK's API
+	lastVKAnswer time.Time // the latest answer of VK's API on this path (the evidence a relay's own answer cannot be)
 	// pathChangedAt: when the path last changed. An attempt that BEGAN before
 	// it belongs to the old network — its late failure is no verdict on the
 	// new one and its late success no evidence for it (the user's review,
@@ -130,26 +151,43 @@ func (h *relayHealth) unanswered(addr string, start time.Time) bool {
 		}
 		return true
 	}
-	if h.answeredAfter(addr, start) {
+	if h.answeredAround(addr, start) {
 		return false
 	}
 	if r.unanswered == 0 {
 		r.unansweredSince = start
 	}
 	r.unanswered++
-	if !h.lastAnswer.IsZero() && !h.lastAnswer.Before(start.Add(-relayEvidenceWindow)) {
+	// The evidence: the latest answer of ANOTHER address or of VK's API —
+	// never addr's own (see the header).
+	if ev := h.evidenceExcept(addr); !ev.IsZero() && !ev.Before(start.Add(-relayEvidenceWindow)) {
 		h.markLocked(r, now)
 		return true
 	}
 	return false
 }
 
-// answeredAfter: addr answered after an attempt begun at start set out — the
-// attempt's failure is no verdict on it. The line is the answer's moment, not
-// the start of the attempt that was answered.
-func (h *relayHealth) answeredAfter(addr string, start time.Time) bool {
+// answeredAround: addr answered after the attempt begun at start set out, or
+// inside relayAnswerGrace before it — the failure is no verdict on addr: a
+// relay that answers its neighbours around the attempt was not silent to it.
+// The line is the answer's MOMENT, not the start of the attempt that was
+// answered (a slow Allocate answered after three seconds covers a failure
+// begun meanwhile).
+func (h *relayHealth) answeredAround(addr string, start time.Time) bool {
 	r := h.rec[addr]
-	return r != nil && start.Before(r.answeredAt)
+	return r != nil && !r.answeredAt.IsZero() && start.Before(r.answeredAt.Add(relayAnswerGrace))
+}
+
+// evidenceExcept: the latest answer on this path from anyone but addr — another
+// relay's or VK's API — zero when nobody else has answered.
+func (h *relayHealth) evidenceExcept(addr string) time.Time {
+	ev := h.lastVKAnswer
+	for a, r := range h.rec {
+		if a != addr && r.answeredAt.After(ev) {
+			ev = r.answeredAt
+		}
+	}
+	return ev
 }
 
 func (h *relayHealth) markLocked(r *relayRecord, now time.Time) {
@@ -168,6 +206,9 @@ func (h *relayHealth) answered(addr string, start time.Time) {
 	}
 	prev := h.lastAnswer
 	h.lastAnswer = now
+	if addr == "" {
+		h.lastVKAnswer = now
+	}
 	if addr != "" {
 		// A record is made if there was none: the late failure may still be
 		// on its way.
@@ -186,7 +227,7 @@ func (h *relayHealth) answered(addr string, start time.Time) {
 // pathChanged forgets everything: the verdicts were about the old network.
 func (h *relayHealth) pathChanged() {
 	h.rec = map[string]*relayRecord{}
-	h.lastAnswer = time.Time{}
+	h.lastAnswer, h.lastVKAnswer = time.Time{}, time.Time{}
 	h.pathChangedAt = h.now()
 }
 

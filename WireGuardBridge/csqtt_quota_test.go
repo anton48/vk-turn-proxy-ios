@@ -188,7 +188,10 @@ func TestTheAdapterJudgesARelayByWhenTheDialBegan(t *testing.T) {
 			time.Sleep(time.Millisecond)
 			began := before
 			if tc.beganBehind {
-				began = time.Now()
+				// Past the relay's own-answer grace (pkg/proxy's relayAnswerGrace,
+				// 2 s): a dial begun while the relay answers its neighbours is no
+				// verdict on it (2026-11-04); one begun well behind the answer is.
+				began = time.Now().Add(3 * time.Second)
 			}
 			w3.Failed(timeout, began)
 			w3.Release()

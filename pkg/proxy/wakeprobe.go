@@ -509,6 +509,38 @@ func (p *Proxy) pingWriteFailed(ctx context.Context, connIdx, credSlot int, labe
 	return false
 }
 
+// pingJoinBudget bounds a session's wait for its ping goroutine at the
+// session's end. What the wait spans: the goroutine's current turn — a ping's
+// write under its 5-s deadline at worst, a probe's listening step, a select
+// that leaves at once on the cancel. A var so that a test can shrink it;
+// nothing else writes it.
+var pingJoinBudget = time.Second
+
+// joinPingLoop: a session returns AFTER its ping goroutine has left (the
+// gate's fixture race of 2026-11-03: a session's ping goroutine of an EARLIER
+// test, leaving on its context at its own time, read the probe's package
+// state while the next test's fixture wrote it — a session that returned
+// without its goroutine left it reading behind the session's back). Deferred
+// right behind the goroutine's start, in both session kinds, so it runs
+// before the defers registered earlier — the relay leg's join and the
+// credential's release among them. The session's context is cancelled first
+// (idempotent); the goroutine leaves at its next select, or when its write's
+// deadline frees it. Bounded: after pingJoinBudget the session returns
+// WITHOUT its ping goroutine and says so — a stop must not wait for a write
+// that the connection's teardown will end anyway.
+func (p *Proxy) joinPingLoop(connCancel func(), done <-chan struct{}, connIdx int, label string) bool {
+	connCancel()
+	timer := time.NewTimer(pingJoinBudget)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		log.Printf("proxy: [conn %d] %sthe session returns WITHOUT its ping goroutine (not ended within %s) — it ends by itself", connIdx, label, pingJoinBudget)
+		return false
+	}
+}
+
 // pingWriteGone says whether a ping write's error means the CONNECTION is gone
 // — a reset, a broken pipe, the kernel's own give-up, a closed socket (the
 // socket's, pion/dtls's) — as opposed to the write's own deadline, a moment's

@@ -2599,7 +2599,14 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// rebuilds the conn with a fresh TURN allocation. See proxy
 	// struct comment on serverProbeable / lastPongTimes for full
 	// rationale.
+	//
+	// Joined by the session before it returns (joinPingLoop, wakeprobe.go):
+	// the goroutine leaves on connCtx at its own time, and a session that
+	// returned without it left it reading the probe's state behind the
+	// session's back (the gate's fixture race, 2026-11-03).
+	pingDone := make(chan struct{})
 	go func() {
+		defer close(pingDone)
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		var seq uint64
@@ -2785,6 +2792,8 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			}
 		}
 	}()
+
+	defer p.joinPingLoop(connCancel, pingDone, connIdx, "")
 
 	// Bidirectional forwarding: sendCh ↔ dtlsConn (long-lived)
 	var wg sync.WaitGroup
@@ -5337,8 +5346,10 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	// Mirrors the DTLS path's tick-gap freeze detector and wakeCh-driven
 	// active-probe-on-wake. Mostly verbatim from runDTLSSession; the
 	// only structural difference is writing through srtpConn instead of
-	// dtlsConn.
+	// dtlsConn. Joined by the session before it returns, as the DTLS one is.
+	pingDone := make(chan struct{})
 	go func() {
+		defer close(pingDone)
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		var seq uint64
@@ -5443,6 +5454,8 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			}
 		}
 	}()
+
+	defer p.joinPingLoop(connCancel, pingDone, connIdx, "SRTP ")
 
 	var wg sync.WaitGroup
 	wg.Add(2)

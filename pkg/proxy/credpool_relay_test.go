@@ -855,11 +855,14 @@ func TestALateFailureBehindARelaysOwnAnswerLeavesTheRelayStanding(t *testing.T) 
 	if addr, _, _ = mustGet(t, cp, 2); addr != relayA {
 		t.Fatalf("conn 2 dials %q after the late failure, want A", addr)
 	}
-	if !strings.Contains(say(), "answered after this attempt began — no verdict") {
+	if !strings.Contains(say(), "answered its neighbours around this attempt — no verdict") {
 		t.Fatal("the log does not say why A was not marked")
 	}
-	cp.noteRelayUnanswered(3, slot, creds, relayA, time.Now())
+	// An attempt begun well after A's answer (past relayAnswerGrace) fails:
+	// a verdict, and the evidence is VK's mint of this pool's credential —
+	// someone else's answer (A's own would be none: relayevidence_test.go).
+	cp.noteRelayUnanswered(3, slot, creds, relayA, time.Now().Add(3*time.Second))
 	if !cp.health.isDead(relayA) {
-		t.Fatal("an attempt begun after A's answer failed, with the answer as evidence — not marked")
+		t.Fatal("an attempt begun past the grace after A's answer failed, VK's mint the evidence — not marked")
 	}
 }

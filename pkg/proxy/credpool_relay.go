@@ -262,8 +262,8 @@ func (cp *credPool) noteRelayUnanswered(connIdx, slot int, creds *TURNCreds, add
 	switch {
 	case marked:
 		log.Printf("credpool: conn %d: relay %s did not answer — marked UNREACHABLE (another relay or VK answered meanwhile); the connections move to the next address", connIdx, addr)
-	case cp.health.answeredAfter(addr, start):
-		log.Printf("credpool: conn %d: relay %s answered after this attempt began — no verdict on it; the next attempt takes the next address", connIdx, addr)
+	case cp.health.answeredAround(addr, start):
+		log.Printf("credpool: conn %d: relay %s answered its neighbours around this attempt — no verdict on it; the next attempt takes the next address", connIdx, addr)
 	default:
 		log.Printf("credpool: conn %d: relay %s did not answer — not marked (nothing else has answered since); the next attempt takes the next address", connIdx, addr)
 	}
