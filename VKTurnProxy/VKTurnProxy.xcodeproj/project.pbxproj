@@ -67,6 +67,7 @@
 		C283D9BDC8B44E083F84A76B /* ConnectionReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 54AD060976AEB359770E134A /* ConnectionReport.swift */; };
 		C414EAD88CD3819206A6E93F /* ServerProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 833BDC3A0FA5D02DCB09DB59 /* ServerProfile.swift */; };
 		C9769AD0AB647DBA7F10F174 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C3A5B4FA5218B9A32CDB5F78 /* SwiftUI.framework */; };
+		CA36FC232FE8100B98B119BA /* TurnOverrideEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93F0D4EA1E67023513E43348 /* TurnOverrideEntry.swift */; };
 		CBF9B6203060C546C778DABA /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD358E048E7135E1596359E1 /* AppConfig.swift */; };
 		CFADBA590C4935186A057FB9 /* LiveActivityIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFF216A96C8B2716DA861C50 /* LiveActivityIntents.swift */; };
 		D2419180C3D80C56401E8C88 /* UnseededStartPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A267ADEB4BF4BEA7C448CE /* UnseededStartPolicy.swift */; };
@@ -161,6 +162,7 @@
 		7C7ECFED5F30EC971C412EFC /* SpeedTestServerPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeedTestServerPicker.swift; sourceTree = "<group>"; };
 		833BDC3A0FA5D02DCB09DB59 /* ServerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProfile.swift; sourceTree = "<group>"; };
 		8B1A512B35CE1D505CB1A3CD /* LiveActivityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityController.swift; sourceTree = "<group>"; };
+		93F0D4EA1E67023513E43348 /* TurnOverrideEntry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TurnOverrideEntry.swift; sourceTree = "<group>"; };
 		975F526A4188951C5B37166D /* ConnectionLinkImport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionLinkImport.swift; sourceTree = "<group>"; };
 		99E2AC40D13D6F8DD598752A /* WireGuardTURN.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = WireGuardTURN.xcframework; path = ../WireGuardBridge/build/WireGuardTURN.xcframework; sourceTree = "<group>"; };
 		9BFB01AD2F5F70DE3F7A4A8C /* ConnectionLinkInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionLinkInbox.swift; sourceTree = "<group>"; };
@@ -307,6 +309,7 @@
 				E74B178DC212A229BC8565F4 /* TunnelManager.swift */,
 				C80CE8603F45C625FABAC090 /* TunnelMTU.swift */,
 				D903EF6DC8FF040AE74C3A2F /* TurnCacheFiles.swift */,
+				93F0D4EA1E67023513E43348 /* TurnOverrideEntry.swift */,
 				D0A267ADEB4BF4BEA7C448CE /* UnseededStartPolicy.swift */,
 				422D7F513A45A12E8A142AA1 /* UplinkPace.swift */,
 				2842251868A37320A5C238F2 /* UplinkPaceSync.swift */,
@@ -535,6 +538,7 @@
 				74676C96495AC72E7D7C7EB5 /* TunnelMTU.swift in Sources */,
 				118478458E595AEBEEA20266 /* TunnelManager.swift in Sources */,
 				60F5FBEB63C5B1C99861D13C /* TurnCacheFiles.swift in Sources */,
+				CA36FC232FE8100B98B119BA /* TurnOverrideEntry.swift in Sources */,
 				D2419180C3D80C56401E8C88 /* UnseededStartPolicy.swift in Sources */,
 				652C39DB65907355CDF83B99 /* UplinkPace.swift in Sources */,
 				54BDFA3B7322033AA76D1C66 /* UplinkPaceSync.swift in Sources */,

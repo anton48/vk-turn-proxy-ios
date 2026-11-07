@@ -4711,8 +4711,8 @@ print("TURN override: $vkurls for VK's own relays (GitHub #105 (2))")
 do {
     let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
     check(cv.contains("static let turnServersVK = \"$vkurls\""), "ConfigValidation names the word once — the same as Go's TURNServersVK")
-    check(cv.contains("static func isTurnOverrideEntry(_ s: String) -> Bool {") && cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || turnOverridePace(s) != nil || s.lowercased() == turnServersVK"),
-          "an override entry is host:port, host:port:quota, host:port:quota:pace OR the word, any case")
+    check(cv.contains("static func isTurnOverrideEntry(_ s: String) -> Bool {") && cv.contains("TurnOverrideEntry.parse(s) != nil || s.lowercased() == turnServersVK"),
+          "an override entry is host:port, host:port:quota, host:port:quota:pace (the one strict parser) OR the word, any case")
     check(cv.contains("let bad = parts.filter { !isTurnOverrideEntry($0) }"), "🚨 the validator judges the list's entries by isTurnOverrideEntry — $vkurls is not 'ignored'")
     let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
     check(tm.contains("if t.lowercased() == ConfigValidation.turnServersVK { t = ConfigValidation.turnServersVK }") && tm.contains("guard ConfigValidation.isTurnOverrideEntry(t), !out.contains(t) else { continue }"),
@@ -4727,18 +4727,32 @@ do {
 print("TURN override: the quota field host:port:quota")
 do {
     let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
-    check(cv.contains("static func turnOverrideQuota(_ s: String) -> (hostPort: String, quota: Int)? {") && cv.contains("field.allSatisfy(\\.isNumber), let q = Int(field), isHostPort(base)"),
-          "turnOverrideQuota reads host:port:digits — the host:port part and the quota")
-    check(cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || turnOverridePace(s) != nil || s.lowercased() == turnServersVK"), "🚨 an override entry may carry the quota field")
+    check(cv.contains("static func turnOverrideQuota(_ s: String) -> (hostPort: String, quota: Int)? {") && cv.contains("guard let e = TurnOverrideEntry.parse(s), let q = e.quota else { return nil }"),
+          "turnOverrideQuota reads host:port:digits through the ONE strict parser (TurnOverrideEntry) — never isHostPort on the remainder, which splits on the LAST colon and took host:port:10 for a host")
+    check(cv.contains("TurnOverrideEntry.parse(s) != nil || s.lowercased() == turnServersVK"), "🚨 an override entry is judged by the ONE strict parser or the word — no alternative readings (the user's review of 7271aef: a pace above the bound fell through to the quota reading)")
     let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
-    check(tm.contains("let s = ConfigValidation.turnOverridePace(entry)?.hostPort ?? ConfigValidation.turnOverrideQuota(entry)?.hostPort ?? entry"), "🚨 the pre-resolution strips the quota and pace fields before it reads the host (else the host would be host:port)")
+    check(tm.contains("let s = TurnOverrideEntry.parse(entry)?.hostPort ?? entry"), "🚨 the pre-resolution strips the quota and pace fields before it reads the host (else the host would be host:port)")
     // 2026-11-07, the user's design: a fourth field, host:port:quota:pace —
     // the relay's pace in KiB/s in both directions, 0 = no pacer; it rides on
     // the quota field (turnOverridePace reads the pace and hands the rest to
     // turnOverrideQuota). The validator accepts it, the parser passes it to Go
     // as typed (Go's parseTURNEntry reads it), the editor's field names it.
-    check(cv.contains("static func turnOverridePace(_ s: String) -> (hostPort: String, quota: Int, pace: Int)? {") && cv.contains("let pace = Int(field), pace <= 65535, let inner = turnOverrideQuota(base)"),
-          "turnOverridePace reads host:port:digits:digits — the pace behind the quota, never without it, and no more than the wire's uint16")
+    check(cv.contains("static func turnOverridePace(_ s: String) -> (hostPort: String, quota: Int, pace: Int)? {") && cv.contains("guard let e = TurnOverrideEntry.parse(s), let q = e.quota, let p = e.pace else { return nil }"),
+          "turnOverridePace reads host:port:digits:digits through the one strict parser — the pace behind the quota, never without it")
+    // The parser itself, RUN (it is a value type compiled into this harness):
+    // the three forms, the bounds, and the review's string.
+    for good in ["relay.example:19302", "relay.example:19302:0", "relay.example:19302:10:500", "relay.example:19302:0:65535", "[2001:db8::1]:19302:3:247", "203.0.113.5:3478:25"] {
+        check(TurnOverrideEntry.parse(good) != nil, "the strict parser accepts \(good)")
+    }
+    if let e = TurnOverrideEntry.parse("[2001:db8::1]:19302:3:247") {
+        check(e.hostPort == "[2001:db8::1]:19302" && e.quota == 3 && e.pace == 247, "the bracketed IPv6 entry's fields are read right")
+    }
+    if let e = TurnOverrideEntry.parse("relay.example:19302:0") {
+        check(e.hostPort == "relay.example:19302" && e.quota == 0 && e.pace == nil, "host:port:quota: the quota alone")
+    }
+    for bad in ["relay.example:19302:10:65536", "relay.example:19302:0:65536", "relay.example:19302:1:2:3", "relay.example:19302:x", "relay.example:19302::500", "relay.example:0", "relay.example", "relay.example:19302:-1", "[2001:db8::1]", "2001:db8::1:19302"] {
+        check(TurnOverrideEntry.parse(bad) == nil, "🚨 the strict parser refuses \(bad)")
+    }
     check(cv.contains("host:port[:quota[:pace]] entries (or \\(turnServersVK))"), "the validator's warning names the pace field")
     // A list typed without its quota field read as a quota defect: the parsed
     // list and the resolved one both hide what the field held. The log says the

@@ -43,6 +43,7 @@ SOURCES=(
     VKTurnProxy/VKTurnProxy/ConnectionLinkFragment.swift
     VKTurnProxy/VKTurnProxy/WireGuardConfText.swift
     "$S/UplinkPace.swift"
+    "$S/TurnOverrideEntry.swift"
     "$S/UplinkPaceSync.swift"
     "$S/UplinkSynth.swift"
     "$S/DirectRouteSync.swift"

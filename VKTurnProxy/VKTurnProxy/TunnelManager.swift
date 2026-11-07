@@ -209,7 +209,7 @@ extension TunnelConfig {
     static func turnOverrideHosts(_ servers: [String]) -> [String] {
         var out: [String] = []
         for entry in servers {
-            let s = ConfigValidation.turnOverridePace(entry)?.hostPort ?? ConfigValidation.turnOverrideQuota(entry)?.hostPort ?? entry
+            let s = TurnOverrideEntry.parse(entry)?.hostPort ?? entry
             guard let colon = s.lastIndex(of: ":") else { continue }
             let host = String(s[..<colon]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
             guard !host.isEmpty, !out.contains(host) else { continue }

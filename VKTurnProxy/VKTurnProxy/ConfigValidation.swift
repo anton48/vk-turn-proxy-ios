@@ -130,11 +130,11 @@ enum ConfigValidation {
     /// it while it answers, in both modes). Returns the host:port part and the
     /// quota, or nil when the entry is not host:port:digits.
     static func turnOverrideQuota(_ s: String) -> (hostPort: String, quota: Int)? {
-        guard let colon = s.lastIndex(of: ":") else { return nil }
-        let base = String(s[..<colon])
-        let field = String(s[s.index(after: colon)...])
-        guard !field.isEmpty, field.allSatisfy(\.isNumber), let q = Int(field), isHostPort(base) else { return nil }
-        return (base, q)
+        // Through the ONE strict parser (TurnOverrideEntry) — the user's review
+        // of 7271aef: isHostPort on the remainder split on the LAST colon and
+        // took host:port:10 for a host.
+        guard let e = TurnOverrideEntry.parse(s), let q = e.quota else { return nil }
+        return (e.hostPort, q)
     }
 
     /// turnOverridePace: the optional fourth field — host:port:quota:pace
@@ -144,20 +144,15 @@ enum ConfigValidation {
     /// policer). It rides on the quota field. Returns the host:port part and
     /// both numbers, or nil when the entry is not host:port:digits:digits.
     static func turnOverridePace(_ s: String) -> (hostPort: String, quota: Int, pace: Int)? {
-        guard let colon = s.lastIndex(of: ":") else { return nil }
-        let base = String(s[..<colon])
-        let field = String(s[s.index(after: colon)...])
-        // Bounded by the field's wire form (Go's paceFieldMax, a uint16): a
-        // larger value would pace the uplink at one rate and declare another.
-        guard !field.isEmpty, field.allSatisfy(\.isNumber), let pace = Int(field), pace <= 65535, let inner = turnOverrideQuota(base) else { return nil }
-        return (inner.hostPort, inner.quota, pace)
+        guard let e = TurnOverrideEntry.parse(s), let q = e.quota, let p = e.pace else { return nil }
+        return (e.hostPort, q, p)
     }
 
     /// isTurnOverrideEntry: what one entry of the TURN override list may be —
     /// host:port, host:port:quota, host:port:quota:pace, or the word for VK's
     /// relays (any case).
     static func isTurnOverrideEntry(_ s: String) -> Bool {
-        isHostPort(s) || turnOverrideQuota(s) != nil || turnOverridePace(s) != nil || s.lowercased() == turnServersVK
+        TurnOverrideEntry.parse(s) != nil || s.lowercased() == turnServersVK
     }
 
     /// Optional override. Empty = OK (use VK's relay). A non-empty value must be

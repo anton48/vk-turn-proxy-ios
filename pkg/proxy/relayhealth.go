@@ -622,7 +622,11 @@ func (o *turnOverride) setServers(list []string) {
 		}
 		t, ok := parseTURNEntry(e)
 		if !ok {
-			o.servers = append(o.servers, e) // an unresolved name stays as it is
+			// Not one of the three forms: dropped, never an address to dial
+			// (the user's review of 7271aef — the app's validator had let a
+			// `host:port:10:65536` through, and this kept it «as a name»). A
+			// NAME that did not resolve is host:port and stays.
+			log.Printf("credpool: TURN relay override: %q is not host:port[:quota[:pace]] — ignored", e)
 			continue
 		}
 		o.servers = append(o.servers, t.addr)
@@ -745,10 +749,14 @@ var lookupTURNHost = func(ctx context.Context, host string) ([]net.IP, error) {
 func ResolveTURNServers(ctx context.Context, servers []string, pre func(host string) []string) []string {
 	var out []string
 	for _, e := range servers {
+		if e == TURNServersVK {
+			out = append(out, e) // the word for VK's relays stays in its place
+			continue
+		}
 		t, ok := parseTURNEntry(e)
 		if !ok {
-			out = append(out, e)
-			continue
+			log.Printf("credpool: TURN relay override: %q is not host:port[:quota[:pace]] — ignored", e)
+			continue // never an address to dial (the user's review of 7271aef)
 		}
 		host, port, err := net.SplitHostPort(t.addr)
 		if err != nil || net.ParseIP(host) != nil {

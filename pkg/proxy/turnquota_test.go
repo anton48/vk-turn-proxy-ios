@@ -1286,3 +1286,26 @@ func TestAReresolutionKeepsTheRelaysPace(t *testing.T) {
 		t.Fatalf("after: the quota of %s is %d %v, want the name's 0", ipR2, q, ok)
 	}
 }
+
+// An entry the parser does not read is DROPPED, never dialled (the user's
+// review of 7271aef): the app's list reaches the pool through
+// ResolveTURNServers and setServers, which kept an unparsable entry «as an
+// unresolved name» — a `host:port:10:65536` the app's validator let through
+// (its host:port check split on the last colon) became a dial target.
+func TestAnUnparsableOverrideEntryIsDroppedNotDialled(t *testing.T) {
+	bad := "relay.example:19302:10:65536"
+	got := ResolveTURNServers(context.Background(), []string{bad, relayA, "x:1:2:3:4"}, nil)
+	if strings.Join(got, ",") != relayA {
+		t.Fatalf("resolved: %v — want the unparsable entries dropped, %s alone", got, relayA)
+	}
+	o := turnOverride{}
+	o.setServers([]string{bad, relayA, TURNServersVK})
+	if strings.Join(o.servers, ",") != relayA+","+TURNServersVK {
+		t.Fatalf("setServers kept an unparsable entry as an address: %v", o.servers)
+	}
+	// A NAME that did not resolve is not unparsable: it stays, as before.
+	o.setServers([]string{nameRelay + ":0:500", relayA})
+	if strings.Join(o.servers, ",") != nameRelay+","+relayA {
+		t.Fatalf("an unresolved name was dropped: %v", o.servers)
+	}
+}
