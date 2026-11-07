@@ -19,6 +19,7 @@ func resetPace() {
 	paceSummary()
 	for i := range paceBuckets {
 		paceBuckets[i].Store(nil)
+		paceRelay[i].Store(nil) // the relays' paces too (2026-11-07) — a test's hand-outs must not pace the next test's writers
 	}
 }
 
@@ -415,4 +416,139 @@ func TestPaceResetConnGivesBackTheBurst(t *testing.T) {
 func paceTestProxy() (*Proxy, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Proxy{ctx: ctx, sendCh: make(chan sendItem, 8)}, cancel
+}
+
+// 2026-11-07, the user's design: the pace is the RELAY's, not the direction's
+// — the override entry's fourth field (host:port:quota:pace, KiB/s; 0 = no
+// pacer) replaces the app's toggle for the connections on that relay. The
+// uplink bucket of a connection takes the rate of the relay it was handed at
+// resolveTURNAddr; the toggle stays the default for relays without the field
+// (VK's: the policer is theirs). Nov 4 §562 measured why: with the toggle on,
+// the own relay's upload was 72 against 224 without — the pacer is its cost
+// alone, while a mixed list (`O:0:0,$vkurls`) seats connections on both.
+//
+// SABOTAGE SEEN TO FAIL: paceFor ignores the relay's rate and returns the
+// toggle's. Compiles; conn 4 then reserves nothing with the toggle off.
+func TestARelaysPaceFieldPacesItsConnectionsAlone(t *testing.T) {
+	resetPace()
+	t.Cleanup(resetPace)
+	p, cancel := paceTestProxy()
+	defer cancel()
+
+	// The toggle OFF; the relay of conn 4 paced at 300: conn 4 reserves at
+	// 300 KiB/s, conn 5 (a relay without the field) does not.
+	setConnRelayPace(4, 300, true)
+	tk := p.paceReserve(4)
+	if tk.reserved == 0 || tk.st == nil {
+		t.Fatal("a connection on a relay with a pace field was not paced while the toggle is off")
+	}
+	p.paceSettle(tk, 1312)
+	if b := paceBuckets[4].Load(); b == nil || b.rate != 300*1024 {
+		t.Fatalf("conn 4's bucket runs at %v, want the relay's 300 KiB/s", b)
+	}
+	if got := p.paceReserve(5); got.reserved != 0 {
+		t.Fatalf("a connection on a relay without the field was paced with the toggle off: %+v", got)
+	}
+
+	// The toggle ON; the relay of conn 6 without a pacer (0): conn 6 is not
+	// paced, conn 7 is, at the toggle's rate.
+	SetUplinkPace(PaceDefaultKiB, PaceDefaultBurstKiB)
+	setConnRelayPace(6, 0, true)
+	if got := p.paceReserve(6); got.reserved != 0 {
+		t.Fatalf("a connection on a relay with pace 0 was paced under the toggle: %+v", got)
+	}
+	tk = p.paceReserve(7)
+	if tk.reserved == 0 {
+		t.Fatal("a connection on a relay without the field was not paced under the toggle")
+	}
+	p.paceSettle(tk, 1312)
+	if b := paceBuckets[7].Load(); b == nil || b.rate != PaceDefaultKiB*1024 {
+		t.Fatalf("conn 7's bucket runs at %v, want the toggle's rate", b)
+	}
+	// Conn 4 under the toggle keeps the relay's rate, not the toggle's.
+	tk = p.paceReserve(4)
+	p.paceSettle(tk, 1312)
+	if b := paceBuckets[4].Load(); b == nil || b.rate != 300*1024 {
+		t.Fatalf("conn 4's bucket under the toggle runs at %v, want the relay's 300 KiB/s still", b)
+	}
+	// The bucket follows the rate it was built for, generation or no
+	// generation: a hand-out that records another rate on the same index
+	// (a session on another relay) rebuilds it.
+	setConnRelayPace(4, 600, true)
+	tk = p.paceReserve(4)
+	p.paceSettle(tk, 1312)
+	if b := paceBuckets[4].Load(); b == nil || b.rate != 600*1024 {
+		t.Fatalf("conn 4's bucket after a hand-out at 600 runs at %v, want 600 KiB/s", b)
+	}
+	// A new session asks its relay again: the reset clears the rate with the bucket.
+	PaceResetConn(4)
+	if _, ok := connRelayPace(4); ok {
+		t.Fatal("PaceResetConn left the previous session's relay pace standing")
+	}
+	if got := p.paceReserve(4); got.reserved == 0 {
+		t.Fatal("after the reset, with the toggle on and no relay pace, conn 4 is not paced")
+	}
+}
+
+// The hand-out is the ONE place a connection learns its relay (every
+// transport's session function calls resolveTURNAddr), so it is where the
+// relay's pace reaches the bucket. A relay without the field leaves the
+// toggle in charge; the probe (connIdx -1) records nothing.
+//
+// SABOTAGE SEEN TO FAIL: resolveTURNAddr does not ask the pool for the
+// relay's pace. Compiles; conn 3's pace is then unset after its hand-out.
+func TestTheHandOutRecordsTheRelaysPace(t *testing.T) {
+	resetPace()
+	t.Cleanup(resetPace)
+	path := writeCache(t, t.TempDir(), credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA, relayB}, Username: futureUser("cached"), Password: "p"})
+	cp, _, _ := relayPool(t, path, relayC)
+	list, err := ParseTURNServers(relayO + ":0:500," + TURNServersVK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp.setOverride(turnOverride{servers: list})
+	p := &Proxy{credPool: cp}
+	addr, _, _, err := p.resolveTURNAddr(3, false)
+	if err != nil || addr != relayO {
+		t.Fatalf("the hand-out: %q %v, want %s", addr, err, relayO)
+	}
+	if kib, ok := connRelayPace(3); !ok || kib != 500 {
+		t.Fatalf("conn 3's relay pace after the hand-out: %d %v, want 500", kib, ok)
+	}
+	// O marked: the next hand-out is VK's relay, which has no field.
+	cp.health.markLocked(cp.health.record(relayO), time.Now())
+	addr, _, _, err = p.resolveTURNAddr(8, false)
+	if err != nil || addr == relayO {
+		t.Fatalf("the hand-out with O marked: %q %v, want VK's relay", addr, err)
+	}
+	if _, ok := connRelayPace(8); ok {
+		t.Fatal("a hand-out of VK's relay recorded a pace")
+	}
+	if _, _, _, err := p.resolveTURNAddr(-1, false); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A writer paced by its RELAY under an OFF toggle waits its full debt: the
+// sleep's "turned off mid-wait" exit asks this connection's own rate, not the
+// toggle (which is off throughout and would end every wait at its first slice).
+//
+// SABOTAGE SEEN TO FAIL: the sleep loop breaks on `!paceNow().on()`.
+// Compiles; the second reserve then returns after one 10-ms slice.
+func TestARelayPacedWriterWaitsUnderAnOffToggle(t *testing.T) {
+	resetPace()
+	t.Cleanup(resetPace)
+	p, cancel := paceTestProxy()
+	defer cancel()
+
+	setConnRelayPace(9, 20, true) // 20 KiB/s: one maximum-size packet is ≈75 ms of debt
+	for i := 0; i < 14; i++ {     // the 16-KiB burst spent
+		p.paceSettle(p.paceReserve(9), 1500)
+	}
+	t0 := time.Now()
+	tk := p.paceReserve(9)
+	if took := time.Since(t0); took < 40*time.Millisecond {
+		t.Fatalf("a relay-paced writer in debt waited %s under an off toggle, want its debt (≈75 ms)", took)
+	}
+	p.paceSettle(tk, 1500)
 }

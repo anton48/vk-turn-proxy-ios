@@ -199,6 +199,16 @@ func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 	return addr, ok
 }
 
+// relayPace: the pace the override list gives the relay at addr, in KiB/s
+// (0 = no pacer), ok false = the direction's default; the session asks it at
+// its hand-out (resolveTURNAddr → uplinkpace.go), the hello carries it to
+// the server. Under the pool's lock: setOverride replaces the list.
+func (cp *credPool) relayPace(addr string) (int, bool) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.override.pace(addr)
+}
+
 // unlimitedFirstLocked: the relay without a quota that takes every connection
 // NOW — the list's first unmarked candidate when it has no quota and no attempt
 // on it went unanswered on this path since the last answer (relayHealth.untried).

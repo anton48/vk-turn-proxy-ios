@@ -224,6 +224,7 @@ func PaceResetConn(connIdx int) {
 		return
 	}
 	paceBuckets[connIdx].Store(nil)
+	paceRelay[connIdx].Store(nil) // the next session's hand-out records its relay's pace afresh
 }
 
 func paceNow() *paceState { return paceCur.Load() }
@@ -321,9 +322,9 @@ type paceBucket struct {
 	last   time.Time
 }
 
-func newPaceBucket(st *paceState) *paceBucket {
-	return &paceBucket{gen: st.gen, rate: st.rate, burst: st.burst,
-		tokens: st.burst, last: time.Now()}
+func newPaceBucket(gen uint64, rate, burst float64) *paceBucket {
+	return &paceBucket{gen: gen, rate: rate, burst: burst,
+		tokens: burst, last: time.Now()}
 }
 
 // take deducts cost and reports how long the caller must wait before the debt
@@ -370,7 +371,8 @@ func (b *paceBucket) refund(cost float64) {
 // writer goes UNPACED rather than sharing someone else's bucket — pacing two
 // allocations from one bucket would meter neither, and the pool ceiling is 60.
 func pacesWriter(st *paceState, connIdx int) bool {
-	return st.on() && connIdx >= 0 && connIdx < paceMaxConns
+	rate, _ := paceFor(st, connIdx)
+	return rate > 0
 }
 
 // paceTicket is what a writer carries from its reservation to its settle: the
@@ -392,9 +394,13 @@ func (p *Proxy) paceReserve(connIdx int) paceTicket {
 	if !pacesWriter(st, connIdx) {
 		return paceTicket{}
 	}
+	rate, burst := paceFor(st, connIdx)
 	b := paceBuckets[connIdx].Load()
-	if b == nil || b.gen != st.gen {
-		b = newPaceBucket(st)
+	// Rebuilt under a new generation, and when the RATE moved for this
+	// connection alone — the relay's field recorded at a hand-out, or the
+	// toggle flipped under a relay without one.
+	if b == nil || b.gen != st.gen || b.rate != rate || b.burst != burst {
+		b = newPaceBucket(st.gen, rate, burst)
 		paceBuckets[connIdx].Store(b)
 	}
 	wait := b.take(paceMaxCost)
@@ -450,9 +456,10 @@ func (p *Proxy) paceReserve(connIdx int) paceTicket {
 			return paceTicket{st: st, reserved: paceMaxCost, connIdx: connIdx}
 		}
 		t.Stop()
-		if !paceNow().on() {
-			// Turned off mid-wait: stop paying for a lever that is no longer
-			// armed, rather than finishing a sleep nobody asked for.
+		if r, _ := paceFor(paceNow(), connIdx); r <= 0 {
+			// Turned off mid-wait — the toggle, or this connection's relay —:
+			// stop paying for a lever that is no longer armed, rather than
+			// finishing a sleep nobody asked for.
 			break
 		}
 		left -= d
@@ -510,7 +517,7 @@ func paceSummary() string {
 	mx := paceWaitMax.Swap(0)
 	by := paceBytes.Swap(0)
 	cx := paceCancels.Swap(0)
-	if !st.on() {
+	if !st.on() && !anyRelayPaced() {
 		return ""
 	}
 	share := 0.0
@@ -541,4 +548,85 @@ func paceSummary() string {
 		time.Duration(plan).Round(time.Millisecond),
 		mean.Round(time.Microsecond), time.Duration(mx).Round(time.Microsecond),
 		by/1024, cx, note)
+}
+
+// THE PACE IS THE RELAY'S (2026-11-07, the user's design). The override list's
+// fourth field — host:port:quota:pace, KiB/s of counted bytes, 0 = no pacer —
+// is the pace of every connection on that relay, in both directions: here the
+// uplink bucket, and the same number declared to the server behind the hello
+// for the downlink (groupPaceMagic, proxy.go). The app's toggle (SetUplinkPace)
+// stays the DEFAULT for a relay without the field — VK's, whose policer the
+// toggle was measured against. Why per relay and not per direction: a list
+// `O:0:0,$vkurls` seats connections on the own relay AND on VK's at once
+// (the failover), and no one toggle is right for both; and on the own relay
+// the pacer is pure cost — Nov 4 §562: the upload 72 with it, 224 without.
+//
+// The rate reaches the bucket at the HAND-OUT — resolveTURNAddr, the one place
+// every transport's session learns its relay — before any writer reserves, and
+// PaceResetConn (run at the top of every session attempt, before the hand-out)
+// clears it with the bucket: a connection that moves to another relay asks
+// again. Indexed like paceBuckets, for the same reason.
+type paceRelayRate struct{ kib int }
+
+var paceRelay [paceMaxConns]atomic.Pointer[paceRelayRate]
+
+// setConnRelayPace records the relay's pace for connIdx: has false = the
+// relay has no field, the toggle decides. Nothing for an index outside the
+// table (the probe's -1; a writer beyond it is unpaced anyway).
+func setConnRelayPace(connIdx int, kib int, has bool) {
+	if connIdx < 0 || connIdx >= paceMaxConns {
+		return
+	}
+	if !has {
+		paceRelay[connIdx].Store(nil)
+		return
+	}
+	paceRelay[connIdx].Store(&paceRelayRate{kib: kib})
+}
+
+// connRelayPace: the relay's pace recorded for connIdx, ok false = none.
+func connRelayPace(connIdx int) (int, bool) {
+	if connIdx < 0 || connIdx >= paceMaxConns {
+		return 0, false
+	}
+	r := paceRelay[connIdx].Load()
+	if r == nil {
+		return 0, false
+	}
+	return r.kib, true
+}
+
+// paceFor is the rate and burst connIdx's writer paces at under st: the
+// relay's rate where the relay has a field (0 = none — unpaced whatever the
+// toggle says), else the toggle's. The burst is the toggle's where it is on,
+// the shipped default otherwise.
+func paceFor(st *paceState, connIdx int) (rate, burst float64) {
+	if connIdx < 0 || connIdx >= paceMaxConns {
+		return 0, 0
+	}
+	burst = st.burst
+	if burst <= 0 {
+		burst = PaceDefaultBurstKiB * 1024
+	}
+	if r := paceRelay[connIdx].Load(); r != nil {
+		if r.kib <= 0 {
+			return 0, 0
+		}
+		return float64(r.kib) * 1024, burst
+	}
+	if !st.on() {
+		return 0, 0
+	}
+	return st.rate, burst
+}
+
+// anyRelayPaced: some connection paces at its relay's rate — the summary
+// line prints while that is so, toggle or no toggle.
+func anyRelayPaced() bool {
+	for i := range paceRelay {
+		if r := paceRelay[i].Load(); r != nil && r.kib > 0 {
+			return true
+		}
+	}
+	return false
 }

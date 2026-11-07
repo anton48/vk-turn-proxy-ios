@@ -137,14 +137,29 @@ enum ConfigValidation {
         return (base, q)
     }
 
+    /// turnOverridePace: the optional fourth field — host:port:quota:pace
+    /// (2026-11-07): the pace of this relay's connections in KiB/s, in both
+    /// directions (the uplink bucket on the phone, the server's downlink pacer
+    /// by the client's declaration); 0 = no pacer (the user's own relay has no
+    /// policer). It rides on the quota field. Returns the host:port part and
+    /// both numbers, or nil when the entry is not host:port:digits:digits.
+    static func turnOverridePace(_ s: String) -> (hostPort: String, quota: Int, pace: Int)? {
+        guard let colon = s.lastIndex(of: ":") else { return nil }
+        let base = String(s[..<colon])
+        let field = String(s[s.index(after: colon)...])
+        guard !field.isEmpty, field.allSatisfy(\.isNumber), let pace = Int(field), let inner = turnOverrideQuota(base) else { return nil }
+        return (inner.hostPort, inner.quota, pace)
+    }
+
     /// isTurnOverrideEntry: what one entry of the TURN override list may be —
-    /// host:port, host:port:quota, or the word for VK's relays (any case).
+    /// host:port, host:port:quota, host:port:quota:pace, or the word for VK's
+    /// relays (any case).
     static func isTurnOverrideEntry(_ s: String) -> Bool {
-        isHostPort(s) || turnOverrideQuota(s) != nil || s.lowercased() == turnServersVK
+        isHostPort(s) || turnOverrideQuota(s) != nil || turnOverridePace(s) != nil || s.lowercased() == turnServersVK
     }
 
     /// Optional override. Empty = OK (use VK's relay). A non-empty value must be
-    /// host:port[:quota] entries (or $vkurls), else a warning (the config layer
+    /// host:port[:quota[:pace]] entries (or $vkurls), else a warning (the config layer
     /// silently ignores it).
     static func turnOverride(_ s: String) -> Issue? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -156,10 +171,10 @@ enum ConfigValidation {
         let parts = t.split(whereSeparator: { ",; \n\t\r".contains($0) }).map(String.init)
         let bad = parts.filter { !isTurnOverrideEntry($0) }
         if bad.count == parts.count {
-            return Issue(.warning, "Not a valid list of host:port[:quota] entries (or \(turnServersVK)) — it will be ignored (VK's relays are used).")
+            return Issue(.warning, "Not a valid list of host:port[:quota[:pace]] entries (or \(turnServersVK)) — it will be ignored (VK's relays are used).")
         }
         if !bad.isEmpty {
-            return Issue(.warning, "Ignored (not host:port[:quota], nor \(turnServersVK)): \(bad.joined(separator: ", ")). The valid entries are used in order.")
+            return Issue(.warning, "Ignored (not host:port[:quota[:pace]], nor \(turnServersVK)): \(bad.joined(separator: ", ")). The valid entries are used in order.")
         }
         return nil
     }

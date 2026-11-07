@@ -46,12 +46,14 @@ func TestParseTURNServersAcceptsAQuota(t *testing.T) {
 		{"203.0.113.5:3478", "203.0.113.5:3478", 0, false},
 		{"[2001:db8::1]:19302:3", "[2001:db8::1]:19302", 3, true},
 	} {
-		addr, quota, has, ok := splitTURNEntry(tc.entry)
-		if !ok || addr != tc.addr || quota != tc.quota || has != tc.has {
-			t.Fatalf("%q → %q %d %v %v, want %q %d %v", tc.entry, addr, quota, has, ok, tc.addr, tc.quota, tc.has)
+		e, ok := parseTURNEntry(tc.entry)
+		if !ok || e.addr != tc.addr || e.quota != tc.quota || e.hasQuota != tc.has {
+			t.Fatalf("%q → %+v %v, want %q %d %v", tc.entry, e, ok, tc.addr, tc.quota, tc.has)
 		}
 	}
-	for _, bad := range []string{"relay.example:19302:x", "relay.example:19302:-1", "relay.example:19302:", "relay.example:19302:1:2"} {
+	// `host:port:1:2` is the four-field form since 2026-11-07 (a quota of one
+	// and a pace of two) — a FIFTH field is what has no form.
+	for _, bad := range []string{"relay.example:19302:x", "relay.example:19302:-1", "relay.example:19302:", "relay.example:19302:1:2:3"} {
 		if _, err := ParseTURNServers(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
@@ -1165,5 +1167,82 @@ func TestASlotWithEveryRelayMarkedIsNotReadyToTheColdStartCap(t *testing.T) {
 	}
 	if addr, _, _, err := cp.get(0, false); err != nil || addr != relayC || mints.Load() != 1 {
 		t.Fatalf("conn 0 with the one slot's relays all marked: %q, %v, mints %d — want a fresh credential on %s", addr, err, mints.Load(), relayC)
+	}
+}
+
+// 2026-11-07, the user's design: an entry may carry a FOURTH field,
+// host:port:quota:pace — the pace of the relay's connections in KiB/s of
+// counted bytes, in both directions: the client's uplink bucket on that
+// relay takes it, and the client declares it to the server for the downlink
+// (groupPaceMagic). 0 = no pacer (the user's own relay has no per-allocation
+// policer — §562: the uplink pacer cost 224 → 72 there); absent = the default
+// (the app's uplink toggle; the server's -downlink-pace). The field rides on
+// the quota field: the pace of a relay is a property of the relay, and the
+// relay without a quota is the one that wants it.
+func TestParseTURNServersAcceptsAPace(t *testing.T) {
+	got, err := ParseTURNServers("relay.example:19302:0:0, 203.0.113.5:3478:25:500,$vkurls, 203.0.113.5:3478:7:0")
+	if err != nil || strings.Join(got, ",") != "relay.example:19302:0:0,203.0.113.5:3478:25:500,"+TURNServersVK {
+		t.Fatalf("%v %v — want the pace fields kept, the second spelling of one address dropped", got, err)
+	}
+	for _, tc := range []struct {
+		entry string
+		want  turnEntry
+	}{
+		{"relay.example:19302:0:0", turnEntry{addr: "relay.example:19302", hasQuota: true, hasPace: true}},
+		{"203.0.113.5:3478:25:500", turnEntry{addr: "203.0.113.5:3478", quota: 25, hasQuota: true, pace: 500, hasPace: true}},
+		{"203.0.113.5:3478:25", turnEntry{addr: "203.0.113.5:3478", quota: 25, hasQuota: true}},
+		{"203.0.113.5:3478", turnEntry{addr: "203.0.113.5:3478"}},
+		{"[2001:db8::1]:19302:3:247", turnEntry{addr: "[2001:db8::1]:19302", quota: 3, hasQuota: true, pace: 247, hasPace: true}},
+	} {
+		got, ok := parseTURNEntry(tc.entry)
+		if !ok || got != tc.want {
+			t.Fatalf("%q → %+v %v, want %+v", tc.entry, got, ok, tc.want)
+		}
+		if got.String() != tc.entry {
+			t.Fatalf("%q spelled back as %q", tc.entry, got.String())
+		}
+	}
+	// A pace rides on a quota field: no pace without one; digits only; no
+	// fifth field.
+	for _, bad := range []string{"relay.example:19302:0:x", "relay.example:19302:0:-1", "relay.example:19302:0:", "relay.example:19302:0:1:2", "relay.example:19302::500"} {
+		if _, err := ParseTURNServers(bad); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+func TestResolveTURNServersKeepsThePace(t *testing.T) {
+	pre := func(host string) []string {
+		if host == nameHost {
+			return []string{ipR1, ipR2}
+		}
+		return nil
+	}
+	got := ResolveTURNServers(context.Background(), []string{nameRelay + ":0:0", "203.0.113.5:3478:25:500", "203.0.113.6:3478:10"}, pre)
+	if strings.Join(got, ",") != ipR1+":19302:0:0,"+ipR2+":19302:0:0,203.0.113.5:3478:25:500,203.0.113.6:3478:10" {
+		t.Fatalf("resolved: %v — want the name's IPs each with the name's quota and pace", got)
+	}
+	o := turnOverride{}
+	o.setServers(got)
+	if p, ok := o.pace(ipR1 + ":19302"); !ok || p != 0 {
+		t.Fatalf("the pace of the first IP: %d %v, want 0 (no pacer), set", p, ok)
+	}
+	if p, ok := o.pace("203.0.113.5:3478"); !ok || p != 500 {
+		t.Fatalf("the pace of the second entry: %d %v, want 500", p, ok)
+	}
+	if _, ok := o.pace("203.0.113.6:3478"); ok {
+		t.Fatal("an entry without the field has a pace")
+	}
+	if q, ok := o.quota("203.0.113.5:3478"); !ok || q != 25 {
+		t.Fatalf("the quota beside the pace: %d %v, want 25", q, ok)
+	}
+	if c := o.candidatesFor(&TURNCreds{Addresses: []string{relayA}}); strings.Join(c, ",") != ipR1+":19302,"+ipR2+":19302,203.0.113.5:3478,203.0.113.6:3478" {
+		t.Fatalf("the candidates carry no field: %v", c)
+	}
+	// The pool answers for its override under its lock.
+	cp := &credPool{}
+	cp.override = o
+	if p, ok := cp.relayPace("203.0.113.5:3478"); !ok || p != 500 {
+		t.Fatalf("the pool's relayPace: %d %v, want 500", p, ok)
 	}
 }

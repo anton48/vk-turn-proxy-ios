@@ -2274,7 +2274,16 @@ func (p *Proxy) directMode() bool {
 // relay/serverAddress mismatch is harmless. See
 // evaluated_alternatives_turn_endpoint_rotation.md.
 func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
-	return p.credPool.get(connIdx, allowCaptchaBlock)
+	addr, creds, slot, err := p.credPool.get(connIdx, allowCaptchaBlock)
+	if err == nil && connIdx >= 0 {
+		// The relay's pace, where the override list gives one, is this
+		// connection's uplink rate from here on and what its hello declares
+		// to the server (uplinkpace.go, groupPaceMagic). The hand-out is the
+		// one place a session learns its relay, on every transport.
+		kib, has := p.credPool.relayPace(addr)
+		setConnRelayPace(connIdx, kib, has)
+	}
+	return addr, creds, slot, err
 }
 
 // wakeChannelFor is the channel a retry parks on after err. A park error
@@ -2635,7 +2644,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		// a probeInterval of that is a probeInterval of the old, skewed
 		// downlink at the start of every tunnel. Re-sent on every tick so a
 		// lost hello heals by repetition and a restarted server re-groups us.
-		p.sendGroupHello(dtlsConn)
+		p.sendGroupHello(dtlsConn, connIdx)
 		// Tick-gap detector: if the gap between two consecutive ticks is
 		// much larger than probeInterval, our goroutine was suspended
 		// (iOS Network Extension freeze). During that time we couldn't
@@ -4863,6 +4872,34 @@ const groupHelloLen = 4 + 16
 // server that knows it reaps the old group at the next tick.
 var groupSupersedeMagic = []byte{0xff, 'S', 'U', 'P'}
 
+// groupPaceMagic opens the sentinel that DECLARES the pace of a connection's
+// relay to the server (2026-11-07, the user's design): 0xff 'P' 'A' 'C' + the
+// rate in KiB/s of counted bytes as two big-endian bytes (0 = no pacer; the
+// field's ceiling 65535), zero-padded to the hello's length — the hello's
+// construction, so a server that predates it forwards it to WireGuard, which
+// drops it (one 20-byte packet per session). A server that knows it paces
+// that connection's downlink at the declared rate in place of its
+// -downlink-pace (its own cap on top). Written right behind the hello and
+// the supersede sentinels, on a connection whose relay has the override
+// list's pace field (host:port:quota:pace); a relay without the field
+// declares nothing, the server's default stands. The client is the one party
+// that knows which relay a connection rides; the server sees an address.
+var groupPaceMagic = []byte{0xff, 'P', 'A', 'C'}
+
+// groupPaceBytes is the declaration for a pace of kib KiB/s.
+func groupPaceBytes(kib int) []byte {
+	if kib < 0 {
+		kib = 0
+	}
+	if kib > 0xffff {
+		kib = 0xffff
+	}
+	b := make([]byte, groupHelloLen)
+	copy(b, groupPaceMagic)
+	b[4], b[5] = byte(kib>>8), byte(kib)
+	return b
+}
+
 // groupGen is one generation of this tunnel's group: its hello, and whether a
 // session has ANNOUNCED it — written the hello to the server, which makes the
 // group one the server can have. The fact belongs to the GENERATION, never to
@@ -5031,7 +5068,7 @@ func (p *Proxy) groupHelloBytes() []byte {
 // optimisations, and a server that never sees them simply keeps the
 // connection on its own socket, or reaps at the backstop; a hello that never
 // left announces nothing.
-func (p *Proxy) sendGroupHello(w io.Writer) {
+func (p *Proxy) sendGroupHello(w io.Writer, connIdx int) {
 	g := p.groupHello.Load()
 	if g == nil {
 		return
@@ -5044,6 +5081,13 @@ func (p *Proxy) sendGroupHello(w io.Writer) {
 			return
 		}
 		p.noteSupersedeSent(s)
+	}
+	// The relay's pace, where its override entry has the field: declared
+	// behind the hello, so the server pairs it with the connection the hello
+	// just grouped (groupPaceMagic). Ignored on error like the rest — an
+	// undeclared connection runs at the server's default.
+	if kib, ok := connRelayPace(connIdx); ok {
+		_, _ = w.Write(groupPaceBytes(kib))
 	}
 }
 
@@ -5375,7 +5419,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		// a probeInterval of that is a probeInterval of the old, skewed
 		// downlink at the start of every tunnel. Re-sent on every tick so a
 		// lost hello heals by repetition and a restarted server re-groups us.
-		p.sendGroupHello(srtpConn)
+		p.sendGroupHello(srtpConn, connIdx)
 		lastTickAt := time.Now()
 		wake := p.newWakeWatch()
 		for {

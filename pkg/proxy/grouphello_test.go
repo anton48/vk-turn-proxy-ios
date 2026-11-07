@@ -54,7 +54,7 @@ func TestGroupHelloConstruction(t *testing.T) {
 // disabled — it runs on the probe path of every conn.
 func TestSendGroupHelloIsSafeWhenDisabled(t *testing.T) {
 	var buf bytes.Buffer
-	(&Proxy{}).sendGroupHello(&buf)
+	(&Proxy{}).sendGroupHello(&buf, -1)
 	if buf.Len() != 0 {
 		t.Fatalf("a disabled hello still wrote %d bytes", buf.Len())
 	}
@@ -62,7 +62,7 @@ func TestSendGroupHelloIsSafeWhenDisabled(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	buf.Reset()
-	p.sendGroupHello(&buf)
+	p.sendGroupHello(&buf, -1)
 	if !bytes.Equal(buf.Bytes(), p.groupHelloBytes()) {
 		t.Fatalf("sent %x, want %x", buf.Bytes(), p.groupHelloBytes())
 	}

@@ -20,7 +20,7 @@ func TestPathUpRotatesTheGroupHello(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	before := append([]byte(nil), p.groupHelloBytes()...)
-	p.sendGroupHello(&bytes.Buffer{}) // announced: a group the server can have is the one a rotation names
+	p.sendGroupHello(&bytes.Buffer{}, -1) // announced: a group the server can have is the one a rotation names
 	p.rotateGroupHello()
 	after := p.groupHelloBytes()
 	if bytes.Equal(before, after) {
@@ -30,7 +30,7 @@ func TestPathUpRotatesTheGroupHello(t *testing.T) {
 		t.Fatalf("rotated hello has the wrong shape: %x", after)
 	}
 	var buf bytes.Buffer
-	p.sendGroupHello(&buf)
+	p.sendGroupHello(&buf, -1)
 	if !bytes.HasPrefix(buf.Bytes(), after) {
 		t.Fatal("sendGroupHello does not send the CURRENT hello first")
 	}

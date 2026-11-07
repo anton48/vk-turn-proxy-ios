@@ -181,9 +181,10 @@ extension TunnelConfig {
     /// "host:port" -> (host, port), or nil when empty/malformed (= no override).
     /// Splits on the LAST colon so IPv4:port parses cleanly.
     /// parseTurnServers reads the profile's TURN override field as a list of
-    /// host:port[:quota] entries separated by commas, semicolons, spaces or
-    /// newlines (the quota field — the relay's limit, 0 = none — travels to Go
-    /// as typed); `$vkurls` (any case) is kept as the word for VK's own relays
+    /// host:port[:quota[:pace]] entries separated by commas, semicolons, spaces or
+    /// newlines (the quota field — the relay's limit, 0 = none — and the pace
+    /// field — the relay's pace in KiB/s, 0 = no pacer — travel to Go as
+    /// typed); `$vkurls` (any case) is kept as the word for VK's own relays
     /// (GitHub #105 (2)); an entry that is neither is dropped (the editor warns
     /// about it). Duplicates are dropped, order is kept.
     static func parseTurnServers(_ raw: String) -> [String] {
@@ -198,8 +199,8 @@ extension TunnelConfig {
     }
 
     /// turnOverrideHosts: the DNS names in the override list — the hosts that
-    /// are not IP literals (`$vkurls`, no host:port, is skipped; a quota field
-    /// is stripped first) — for the pre-resolution beside the VK hosts
+    /// are not IP literals (`$vkurls`, no host:port, is skipped; the quota and
+    /// pace fields are stripped first) — for the pre-resolution beside the VK hosts
     /// (GitHub #105, 2026-10-29). The extension's own resolver lost 5 s to a
     /// timeout on the first dial and iOS refuses a name as the tunnel's remote
     /// address; the main app resolves on the physical path before the
@@ -208,7 +209,7 @@ extension TunnelConfig {
     static func turnOverrideHosts(_ servers: [String]) -> [String] {
         var out: [String] = []
         for entry in servers {
-            let s = ConfigValidation.turnOverrideQuota(entry)?.hostPort ?? entry
+            let s = ConfigValidation.turnOverridePace(entry)?.hostPort ?? ConfigValidation.turnOverrideQuota(entry)?.hostPort ?? entry
             guard let colon = s.lastIndex(of: ":") else { continue }
             let host = String(s[..<colon]).trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
             guard !host.isEmpty, !out.contains(host) else { continue }

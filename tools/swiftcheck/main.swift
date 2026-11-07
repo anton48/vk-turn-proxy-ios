@@ -4711,13 +4711,13 @@ print("TURN override: $vkurls for VK's own relays (GitHub #105 (2))")
 do {
     let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
     check(cv.contains("static let turnServersVK = \"$vkurls\""), "ConfigValidation names the word once — the same as Go's TURNServersVK")
-    check(cv.contains("static func isTurnOverrideEntry(_ s: String) -> Bool {") && cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || s.lowercased() == turnServersVK"),
-          "an override entry is host:port, host:port:quota OR the word, any case")
+    check(cv.contains("static func isTurnOverrideEntry(_ s: String) -> Bool {") && cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || turnOverridePace(s) != nil || s.lowercased() == turnServersVK"),
+          "an override entry is host:port, host:port:quota, host:port:quota:pace OR the word, any case")
     check(cv.contains("let bad = parts.filter { !isTurnOverrideEntry($0) }"), "🚨 the validator judges the list's entries by isTurnOverrideEntry — $vkurls is not 'ignored'")
     let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
     check(tm.contains("if t.lowercased() == ConfigValidation.turnServersVK { t = ConfigValidation.turnServersVK }") && tm.contains("guard ConfigValidation.isTurnOverrideEntry(t), !out.contains(t) else { continue }"),
           "🚨 parseTurnServers keeps $vkurls (folded to the word) — the extension receives it in turn_servers")
-    check(source("VKTurnProxy/VKTurnProxy/ServerEditView.swift").contains("TURN servers (host:port[:quota] or $vkurls, comma-separated, optional)"), "the field names the word and the quota field")
+    check(source("VKTurnProxy/VKTurnProxy/ServerEditView.swift").contains("TURN servers (host:port[:quota[:pace]] or $vkurls, comma-separated, optional)"), "the field names the word, the quota field and the pace field")
 }
 
 // 2026-10-30, the user's design: a third field, host:port:quota — the relay's
@@ -4729,9 +4729,17 @@ do {
     let cv = codeWithoutComments("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
     check(cv.contains("static func turnOverrideQuota(_ s: String) -> (hostPort: String, quota: Int)? {") && cv.contains("field.allSatisfy(\\.isNumber), let q = Int(field), isHostPort(base)"),
           "turnOverrideQuota reads host:port:digits — the host:port part and the quota")
-    check(cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || s.lowercased() == turnServersVK"), "🚨 an override entry may carry the quota field")
+    check(cv.contains("isHostPort(s) || turnOverrideQuota(s) != nil || turnOverridePace(s) != nil || s.lowercased() == turnServersVK"), "🚨 an override entry may carry the quota field")
     let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
-    check(tm.contains("let s = ConfigValidation.turnOverrideQuota(entry)?.hostPort ?? entry"), "🚨 the pre-resolution strips the quota field before it reads the host (else the host would be host:port)")
+    check(tm.contains("let s = ConfigValidation.turnOverridePace(entry)?.hostPort ?? ConfigValidation.turnOverrideQuota(entry)?.hostPort ?? entry"), "🚨 the pre-resolution strips the quota and pace fields before it reads the host (else the host would be host:port)")
+    // 2026-11-07, the user's design: a fourth field, host:port:quota:pace —
+    // the relay's pace in KiB/s in both directions, 0 = no pacer; it rides on
+    // the quota field (turnOverridePace reads the pace and hands the rest to
+    // turnOverrideQuota). The validator accepts it, the parser passes it to Go
+    // as typed (Go's parseTURNEntry reads it), the editor's field names it.
+    check(cv.contains("static func turnOverridePace(_ s: String) -> (hostPort: String, quota: Int, pace: Int)? {") && cv.contains("let pace = Int(field), let inner = turnOverrideQuota(base)"),
+          "turnOverridePace reads host:port:digits:digits — the pace behind the quota, never without it")
+    check(cv.contains("host:port[:quota[:pace]] entries (or \\(turnServersVK))"), "the validator's warning names the pace field")
     // A list typed without its quota field read as a quota defect: the parsed
     // list and the resolved one both hide what the field held. The log says the
     // field's own text, entries the parser dropped included.
