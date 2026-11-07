@@ -184,6 +184,9 @@ func (p *Proxy) endConnSession(connIdx int) {
 		return
 	}
 	p.connCancel[connIdx] = nil
+	if connIdx < len(p.connRelay) {
+		p.connRelay[connIdx] = "" // the relay it sat on goes with the session (relaymarkend.go)
+	}
 }
 
 // restartSessionsOlderThan cancels every running session stamped before

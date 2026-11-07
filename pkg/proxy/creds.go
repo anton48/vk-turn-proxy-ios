@@ -1188,6 +1188,7 @@ type credCacheEntry struct {
 // across the fetch call) so a long captcha solve on one slot cannot
 // block fast-path get() calls on other conns' fresh slots.
 type credPool struct {
+	onRelayMarked func(addr string) // told, outside the lock, of every relay newly marked UNREACHABLE — the proxy ends the sessions still on it (relaymarkend.go)
 	mu       sync.Mutex
 	pool     []credPoolEntry // indexed by slot index; grown lazily up to size
 	nextGen  uint64          // last claim stamp handed out — see credPoolEntry.gen

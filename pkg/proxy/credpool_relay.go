@@ -266,8 +266,8 @@ func (cp *credPool) noteRelayUnanswered(connIdx, slot int, creds *TURNCreds, add
 		return
 	}
 	cp.mu.Lock()
-	defer cp.mu.Unlock()
 	cp.cursor[connIdx]++
+	before := cp.deadAddrsLocked()
 	marked := cp.health.unanswered(addr, start)
 	switch {
 	case marked:
@@ -276,6 +276,43 @@ func (cp *credPool) noteRelayUnanswered(connIdx, slot int, creds *TURNCreds, add
 		log.Printf("credpool: conn %d: relay %s answered its neighbours around this attempt — no verdict on it; the next attempt takes the next address", connIdx, addr)
 	default:
 		log.Printf("credpool: conn %d: relay %s did not answer — not marked (nothing else has answered since); the next attempt takes the next address", connIdx, addr)
+	}
+	newly := cp.newlyDeadLocked(before)
+	cp.mu.Unlock()
+	cp.fireRelayMarked(newly)
+}
+
+// deadAddrsLocked: the relays marked UNREACHABLE now.
+func (cp *credPool) deadAddrsLocked() map[string]bool {
+	out := map[string]bool{}
+	for a, r := range cp.health.rec {
+		if r.dead {
+			out[a] = true
+		}
+	}
+	return out
+}
+
+// newlyDeadLocked: the relays marked since `before` was taken.
+func (cp *credPool) newlyDeadLocked(before map[string]bool) []string {
+	var out []string
+	for a, r := range cp.health.rec {
+		if r.dead && !before[a] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// fireRelayMarked tells the hook of every newly marked relay — OUTSIDE the
+// pool's lock: the hook ends sessions whose re-dials ask the pool
+// (relaymarkend.go).
+func (cp *credPool) fireRelayMarked(addrs []string) {
+	if cp.onRelayMarked == nil {
+		return
+	}
+	for _, a := range addrs {
+		cp.onRelayMarked(a)
 	}
 }
 
@@ -289,12 +326,14 @@ func (cp *credPool) noteAllocatedAt(slot int, creds *TURNCreds, addr string, sta
 	}
 	cp.noteAllocated(slot, creds)
 	cp.mu.Lock()
-	defer cp.mu.Unlock()
-	before := cp.deadCountLocked()
+	before := cp.deadAddrsLocked()
 	cp.health.answered(addr, start)
-	if after := cp.deadCountLocked(); after > before {
-		log.Printf("credpool: relay %s answered — %d relay(s) unanswered since the previous answer marked UNREACHABLE", addr, after-before)
+	newly := cp.newlyDeadLocked(before)
+	if len(newly) > 0 {
+		log.Printf("credpool: relay %s answered — %d relay(s) unanswered since the previous answer marked UNREACHABLE", addr, len(newly))
 	}
+	cp.mu.Unlock()
+	cp.fireRelayMarked(newly)
 }
 
 func (cp *credPool) deadCountLocked() int {

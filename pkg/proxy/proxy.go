@@ -291,6 +291,7 @@ type Proxy struct {
 	connMu      sync.Mutex
 	connEpoch   []int64
 	connCancel  []func()
+	connRelay   []string // the relay each connection was handed at resolveTURNAddr; "" between sessions (relaymarkend.go)
 	pathRestart pathRestart
 
 	// ups records when sessions came up, per connection and proxy-wide — what
@@ -612,6 +613,7 @@ func NewProxy(cfg Config) *Proxy {
 		lastRxAt:          make([]atomic.Int64, cfg.NumConns),
 		connLocalIPs:      make([]atomic.Value, cfg.NumConns),
 		connEpoch:         make([]int64, cfg.NumConns),
+		connRelay:         make([]string, cfg.NumConns),
 		connCancel:        make([]func(), cfg.NumConns),
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
@@ -650,6 +652,9 @@ func NewProxy(cfg Config) *Proxy {
 	}
 	p.credPool = newCredPool(ctx, poolSize, cfg.CredPoolCooldown, cfg.CredCachePath, p.fetchFreshCreds)
 	p.credPool.setColdStartTarget(cfg.NumConns)
+	// A relay the pool marks UNREACHABLE ends the sessions still on it
+	// (relaymarkend.go); the pool calls this outside its lock.
+	p.credPool.onRelayMarked = func(addr string) { p.endSessionsOnRelay(addr) }
 	// The TURN override is applied when a credential is HANDED OUT, to every
 	// credential — the cache's included (issue #102: an override that did not
 	// reach a cached credential kept the client on a dead relay).
@@ -2279,9 +2284,12 @@ func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *T
 		// The relay's pace, where the override list gives one, is this
 		// connection's uplink rate from here on and what its hello declares
 		// to the server (uplinkpace.go, groupPaceMagic). The hand-out is the
-		// one place a session learns its relay, on every transport.
+		// one place a session learns its relay, on every transport — so it
+		// is also where the proxy records which relay the connection sits
+		// on, for the day the relay is marked dead (relaymarkend.go).
 		kib, has := p.credPool.relayPace(addr)
 		setConnRelayPace(connIdx, kib, has)
+		p.setConnRelay(connIdx, addr)
 	}
 	return addr, creds, slot, err
 }
