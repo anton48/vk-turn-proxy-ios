@@ -147,7 +147,9 @@ enum ConfigValidation {
         guard let colon = s.lastIndex(of: ":") else { return nil }
         let base = String(s[..<colon])
         let field = String(s[s.index(after: colon)...])
-        guard !field.isEmpty, field.allSatisfy(\.isNumber), let pace = Int(field), let inner = turnOverrideQuota(base) else { return nil }
+        // Bounded by the field's wire form (Go's paceFieldMax, a uint16): a
+        // larger value would pace the uplink at one rate and declare another.
+        guard !field.isEmpty, field.allSatisfy(\.isNumber), let pace = Int(field), pace <= 65535, let inner = turnOverrideQuota(base) else { return nil }
         return (inner.hostPort, inner.quota, pace)
     }
 

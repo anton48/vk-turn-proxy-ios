@@ -546,6 +546,10 @@ func (o turnOverride) candidatesFor(creds *TURNCreds) []string {
 // uplink). Absent = each direction's default. The pace rides on the quota
 // field, never without it: both are the relay's own properties, and the
 // relay without a quota is the one with no policer.
+// paceFieldMax is the pace field's ceiling: the declaration's uint16, 65535
+// KiB/s (≈537 Mbit/s per connection — no relay of ours is near it).
+const paceFieldMax = 0xffff
+
 type turnEntry struct {
 	addr        string
 	quota, pace int
@@ -577,7 +581,13 @@ func parseTURNEntry(e string) (t turnEntry, ok bool) {
 	if _, _, err := net.SplitHostPort(base); err == nil {
 		return turnEntry{addr: base, quota: q, hasQuota: true}, true
 	}
-	// Two fields: the one just read was the pace, the one before it the quota.
+	// Two fields: the one just read was the pace, the one before it the
+	// quota. The pace is bounded by its wire form — the declaration carries
+	// a uint16 (groupPaceBytes) — so that the uplink and the downlink never
+	// read two rates off one field (the user's review of 9d58dda).
+	if q > paceFieldMax {
+		return turnEntry{}, false
+	}
 	base2, q2, ok := field(base)
 	if !ok {
 		return turnEntry{}, false

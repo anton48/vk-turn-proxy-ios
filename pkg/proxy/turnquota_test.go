@@ -5,7 +5,9 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1203,8 +1205,13 @@ func TestParseTURNServersAcceptsAPace(t *testing.T) {
 		}
 	}
 	// A pace rides on a quota field: no pace without one; digits only; no
-	// fifth field.
-	for _, bad := range []string{"relay.example:19302:0:x", "relay.example:19302:0:-1", "relay.example:19302:0:", "relay.example:19302:0:1:2", "relay.example:19302::500"} {
+	// fifth field; and no more than the wire's uint16 (65535 KiB/s) — the
+	// user's review of 9d58dda: the parser took 100000, the uplink paced at
+	// it and the declaration clamped it, two rates for one field.
+	if _, err := ParseTURNServers("relay.example:19302:0:65535"); err != nil {
+		t.Fatalf("the field's ceiling rejected: %v", err)
+	}
+	for _, bad := range []string{"relay.example:19302:0:x", "relay.example:19302:0:-1", "relay.example:19302:0:", "relay.example:19302:0:1:2", "relay.example:19302::500", "relay.example:19302:0:65536", "relay.example:19302:0:100000"} {
 		if _, err := ParseTURNServers(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
@@ -1244,5 +1251,38 @@ func TestResolveTURNServersKeepsThePace(t *testing.T) {
 	cp.override = o
 	if p, ok := cp.relayPace("203.0.113.5:3478"); !ok || p != 500 {
 		t.Fatalf("the pool's relayPace: %d %v, want 500", p, ok)
+	}
+}
+
+// A re-resolution of a NAME keeps the name's pace on its new IPs (the user's
+// review of 9d58dda): reresolveOverride replaced the addresses and the
+// quotas and left the old paces map — a relay that moved from A to B was
+// handed out as B with no pace, the uplink back at the toggle and nothing
+// declared to the server.
+func TestAReresolutionKeepsTheRelaysPace(t *testing.T) {
+	path := writeCache(t, t.TempDir(), credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA, relayB}, Username: futureUser("cached"), Password: "p"})
+	cp, _, _ := relayPool(t, path, relayC)
+	old := lookupTURNHost
+	t.Cleanup(func() { lookupTURNHost = old })
+	answer := ipR2
+	lookupTURNHost = func(ctx context.Context, host string) ([]net.IP, error) {
+		if host != nameHost {
+			return nil, errors.New("unknown host")
+		}
+		return []net.IP{net.ParseIP(answer)}, nil
+	}
+	cp.setOverride(turnOverride{servers: []string{ipR1 + ":19302:0:500", TURNServersVK}, raw: []string{nameRelay + ":0:500", TURNServersVK}})
+	if kib, ok := cp.relayPace(ipR1 + ":19302"); !ok || kib != 500 {
+		t.Fatalf("before: the pace of %s is %d %v, want 500", ipR1, kib, ok)
+	}
+	cp.reresolveOverride("test", false)
+	if got := strings.Join(cp.overrideServers(), ","); got != ipR2+":19302,"+TURNServersVK {
+		t.Fatalf("the list after the re-resolution: %s", got)
+	}
+	if kib, ok := cp.relayPace(ipR2 + ":19302"); !ok || kib != 500 {
+		t.Fatalf("after: the pace of %s is %d %v, want the name's 500", ipR2, kib, ok)
+	}
+	if q, ok := cp.override.quota(ipR2 + ":19302"); !ok || q != 0 {
+		t.Fatalf("after: the quota of %s is %d %v, want the name's 0", ipR2, q, ok)
 	}
 }

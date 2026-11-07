@@ -2702,7 +2702,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				lastTickAt = now
 				// The tick's ping is ONE body for both session kinds — seq and the stamp a
 				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
-				if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil {
+				if err := p.tickPing(&seq, &lastPingAt, now, sendPing, dtlsConn, connIdx); err != nil {
 					// ONE verdict for both session kinds (pingWriteFailed, wakeprobe.go,
 					// build 469): the connection gone ends the session here; any other
 					// error leaves the goroutine — and the zombie detector below — alive.
@@ -5084,8 +5084,16 @@ func (p *Proxy) sendGroupHello(w io.Writer, connIdx int) {
 	}
 	// The relay's pace, where its override entry has the field: declared
 	// behind the hello, so the server pairs it with the connection the hello
-	// just grouped (groupPaceMagic). Ignored on error like the rest — an
-	// undeclared connection runs at the server's default.
+	// just grouped (groupPaceMagic), and again behind every tick's ping
+	// (tickPing) — a lost copy heals by repetition.
+	p.sendPaceDeclaration(w, connIdx)
+}
+
+// sendPaceDeclaration writes the declaration of connIdx's relay's pace, where
+// the relay has the field; nothing otherwise. Ignored on error like the hello
+// and the sentinels: the next tick writes it again, and a connection the
+// server never hears it from runs at the server's default.
+func (p *Proxy) sendPaceDeclaration(w io.Writer, connIdx int) {
 	if kib, ok := connRelayPace(connIdx); ok {
 		_, _ = w.Write(groupPaceBytes(kib))
 	}
@@ -5446,7 +5454,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				lastTickAt = now
 				// The tick's ping is ONE body for both session kinds — seq and the stamp a
 				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
-				if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil {
+				if err := p.tickPing(&seq, &lastPingAt, now, sendPing, srtpConn, connIdx); err != nil {
 					// The one verdict — see the DTLS session's tick (pingWriteFailed).
 					if p.pingWriteFailed(connCtx, connIdx, credSlot, "SRTP ", err, connCancel) {
 						return

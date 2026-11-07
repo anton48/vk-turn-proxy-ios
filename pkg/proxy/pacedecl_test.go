@@ -4,7 +4,9 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"testing"
+	"time"
 )
 
 // 2026-11-07, the user's design: the pace of a relay reaches the SERVER's
@@ -84,5 +86,49 @@ func TestTheHelloIsFollowedByTheRelaysPaceDeclaration(t *testing.T) {
 	(&Proxy{}).sendGroupHello(&buf, 2)
 	if buf.Len() != 0 {
 		t.Fatalf("a disabled hello still wrote %d bytes", buf.Len())
+	}
+}
+
+// The declaration goes AGAIN with every tick's ping (the user's review of
+// 9d58dda): one write behind the hello, its error ignored, was the only copy
+// — and relay → server is UDP whatever the leg to the relay, so a successful
+// write is no delivery. Lost, a «no pacer» left the server pacing the own
+// relay for the session, a positive rate under a server with its pacer off
+// never took. A repeat is 20 bytes per tick; the server reads the same word
+// as no change. Nothing after a failed ping (the connection is being judged);
+// nothing for a connection whose relay has no field.
+//
+// SABOTAGE SEEN TO FAIL: tickPing writes no declaration. Compiles; the
+// buffer then stays empty across the ticks.
+func TestTheDeclarationGoesAgainWithEveryTicksPing(t *testing.T) {
+	resetPace()
+	t.Cleanup(resetPace)
+	p := &Proxy{}
+	setConnRelayPace(2, 500, true)
+	var seq uint64
+	var lastPingAt time.Time
+	pings := 0
+	send := func(uint64, time.Time) error { pings++; return nil }
+
+	var buf bytes.Buffer
+	for i := 0; i < 3; i++ {
+		if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := bytes.Repeat(groupPaceBytes(500), 3)
+	if pings != 3 || !bytes.Equal(buf.Bytes(), want) {
+		t.Fatalf("after 3 ticks: %d pings, the conn got %x — want the declaration of 500 behind each ping", pings, buf.Bytes())
+	}
+
+	// A failed ping: nothing behind it.
+	buf.Reset()
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), func(uint64, time.Time) error { return errors.New("gone") }, &buf, 2); err == nil || buf.Len() != 0 {
+		t.Fatalf("a failed ping: err %v, %d bytes written after it", err, buf.Len())
+	}
+	// No field: no declaration.
+	buf.Reset()
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 3); err != nil || buf.Len() != 0 {
+		t.Fatalf("a relay without the field: err %v, %d bytes written", err, buf.Len())
 	}
 }

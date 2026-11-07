@@ -4737,8 +4737,8 @@ do {
     // the quota field (turnOverridePace reads the pace and hands the rest to
     // turnOverrideQuota). The validator accepts it, the parser passes it to Go
     // as typed (Go's parseTURNEntry reads it), the editor's field names it.
-    check(cv.contains("static func turnOverridePace(_ s: String) -> (hostPort: String, quota: Int, pace: Int)? {") && cv.contains("let pace = Int(field), let inner = turnOverrideQuota(base)"),
-          "turnOverridePace reads host:port:digits:digits — the pace behind the quota, never without it")
+    check(cv.contains("static func turnOverridePace(_ s: String) -> (hostPort: String, quota: Int, pace: Int)? {") && cv.contains("let pace = Int(field), pace <= 65535, let inner = turnOverrideQuota(base)"),
+          "turnOverridePace reads host:port:digits:digits — the pace behind the quota, never without it, and no more than the wire's uint16")
     check(cv.contains("host:port[:quota[:pace]] entries (or \\(turnServersVK))"), "the validator's warning names the pace field")
     // A list typed without its quota field read as a quota defect: the parsed
     // list and the resolved one both hide what the field held. The log says the

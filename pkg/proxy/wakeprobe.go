@@ -451,7 +451,7 @@ func pingStamp(wokeInside bool, started, finished time.Time) time.Time {
 // pong from before the sleep for an answer. Now the stamp is voided the moment
 // seq moves, and says afterwards what pingStamp allows — here and in the probe's
 // own ping alike; nobody else writes either of the two.
-func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send func(seq uint64, now time.Time) error) error {
+func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send func(seq uint64, now time.Time) error, conn io.Writer, connIdx int) error {
 	*seq++
 	*lastPingAt = time.Time{} // seq names a ping that is not sent yet: the stamp of the one before says nothing about it
 	epoch := p.wakeEpoch.Load()
@@ -459,6 +459,12 @@ func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send
 		return err
 	}
 	*lastPingAt = pingStamp(p.wakeEpoch.Load() != epoch, now, wakeProbeClock())
+	// The relay's pace declared AGAIN behind every tick's ping (the user's
+	// review of 9d58dda): the one copy behind the hello is a UDP datagram on
+	// the relay → server leg whatever the leg to the relay, and a lost copy
+	// left the server at the wrong rate for the session. The server reads a
+	// repeat of the same word as no change; 20 bytes per tick.
+	p.sendPaceDeclaration(conn, connIdx)
 	return nil
 }
 

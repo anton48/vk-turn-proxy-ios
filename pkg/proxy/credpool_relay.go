@@ -472,7 +472,7 @@ func (cp *credPool) reresolveOverride(reason string, limited bool) {
 		cp.mu.Unlock()
 		return
 	}
-	cp.override.servers, cp.override.quotas = next.servers, next.quotas
+	cp.override.servers, cp.override.quotas, cp.override.paces = next.servers, next.quotas, next.paces // the name's fields on its new IPs — the paces too (the user's review of 9d58dda)
 	servers = next.servers
 	if cp.mode == credCacheModeCookie {
 		cp.growForListLocked()               // more fixed entries: more slots, VK's kept
