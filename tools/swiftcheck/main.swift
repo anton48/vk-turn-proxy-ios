@@ -4750,7 +4750,10 @@ do {
     if let e = TurnOverrideEntry.parse("relay.example:19302:0") {
         check(e.hostPort == "relay.example:19302" && e.quota == 0 && e.pace == nil, "host:port:quota: the quota alone")
     }
-    for bad in ["relay.example:19302:10:65536", "relay.example:19302:0:65536", "relay.example:19302:1:2:3", "relay.example:19302:x", "relay.example:19302::500", "relay.example:0", "relay.example", "relay.example:19302:-1", "[2001:db8::1]", "2001:db8::1:19302"] {
+    // The quota and the pace are CANONICAL numbers, as Go reads them (f ==
+    // strconv.Itoa(n)): `0:00` and `10:0247` passed here and Go dropped the
+    // relay from the list (the user's review of 15c8e98).
+    for bad in ["relay.example:19302:10:65536", "relay.example:19302:0:65536", "relay.example:19302:1:2:3", "relay.example:19302:x", "relay.example:19302::500", "relay.example:0", "relay.example", "relay.example:19302:-1", "[2001:db8::1]", "2001:db8::1:19302", "198.51.100.7:19302:0:00", "198.51.100.7:19302:10:0247", "198.51.100.7:19302:00", "198.51.100.7:19302:010:5"] {
         check(TurnOverrideEntry.parse(bad) == nil, "🚨 the strict parser refuses \(bad)")
     }
     check(cv.contains("host:port[:quota[:pace]] entries (or \\(turnServersVK))"), "the validator's warning names the pace field")

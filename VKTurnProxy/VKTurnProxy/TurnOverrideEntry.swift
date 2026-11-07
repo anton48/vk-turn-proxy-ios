@@ -54,8 +54,13 @@ enum TurnOverrideEntry {
         let fields = rest.split(separator: ":", omittingEmptySubsequences: false)
         guard (1...3).contains(fields.count) else { return nil }
         var numbers: [Int] = []
-        for f in fields {
+        for (i, f) in fields.enumerated() {
             guard !f.isEmpty, f.allSatisfy(\.isNumber), let n = Int(f) else { return nil }
+            // The quota and the pace are CANONICAL numbers — as Go reads them
+            // (f == strconv.Itoa(n)): `0:00` and `10:0247` passed here once and
+            // Go dropped the relay from the list (the user's review of 15c8e98).
+            // The port is read as Go reads it, by its value.
+            if i > 0, String(n) != f { return nil }
             numbers.append(n)
         }
         guard (1...65535).contains(numbers[0]) else { return nil }
