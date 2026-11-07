@@ -288,11 +288,13 @@ type Proxy struct {
 	// the epoch each running session stamped at its start and the cancel that
 	// restarts it, both under connMu so a restart never hits a session that
 	// started after its epoch.
-	connMu      sync.Mutex
-	connEpoch   []int64
-	connCancel  []func()
-	connRelay   []string // the relay each connection was handed at resolveTURNAddr; "" between sessions (relaymarkend.go)
-	pathRestart pathRestart
+	connMu       sync.Mutex
+	connEpoch    []int64
+	connCancel   []func()
+	connRelay    []string // the relay each connection was handed at resolveTURNAddr; "" between sessions (relaymarkend.go)
+	connRelaySeq []uint64 // the hand-out's stamp (relayHandSeq at setConnRelay): a mark's notice ends only sessions handed their relay before it
+	relayHandSeq atomic.Uint64
+	pathRestart  pathRestart
 
 	// ups records when sessions came up, per connection and proxy-wide — what
 	// the retry floor asks about (retryfloor.go).
@@ -614,6 +616,7 @@ func NewProxy(cfg Config) *Proxy {
 		connLocalIPs:      make([]atomic.Value, cfg.NumConns),
 		connEpoch:         make([]int64, cfg.NumConns),
 		connRelay:         make([]string, cfg.NumConns),
+		connRelaySeq:      make([]uint64, cfg.NumConns),
 		connCancel:        make([]func(), cfg.NumConns),
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
@@ -654,7 +657,8 @@ func NewProxy(cfg Config) *Proxy {
 	p.credPool.setColdStartTarget(cfg.NumConns)
 	// A relay the pool marks UNREACHABLE ends the sessions still on it
 	// (relaymarkend.go); the pool calls this outside its lock.
-	p.credPool.onRelayMarked = func(addr string) { p.endSessionsOnRelay(addr) }
+	p.credPool.onRelayMarked = func(addr string, stamp uint64) { p.endSessionsOnRelay(addr, stamp) }
+	p.credPool.markStamp = p.relayHandSeq.Load // read under the pool's lock at the mark: the notice reaches only hand-outs before it
 	// The TURN override is applied when a credential is HANDED OUT, to every
 	// credential — the cache's included (issue #102: an override that did not
 	// reach a cached credential kept the client on a dead relay).

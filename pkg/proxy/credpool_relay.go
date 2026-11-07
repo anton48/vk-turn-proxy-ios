@@ -278,8 +278,9 @@ func (cp *credPool) noteRelayUnanswered(connIdx, slot int, creds *TURNCreds, add
 		log.Printf("credpool: conn %d: relay %s did not answer — not marked (nothing else has answered since); the next attempt takes the next address", connIdx, addr)
 	}
 	newly := cp.newlyDeadLocked(before)
+	stamp := cp.stampLocked()
 	cp.mu.Unlock()
-	cp.fireRelayMarked(newly)
+	cp.fireRelayMarked(newly, stamp)
 }
 
 // deadAddrsLocked: the relays marked UNREACHABLE now.
@@ -304,15 +305,15 @@ func (cp *credPool) newlyDeadLocked(before map[string]bool) []string {
 	return out
 }
 
-// fireRelayMarked tells the hook of every newly marked relay — OUTSIDE the
-// pool's lock: the hook ends sessions whose re-dials ask the pool
-// (relaymarkend.go).
-func (cp *credPool) fireRelayMarked(addrs []string) {
+// fireRelayMarked tells the hook of every newly marked relay, with the
+// hand-out stamp read at the mark — OUTSIDE the pool's lock: the hook ends
+// sessions whose re-dials ask the pool (relaymarkend.go).
+func (cp *credPool) fireRelayMarked(addrs []string, stamp uint64) {
 	if cp.onRelayMarked == nil {
 		return
 	}
 	for _, a := range addrs {
-		cp.onRelayMarked(a)
+		cp.onRelayMarked(a, stamp)
 	}
 }
 
@@ -332,8 +333,19 @@ func (cp *credPool) noteAllocatedAt(slot int, creds *TURNCreds, addr string, sta
 	if len(newly) > 0 {
 		log.Printf("credpool: relay %s answered — %d relay(s) unanswered since the previous answer marked UNREACHABLE", addr, len(newly))
 	}
+	stamp := cp.stampLocked()
 	cp.mu.Unlock()
-	cp.fireRelayMarked(newly)
+	cp.fireRelayMarked(newly, stamp)
+}
+
+// stampLocked: the proxy's hand-out counter as it stands now, under the
+// lock — the notice of a mark carries it (relaymarkend.go); no proxy
+// (tests, csqtt's pool) = every hand-out.
+func (cp *credPool) stampLocked() uint64 {
+	if cp.markStamp == nil {
+		return ^uint64(0)
+	}
+	return cp.markStamp()
 }
 
 func (cp *credPool) deadCountLocked() int {
@@ -349,11 +361,19 @@ func (cp *credPool) deadCountLocked() int {
 // noteVKAnsweredLocked: VK's API minted a credential (the fetch begun at
 // start) — the network works.
 func (cp *credPool) noteVKAnsweredLocked(start time.Time) {
-	before := cp.deadCountLocked()
+	before := cp.deadAddrsLocked()
 	cp.health.answered("", start)
-	if after := cp.deadCountLocked(); after > before {
-		log.Printf("credpool: VK answered — %d relay(s) unanswered since the previous answer marked UNREACHABLE", after-before)
+	newly := cp.newlyDeadLocked(before)
+	if len(newly) == 0 {
+		return
 	}
+	log.Printf("credpool: VK answered — %d relay(s) unanswered since the previous answer marked UNREACHABLE", len(newly))
+	// The third way a relay gets marked fires the hook too (the user's review
+	// of 589dfb2) — from a goroutine, since this runs under the lock inside
+	// get and tryFill, across several of their returns; the stamp is read
+	// here, under the lock, as on the other two paths.
+	stamp := cp.stampLocked()
+	go cp.fireRelayMarked(newly, stamp)
 }
 
 // noteMintLocked: a fresh credential landed in slot. With no candidate to
