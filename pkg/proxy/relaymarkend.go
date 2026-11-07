@@ -38,18 +38,48 @@ import "log"
 // and the hook's run the pool's lock is released; a notice naming only the
 // address could arrive late — a path change clears the marks meanwhile, a
 // NEW session is handed the same relay and allocates — and end that new
-// session. So every hand-out stamps the connection (relayHandSeq, read at
-// setConnRelay), the pool reads the counter UNDER its lock at the mark
-// (markStamp) and hands it over with the address, and the ending spares every
-// session handed its relay after the stamp. The same stamp also spares the
-// one re-try of a marked relay (hasCandidate's probe), handed out after the
-// mark by construction. And a relay gets marked by THREE paths — the failing
-// attempt's own verdict, a neighbour's answer, VK's API answering a mint —
-// and all three fire the hook (the third from a goroutine: its callers hold
-// the lock across several returns).
+// session. So every hand-out is stamped, the pool reads the counter UNDER
+// its lock at the mark and hands it over with the address, and the ending
+// spares every session handed its relay after the stamp. The same stamp also
+// spares the one re-try of a marked relay (hasCandidate's probe), handed out
+// after the mark by construction. And a relay gets marked by THREE paths —
+// the failing attempt's own verdict, a neighbour's answer, VK's API answering
+// a mint — and all three fire the hook (the third from a goroutine: its
+// callers hold the lock across several returns).
+//
+// THE STAMP IS THE POOL'S, MOVED AT THE HAND-OUT UNDER THE POOL'S LOCK (the
+// user's review of 6e86895). The first cut moved a counter of the proxy's in
+// setConnRelay — AFTER get had returned and released the pool's lock — so a
+// mark falling between the two read a stamp below the hand-out's own, and
+// the notice spared a session that had been handed the relay BEFORE the mark:
+// it went on to dial the dead relay. Now the counter moves inside get, where
+// the address is handed out (credPool.stampHandOutLocked), the mark reads it
+// under the same lock and records it on the relay (relayRecord.markSeq), and
+// the record of a hand-out (recordHandOut) asks whether its relay was marked
+// at or after the hand-out — the notice may have run before the record
+// existed — and ends the session itself.
 
-// setConnRelay records the relay connIdx was handed (resolveTURNAddr).
-func (p *Proxy) setConnRelay(connIdx int, addr string) {
+// recordHandOut records the relay connIdx was handed (resolveTURNAddr, the one
+// hand-out site) with the pool's stamp of that hand-out, and asks whether the
+// relay was marked at or after it meanwhile — the mark's notice may have run
+// before this record existed — in which case the session is ended here, as
+// the notice would have ended it.
+func (p *Proxy) recordHandOut(connIdx int, addr string) {
+	if p.credPool == nil {
+		p.setConnRelay(connIdx, addr, 0)
+		return
+	}
+	seq := p.credPool.handStampOf(connIdx)
+	p.setConnRelay(connIdx, addr, seq)
+	if markSeq, dead := p.credPool.relayMarkedSince(addr); dead && markSeq >= seq {
+		p.endConnOnMarkedRelay(connIdx, addr)
+	}
+}
+
+// setConnRelay records the relay connIdx was handed and the hand-out's stamp
+// (the pool's counter at the hand-out): a mark's notice reaches only
+// hand-outs stamped at or below the stamp it carries.
+func (p *Proxy) setConnRelay(connIdx int, addr string, seq uint64) {
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
 	if connIdx < 0 || connIdx >= len(p.connRelay) {
@@ -57,7 +87,24 @@ func (p *Proxy) setConnRelay(connIdx int, addr string) {
 	}
 	p.connRelay[connIdx] = addr
 	if connIdx < len(p.connRelaySeq) {
-		p.connRelaySeq[connIdx] = p.relayHandSeq.Add(1) // this hand-out's stamp: a mark's notice reaches only hand-outs before it
+		p.connRelaySeq[connIdx] = seq
+	}
+}
+
+// endConnOnMarkedRelay cancels connIdx's running session: its relay was
+// marked UNREACHABLE between the hand-out and its record (recordHandOut).
+func (p *Proxy) endConnOnMarkedRelay(connIdx int, addr string) {
+	if p.ctx != nil && p.ctx.Err() != nil {
+		return
+	}
+	p.connMu.Lock()
+	ended := connIdx >= 0 && connIdx < len(p.connCancel) && p.connCancel[connIdx] != nil
+	if ended {
+		p.connCancel[connIdx]()
+	}
+	p.connMu.Unlock()
+	if ended {
+		log.Printf("proxy: conn %d: relay %s was marked UNREACHABLE right behind this hand-out — the session ends before it dials; the re-dial takes the next address", connIdx, addr)
 	}
 }
 

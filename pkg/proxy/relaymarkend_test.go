@@ -30,11 +30,11 @@ func TestAMarkedRelayEndsTheSessionsStillOnIt(t *testing.T) {
 		i := i
 		p.beginConnSession(i, func() { ended[i]++ })
 	}
-	p.setConnRelay(0, relayA)
-	p.setConnRelay(1, relayA)
-	p.setConnRelay(2, relayB)
+	p.setConnRelay(0, relayA, 1)
+	p.setConnRelay(1, relayA, 2)
+	p.setConnRelay(2, relayB, 3)
 	// conn 3: no session.
-	if n := p.endSessionsOnRelay(relayA, p.relayHandSeq.Load()); n != 2 || ended != [4]int{1, 1, 0, 0} {
+	if n := p.endSessionsOnRelay(relayA, 3); n != 2 || ended != [4]int{1, 1, 0, 0} {
 		t.Fatalf("ended %d, cancels %v — want the two sessions on A and nothing else", n, ended)
 	}
 	// A session that ended forgets its relay: the next mark finds nothing of it.
@@ -42,10 +42,10 @@ func TestAMarkedRelayEndsTheSessionsStillOnIt(t *testing.T) {
 	if r, _ := p.connRelayOf(0); r != "" {
 		t.Fatalf("conn 0's relay after its session ended: %q", r)
 	}
-	if n := p.endSessionsOnRelay(relayA, p.relayHandSeq.Load()); n != 1 || ended[0] != 1 {
+	if n := p.endSessionsOnRelay(relayA, 3); n != 1 || ended[0] != 1 {
 		t.Fatalf("the second mark ended %d (conn 0 again: %d) — want conn 1 alone, conn 0's old cancel never again", n, ended[0])
 	}
-	if p.endSessionsOnRelay("203.0.113.99:1", p.relayHandSeq.Load()) != 0 {
+	if p.endSessionsOnRelay("203.0.113.99:1", 3) != 0 {
 		t.Fatal("a relay nobody is on ended something")
 	}
 }
@@ -143,7 +143,7 @@ func TestTheRelayMarkEndingIsWired(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := string(b)
-	for _, want := range []string{"p.setConnRelay(connIdx, addr)", "p.credPool.onRelayMarked = func(addr string, stamp uint64) { p.endSessionsOnRelay(addr, stamp) }", "p.credPool.markStamp = p.relayHandSeq.Load"} {
+	for _, want := range []string{"p.recordHandOut(connIdx, addr)", "p.credPool.onRelayMarked = func(addr string, stamp uint64) { p.endSessionsOnRelay(addr, stamp) }"} {
 		if strings.Count(src, want) != 1 {
 			t.Errorf("proxy.go holds %d × %q, want 1", strings.Count(src, want), want)
 		}
@@ -207,7 +207,7 @@ func TestAVKAnswerThatMarksARelayEndsItsSessions(t *testing.T) {
 // (2) A notice that arrives late — the mark made, the lock released, a path change
 // clearing the marks, a NEW session handed the same relay and allocated — must not
 // end that new session. The notice carries the proxy's hand-out stamp as it stood at
-// the mark (read under the pool's lock through markStamp), and the ending spares
+// the mark (read under the pool's lock, the pool's own counter), and the ending spares
 // every session handed its relay after it.
 func TestALateNoticeSparesASessionHandedTheRelayAfterTheMark(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -218,10 +218,10 @@ func TestALateNoticeSparesASessionHandedTheRelayAfterTheMark(t *testing.T) {
 		i := i
 		p.beginConnSession(i, func() { ended[i]++ })
 	}
-	p.setConnRelay(0, relayA)
-	p.setConnRelay(1, relayA)
-	stamp := p.relayHandSeq.Load() // the mark happens here
-	p.setConnRelay(2, relayA)      // handed A after the mark (a path change cleared it, say)
+	p.setConnRelay(0, relayA, 1)
+	p.setConnRelay(1, relayA, 2)
+	stamp := uint64(2)           // the mark happens here
+	p.setConnRelay(2, relayA, 3) // handed A after the mark (a path change cleared it, say)
 	if n := p.endSessionsOnRelay(relayA, stamp); n != 2 || ended != [3]int{1, 1, 0} {
 		t.Fatalf("ended %d, cancels %v — want the two sessions handed A before the mark, the later one spared", n, ended)
 	}
@@ -231,20 +231,25 @@ func TestALateNoticeSparesASessionHandedTheRelayAfterTheMark(t *testing.T) {
 	p.endConnSession(0)
 	p.endConnSession(1)
 	p.beginConnSession(0, func() { ended[0]++ })
-	p.setConnRelay(0, relayA)
+	p.setConnRelay(0, relayA, 4)
 	if n := p.endSessionsOnRelay(relayA, stamp); n != 0 {
 		t.Fatalf("an old notice ended %d fresh session(s)", n)
 	}
 }
 
-// The pool reads the stamp UNDER its lock, at the mark, on all three paths.
+// The pool reads the stamp UNDER its lock, at the mark, on all three paths — its
+// own hand-out counter, moved by every hand-out under that lock.
 func TestTheNoticeCarriesTheStampReadAtTheMark(t *testing.T) {
 	path := writeCache(t, t.TempDir(), credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA, relayB}, Username: futureUser("cached"), Password: "p"})
 	cp, _, _ := relayPool(t, path, relayC)
 	clock := time.Now()
 	cp.health.now = func() time.Time { return clock }
-	var stampAt uint64 = 7
-	cp.markStamp = func() uint64 { return stampAt }
+	setSeq := func(n uint64) {
+		cp.mu.Lock()
+		cp.handSeq = n
+		cp.mu.Unlock()
+	}
+	setSeq(7)
 	got := make(chan uint64, 8)
 	cp.onRelayMarked = func(addr string, stamp uint64) { got <- stamp }
 	take := func(name string) uint64 {
@@ -269,18 +274,21 @@ func TestTheNoticeCarriesTheStampReadAtTheMark(t *testing.T) {
 	}
 	// The neighbour's-answer path.
 	cp.health.pathChanged()
-	stampAt = 11
+	setSeq(11)
 	clock = clock.Add(70 * time.Second)
 	cp.noteRelayUnanswered(2, 0, nil, relayC, clock)
 	clock = clock.Add(5 * time.Second)
-	addr, creds, slot := mustGet(t, cp, 3)
+	addr, creds, slot := mustGet(t, cp, 3) // a hand-out: the counter moves to 12, under the lock
+	if got := cp.handStampOf(3); got != 12 {
+		t.Fatalf("the hand-out's stamp is %d, want 12", got)
+	}
 	cp.noteAllocatedAt(slot, creds, addr, time.Time{})
-	if s := take("neighbour"); s != 11 {
-		t.Fatalf("the neighbour's notice carries stamp %d, want 11", s)
+	if s := take("neighbour"); s != 12 {
+		t.Fatalf("the neighbour's notice carries stamp %d, want 12 (the hand-out before it)", s)
 	}
 	// The VK path.
 	cp.health.pathChanged()
-	stampAt = 13
+	setSeq(13)
 	clock = clock.Add(70 * time.Second)
 	cp.noteRelayUnanswered(4, 0, nil, relayO, clock)
 	clock = clock.Add(5 * time.Second)
@@ -289,5 +297,79 @@ func TestTheNoticeCarriesTheStampReadAtTheMark(t *testing.T) {
 	cp.mu.Unlock()
 	if s := take("VK"); s != 13 {
 		t.Fatalf("VK's notice carries stamp %d, want 13", s)
+	}
+}
+
+// The user's review of 6e86895: the hand-out's stamp was taken AFTER the pool's
+// lock — in setConnRelay, under the proxy's own lock — while the pool read the
+// counter at the mark under ITS lock. The pool hands A out (under cp.mu) → another
+// goroutine marks A and reads the stamp before the hand-out moved it → the record
+// stamps the hand-out one higher → the notice spares it as «handed after the
+// mark», and the session dials the dead relay. Now the counter is the POOL's and
+// moves under its lock at the hand-out itself (get), every mark records on the
+// relay the stamp it saw, and the record of a hand-out (recordHandOut) asks
+// whether its relay was marked at or after it — and ends the session itself.
+func TestAMarkBetweenTheHandOutAndItsRecordEndsTheSession(t *testing.T) {
+	path := writeCache(t, t.TempDir(), credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA, relayB}, Username: futureUser("cached"), Password: "p"})
+	cp, _, _ := relayPool(t, path, relayC)
+	clock := time.Now()
+	cp.health.now = func() time.Time { return clock }
+	list, err := ParseTURNServers(relayO + ":0," + TURNServersVK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp.setOverride(turnOverride{servers: list})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := &Proxy{ctx: ctx, credPool: cp, connEpoch: make([]int64, 4), connCancel: make([]func(), 4), connRelay: make([]string, 4), connRelaySeq: make([]uint64, 4)}
+	cp.onRelayMarked = func(addr string, stamp uint64) { p.endSessionsOnRelay(addr, stamp) }
+	var ended [4]int
+	p.beginConnSession(0, func() { ended[0]++ })
+	// The pool hands conn 0 its relay — O, without a quota and untried.
+	addr, _, _ := mustGet(t, cp, 0)
+	if addr != relayO {
+		t.Fatalf("the fixture handed %s, want the own relay", addr)
+	}
+	// Before the proxy records the hand-out, O is marked: conn 1's attempt on it
+	// got no answer while B answered after that attempt began. The notice finds
+	// no session recorded on O yet.
+	cp.health.answered(relayB, time.Time{})
+	clock = clock.Add(10 * time.Second)
+	begun := clock
+	clock = clock.Add(2 * time.Second)
+	cp.health.answered(relayB, time.Time{})
+	clock = clock.Add(3 * time.Second)
+	cp.noteRelayUnanswered(1, 0, nil, relayO, begun)
+	if !cp.health.isDead(relayO) {
+		t.Fatal("the fixture: O was not marked")
+	}
+	if ended[0] != 0 {
+		t.Fatalf("the notice ended a session the proxy had not recorded: %d", ended[0])
+	}
+	// The record of the hand-out, after the mark: the hand-out was made BEFORE
+	// the mark, so the session is ended here.
+	p.recordHandOut(0, addr)
+	if ended[0] != 1 {
+		t.Fatalf("the session handed O before the mark went on to dial it: ended %d, want 1", ended[0])
+	}
+	// A hand-out stamped AFTER the mark — the one re-try of a marked relay — is
+	// recorded and spared: the mark is not about it.
+	cp.mu.Lock()
+	cp.handSeq++
+	cp.handStamp[2] = cp.handSeq
+	cp.mu.Unlock()
+	p.beginConnSession(2, func() { ended[2]++ })
+	p.recordHandOut(2, relayO)
+	if ended[2] != 0 {
+		t.Fatalf("the re-try handed O after the mark was ended at its record: %d", ended[2])
+	}
+	// A hand-out after a path change is not ended by the old mark (O untried again).
+	cp.health.pathChanged()
+	p.endConnSession(0)
+	p.beginConnSession(0, func() { ended[0]++ })
+	addr, _, _ = mustGet(t, cp, 0)
+	p.recordHandOut(0, addr)
+	if ended[0] != 1 {
+		t.Fatalf("a hand-out after the mark was ended: %d", ended[0])
 	}
 }

@@ -93,6 +93,7 @@ type relayRecord struct {
 	claimedUntil    time.Time // a re-try is out on this address until then
 	claimedAt       time.Time // when that re-try was handed out: a result belongs to it only if its attempt began after
 	answeredAt      time.Time // the relay's own last answer: an attempt begun before it says nothing about the relay
+	markSeq         uint64    // the pool's hand-out counter at the mark (credpool_relay.go): a hand-out stamped at or below it was made before the mark
 }
 
 type relayHealth struct {

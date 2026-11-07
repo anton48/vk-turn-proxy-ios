@@ -294,11 +294,13 @@ func (cp *credPool) deadAddrsLocked() map[string]bool {
 	return out
 }
 
-// newlyDeadLocked: the relays marked since `before` was taken.
+// newlyDeadLocked: the relays marked since `before` was taken; each records
+// the hand-out stamp its mark saw (relayMarkedSince reads it).
 func (cp *credPool) newlyDeadLocked(before map[string]bool) []string {
 	var out []string
 	for a, r := range cp.health.rec {
 		if r.dead && !before[a] {
+			r.markSeq = cp.handSeq
 			out = append(out, a)
 		}
 	}
@@ -338,14 +340,45 @@ func (cp *credPool) noteAllocatedAt(slot int, creds *TURNCreds, addr string, sta
 	cp.fireRelayMarked(newly, stamp)
 }
 
-// stampLocked: the proxy's hand-out counter as it stands now, under the
-// lock — the notice of a mark carries it (relaymarkend.go); no proxy
-// (tests, csqtt's pool) = every hand-out.
+// stampLocked: the hand-out counter as it stands now, under the lock — the
+// notice of a mark carries it (relaymarkend.go). The counter is the POOL's
+// and moves where an address is handed out, under this same lock (get →
+// stampHandOutLocked): a hand-out and a mark are thereby ordered — a stamp
+// at or below the mark's was made before it (the user's review of 6e86895:
+// a counter moved after get returned let a mark in between read a stamp
+// below the hand-out's own, and the notice spared the session).
 func (cp *credPool) stampLocked() uint64 {
-	if cp.markStamp == nil {
-		return ^uint64(0)
+	return cp.handSeq
+}
+
+// stampHandOutLocked moves the hand-out counter for connIdx's hand-out, under
+// the lock, at the moment the address is handed out.
+func (cp *credPool) stampHandOutLocked(connIdx int) {
+	cp.handSeq++
+	if cp.handStamp == nil {
+		cp.handStamp = map[int]uint64{}
 	}
-	return cp.markStamp()
+	cp.handStamp[connIdx] = cp.handSeq
+}
+
+// handStampOf: the stamp of connIdx's latest hand-out (0 = none).
+func (cp *credPool) handStampOf(connIdx int) uint64 {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.handStamp[connIdx]
+}
+
+// relayMarkedSince: whether addr is marked UNREACHABLE now and the stamp its
+// mark saw — the record of a hand-out asks it (recordHandOut): a hand-out
+// stamped at or below it was made before the mark and is ended there.
+func (cp *credPool) relayMarkedSince(addr string) (uint64, bool) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	r := cp.health.rec[addr]
+	if r == nil || !r.dead {
+		return 0, false
+	}
+	return r.markSeq, true
 }
 
 func (cp *credPool) deadCountLocked() int {

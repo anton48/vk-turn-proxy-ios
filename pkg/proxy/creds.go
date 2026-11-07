@@ -1189,7 +1189,8 @@ type credCacheEntry struct {
 // block fast-path get() calls on other conns' fresh slots.
 type credPool struct {
 	onRelayMarked func(addr string, stamp uint64) // told, outside the lock, of every relay newly marked UNREACHABLE with the proxy's hand-out stamp at the mark — the proxy ends the sessions handed that relay before it (relaymarkend.go)
-	markStamp     func() uint64                   // the proxy's hand-out counter, read under the lock at a mark; nil = no stamp (everything)
+	handSeq       uint64                          // the hand-out counter, moved UNDER THE LOCK at every address handed out (get → stampHandOutLocked); a mark reads it there and the notice carries it (relaymarkend.go)
+	handStamp     map[int]uint64                  // the stamp of each connection's latest hand-out, by connIdx (recordHandOut reads it)
 	mu       sync.Mutex
 	pool     []credPoolEntry // indexed by slot index; grown lazily up to size
 	nextGen  uint64          // last claim stamp handed out — see credPoolEntry.gen
@@ -2410,6 +2411,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			return "", nil, -1, park
 		}
 		cp.seatLocked(slot, addr)
+		cp.stampHandOutLocked(connIdx) // the hand-out's stamp, under the lock the hand-out is made under (relaymarkend.go)
 		e := cp.pool[slot]
 		capacity := cp.capOnLocked(addr)
 		seats := cp.seatsOnLocked(slot, addr)
