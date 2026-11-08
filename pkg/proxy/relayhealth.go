@@ -41,9 +41,11 @@ package proxy
 //     which never failed; the two attempts had not shared a moment of the
 //     network. The path's OWN answer (an errno — no route to host, refused,
 //     reset: §618's failover) keeps the rule above: the path spoke, a later
-//     answer inside the window is evidence. pathSpoke tells the two apart;
-//     the record keeps whether its streak was silent and when its latest
-//     attempt gave up. The cost: a black hole that DROPS marks one dial
+//     answer inside the window is evidence. pathSpoke tells the two apart
+//     (a closed set of errnos speaks; ETIMEDOUT is the kernel's silence); the
+//     record keeps whether its streak was silent and when its latest attempt
+//     gave up. An answer that does not overlap a silent streak ENDS it — the
+//     verdict void, the address untried again — never leaves it pending. The cost: a black hole that DROPS marks one dial
 //     timeout later, when the first answer overlaps the other connections'
 //     silent attempts; one connection alone never marks a silent relay —
 //     its cursor still moves it on.
@@ -269,6 +271,14 @@ func (h *relayHealth) answered(addr string, start time.Time) {
 		// timed out, and the first VK answer — to an attempt begun after
 		// those had given up — marked the own relay, which never failed.
 		if r.silent && (start.IsZero() || start.After(r.lastFailureAt)) {
+			// And the streak ENDS here (the user's review of b724d42): left
+			// open it was a third state the hand-out does not know — neither
+			// untried nor marked-and-due, so a credential naming that relay
+			// alone was never handed out again — and its old start kept a
+			// later, overlapping answer from marking a new streak. The
+			// verdict is void: the network's state during those attempts is
+			// unknown; the address is untried again on this path.
+			r.unanswered, r.unansweredSince, r.lastFailureAt, r.silent = 0, time.Time{}, time.Time{}, false
 			continue
 		}
 		if prev.IsZero() || !r.unansweredSince.Before(prev) {
@@ -453,15 +463,24 @@ func (h *relayHealth) deadList(cands []string) string {
 // pathSpoke: the failure was the PATH's own answer — an errno the network
 // returned for the attempt (no route to host, network unreachable, connection
 // refused, reset, broken pipe) — as opposed to SILENCE: a timeout, pion's
-// retransmissions run out, a deadline. The relay leg wraps its errors with %v,
-// so the text is read beside the errno in the chain.
+// retransmissions run out, a deadline, and the kernel's own ETIMEDOUT (its
+// retransmissions given up: nobody answered — the user's review of b724d42,
+// which had read every errno as the path's word). The set of errnos that
+// speak is closed; anything else is silence. The relay leg wraps its errors
+// with %v, so the text is read beside the errno in the chain.
 func pathSpoke(err error) bool {
 	if err == nil {
 		return false
 	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
-		return true
+		switch errno {
+		case syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ENETDOWN, syscall.EHOSTDOWN,
+			syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.ECONNABORTED, syscall.EPIPE:
+			return true // the path answered: no route, refused, reset
+		default:
+			return false // ETIMEDOUT (the kernel's own give-up), EAGAIN and the rest: silence (the user's review of b724d42)
+		}
 	}
 	s := err.Error()
 	for _, w := range []string{"no route to host", "network is unreachable", "network is down", "host is down", "connection refused", "connection reset", "broken pipe"} {

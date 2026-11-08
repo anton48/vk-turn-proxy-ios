@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -136,6 +137,10 @@ func TestTheDialErrorTellsSilenceFromThePathsAnswer(t *testing.T) {
 		errors.New("dial tcp 203.0.113.9:3478: connect: network is unreachable"),
 	}
 	silent := []error{
+		&net.OpError{Op: "dial", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ETIMEDOUT}}, // the kernel's give-up IS silence (the user's review of b724d42)
+		fmt.Errorf("SRTP dial to relay failed: %v", &net.OpError{Op: "dial", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ETIMEDOUT}}),
+		syscall.EAGAIN,
+		errors.New("dial tcp 203.0.113.9:3478: connect: operation timed out"),
 		errors.New("dial tcp 203.0.113.9:3478: i/o timeout"),
 		fmt.Errorf("allocate failed: %v", errors.New("all retransmissions failed for 1234")),
 		errors.New("context deadline exceeded"),
@@ -153,5 +158,98 @@ func TestTheDialErrorTellsSilenceFromThePathsAnswer(t *testing.T) {
 	}
 	if pathSpoke(nil) {
 		t.Error("nil spoke")
+	}
+}
+
+// The user's review of b724d42, finding 1: an answer that does not overlap a
+// silent streak used to leave the streak OPEN — unanswered > 0, not dead — a
+// state the hand-out does not know: neither untried nor marked-and-due, so a
+// credential naming only that relay was never handed out again, and the
+// streak's old start kept a LATER, overlapping answer from marking it. Now
+// such an answer ENDS the streak: the verdict is void (the network's state
+// during those attempts is unknown), the address is untried again on this
+// path, and a new streak begins with its own start.
+func TestANonOverlappingAnswerEndsASilentStreak(t *testing.T) {
+	T := time.Now()
+	h := newRelayHealth()
+	clock := T
+	h.now = func() time.Time { return clock }
+	h.pathChanged()
+	// O silent [1 … 9]; A's attempt [12 … 19] answered: no verdict on O — and
+	// no limbo either: O is untried again, a candidate.
+	clock = T.Add(9 * time.Second)
+	h.failed(relayO, T.Add(1*time.Second), true)
+	clock = T.Add(19 * time.Second)
+	h.answered(relayA, T.Add(12*time.Second))
+	if h.isDead(relayO) {
+		t.Fatal("marked without overlap")
+	}
+	if got := h.untried([]string{relayO}); len(got) != 1 {
+		t.Fatalf("after a non-overlapping answer O is not untried again: %v", got)
+	}
+	if !h.hasCandidate([]string{relayO}) {
+		t.Fatal("a credential naming O alone has no candidate — the hand-out would park")
+	}
+	// A NEW silent streak [21 … 29] and A's attempt [25 … 30] answered: they
+	// overlap — O is marked (the old streak's start no longer stands in the way).
+	clock = T.Add(29 * time.Second)
+	h.failed(relayO, T.Add(21*time.Second), true)
+	clock = T.Add(30 * time.Second)
+	h.answered(relayA, T.Add(25*time.Second))
+	if !h.isDead(relayO) {
+		t.Fatal("a new silent streak overlapped by an answer was not marked — the old streak's start stood in the way")
+	}
+}
+
+// The user's repro at the pool: one VK address, a silent failure on it, then
+// VK's API minting again for the same address — the pool hands the address
+// out again instead of parking for good.
+func TestASingleRelayComesBackAfterAnUnconfirmedTimeout(t *testing.T) {
+	cp, _, clock := relayPool(t, "", relayA)
+	addr, creds, slot := mustGet(t, cp, 0)
+	if addr != relayA {
+		t.Fatalf("handed %s, want the one address", addr)
+	}
+	cp.release(slot, creds, "")
+	// The attempt on A begins 5 s after the mint's answer and times out 8 s
+	// later; nothing else has answered meanwhile.
+	*clock = clock.Add(13 * time.Second)
+	cp.noteRelayFailure(0, slot, creds, relayA, clock.Add(-8*time.Second), true)
+	// The network recovers: VK's API answers a mint begun after the failure.
+	*clock = clock.Add(20 * time.Second)
+	cp.mu.Lock()
+	cp.noteVKAnsweredLocked(clock.Add(-2 * time.Second))
+	cp.mu.Unlock()
+	if cp.health.isDead(relayA) {
+		t.Fatal("the one address marked on an answer that did not overlap its silent attempt")
+	}
+	for _, later := range []time.Duration{3 * time.Minute, 20 * time.Minute, 60 * time.Minute} {
+		*clock = clock.Add(later)
+		got, _, _, err := cp.get(1, false)
+		if err != nil || got != relayA {
+			t.Fatalf("after %v the pool does not hand the one address out again: %q, %v", later, got, err)
+		}
+	}
+}
+
+// Finding 2: ETIMEDOUT through the relay leg's chain (net.OpError →
+// os.SyscallError → errno) is the kernel's give-up — silence — and takes no
+// evidence from before the attempt began.
+func TestETIMEDOUTIsSilenceThroughTheRelayLeg(t *testing.T) {
+	cp, _, clock := relayPool(t, "", relayA)
+	p := &Proxy{credPool: cp}
+	T := *clock
+	cp.mu.Lock()
+	cp.noteVKAnsweredLocked(T) // VK answered at T
+	cp.mu.Unlock()
+	_, creds, slot := mustGet(t, cp, 0)
+	cp.release(slot, creds, "")
+	*clock = T.Add(38 * time.Second)
+	var err error = &net.OpError{Op: "dial", Net: "tcp", Err: &os.SyscallError{Syscall: "connect", Err: syscall.ETIMEDOUT}}
+	if got := p.relayUnanswered(0, slot, creds, relayA, T.Add(30*time.Second), err); got != err {
+		t.Fatal("the error did not come back as it was")
+	}
+	if cp.health.isDead(relayA) {
+		t.Fatal("ETIMEDOUT read as the path's answer: marked on VK's answer from before the attempt began")
 	}
 }
