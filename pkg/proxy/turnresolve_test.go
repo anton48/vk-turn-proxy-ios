@@ -185,7 +185,7 @@ func TestTheOverrideIsReResolvedWhenItsRelaysAreExhausted(t *testing.T) {
 	answer.Store("203.0.113.42")
 	cp.Release(slot, creds, "")
 	cp.cp.health.answered("", time.Time{})
-	cp.NoteRelayUnanswered(0, slot, creds, "203.0.113.41:19302", time.Now())
+	cp.NoteRelayUnanswered(0, slot, creds, "203.0.113.41:19302", time.Now(), errors.New("connection refused"))
 	// The resolution runs off the lock (DNS I/O): the list follows within a
 	// lookup's time — a hand-out before that may still name the old relay.
 	waitFor := func(want string, what string) {

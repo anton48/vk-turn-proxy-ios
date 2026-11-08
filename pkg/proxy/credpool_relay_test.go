@@ -364,14 +364,14 @@ func TestEveryRelayLegFailureIsToldToTheRelayHealth(t *testing.T) {
 			t.Errorf("%s does not stamp when its relay attempt began", tc.name)
 		}
 	}
-	if !strings.Contains(code, "if isRelayUnanswered(err) {\n\t\tp.credPool.noteRelayUnanswered(connIdx, slot, creds, turnAddr, attempt)") {
+	if !strings.Contains(code, "if isRelayUnanswered(err) {\n\t\tp.credPool.noteRelayFailure(connIdx, slot, creds, turnAddr, attempt, !pathSpoke(err))") {
 		t.Error("relayUnanswered does not hand an unanswered relay to the pool")
 	}
 	bridge, err := os.ReadFile("../../WireGuardBridge/csqtt_bridge.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(bridge), "case proxy.IsRelayUnanswered(err):\n\t\ta.pool.NoteRelayUnanswered(connIdx, slot, creds, addr, attempt)") {
+	if !strings.Contains(string(bridge), "case proxy.IsRelayUnanswered(err):\n\t\ta.pool.NoteRelayUnanswered(connIdx, slot, creds, addr, attempt, err)") {
 		t.Error("csqtt_bridge.go: the adapter does not hand an unanswered relay to the pool")
 	}
 }

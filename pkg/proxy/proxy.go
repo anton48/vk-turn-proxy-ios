@@ -2421,7 +2421,7 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 // goes back as it is. Any other error passes through untouched.
 func (p *Proxy) relayUnanswered(connIdx, slot int, creds *TURNCreds, turnAddr string, attempt time.Time, err error) error {
 	if isRelayUnanswered(err) {
-		p.credPool.noteRelayUnanswered(connIdx, slot, creds, turnAddr, attempt)
+		p.credPool.noteRelayFailure(connIdx, slot, creds, turnAddr, attempt, !pathSpoke(err))
 	}
 	return err
 }

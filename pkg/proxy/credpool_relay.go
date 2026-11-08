@@ -262,13 +262,20 @@ func (cp *credPool) relayParkLocked(connIdx, slot int) *poolParkError {
 // answer; the attempt began at start. The connection's cursor moves on; the
 // address is marked only with evidence that the network works (relayhealth.go).
 func (cp *credPool) noteRelayUnanswered(connIdx, slot int, creds *TURNCreds, addr string, start time.Time) {
+	cp.noteRelayFailure(connIdx, slot, creds, addr, start, false)
+}
+
+// noteRelayFailure is noteRelayUnanswered with the failure's kind — silent
+// (a timeout) or the path's own answer (an errno) — which the health reads
+// (relayhealth.go, failed).
+func (cp *credPool) noteRelayFailure(connIdx, slot int, creds *TURNCreds, addr string, start time.Time, silent bool) {
 	if cp == nil || addr == "" {
 		return
 	}
 	cp.mu.Lock()
 	cp.cursor[connIdx]++
 	before := cp.deadAddrsLocked()
-	marked := cp.health.unanswered(addr, start)
+	marked := cp.health.failed(addr, start, silent)
 	switch {
 	case marked:
 		log.Printf("credpool: conn %d: relay %s did not answer — marked UNREACHABLE (another relay or VK answered meanwhile); the connections move to the next address", connIdx, addr)

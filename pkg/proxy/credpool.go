@@ -254,11 +254,12 @@ func (p *CredPool) NoteAllocatedAt(slot int, creds *TURNCreds, addr string, star
 
 // NoteRelayUnanswered reports an Allocate on addr that got NO answer from
 // the relay — connIdx's attempt on creds, the credential it leased from slot,
-// begun at start. The connection's next attempt takes the next candidate;
+// begun at start, failed with err (its kind — a timeout's silence or the
+// path's errno — decides what counts as evidence; relayhealth.go). The connection's next attempt takes the next candidate;
 // the relay is marked unreachable only with evidence that the network works
 // (relayhealth.go).
-func (p *CredPool) NoteRelayUnanswered(connIdx, slot int, creds *TURNCreds, addr string, start time.Time) {
-	p.cp.noteRelayUnanswered(connIdx, slot, creds, addr, start)
+func (p *CredPool) NoteRelayUnanswered(connIdx, slot int, creds *TURNCreds, addr string, start time.Time, err error) {
+	p.cp.noteRelayFailure(connIdx, slot, creds, addr, start, !pathSpoke(err))
 }
 
 // IsRelayUnanswered reports an Allocate the relay never answered — a dial

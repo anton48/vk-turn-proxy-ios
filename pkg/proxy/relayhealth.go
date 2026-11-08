@@ -31,6 +31,22 @@ package proxy
 //     answers. A route errno stays «no answer» (a null route for one relay
 //     reads so on the stand, 2026-10-19) — what tells the local transient
 //     from the network's verdict is the relay's own answers around it.
+//   - 🆕 2026-11-08 (the user's run, Nov 8 §620): a failure has a KIND. A
+//     SILENT one (a timeout — nobody answered during the attempt's window)
+//     is judged only by an answer to an attempt IN FLIGHT BESIDE IT: begun
+//     before the silent attempt gave up, answered at or after it began. At
+//     a Wi-Fi → LTE switch the new path passed nothing for ≈18 s: every
+//     attempt on the own relay timed out, VK's first answer went to an
+//     attempt begun after those had given up — and marked the own relay,
+//     which never failed; the two attempts had not shared a moment of the
+//     network. The path's OWN answer (an errno — no route to host, refused,
+//     reset: §618's failover) keeps the rule above: the path spoke, a later
+//     answer inside the window is evidence. pathSpoke tells the two apart;
+//     the record keeps whether its streak was silent and when its latest
+//     attempt gave up. The cost: a black hole that DROPS marks one dial
+//     timeout later, when the first answer overlaps the other connections'
+//     silent attempts; one connection alone never marks a silent relay —
+//     its cursor still moves it on.
 //   - A mark does not expire. A marked address is tried again only when a
 //     credential has no unmarked candidate left — the oldest mark first, one
 //     connection at a time, at growing intervals — at a path change (every
@@ -43,11 +59,13 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -94,6 +112,8 @@ type relayRecord struct {
 	claimedAt       time.Time // when that re-try was handed out: a result belongs to it only if its attempt began after
 	answeredAt      time.Time // the relay's own last answer: an attempt begun before it says nothing about the relay
 	markSeq         uint64    // the pool's hand-out counter at the mark (credpool_relay.go): a hand-out stamped at or below it was made before the mark
+	lastFailureAt   time.Time // the latest failure of the running streak — when its attempt gave up
+	silent          bool      // every failure of the streak was SILENCE (a timeout: nobody answered during the attempt's window), none an errno from the path
 }
 
 type relayHealth struct {
@@ -134,6 +154,14 @@ func (h *relayHealth) record(addr string) *relayRecord {
 // dozen from parallel connections (the user's review: thirty of them had put
 // the first re-try thirty minutes away).
 func (h *relayHealth) unanswered(addr string, start time.Time) bool {
+	return h.failed(addr, start, false)
+}
+
+// failed is unanswered with the failure's KIND: silent (a timeout — nobody
+// answered during the attempt's window) or the path's own answer (an errno:
+// no route, refused, reset). The kind decides what counts as evidence
+// (the user's run of 2026-11-08, Nov 8 §620).
+func (h *relayHealth) failed(addr string, start time.Time, silent bool) bool {
 	now := h.now()
 	if start.Before(h.pathChangedAt) {
 		return false
@@ -157,13 +185,27 @@ func (h *relayHealth) unanswered(addr string, start time.Time) bool {
 	}
 	if r.unanswered == 0 {
 		r.unansweredSince = start
+		r.silent = silent
+	} else {
+		r.silent = r.silent && silent
 	}
 	r.unanswered++
+	r.lastFailureAt = now
 	// The evidence: the latest answer of ANOTHER address or of VK's API —
-	// never addr's own (see the header).
-	if ev := h.evidenceExcept(addr); !ev.IsZero() && !ev.Before(start.Add(-relayEvidenceWindow)) {
-		h.markLocked(r, now)
-		return true
+	// never addr's own (see the header). For SILENCE the answer must have
+	// come while this attempt was waiting — at or after its start (the user's
+	// run of 2026-11-08: an answer from before the attempt says nothing about
+	// the network during it); for the path's own answer the window reaches
+	// relayEvidenceWindow back, as before.
+	if ev := h.evidenceExcept(addr); !ev.IsZero() {
+		since := start.Add(-relayEvidenceWindow)
+		if r.silent {
+			since = start
+		}
+		if !ev.Before(since) {
+			h.markLocked(r, now)
+			return true
+		}
 	}
 	return false
 }
@@ -217,6 +259,16 @@ func (h *relayHealth) answered(addr string, start time.Time) {
 	}
 	for a, r := range h.rec {
 		if a == addr || r.dead || r.unanswered == 0 {
+			continue
+		}
+		// A SILENT streak is marked only by an answer to an attempt that was
+		// in flight beside it: begun before the streak's latest attempt gave
+		// up (an answer without a start — zero — can show no overlap). The
+		// user's run of 2026-11-08, Nov 8 §620: at a Wi-Fi → LTE switch the
+		// new path passed nothing for ≈18 s; every attempt on the own relay
+		// timed out, and the first VK answer — to an attempt begun after
+		// those had given up — marked the own relay, which never failed.
+		if r.silent && (start.IsZero() || start.After(r.lastFailureAt)) {
 			continue
 		}
 		if prev.IsZero() || !r.unansweredSince.Before(prev) {
@@ -398,6 +450,28 @@ func (h *relayHealth) deadList(cands []string) string {
 // network works — relayHealth). Two things are not «no answer»: a STUN error
 // response (486, 401, 400, 437 — the relay spoke), and our own closing of the
 // socket or cancelling of the attempt.
+// pathSpoke: the failure was the PATH's own answer — an errno the network
+// returned for the attempt (no route to host, network unreachable, connection
+// refused, reset, broken pipe) — as opposed to SILENCE: a timeout, pion's
+// retransmissions run out, a deadline. The relay leg wraps its errors with %v,
+// so the text is read beside the errno in the chain.
+func pathSpoke(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return true
+	}
+	s := err.Error()
+	for _, w := range []string{"no route to host", "network is unreachable", "network is down", "host is down", "connection refused", "connection reset", "broken pipe"} {
+		if strings.Contains(s, w) {
+			return true
+		}
+	}
+	return false
+}
+
 func isRelayUnanswered(err error) bool {
 	if err == nil {
 		return false

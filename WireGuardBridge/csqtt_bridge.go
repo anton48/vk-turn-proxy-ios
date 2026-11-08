@@ -379,7 +379,7 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 func (a *csqttPoolAdapter) refused(workerID, connIdx, slot int, creds *proxy.TURNCreds, addr string, attempt time.Time, err error) {
 	switch {
 	case proxy.IsRelayUnanswered(err):
-		a.pool.NoteRelayUnanswered(connIdx, slot, creds, addr, attempt)
+		a.pool.NoteRelayUnanswered(connIdx, slot, creds, addr, attempt, err)
 	case proxy.IsQuotaError(err):
 		cd := a.pool.MarkSaturated(slot, creds, addr)
 		log.Printf("csqtt: worker %d: TURN allocate quota error (486) on slot %d (cooldown %s) — the next credential comes from another slot",

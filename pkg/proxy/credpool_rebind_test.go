@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -98,7 +99,7 @@ func TestCookieModeAReorderedListKeepsEachSlotOnItsRelay(t *testing.T) {
 	}
 	cp.Release(1, creds1, "")
 	cp.cp.health.answered("", time.Time{})
-	cp.NoteRelayUnanswered(10, 1, creds1, r2, time.Now())
+	cp.NoteRelayUnanswered(10, 1, creds1, r2, time.Now(), errors.New("connection refused")) // the path's own answer: today's rule
 	// DNS answers in the other order; the exhaustion (slot 0 full, slot 1
 	// marked) has the list resolved again.
 	answer.Store([]string{ipR2, ipR1})
