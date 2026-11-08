@@ -5121,26 +5121,49 @@ func (p *Proxy) sendPaceDeclaration(w io.Writer, connIdx int) {
 // them the next ≈40 packets (WireGuard's handshake responses, the SYN-ACKs)
 // while the live sessions got nothing: ≈28 s of a deaf tunnel right after a
 // 1.5-s failover, the first download timed out. The hello's construction:
-// 0xff 'R' 'E' 'P' + uint16 big-endian, zero-padded to groupHelloLen; an old
-// server forwards it to WireGuard, which drops it; a repeat is a no-op there.
+// 0xff 'R' 'E' 'P' + the index (uint16) + the session's GENERATION (uint64),
+// big-endian, zero-padded to groupHelloLen; an old server forwards it to
+// WireGuard, which drops it; a repeat is a no-op there.
+//
+// THE GENERATION (the user's review of b1372eb): the index alone let the ORDER
+// of arrival decide who the successor was — the sentinel is repeated and
+// travels a UDP leg, so a late first copy of the old session, or a repeat it
+// had read before its end, could displace the healthy new session. The
+// generation is the session's hand-out stamp (the pool's counter at the
+// hand-out, recorded by recordHandOut — relaymarkend.go): fixed for one
+// session, higher for every later session on the index. The server keeps the
+// highest accepted per index and ignores anything at or below it.
 var groupReplaceMagic = []byte{0xff, 'R', 'E', 'P'}
 
-// groupReplaceBytes: the sentinel naming connIdx; nil for an index the wire
-// cannot carry (negative — the probe's — or above uint16).
-func groupReplaceBytes(connIdx int) []byte {
+// groupReplaceBytes: the sentinel naming connIdx's session of generation gen;
+// nil for an index the wire cannot carry (negative — the probe's — or above
+// uint16).
+func groupReplaceBytes(connIdx int, gen uint64) []byte {
 	if connIdx < 0 || connIdx > 0xffff {
 		return nil
 	}
 	b := make([]byte, groupHelloLen)
 	copy(b, groupReplaceMagic)
 	binary.BigEndian.PutUint16(b[4:], uint16(connIdx))
+	binary.BigEndian.PutUint64(b[6:], gen)
 	return b
 }
 
-// sendReplaceDeclaration writes the replacement sentinel for connIdx — behind
-// the hello (sendGroupHello) and behind every tick's ping (tickPing).
+// connSessionGen: the generation of connIdx's running session — its hand-out
+// stamp (connRelaySeq); 0 for a connection without one (no table, no hand-out).
+func (p *Proxy) connSessionGen(connIdx int) uint64 {
+	p.connMu.Lock()
+	defer p.connMu.Unlock()
+	if connIdx < 0 || connIdx >= len(p.connRelaySeq) {
+		return 0
+	}
+	return p.connRelaySeq[connIdx]
+}
+
+// sendReplaceDeclaration writes the replacement sentinel for connIdx's session
+// — behind the hello (sendGroupHello) and behind every tick's ping (tickPing).
 func (p *Proxy) sendReplaceDeclaration(w io.Writer, connIdx int) {
-	if b := groupReplaceBytes(connIdx); b != nil {
+	if b := groupReplaceBytes(connIdx, p.connSessionGen(connIdx)); b != nil {
 		_, _ = w.Write(b)
 	}
 }
