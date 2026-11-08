@@ -356,6 +356,9 @@ func TestAMarkBetweenTheHandOutAndItsRecordEndsTheSession(t *testing.T) {
 	// recorded and spared: the mark is not about it.
 	cp.mu.Lock()
 	cp.handSeq++
+	if cp.handStamp == nil { // a sabotaged pool that never stamped: the test still reaches its verdict
+		cp.handStamp = map[int]uint64{}
+	}
 	cp.handStamp[2] = cp.handSeq
 	cp.mu.Unlock()
 	p.beginConnSession(2, func() { ended[2]++ })
@@ -371,5 +374,36 @@ func TestAMarkBetweenTheHandOutAndItsRecordEndsTheSession(t *testing.T) {
 	p.recordHandOut(0, addr)
 	if ended[0] != 1 {
 		t.Fatalf("a hand-out after the mark was ended: %d", ended[0])
+	}
+}
+
+// The user's review of b220706: the stamp was taken behind the FIRST of get's
+// three hand-outs alone — a hand-out after a fresh mint, or from the slot found
+// after a failed fetch, carried the connection's previous stamp (0 at the
+// start): after a path change a connection minted, allocated, and a late notice
+// of the old mark ended it. Every hand-out of get goes through ONE body that
+// seats and stamps (handOutLocked); nothing in get seats a connection bare.
+func TestEveryHandOutOfGetIsStamped(t *testing.T) {
+	// Behaviour on the mint path: an empty pool, the first hand-out minted, stamped 1.
+	cp, mints, _ := relayPool(t, "", relayA)
+	mustGet(t, cp, 5)
+	if mints.Load() != 1 {
+		t.Fatalf("the fixture: %d mint(s), want the hand-out minted", mints.Load())
+	}
+	if got := cp.handStampOf(5); got != 1 {
+		t.Fatalf("the hand-out after a fresh mint carries stamp %d, want 1", got)
+	}
+	mustGet(t, cp, 6) // the ready slot's path
+	if got := cp.handStampOf(6); got != 2 {
+		t.Fatalf("the next hand-out carries stamp %d, want 2", got)
+	}
+	// The pin: every hand-out of get, the fallback after a failed fetch included
+	// (not driven here), goes through the one body; nothing is seated bare.
+	get := goFuncBody(t, "creds.go", "func (cp *credPool) get(")
+	if n := strings.Count(get, "cp.seatLocked("); n != 0 {
+		t.Fatalf("get seats a connection bare %d time(s) — every hand-out goes through handOutLocked", n)
+	}
+	if n := strings.Count(get, "cp.handOutLocked(connIdx, "); n != 3 {
+		t.Fatalf("get hands out through handOutLocked %d time(s), want 3 (a ready slot; a fresh mint; the slot found after a failed fetch)", n)
 	}
 }

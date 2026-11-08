@@ -2410,8 +2410,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			cp.mu.Unlock()
 			return "", nil, -1, park
 		}
-		cp.seatLocked(slot, addr)
-		cp.stampHandOutLocked(connIdx) // the hand-out's stamp, under the lock the hand-out is made under (relaymarkend.go)
+		cp.handOutLocked(connIdx, slot, addr) // the seat and the hand-out's stamp, under the lock the hand-out is made under (relaymarkend.go)
 		e := cp.pool[slot]
 		capacity := cp.capOnLocked(addr)
 		seats := cp.seatsOnLocked(slot, addr)
@@ -2697,7 +2696,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				log.Printf("credpool: conn %d: slot %d's credential was issued again with its %d previous holders still out — kept, no seat until they release", connIdx, got, held)
 				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's credential was issued again with its %d previous holders still out — parking until they release", got, held), wake: wake}
 			}
-			cp.seatLocked(got, dial)
+			cp.handOutLocked(connIdx, got, dial)
 			filled := cp.countFreshLocked()
 			cp.mu.Unlock()
 			if got == target {
@@ -2738,7 +2737,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			cp.mu.Unlock()
 			return "", nil, -1, park
 		}
-		cp.seatLocked(slot, dial)
+		cp.handOutLocked(connIdx, slot, dial)
 		e := cp.pool[slot]
 		cp.mu.Unlock()
 		var tag string

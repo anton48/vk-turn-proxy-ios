@@ -351,8 +351,20 @@ func (cp *credPool) stampLocked() uint64 {
 	return cp.handSeq
 }
 
+// handOutLocked is THE hand-out: the seat taken on slot's credential at addr
+// and the connection's stamp moved, under the lock, as one body — get's
+// three ways of handing an address out (a ready slot, a fresh mint, the slot
+// found after a failed fetch) all go through it (the user's review of
+// b220706: the stamp behind the first of the three alone left a hand-out
+// after a mint with the connection's previous stamp, and a late notice of an
+// old mark ended the new session). A scan pins that get seats nothing bare.
+func (cp *credPool) handOutLocked(connIdx, slot int, addr string) {
+	cp.seatLocked(slot, addr)
+	cp.stampHandOutLocked(connIdx)
+}
+
 // stampHandOutLocked moves the hand-out counter for connIdx's hand-out, under
-// the lock, at the moment the address is handed out.
+// the lock, at the moment the address is handed out (handOutLocked).
 func (cp *credPool) stampHandOutLocked(connIdx int) {
 	cp.handSeq++
 	if cp.handStamp == nil {

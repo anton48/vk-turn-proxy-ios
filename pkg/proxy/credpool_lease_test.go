@@ -325,8 +325,17 @@ func TestEveryLeaseHolderNamesItsCredential(t *testing.T) {
 		t.Error("seatLocked does not move the entry's count, the record and the record by relay together")
 	}
 	get := goFuncBody(t, "creds.go", "func (cp *credPool) get(")
-	if n := strings.Count(get, "cp.seatLocked("); n != 3 {
-		t.Errorf("get(): %d seats through seatLocked, want 3 — Phase 1's, the fetched credential's own slot, the fallback's", n)
+	// Since b220706 / the review of it: get hands out through ONE body that seats
+	// AND stamps the connection (handOutLocked, credpool_relay.go) — three times,
+	// and never seats bare; the body itself seats through seatLocked.
+	if n := strings.Count(get, "cp.handOutLocked(connIdx, "); n != 3 {
+		t.Errorf("get(): %d hand-outs through handOutLocked, want 3 — Phase 1's, the fetched credential's own slot, the fallback's", n)
+	}
+	if n := strings.Count(get, "cp.seatLocked("); n != 0 {
+		t.Errorf("get(): %d bare seat(s) through seatLocked — every hand-out goes through handOutLocked", n)
+	}
+	if body := goFuncBody(t, "credpool_relay.go", "func (cp *credPool) handOutLocked("); !strings.Contains(body, "cp.seatLocked(slot, addr)") {
+		t.Error("handOutLocked does not seat through seatLocked")
 	}
 	if m := regexp.MustCompile(`cp\.holders\s*=[^=]|clear\(cp\.holders\)`).FindAllString(creds, -1); len(m) != 1 {
 		t.Errorf("creds.go assigns or clears the record in %d places, want 1 — seatLocked's lazy make; nothing may reset the leases still out", len(m))
