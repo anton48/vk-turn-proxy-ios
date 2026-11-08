@@ -777,7 +777,7 @@ func TestARefusedTickPingIsNotAdoptedByThePreviousPingsTime(t *testing.T) {
 		p.notePongSeq(0, s) // answered — BEFORE the sleep
 		p.broadcastWake()   // the phone sleeps and wakes before the write has returned
 		return nil
-	}, io.Discard, -1); err != nil {
+	}, io.Discard, -1, 0); err != nil {
 		t.Fatal(err)
 	}
 	if !lastPingAt.IsZero() {
@@ -846,7 +846,7 @@ func TestTheTicksPingMovesSeqAndStampTogether(t *testing.T) {
 			return fail
 		}
 	}
-	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(false, nil), io.Discard, -1); err != nil || seq != 1 {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(false, nil), io.Discard, -1, 0); err != nil || seq != 1 {
 		t.Fatalf("err %v seq %d", err, seq)
 	}
 	if !duringWrite.IsZero() {
@@ -858,21 +858,21 @@ func TestTheTicksPingMovesSeqAndStampTogether(t *testing.T) {
 	if lastPingAt.Before(writeEnd) {
 		t.Errorf("lastPingAt lies %s before the end of the tick's write — a ping is sent when its write is over", writeEnd.Sub(lastPingAt))
 	}
-	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(true, nil), io.Discard, -1); err != nil || seq != 2 {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(true, nil), io.Discard, -1, 0); err != nil || seq != 2 {
 		t.Fatalf("err %v seq %d", err, seq)
 	}
 	if !lastPingAt.IsZero() {
 		t.Errorf("a wake crossed the write of ping 2 and lastPingAt reads %v — want nothing", lastPingAt)
 	}
 	lastPingAt = time.Now()
-	if err := p.tickPing(&seq, &lastPingAt, time.Now().Add(-3*time.Second), write(false, nil), io.Discard, -1); err != nil || seq != 3 {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now().Add(-3*time.Second), write(false, nil), io.Discard, -1, 0); err != nil || seq != 3 {
 		t.Fatalf("err %v seq %d", err, seq)
 	}
 	if !lastPingAt.IsZero() {
 		t.Errorf("the write of ping 3 took three seconds and lastPingAt reads %v — want nothing", lastPingAt)
 	}
 	lastPingAt = time.Now()
-	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(false, context.Canceled), io.Discard, -1); err == nil {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), write(false, context.Canceled), io.Discard, -1, 0); err == nil {
 		t.Fatal("a failed write must be reported")
 	}
 	if !lastPingAt.IsZero() {
@@ -991,7 +991,7 @@ func TestBothSessionKindsRunTheOneWakeProbe(t *testing.T) {
 	// (the closure it hands to the tick and to the wake alike), and only declares the pair and passes it on.
 	// The tick takes the session's connection and index too (the pace
 	// declared again behind its ping, 2026-11-07) — each kind hands its own.
-	for what, want := range map[string]int{"p.tickPing(&seq, &lastPingAt, now, sendPing, ": 2, "sendPing, dtlsConn, connIdx)": 1, "sendPing, srtpConn, connIdx)": 1, "&seq, &lastPingAt, sendPing)": 2, ".Write(pingPkt)": 2} {
+	for what, want := range map[string]int{"p.tickPing(&seq, &lastPingAt, now, sendPing, ": 2, "sendPing, dtlsConn, connIdx, sessGen)": 1, "sendPing, srtpConn, connIdx, sessGen)": 1, "p.sendGroupHello(dtlsConn, connIdx, sessGen)": 1, "p.sendGroupHello(srtpConn, connIdx, sessGen)": 1, "&seq, &lastPingAt, sendPing)": 2, ".Write(pingPkt)": 2} {
 		if got := strings.Count(src, what); got != want {
 			t.Errorf("proxy.go holds %d × %q, want %d — one per session kind", got, what, want)
 		}

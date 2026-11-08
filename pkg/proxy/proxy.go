@@ -293,6 +293,7 @@ type Proxy struct {
 	connCancel   []func()
 	connRelay    []string // the relay each connection was handed at resolveTURNAddr; "" between sessions (relaymarkend.go)
 	connRelaySeq []uint64 // the hand-out's stamp (the pool's counter at the hand-out, recorded by setConnRelay): a mark's notice ends only sessions handed their relay before it
+	connSerial   []uint64 // the running session's serial per connection (beginConnSession): the row — cancel, relay, stamp — is written and cleared by that session alone (pathrestart.go)
 	pathRestart  pathRestart
 
 	// ups records when sessions came up, per connection and proxy-wide — what
@@ -616,6 +617,7 @@ func NewProxy(cfg Config) *Proxy {
 		connEpoch:         make([]int64, cfg.NumConns),
 		connRelay:         make([]string, cfg.NumConns),
 		connRelaySeq:      make([]uint64, cfg.NumConns),
+		connSerial:        make([]uint64, cfg.NumConns),
 		connCancel:        make([]func(), cfg.NumConns),
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
@@ -1189,7 +1191,7 @@ func (p *Proxy) waitCaptchaAndRestart() {
 			// creating a self-amplifying decay loop. credPool.get below
 			// returns cached cred if available, otherwise fetches with
 			// allowCaptchaBlock=false (surfaces captcha as error w/o blocking).
-			probeAddr, probeCreds, probeSlot, probeErr := p.resolveTURNAddr(-1, false)
+			probeAddr, probeCreds, probeSlot, _, probeErr := p.resolveTURNAddr(context.Background(), -1, false) // no session: nothing is recorded for -1
 			// Probe is non-consuming; release whatever slot got acquired so
 			// it doesn't leak quota count for a cred we never used.
 			if probeErr == nil {
@@ -2097,7 +2099,8 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		// restart this conn alone (pathrestart.go) while Pause/Resume keep
 		// cancelling everything through the parent.
 		connCtx, connCancel := context.WithCancel(sessCtx)
-		p.beginConnSession(connIdx, connCancel)
+		serial := p.beginConnSession(connIdx, connCancel)
+		connCtx = withConnSerial(connCtx, serial) // the session's registration is its own to write and clear (pathrestart.go)
 		var err error
 		switch {
 		case p.sessionHook != nil: // a test seam, nil in production
@@ -2129,7 +2132,7 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		// that announces the new group.
 		asked := connCtx.Err() != nil && sessCtx.Err() == nil && p.ctx.Err() == nil
 		connCancel()
-		p.endConnSession(connIdx)
+		p.endConnSession(connIdx, serial)
 		if asked {
 			log.Printf("proxy: [conn %d] session ended after %s by request (path change) — restarting now",
 				connIdx, time.Since(start).Round(time.Second))
@@ -2280,8 +2283,16 @@ func (p *Proxy) directMode() bool {
 // still don't actively rotate — no demonstrated throughput win — but a
 // relay/serverAddress mismatch is harmless. See
 // evaluated_alternatives_turn_endpoint_rotation.md.
-func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
-	addr, creds, slot, err := p.credPool.get(connIdx, allowCaptchaBlock)
+//
+// The fourth result is the hand-out's stamp — the session's GENERATION, what
+// its replacement sentinel declares (sendGroupHello, tickPing): THIS hand-out's,
+// returned by the pool from under its lock, never read back from the table
+// (the user's review of af80e3c: the table holds the LATEST hand-out on the
+// index, another session's after a Resume or a ForceReconnect). ctx is the
+// session's own (its serial — pathrestart.go), so that a stale session's late
+// hand-out does not overwrite its successor's row.
+func (p *Proxy) resolveTURNAddr(ctx context.Context, connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, uint64, error) {
+	addr, creds, slot, stamp, err := p.credPool.handOut(connIdx, allowCaptchaBlock)
 	if err == nil && connIdx >= 0 {
 		// The relay's pace, where the override list gives one, is this
 		// connection's uplink rate from here on and what its hello declares
@@ -2291,9 +2302,9 @@ func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *T
 		// on, for the day the relay is marked dead (relaymarkend.go).
 		kib, has := p.credPool.relayPace(addr)
 		setConnRelayPace(connIdx, kib, has)
-		p.recordHandOut(connIdx, addr)
+		p.recordHandOut(ctx, connIdx, addr, stamp)
 	}
-	return addr, creds, slot, err
+	return addr, creds, slot, stamp, err
 }
 
 // wakeChannelFor is the channel a retry parks on after err. A park error
@@ -2457,7 +2468,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// the first such waiter started in mid-session). Bootstrap captcha is
 	// handled separately at runConnection's level via waitCaptchaAndRestart
 	// + captchaWaiterActive guard, before we ever reach this code.
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	turnAddr, creds, credSlot, sessGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
@@ -2654,7 +2665,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		// a probeInterval of that is a probeInterval of the old, skewed
 		// downlink at the start of every tunnel. Re-sent on every tick so a
 		// lost hello heals by repetition and a restarted server re-groups us.
-		p.sendGroupHello(dtlsConn, connIdx)
+		p.sendGroupHello(dtlsConn, connIdx, sessGen)
 		// Tick-gap detector: if the gap between two consecutive ticks is
 		// much larger than probeInterval, our goroutine was suspended
 		// (iOS Network Extension freeze). During that time we couldn't
@@ -2712,7 +2723,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				lastTickAt = now
 				// The tick's ping is ONE body for both session kinds — seq and the stamp a
 				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
-				if err := p.tickPing(&seq, &lastPingAt, now, sendPing, dtlsConn, connIdx); err != nil {
+				if err := p.tickPing(&seq, &lastPingAt, now, sendPing, dtlsConn, connIdx, sessGen); err != nil {
 					// ONE verdict for both session kinds (pingWriteFailed, wakeprobe.go,
 					// build 469): the connection gone ends the session here; any other
 					// error leaves the goroutine — and the zombie detector below — alive.
@@ -3006,7 +3017,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	})
 
 	// allowCaptchaBlock=false — see runDTLSSession's matching comment.
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	turnAddr, creds, credSlot, _, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
@@ -3072,7 +3083,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 					return
 				}
 				// allowCaptchaBlock=false — see runDTLSSession's matching comment.
-				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, false)
+				newAddr, newCreds, newSlot, _, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 				if err != nil {
 					retries++
 					select {
@@ -3186,7 +3197,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	defer conn1.Close()
 	defer conn2.Close()
 
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	turnAddr, creds, credSlot, _, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
@@ -5078,7 +5089,7 @@ func (p *Proxy) groupHelloBytes() []byte {
 // optimisations, and a server that never sees them simply keeps the
 // connection on its own socket, or reaps at the backstop; a hello that never
 // left announces nothing.
-func (p *Proxy) sendGroupHello(w io.Writer, connIdx int) {
+func (p *Proxy) sendGroupHello(w io.Writer, connIdx int, gen uint64) {
 	g := p.groupHello.Load()
 	if g == nil {
 		return
@@ -5099,7 +5110,7 @@ func (p *Proxy) sendGroupHello(w io.Writer, connIdx int) {
 	p.sendPaceDeclaration(w, connIdx)
 	// And the connection this session replaces — its own index — so that the
 	// server ends the predecessor at once (groupReplaceMagic).
-	p.sendReplaceDeclaration(w, connIdx)
+	p.sendReplaceDeclaration(w, connIdx, gen)
 }
 
 // sendPaceDeclaration writes the declaration of connIdx's relay's pace, where
@@ -5133,6 +5144,16 @@ func (p *Proxy) sendPaceDeclaration(w io.Writer, connIdx int) {
 // hand-out, recorded by recordHandOut — relaymarkend.go): fixed for one
 // session, higher for every later session on the index. The server keeps the
 // highest accepted per index and ignores anything at or below it.
+//
+// THE GENERATION IS THE SESSION's OWN (the user's review of af80e3c). The first
+// cut read it back from the connection table (connRelaySeq) at every send — and
+// Resume / ForceReconnect start new sessions without waiting for the old ones,
+// so an old session's tick declared the NEW hand-out's stamp, and the old
+// session's end cleared the row under the new one, which then declared 0 (a
+// real successor with generation 0 displaces nobody). Now the stamp of THIS
+// hand-out comes back from the pool with the address (handOut →
+// resolveTURNAddr) and the session hands it to its hello and its ticks; the
+// table row belongs to the session whose serial it holds (pathrestart.go).
 var groupReplaceMagic = []byte{0xff, 'R', 'E', 'P'}
 
 // groupReplaceBytes: the sentinel naming connIdx's session of generation gen;
@@ -5149,21 +5170,13 @@ func groupReplaceBytes(connIdx int, gen uint64) []byte {
 	return b
 }
 
-// connSessionGen: the generation of connIdx's running session — its hand-out
-// stamp (connRelaySeq); 0 for a connection without one (no table, no hand-out).
-func (p *Proxy) connSessionGen(connIdx int) uint64 {
-	p.connMu.Lock()
-	defer p.connMu.Unlock()
-	if connIdx < 0 || connIdx >= len(p.connRelaySeq) {
-		return 0
-	}
-	return p.connRelaySeq[connIdx]
-}
-
 // sendReplaceDeclaration writes the replacement sentinel for connIdx's session
-// — behind the hello (sendGroupHello) and behind every tick's ping (tickPing).
-func (p *Proxy) sendReplaceDeclaration(w io.Writer, connIdx int) {
-	if b := groupReplaceBytes(connIdx, p.connSessionGen(connIdx)); b != nil {
+// of generation gen — behind the hello (sendGroupHello) and behind every tick's
+// ping (tickPing). gen is the SESSION's, handed down from its hand-out
+// (resolveTURNAddr): never read back from the table here (the user's review
+// of af80e3c — see the block above).
+func (p *Proxy) sendReplaceDeclaration(w io.Writer, connIdx int, gen uint64) {
+	if b := groupReplaceBytes(connIdx, gen); b != nil {
 		_, _ = w.Write(b)
 	}
 }
@@ -5355,7 +5368,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	defer connCancel()
 
 	// Acquire cred — same pattern as runDTLSSession / runDirectSession.
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	turnAddr, creds, credSlot, sessGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
@@ -5496,7 +5509,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		// a probeInterval of that is a probeInterval of the old, skewed
 		// downlink at the start of every tunnel. Re-sent on every tick so a
 		// lost hello heals by repetition and a restarted server re-groups us.
-		p.sendGroupHello(srtpConn, connIdx)
+		p.sendGroupHello(srtpConn, connIdx, sessGen)
 		lastTickAt := time.Now()
 		wake := p.newWakeWatch()
 		for {
@@ -5523,7 +5536,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				lastTickAt = now
 				// The tick's ping is ONE body for both session kinds — seq and the stamp a
 				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
-				if err := p.tickPing(&seq, &lastPingAt, now, sendPing, srtpConn, connIdx); err != nil {
+				if err := p.tickPing(&seq, &lastPingAt, now, sendPing, srtpConn, connIdx, sessGen); err != nil {
 					// The one verdict — see the DTLS session's tick (pingWriteFailed).
 					if p.pingWriteFailed(connCtx, connIdx, credSlot, "SRTP ", err, connCancel) {
 						return

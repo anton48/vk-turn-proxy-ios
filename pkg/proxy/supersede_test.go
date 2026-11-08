@@ -62,7 +62,7 @@ func TestARotationNamesTheGroupItLeaves(t *testing.T) {
 	first := append([]byte(nil), p.groupHelloBytes()...)
 
 	w := &recorder{}
-	p.sendGroupHello(w, -1) // announces A
+	p.sendGroupHello(w, -1, 0) // announces A
 	if len(w.pkts) != 1 || !bytes.Equal(w.pkts[0], first) {
 		t.Fatalf("before any rotation a session must send the hello alone: %d packet(s)", len(w.pkts))
 	}
@@ -76,7 +76,7 @@ func TestARotationNamesTheGroupItLeaves(t *testing.T) {
 		t.Fatal("fixture: the rotation did not change the hello")
 	}
 	w = &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	if len(w.pkts) != 2 || !bytes.Equal(w.pkts[0], second) {
 		t.Fatalf("after a rotation a session must send the NEW hello first and then the sentinel: %d packet(s)", len(w.pkts))
 	}
@@ -92,13 +92,13 @@ func TestARotationNamesTheGroupItLeaves(t *testing.T) {
 	// group is forgotten: the copies go out on the first sessions to come up.
 	for i := 1; i < supersedeSends; i++ {
 		w = &recorder{}
-		p.sendGroupHello(w, -1)
+		p.sendGroupHello(w, -1, 0)
 		if !containsID(sentinels(t, w.pkts), helloID(first)) {
 			t.Fatalf("hello %d after the rotation did not carry the sentinel (%d are due)", i+1, supersedeSends)
 		}
 	}
 	w = &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	if len(w.pkts) != 1 {
 		t.Fatalf("after %d sentinels the group is still named: %d packet(s)", supersedeSends, len(w.pkts))
 	}
@@ -106,7 +106,7 @@ func TestARotationNamesTheGroupItLeaves(t *testing.T) {
 	// A second rotation names the second group, which was announced.
 	p.rotateGroupHello()
 	w = &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	ids = sentinels(t, w.pkts)
 	if len(ids) != 1 || !bytes.Equal(ids[0], helloID(second)) {
 		t.Fatal("after a second rotation the sentinel must name the group just left, not the original one")
@@ -122,7 +122,7 @@ func TestACascadeOfRotationsNamesTheGroupTheServerHas(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	a := append([]byte(nil), p.groupHelloBytes()...)
-	p.sendGroupHello(&recorder{}, -1) // A announced
+	p.sendGroupHello(&recorder{}, -1, 0) // A announced
 
 	p.rotateGroupHello() // → B, no session comes up
 	b := append([]byte(nil), p.groupHelloBytes()...)
@@ -130,7 +130,7 @@ func TestACascadeOfRotationsNamesTheGroupTheServerHas(t *testing.T) {
 	c := append([]byte(nil), p.groupHelloBytes()...)
 
 	w := &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	if len(w.pkts) < 2 || !bytes.Equal(w.pkts[0], c) {
 		t.Fatalf("the hello must be C, first: %d packet(s)", len(w.pkts))
 	}
@@ -156,23 +156,23 @@ func TestEveryAnnouncedGroupLeftIsNamedUntilItsSends(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	a := append([]byte(nil), p.groupHelloBytes()...)
-	p.sendGroupHello(&recorder{}, -1)
+	p.sendGroupHello(&recorder{}, -1, 0)
 	p.rotateGroupHello()
 	b := append([]byte(nil), p.groupHelloBytes()...)
-	p.sendGroupHello(&recorder{}, -1) // announces B, names A once
+	p.sendGroupHello(&recorder{}, -1, 0) // announces B, names A once
 	p.rotateGroupHello()
 
 	w := &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	ids := sentinels(t, w.pkts)
 	if !containsID(ids, helloID(b)) || !containsID(ids, helloID(a)) {
 		t.Fatalf("the hellos of C must name B and A (A's sends are not full): named %d", len(ids))
 	}
 	for i := 0; i < supersedeSends; i++ {
-		p.sendGroupHello(&recorder{}, -1)
+		p.sendGroupHello(&recorder{}, -1, 0)
 	}
 	w = &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	if len(sentinels(t, w.pkts)) != 0 {
 		t.Fatal("groups are still named after their sends")
 	}
@@ -186,12 +186,12 @@ func TestAHelloInFlightAcrossARotationLeavesAGroupTheServerHas(t *testing.T) {
 	p.initGroupHello(Config{})
 	a := append([]byte(nil), p.groupHelloBytes()...)
 	w := &rotatingRecorder{p: p}
-	p.sendGroupHello(w, -1) // the hello of A is written; the rotation lands inside the write
+	p.sendGroupHello(w, -1, 0) // the hello of A is written; the rotation lands inside the write
 	if bytes.Equal(p.groupHelloBytes(), a) {
 		t.Fatal("fixture: the rotation inside the write did not happen")
 	}
 	w2 := &recorder{}
-	p.sendGroupHello(w2, -1)
+	p.sendGroupHello(w2, -1, 0)
 	if !containsID(sentinels(t, w2.pkts), helloID(a)) {
 		t.Fatal("the group announced by a hello in flight across the rotation was not named — it lives on at the server")
 	}
@@ -234,13 +234,13 @@ func TestAFailedSentinelWriteCountsForNothing(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	a := append([]byte(nil), p.groupHelloBytes()...)
-	p.sendGroupHello(&recorder{}, -1)
+	p.sendGroupHello(&recorder{}, -1, 0)
 	p.rotateGroupHello()
 	for i := 0; i < 2*supersedeSends; i++ {
-		p.sendGroupHello(&failAfterFirst{}, -1)
+		p.sendGroupHello(&failAfterFirst{}, -1, 0)
 	}
 	w := &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	if !containsID(sentinels(t, w.pkts), helloID(a)) {
 		t.Fatal("failed writes were counted as sends: the group is no longer named")
 	}
@@ -263,7 +263,7 @@ func TestTheGroupsLeftAreBounded(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	for i := 0; i < groupsLeftCap+3; i++ {
-		p.sendGroupHello(&failAfterFirst{}, -1) // announce; the sentinels behind it fail, so nothing is ever counted
+		p.sendGroupHello(&failAfterFirst{}, -1, 0) // announce; the sentinels behind it fail, so nothing is ever counted
 		p.rotateGroupHello()
 	}
 	p.groupsLeftMu.Lock()
@@ -305,16 +305,16 @@ func TestALateHelloOfAnOldGroupDoesNotUnannounceTheNewOne(t *testing.T) {
 	w := &hookedRecorder{hook: func() {
 		p.rotateGroupHello() // A → B while A's hello is in flight
 		b = append([]byte(nil), p.groupHelloBytes()...)
-		p.sendGroupHello(&recorder{}, -1) // a session of B announces B, whole
+		p.sendGroupHello(&recorder{}, -1, 0) // a session of B announces B, whole
 	}}
-	p.sendGroupHello(w, -1) // A's hello completes last
+	p.sendGroupHello(w, -1, 0) // A's hello completes last
 	if bytes.Equal(b, a) || len(b) == 0 {
 		t.Fatal("fixture: the rotation inside the write did not happen")
 	}
 	p.rotateGroupHello() // B → C: B was announced and must be named
 	c := append([]byte(nil), p.groupHelloBytes()...)
 	w2 := &recorder{}
-	p.sendGroupHello(w2, -1)
+	p.sendGroupHello(w2, -1, 0)
 	ids := sentinels(t, w2.pkts)
 	if !containsID(ids, helloID(b)) {
 		t.Fatal("B — announced by a session of its own — is not named after the rotation away from it: the late hello of A un-announced it, and the server keeps B to its backstop")
@@ -341,10 +341,10 @@ func TestALateHelloAnnouncesItsOwnGroupOnly(t *testing.T) {
 		p.rotateGroupHello() // A → B while A's hello is in flight; nobody announces B
 		b = append([]byte(nil), p.groupHelloBytes()...)
 	}}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	p.rotateGroupHello() // B → C
 	w2 := &recorder{}
-	p.sendGroupHello(w2, -1)
+	p.sendGroupHello(w2, -1, 0)
 	ids := sentinels(t, w2.pkts)
 	if containsID(ids, helloID(b)) {
 		t.Fatal("B named although no session ever announced it: the late hello of A announced the CURRENT group instead of its own")
@@ -389,7 +389,7 @@ func TestASelfSupersedeIsNeverWrittenAndSpendsNothing(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	a := append([]byte(nil), p.groupHelloBytes()...)
-	p.sendGroupHello(&recorder{}, -1) // A announced
+	p.sendGroupHello(&recorder{}, -1, 0) // A announced
 
 	gate := make(chan struct{})
 	var entered, done sync.WaitGroup
@@ -400,7 +400,7 @@ func TestASelfSupersedeIsNeverWrittenAndSpendsNothing(t *testing.T) {
 		done.Add(1)
 		go func(w *gatedRecorder) {
 			defer done.Done()
-			p.sendGroupHello(w, -1)
+			p.sendGroupHello(w, -1, 0)
 		}(ws[i])
 	}
 	entered.Wait()       // the three are inside their hello's write: each loaded A
@@ -419,7 +419,7 @@ func TestASelfSupersedeIsNeverWrittenAndSpendsNothing(t *testing.T) {
 	// The sessions of B name A — all supersedeSends of them — and not one more.
 	for i := 0; i < supersedeSends; i++ {
 		w := &recorder{}
-		p.sendGroupHello(w, -1)
+		p.sendGroupHello(w, -1, 0)
 		if len(w.pkts) < 1 || !bytes.Equal(w.pkts[0], b) {
 			t.Fatalf("fixture: session %d of B did not write the hello of B", i+1)
 		}
@@ -428,7 +428,7 @@ func TestASelfSupersedeIsNeverWrittenAndSpendsNothing(t *testing.T) {
 		}
 	}
 	w := &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	if len(sentinels(t, w.pkts)) != 0 {
 		t.Fatal("A is still named after its sends")
 	}
@@ -444,10 +444,10 @@ func (failEvery) Write(b []byte) (int, error) { return 0, os.ErrClosed }
 func TestAFailedHelloAnnouncesNothing(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
-	p.sendGroupHello(failEvery{}, -1)
+	p.sendGroupHello(failEvery{}, -1, 0)
 	p.rotateGroupHello()
 	w := &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	if len(sentinels(t, w.pkts)) != 0 {
 		t.Fatal("a group whose hello never left is named — the server never had it")
 	}
@@ -516,7 +516,7 @@ func TestNoSentinelWhenGroupingIsOff(t *testing.T) {
 		t.Fatal("a sentinel was built with grouping off")
 	}
 	w := &recorder{}
-	p.sendGroupHello(w, -1)
+	p.sendGroupHello(w, -1, 0)
 	if len(w.pkts) != 0 {
 		t.Fatalf("%d packet(s) sent with grouping off", len(w.pkts))
 	}

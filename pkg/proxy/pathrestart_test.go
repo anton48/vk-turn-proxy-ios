@@ -20,7 +20,7 @@ func TestPathUpRotatesTheGroupHello(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	before := append([]byte(nil), p.groupHelloBytes()...)
-	p.sendGroupHello(&bytes.Buffer{}, -1) // announced: a group the server can have is the one a rotation names
+	p.sendGroupHello(&bytes.Buffer{}, -1, 0) // announced: a group the server can have is the one a rotation names
 	p.rotateGroupHello()
 	after := p.groupHelloBytes()
 	if bytes.Equal(before, after) {
@@ -30,7 +30,7 @@ func TestPathUpRotatesTheGroupHello(t *testing.T) {
 		t.Fatalf("rotated hello has the wrong shape: %x", after)
 	}
 	var buf bytes.Buffer
-	p.sendGroupHello(&buf, -1)
+	p.sendGroupHello(&buf, -1, 0)
 	if !bytes.HasPrefix(buf.Bytes(), after) {
 		t.Fatal("sendGroupHello does not send the CURRENT hello first")
 	}
@@ -127,7 +127,7 @@ func TestRestartSessionsOlderThanSparesTheNewOnes(t *testing.T) {
 	if oldCancelled != 1 || newCancelled != 0 {
 		t.Fatalf("old cancelled %d, new cancelled %d — want 1 and 0", oldCancelled, newCancelled)
 	}
-	p.endConnSession(0)
+	p.endConnSession(0, 0)
 	p.restartSessionsOlderThan(1, "test again")
 	if oldCancelled != 1 {
 		t.Fatal("a session that already ended was cancelled again")

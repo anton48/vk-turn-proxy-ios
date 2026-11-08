@@ -58,23 +58,23 @@ func TestTheHelloIsFollowedByTheReplacementSentinel(t *testing.T) {
 	p := &Proxy{}
 	p.initGroupHello(Config{})
 	var buf bytes.Buffer
-	p.sendGroupHello(&buf, 7)
+	p.sendGroupHello(&buf, 7, 0)
 	if want := append(append([]byte(nil), p.groupHelloBytes()...), groupReplaceBytes(7, 0)...); !bytes.Equal(buf.Bytes(), want) {
 		t.Fatalf("hello for conn 7 is %x, want the hello and the replacement sentinel", buf.Bytes())
 	}
 	setConnRelayPace(8, 500, true)
 	buf.Reset()
-	p.sendGroupHello(&buf, 8)
+	p.sendGroupHello(&buf, 8, 0)
 	if want := append(append(append([]byte(nil), p.groupHelloBytes()...), groupPaceBytes(500)...), groupReplaceBytes(8, 0)...); !bytes.Equal(buf.Bytes(), want) {
 		t.Fatalf("hello for conn 8 is %x, want hello + pace + replacement", buf.Bytes())
 	}
 	buf.Reset()
-	p.sendGroupHello(&buf, -1)
+	p.sendGroupHello(&buf, -1, 0)
 	if !bytes.Equal(buf.Bytes(), p.groupHelloBytes()) {
 		t.Fatalf("the probe's hello carries %d bytes, want the hello alone", buf.Len())
 	}
 	buf.Reset()
-	(&Proxy{}).sendGroupHello(&buf, 7)
+	(&Proxy{}).sendGroupHello(&buf, 7, 0)
 	if buf.Len() != 0 {
 		t.Fatal("a disabled hello wrote the replacement sentinel")
 	}
@@ -91,7 +91,7 @@ func TestTheReplacementGoesAgainWithEveryTicksPing(t *testing.T) {
 	send := func(uint64, time.Time) error { return nil }
 	var buf bytes.Buffer
 	for i := 0; i < 3; i++ {
-		if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 9); err != nil {
+		if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 9, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -100,48 +100,50 @@ func TestTheReplacementGoesAgainWithEveryTicksPing(t *testing.T) {
 	}
 	buf.Reset()
 	failing := func(uint64, time.Time) error { return errors.New("the ping did not go") }
-	if err := p.tickPing(&seq, &lastPingAt, time.Now(), failing, &buf, 9); err == nil || buf.Len() != 0 {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), failing, &buf, 9, 0); err == nil || buf.Len() != 0 {
 		t.Fatalf("a failed ping: err %v, %d bytes behind it — want the error and nothing written", err, buf.Len())
 	}
 }
 
 // The user's review of b1372eb: the sentinel carries the session's GENERATION —
-// the hand-out stamp the pool gave this session (recorded by recordHandOut),
-// read under connMu — so that the server tells a late copy of the old session
-// from the new session's claim. A connection without a hand-out sends 0.
+// and, the user's review of af80e3c, the generation is the SESSION's OWN: the
+// stamp its hand-out returned (resolveTURNAddr), handed to the hello and the
+// tick — never read back from the table, which holds the LATEST hand-out on the
+// index: another session's after a Resume or a ForceReconnect (an old tick
+// declared 57 after the new hand-out; the old session's end cleared the row and
+// the new session declared 0).
 func TestTheReplacementSentinelCarriesTheSessionsGeneration(t *testing.T) {
 	resetPace()
 	t.Cleanup(resetPace)
 	p := &Proxy{connRelay: make([]string, 4), connRelaySeq: make([]uint64, 4)}
 	p.initGroupHello(Config{})
-	p.setConnRelay(2, relayA, 41) // the hand-out's stamp
+	p.setConnRelay(2, relayA, 57) // a LATER hand-out on the index — another session's
 	var buf bytes.Buffer
-	p.sendGroupHello(&buf, 2)
+	p.sendGroupHello(&buf, 2, 41) // this session's own stamp
 	if want := append(append([]byte(nil), p.groupHelloBytes()...), groupReplaceBytes(2, 41)...); !bytes.Equal(buf.Bytes(), want) {
-		t.Fatalf("the hello's sentinel does not carry the hand-out's stamp 41: %x", buf.Bytes()[len(p.groupHelloBytes()):])
+		t.Fatalf("the hello's sentinel does not carry the session's own generation 41 against the table's 57: % x", buf.Bytes())
 	}
-	// The tick's repeat carries the same generation; a new hand-out moves it.
 	var seq uint64
 	var lastPingAt time.Time
 	send := func(uint64, time.Time) error { return nil }
 	buf.Reset()
-	if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 2); err != nil {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 2, 41); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(buf.Bytes(), groupReplaceBytes(2, 41)) {
-		t.Fatalf("the tick's sentinel carries %x, want generation 41", buf.Bytes())
+		t.Fatalf("the tick's sentinel does not carry the session's own generation 41: % x", buf.Bytes())
 	}
-	p.endConnSession(2)
-	p.setConnRelay(2, relayA, 57)
+	// The table cleared (an old session's end): the session still declares its own.
+	p.endConnSession(2, 0)
 	buf.Reset()
-	p.sendReplaceDeclaration(&buf, 2)
-	if !bytes.Equal(buf.Bytes(), groupReplaceBytes(2, 57)) {
-		t.Fatalf("after a new hand-out the sentinel carries %x, want generation 57", buf.Bytes())
+	p.sendReplaceDeclaration(&buf, 2, 41)
+	if !bytes.Equal(buf.Bytes(), groupReplaceBytes(2, 41)) {
+		t.Fatalf("after the row was cleared the sentinel carries % x, want generation 41", buf.Bytes())
 	}
-	// Another index: its own stamp (0 when none).
+	// A session without a hand-out (none): 0.
 	buf.Reset()
-	p.sendReplaceDeclaration(&buf, 3)
+	p.sendReplaceDeclaration(&buf, 3, 0)
 	if !bytes.Equal(buf.Bytes(), groupReplaceBytes(3, 0)) {
-		t.Fatalf("an index without a hand-out carries %x, want generation 0", buf.Bytes())
+		t.Fatalf("a session without a hand-out declares % x, want generation 0", buf.Bytes())
 	}
 }

@@ -2,7 +2,10 @@
 
 package proxy
 
-import "log"
+import (
+	"context"
+	"log"
+)
 
 // A RELAY MARKED UNREACHABLE ENDS THE SESSIONS STILL ON IT (2026-11-07, the
 // failover run on 476 — Nov 7 §591).
@@ -64,13 +67,13 @@ import "log"
 // relay was marked at or after it meanwhile — the mark's notice may have run
 // before this record existed — in which case the session is ended here, as
 // the notice would have ended it.
-func (p *Proxy) recordHandOut(connIdx int, addr string) {
+func (p *Proxy) recordHandOut(ctx context.Context, connIdx int, addr string, seq uint64) {
+	if !p.setConnRelayFor(connSerialOf(ctx), connIdx, addr, seq) {
+		return // the row is a successor's: this is a stale session's late hand-out
+	}
 	if p.credPool == nil {
-		p.setConnRelay(connIdx, addr, 0)
 		return
 	}
-	seq := p.credPool.handStampOf(connIdx)
-	p.setConnRelay(connIdx, addr, seq)
 	if markSeq, dead := p.credPool.relayMarkedSince(addr); dead && markSeq >= seq {
 		p.endConnOnMarkedRelay(connIdx, addr)
 	}
@@ -80,15 +83,27 @@ func (p *Proxy) recordHandOut(connIdx int, addr string) {
 // (the pool's counter at the hand-out): a mark's notice reaches only
 // hand-outs stamped at or below the stamp it carries.
 func (p *Proxy) setConnRelay(connIdx int, addr string, seq uint64) {
+	p.setConnRelayFor(0, connIdx, addr, seq)
+}
+
+// setConnRelayFor is setConnRelay for the session of serial `serial`: the row
+// is written only while it is that session's (pathrestart.go — a successor
+// already registered keeps its row against a stale session's late hand-out);
+// 0 writes unconditionally. Whether it wrote.
+func (p *Proxy) setConnRelayFor(serial uint64, connIdx int, addr string, seq uint64) bool {
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
 	if connIdx < 0 || connIdx >= len(p.connRelay) {
-		return
+		return false
+	}
+	if serial != 0 && connIdx < len(p.connSerial) && p.connSerial[connIdx] != serial {
+		return false // a successor's row: a stale session's late hand-out writes nothing
 	}
 	p.connRelay[connIdx] = addr
 	if connIdx < len(p.connRelaySeq) {
 		p.connRelaySeq[connIdx] = seq
 	}
+	return true
 }
 
 // endConnOnMarkedRelay cancels connIdx's running session: its relay was

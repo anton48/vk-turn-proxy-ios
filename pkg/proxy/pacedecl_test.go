@@ -60,14 +60,14 @@ func TestTheHelloIsFollowedByTheRelaysPaceDeclaration(t *testing.T) {
 	setConnRelayPace(3, 0, true)
 
 	var buf bytes.Buffer
-	p.sendGroupHello(&buf, 2)
+	p.sendGroupHello(&buf, 2, 0)
 	want := append(append(append([]byte(nil), p.groupHelloBytes()...), groupPaceBytes(500)...), groupReplaceBytes(2, 0)...)
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Fatalf("conn 2 wrote %x, want the hello then the declaration of 500: %x", buf.Bytes(), want)
 	}
 
 	buf.Reset()
-	p.sendGroupHello(&buf, 3)
+	p.sendGroupHello(&buf, 3, 0)
 	want = append(append(append([]byte(nil), p.groupHelloBytes()...), groupPaceBytes(0)...), groupReplaceBytes(3, 0)...)
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Fatalf("conn 3 wrote %x, want the hello then the declaration of no pacer: %x", buf.Bytes(), want)
@@ -75,7 +75,7 @@ func TestTheHelloIsFollowedByTheRelaysPaceDeclaration(t *testing.T) {
 
 	for _, idx := range []int{4, -1} {
 		buf.Reset()
-		p.sendGroupHello(&buf, idx)
+		p.sendGroupHello(&buf, idx, 0)
 		if !bytes.Equal(buf.Bytes(), append(append([]byte(nil), p.groupHelloBytes()...), groupReplaceBytes(idx, 0)...)) {
 			t.Fatalf("conn %d (no field) wrote %x, want the hello alone", idx, buf.Bytes())
 		}
@@ -83,7 +83,7 @@ func TestTheHelloIsFollowedByTheRelaysPaceDeclaration(t *testing.T) {
 
 	// Disabled hello (a third party's server): nothing, the declaration included.
 	buf.Reset()
-	(&Proxy{}).sendGroupHello(&buf, 2)
+	(&Proxy{}).sendGroupHello(&buf, 2, 0)
 	if buf.Len() != 0 {
 		t.Fatalf("a disabled hello still wrote %d bytes", buf.Len())
 	}
@@ -112,7 +112,7 @@ func TestTheDeclarationGoesAgainWithEveryTicksPing(t *testing.T) {
 
 	var buf bytes.Buffer
 	for i := 0; i < 3; i++ {
-		if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 2); err != nil {
+		if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 2, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -123,12 +123,12 @@ func TestTheDeclarationGoesAgainWithEveryTicksPing(t *testing.T) {
 
 	// A failed ping: nothing behind it.
 	buf.Reset()
-	if err := p.tickPing(&seq, &lastPingAt, time.Now(), func(uint64, time.Time) error { return errors.New("gone") }, &buf, 2); err == nil || buf.Len() != 0 {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), func(uint64, time.Time) error { return errors.New("gone") }, &buf, 2, 0); err == nil || buf.Len() != 0 {
 		t.Fatalf("a failed ping: err %v, %d bytes written after it", err, buf.Len())
 	}
 	// No field: no declaration.
 	buf.Reset()
-	if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 3); err != nil || !bytes.Equal(buf.Bytes(), groupReplaceBytes(3, 0)) {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 3, 0); err != nil || !bytes.Equal(buf.Bytes(), groupReplaceBytes(3, 0)) {
 		t.Fatalf("a relay without the field: err %v, %d bytes written", err, buf.Len())
 	}
 }

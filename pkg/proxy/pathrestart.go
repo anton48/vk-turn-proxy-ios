@@ -34,6 +34,7 @@ package proxy
 //     (the rotation itself is immediate) and are spared by their epoch.
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -163,25 +164,65 @@ func (p *Proxy) rotateGroupHello() {
 	log.Printf("proxy: group hello rotated to %s — the server's old group keeps only the dead sessions, and is told so", id)
 }
 
+// THE SESSION SERIAL (the user's review of af80e3c). Resume and ForceReconnect
+// cancel the session context and start NEW connection loops without waiting
+// for the old ones, so for a moment two sessions of one index are alive: the
+// old one ending, the new one registering (beginConnSession, recordHandOut).
+// The registration — the cancel, the relay, the hand-out's stamp — is ONE
+// table row per index, and the old session's end used to clear it whole: the
+// new session stood unregistered (no mark could end it, no restart could
+// cancel it, its sentinel declared generation 0), and a late hand-out of the
+// old session overwrote the new one's row. Now every session has a serial
+// (beginConnSession returns it, the loop carries it in the session's context),
+// and the row is written and cleared only by the session whose serial it
+// holds. A serial of 0 — no table, a context without one — is the unconditional
+// old behaviour, for the probes and the tests.
+type connSerialKey struct{}
+
+// withConnSerial carries the session's serial in its context.
+func withConnSerial(ctx context.Context, serial uint64) context.Context {
+	return context.WithValue(ctx, connSerialKey{}, serial)
+}
+
+// connSerialOf: the session's serial from its context, 0 when none.
+func connSerialOf(ctx context.Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	serial, _ := ctx.Value(connSerialKey{}).(uint64)
+	return serial
+}
+
 // beginConnSession stamps a starting session with the current epoch and
 // records the cancel that restarts it. Under one lock with the restart, so
-// a restart can never cancel a session that started after its epoch.
-func (p *Proxy) beginConnSession(connIdx int, cancel func()) {
+// a restart can never cancel a session that started after its epoch. It
+// returns the session's serial (0 without a table).
+func (p *Proxy) beginConnSession(connIdx int, cancel func()) uint64 {
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
 	if connIdx < 0 || connIdx >= len(p.connEpoch) {
-		return
+		return 0
 	}
 	p.connEpoch[connIdx] = p.pathRestart.current()
 	p.connCancel[connIdx] = cancel
+	if connIdx < len(p.connSerial) {
+		p.connSerial[connIdx]++
+		return p.connSerial[connIdx]
+	}
+	return 0
 }
 
-// endConnSession forgets the cancel once the session is over.
-func (p *Proxy) endConnSession(connIdx int) {
+// endConnSession forgets the cancel, the relay and the stamp once the session
+// is over — the session of serial `serial`, and only while the row is still
+// its (a successor's registration stands); 0 clears unconditionally.
+func (p *Proxy) endConnSession(connIdx int, serial uint64) {
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
 	if connIdx < 0 || connIdx >= len(p.connCancel) {
 		return
+	}
+	if serial != 0 && connIdx < len(p.connSerial) && p.connSerial[connIdx] != serial {
+		return // a successor's registration: not this session's to clear
 	}
 	p.connCancel[connIdx] = nil
 	if connIdx < len(p.connRelay) {

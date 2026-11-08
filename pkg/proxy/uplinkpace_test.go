@@ -508,7 +508,7 @@ func TestTheHandOutRecordsTheRelaysPace(t *testing.T) {
 	}
 	cp.setOverride(turnOverride{servers: list})
 	p := &Proxy{credPool: cp}
-	addr, _, _, err := p.resolveTURNAddr(3, false)
+	addr, _, _, _, err := p.resolveTURNAddr(context.Background(), 3, false)
 	if err != nil || addr != relayO {
 		t.Fatalf("the hand-out: %q %v, want %s", addr, err, relayO)
 	}
@@ -517,14 +517,14 @@ func TestTheHandOutRecordsTheRelaysPace(t *testing.T) {
 	}
 	// O marked: the next hand-out is VK's relay, which has no field.
 	cp.health.markLocked(cp.health.record(relayO), time.Now())
-	addr, _, _, err = p.resolveTURNAddr(8, false)
+	addr, _, _, _, err = p.resolveTURNAddr(context.Background(), 8, false)
 	if err != nil || addr == relayO {
 		t.Fatalf("the hand-out with O marked: %q %v, want VK's relay", addr, err)
 	}
 	if _, ok := connRelayPace(8); ok {
 		t.Fatal("a hand-out of VK's relay recorded a pace")
 	}
-	if _, _, _, err := p.resolveTURNAddr(-1, false); err != nil {
+	if _, _, _, _, err := p.resolveTURNAddr(context.Background(), -1, false); err != nil {
 		t.Fatal(err)
 	}
 }

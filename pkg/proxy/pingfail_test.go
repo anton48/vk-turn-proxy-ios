@@ -200,7 +200,7 @@ func TestBothSessionKindsJudgeAFailedPingByTheOneRule(t *testing.T) {
 	// The tick carries the session's own connection and index since 2026-11-07:
 	// the relay's pace is declared again behind every tick's ping (tickPing).
 	for label, conn := range map[string]string{`""`: "dtlsConn", `"SRTP "`: "srtpConn"} {
-		tick := `if err := p.tickPing(&seq, &lastPingAt, now, sendPing, ` + conn + `, connIdx); err != nil { if p.pingWriteFailed(connCtx, connIdx, credSlot, ` + label + `, err, connCancel) { return } }`
+		tick := `if err := p.tickPing(&seq, &lastPingAt, now, sendPing, ` + conn + `, connIdx, sessGen); err != nil { if p.pingWriteFailed(connCtx, connIdx, credSlot, ` + label + `, err, connCancel) { return } }`
 		if got := strings.Count(src, tick); got != 1 {
 			t.Errorf("proxy.go holds %d × the tick's exit through the one rule for the %s session kind, want 1:\n%s", got, label, tick)
 		}

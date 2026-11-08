@@ -2346,7 +2346,7 @@ type poolParkError struct {
 
 func (e *poolParkError) Error() string { return e.msg }
 
-func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
+func (cp *credPool) handOut(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, uint64, error) {
 	cp.mu.Lock()
 
 	// Path-change pause: while pauseAcquireUntil is in the future, refuse
@@ -2358,7 +2358,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		remaining := time.Until(cp.pauseAcquireUntil).Round(time.Millisecond)
 		wake := cp.slotAvailableCh
 		cp.mu.Unlock()
-		return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: paused for path-change settle, %s remaining", remaining), wake: wake}
+		return "", nil, -1, 0, &poolParkError{msg: fmt.Sprintf("credpool: paused for path-change settle, %s remaining", remaining), wake: wake}
 	}
 
 	// ownSlot is the slot this conn would prefer to live on, by
@@ -2408,9 +2408,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		if !ok { // no address after all (a re-try's claim ran out between the two looks): no seat, a park
 			park := cp.relayParkLocked(connIdx, slot)
 			cp.mu.Unlock()
-			return "", nil, -1, park
+			return "", nil, -1, 0, park
 		}
-		cp.handOutLocked(connIdx, slot, addr) // the seat and the hand-out's stamp, under the lock the hand-out is made under (relaymarkend.go)
+		hand := cp.handOutLocked(connIdx, slot, addr) // the seat and the hand-out's stamp, under the lock the hand-out is made under (relaymarkend.go)
 		e := cp.pool[slot]
 		capacity := cp.capOnLocked(addr)
 		seats := cp.seatsOnLocked(slot, addr)
@@ -2428,14 +2428,14 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		}
 		log.Printf("credpool: conn %d acquired slot %d (%s, active=%d/%s, age %s) — relay %s",
 			connIdx, slot, tag, seats, capText(capacity), time.Since(e.ts).Round(time.Second), addr)
-		return addr, e.creds, slot, nil
+		return addr, e.creds, slot, hand, nil
 	}
 
 	// Every fresh credential blocked by its relay marks, and a mint no way out
 	// (the override list, or the dead-mint pause): wait (credpool_relay.go).
 	if park := cp.healthParkLocked(); park != nil {
 		cp.mu.Unlock()
-		return "", nil, -1, park
+		return "", nil, -1, 0, park
 	}
 
 	// The relay-refusal breaker (quotabreaker.go): while the relay refuses
@@ -2444,7 +2444,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 	if remaining, paused := cp.mintPausedLocked(time.Now()); paused {
 		wake := cp.slotAvailableCh
 		cp.mu.Unlock()
-		return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: minting paused — the relay refuses fresh credentials (486), %s remaining", remaining.Round(time.Second)), wake: wake}
+		return "", nil, -1, 0, &poolParkError{msg: fmt.Sprintf("credpool: minting paused — the relay refuses fresh credentials (486), %s remaining", remaining.Round(time.Second)), wake: wake}
 	}
 
 	// Phase 2 cold-start cap: don't let a COLD pool get over-fetched. When the
@@ -2529,7 +2529,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		if ready+inFlight >= coldStartTarget {
 			wake := cp.slotAvailableCh
 			cp.mu.Unlock()
-			return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: cold-start cap (%d ready+inflight >= %d target) — parking to share instead of over-fetching", ready+inFlight, coldStartTarget), wake: wake}
+			return "", nil, -1, 0, &poolParkError{msg: fmt.Sprintf("credpool: cold-start cap (%d ready+inflight >= %d target) — parking to share instead of over-fetching", ready+inFlight, coldStartTarget), wake: wake}
 		}
 	}
 
@@ -2590,7 +2590,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		// again later.
 		wake := cp.slotAvailableCh
 		cp.mu.Unlock()
-		return "", nil, -1, &poolParkError{msg: "credpool: no slot available (all saturated, cooling down, or fetching)", wake: wake}
+		return "", nil, -1, 0, &poolParkError{msg: "credpool: no slot available (all saturated, cooling down, or fetching)", wake: wake}
 	}
 	gen := cp.claimForFetchLocked(target)
 	cp.mu.Unlock()
@@ -2628,7 +2628,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				wake := cp.slotAvailableCh
 				cp.mu.Unlock()
 				cp.saveToDisk()
-				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", target), wake: wake}
+				return "", nil, -1, 0, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", target), wake: wake}
 			}
 			// The seat is taken below, after the address is picked — and
 			// judged against THAT relay's quota and the holders still out on
@@ -2641,7 +2641,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 					wake := cp.slotAvailableCh
 					cp.mu.Unlock()
 					cp.saveToDisk()
-					return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", got), wake: wake}
+					return "", nil, -1, 0, &poolParkError{msg: fmt.Sprintf("credpool: the fresh credential in slot %d names only relays marked unreachable — parking", got), wake: wake}
 				}
 			} else {
 				got, why = cp.placeIntoEmptySlotLocked(addr, creds, 0) // the seat below, after the pick
@@ -2665,7 +2665,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				park := cp.relayParkLocked(connIdx, got)
 				cp.mu.Unlock()
 				cp.saveToDisk()
-				return "", nil, -1, park
+				return "", nil, -1, 0, park
 			}
 			if until := cp.clockLocked(got, dial); time.Now().Before(until) {
 				wait := time.Until(until).Round(time.Second)
@@ -2677,7 +2677,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				}
 				cp.saveToDisk()
 				log.Printf("credpool: conn %d: the fresh credential in slot %d dials a relay whose seats may still be held — pending, usable in %s — parking", connIdx, got, wait)
-				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's fresh credential is pending (its relay's seats may still be held) — parking, usable in %s", got, wait), wake: wake}
+				return "", nil, -1, 0, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's fresh credential is pending (its relay's seats may still be held) — parking, usable in %s", got, wait), wake: wake}
 			}
 			// A credential issued AGAIN into its slot (cookie mode after a
 			// Resume's invalidate()) starts with its previous holders still
@@ -2694,9 +2694,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 				}
 				cp.saveToDisk()
 				log.Printf("credpool: conn %d: slot %d's credential was issued again with its %d previous holders still out — kept, no seat until they release", connIdx, got, held)
-				return "", nil, -1, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's credential was issued again with its %d previous holders still out — parking until they release", got, held), wake: wake}
+				return "", nil, -1, 0, &poolParkError{msg: fmt.Sprintf("credpool: slot %d's credential was issued again with its %d previous holders still out — parking until they release", got, held), wake: wake}
 			}
-			cp.handOutLocked(connIdx, got, dial)
+			hand := cp.handOutLocked(connIdx, got, dial)
 			filled := cp.countFreshLocked()
 			cp.mu.Unlock()
 			if got == target {
@@ -2715,7 +2715,7 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 			// the remaining connsPerSlot-1 slots of capacity are open for
 			// other parked conns that lost the race for ownSlot.
 			cp.broadcastSlotAvailable()
-			return dial, creds, got, nil
+			return dial, creds, got, hand, nil
 		}
 	}
 
@@ -2735,9 +2735,9 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		if !ok {
 			park := cp.relayParkLocked(connIdx, slot)
 			cp.mu.Unlock()
-			return "", nil, -1, park
+			return "", nil, -1, 0, park
 		}
-		cp.handOutLocked(connIdx, slot, dial)
+		hand := cp.handOutLocked(connIdx, slot, dial)
 		e := cp.pool[slot]
 		cp.mu.Unlock()
 		var tag string
@@ -2751,12 +2751,21 @@ func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds
 		}
 		log.Printf("credpool: conn %d fetch into slot %d failed (%v), falling back to slot %d (%s, active=%d/%d, age %s), cooldown %s — relay %s",
 			connIdx, target, fetchErr, slot, tag, e.active, connsPerSlot, time.Since(e.ts).Round(time.Second), cp.cooldown, dial)
-		return dial, e.creds, slot, nil
+		return dial, e.creds, slot, hand, nil
 	}
 	cp.mu.Unlock()
 	log.Printf("credpool: conn %d fetch into slot %d failed and no fallback available: %v (cooldown %s)",
 		connIdx, target, fetchErr, cp.cooldown)
-	return "", nil, -1, fetchErr
+	return "", nil, -1, 0, fetchErr
+}
+
+// get hands connIdx an address through handOut, the hand-out's stamp dropped:
+// for the callers that run no session on it (the console's and the app's
+// probes, the tests). A session takes its address through resolveTURNAddr,
+// which keeps the stamp as the session's generation.
+func (cp *credPool) get(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
+	addr, creds, slot, _, err := cp.handOut(connIdx, allowCaptchaBlock)
+	return addr, creds, slot, err
 }
 
 // release decrements the active conn count on slot, signaling that the

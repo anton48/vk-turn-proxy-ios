@@ -421,7 +421,7 @@ func TestTheBreakerHooksSitOnEveryMintPath(t *testing.T) {
 		}
 	}
 	inOrder("func (cp *credPool) markSaturated(", "entry := cp.pool[slot]", "cp.noteQuotaRefusalLocked(slot, time.Now())", "cp.applySaturationLocked(slot, addr, cooldown, reason)")
-	inOrder("func (cp *credPool) get(", "cp.mintPausedLocked(time.Now()); paused {", "wake := cp.slotAvailableCh", "cp.mu.Unlock()", "minting paused", "Phase 2 cold-start cap")
+	inOrder("func (cp *credPool) handOut(", "cp.mintPausedLocked(time.Now()); paused {", "wake := cp.slotAvailableCh", "cp.mu.Unlock()", "minting paused", "Phase 2 cold-start cap")
 	inOrder("func (cp *credPool) tryFill(", "cp.mintPausedLocked(time.Now()); paused {", "cp.mu.Unlock()", "return false", "gen := cp.claimForFetchLocked(slot)")
 	if strings.Count(c, "cp.noteQuotaRefusalLocked(") != 1 {
 		t.Errorf("creds.go calls noteQuotaRefusalLocked %d times, want exactly 1 — inside markSaturated, the one place every 486 reaches the pool", strings.Count(c, "cp.noteQuotaRefusalLocked("))

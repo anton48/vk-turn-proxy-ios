@@ -189,7 +189,7 @@ func TestAHerdOfInstantFailuresIsBoundedByTheFloor(t *testing.T) {
 	var dials atomic.Int64
 	p := &Proxy{ctx: ctx, credPool: cp}
 	p.sessionHook = func(_ context.Context, connIdx int) error {
-		_, creds, slot, err := p.resolveTURNAddr(connIdx, false)
+		_, creds, slot, _, err := p.resolveTURNAddr(context.Background(), connIdx, false)
 		if err != nil {
 			return err // a park: the pool's own answer, no floor
 		}

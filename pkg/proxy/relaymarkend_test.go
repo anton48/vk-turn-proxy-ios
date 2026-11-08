@@ -38,7 +38,7 @@ func TestAMarkedRelayEndsTheSessionsStillOnIt(t *testing.T) {
 		t.Fatalf("ended %d, cancels %v — want the two sessions on A and nothing else", n, ended)
 	}
 	// A session that ended forgets its relay: the next mark finds nothing of it.
-	p.endConnSession(0)
+	p.endConnSession(0, 0)
 	if r, _ := p.connRelayOf(0); r != "" {
 		t.Fatalf("conn 0's relay after its session ended: %q", r)
 	}
@@ -59,14 +59,14 @@ func TestTheHandOutRecordsTheConnectionsRelay(t *testing.T) {
 	}
 	cp.setOverride(turnOverride{servers: list})
 	p := &Proxy{credPool: cp, connEpoch: make([]int64, 8), connCancel: make([]func(), 8), connRelay: make([]string, 8)}
-	addr, _, _, err := p.resolveTURNAddr(3, false)
+	addr, _, _, _, err := p.resolveTURNAddr(context.Background(), 3, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r, ok := p.connRelayOf(3); !ok || r != addr {
 		t.Fatalf("conn 3's relay after the hand-out: %q %v, want %q", r, ok, addr)
 	}
-	if _, _, _, err := p.resolveTURNAddr(-1, false); err != nil {
+	if _, _, _, _, err := p.resolveTURNAddr(context.Background(), -1, false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -143,7 +143,7 @@ func TestTheRelayMarkEndingIsWired(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := string(b)
-	for _, want := range []string{"p.recordHandOut(connIdx, addr)", "p.credPool.onRelayMarked = func(addr string, stamp uint64) { p.endSessionsOnRelay(addr, stamp) }"} {
+	for _, want := range []string{"p.recordHandOut(ctx, connIdx, addr, stamp)", "p.credPool.onRelayMarked = func(addr string, stamp uint64) { p.endSessionsOnRelay(addr, stamp) }"} {
 		if strings.Count(src, want) != 1 {
 			t.Errorf("proxy.go holds %d × %q, want 1", strings.Count(src, want), want)
 		}
@@ -228,8 +228,8 @@ func TestALateNoticeSparesASessionHandedTheRelayAfterTheMark(t *testing.T) {
 	// The ended sessions end (production: endConnSession behind the session's
 	// return); a connection handed A again later carries a fresher stamp — an
 	// old notice never reaches it.
-	p.endConnSession(0)
-	p.endConnSession(1)
+	p.endConnSession(0, 0)
+	p.endConnSession(1, 0)
 	p.beginConnSession(0, func() { ended[0]++ })
 	p.setConnRelay(0, relayA, 4)
 	if n := p.endSessionsOnRelay(relayA, stamp); n != 0 {
@@ -348,7 +348,7 @@ func TestAMarkBetweenTheHandOutAndItsRecordEndsTheSession(t *testing.T) {
 	}
 	// The record of the hand-out, after the mark: the hand-out was made BEFORE
 	// the mark, so the session is ended here.
-	p.recordHandOut(0, addr)
+	p.recordHandOut(context.Background(), 0, addr, cp.handStampOf(0))
 	if ended[0] != 1 {
 		t.Fatalf("the session handed O before the mark went on to dial it: ended %d, want 1", ended[0])
 	}
@@ -362,16 +362,16 @@ func TestAMarkBetweenTheHandOutAndItsRecordEndsTheSession(t *testing.T) {
 	cp.handStamp[2] = cp.handSeq
 	cp.mu.Unlock()
 	p.beginConnSession(2, func() { ended[2]++ })
-	p.recordHandOut(2, relayO)
+	p.recordHandOut(context.Background(), 2, relayO, cp.handStampOf(2))
 	if ended[2] != 0 {
 		t.Fatalf("the re-try handed O after the mark was ended at its record: %d", ended[2])
 	}
 	// A hand-out after a path change is not ended by the old mark (O untried again).
 	cp.health.pathChanged()
-	p.endConnSession(0)
+	p.endConnSession(0, 0)
 	p.beginConnSession(0, func() { ended[0]++ })
 	addr, _, _ = mustGet(t, cp, 0)
-	p.recordHandOut(0, addr)
+	p.recordHandOut(context.Background(), 0, addr, cp.handStampOf(0))
 	if ended[0] != 1 {
 		t.Fatalf("a hand-out after the mark was ended: %d", ended[0])
 	}
@@ -399,11 +399,16 @@ func TestEveryHandOutOfGetIsStamped(t *testing.T) {
 	}
 	// The pin: every hand-out of get, the fallback after a failed fetch included
 	// (not driven here), goes through the one body; nothing is seated bare.
-	get := goFuncBody(t, "creds.go", "func (cp *credPool) get(")
+	get := goFuncBody(t, "creds.go", "func (cp *credPool) handOut(")
 	if n := strings.Count(get, "cp.seatLocked("); n != 0 {
 		t.Fatalf("get seats a connection bare %d time(s) — every hand-out goes through handOutLocked", n)
 	}
 	if n := strings.Count(get, "cp.handOutLocked(connIdx, "); n != 3 {
 		t.Fatalf("get hands out through handOutLocked %d time(s), want 3 (a ready slot; a fresh mint; the slot found after a failed fetch)", n)
+	}
+	// And get itself is the wrapper that drops the stamp — the body is handOut's
+	// (the user's review of af80e3c: the stamp is returned, never read back).
+	if wrapper := goFuncBody(t, "creds.go", "func (cp *credPool) get("); !strings.Contains(wrapper, "cp.handOut(connIdx, allowCaptchaBlock)") || strings.Contains(wrapper, "handOutLocked") {
+		t.Fatal("get is not the one-line wrapper over handOut")
 	}
 }

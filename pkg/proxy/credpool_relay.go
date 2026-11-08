@@ -358,19 +358,25 @@ func (cp *credPool) stampLocked() uint64 {
 // b220706: the stamp behind the first of the three alone left a hand-out
 // after a mint with the connection's previous stamp, and a late notice of an
 // old mark ended the new session). A scan pins that get seats nothing bare.
-func (cp *credPool) handOutLocked(connIdx, slot int, addr string) {
+func (cp *credPool) handOutLocked(connIdx, slot int, addr string) uint64 {
 	cp.seatLocked(slot, addr)
-	cp.stampHandOutLocked(connIdx)
+	return cp.stampHandOutLocked(connIdx)
 }
 
 // stampHandOutLocked moves the hand-out counter for connIdx's hand-out, under
-// the lock, at the moment the address is handed out (handOutLocked).
-func (cp *credPool) stampHandOutLocked(connIdx int) {
+// the lock, at the moment the address is handed out (handOutLocked), and
+// returns THIS hand-out's stamp — the session's generation (the user's review
+// of af80e3c: read back from the table later, the stamp was whatever the
+// LATEST hand-out on the index had left there, another session's after a
+// Resume or a ForceReconnect, which start new sessions without waiting for
+// the old ones).
+func (cp *credPool) stampHandOutLocked(connIdx int) uint64 {
 	cp.handSeq++
 	if cp.handStamp == nil {
 		cp.handStamp = map[int]uint64{}
 	}
 	cp.handStamp[connIdx] = cp.handSeq
+	return cp.handSeq
 }
 
 // handStampOf: the stamp of connIdx's latest hand-out (0 = none).

@@ -324,7 +324,7 @@ func TestEveryLeaseHolderNamesItsCredential(t *testing.T) {
 	if !strings.Contains(seat, "cp.pool[slot].active++") || !strings.Contains(seat, "cp.holders[k]++") || !strings.Contains(seat, "cp.seats[k][relay]++") {
 		t.Error("seatLocked does not move the entry's count, the record and the record by relay together")
 	}
-	get := goFuncBody(t, "creds.go", "func (cp *credPool) get(")
+	get := goFuncBody(t, "creds.go", "func (cp *credPool) handOut(")
 	// Since b220706 / the review of it: get hands out through ONE body that seats
 	// AND stamps the connection (handOutLocked, credpool_relay.go) — three times,
 	// and never seats bare; the body itself seats through seatLocked.

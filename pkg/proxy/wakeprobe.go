@@ -451,7 +451,7 @@ func pingStamp(wokeInside bool, started, finished time.Time) time.Time {
 // pong from before the sleep for an answer. Now the stamp is voided the moment
 // seq moves, and says afterwards what pingStamp allows — here and in the probe's
 // own ping alike; nobody else writes either of the two.
-func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send func(seq uint64, now time.Time) error, conn io.Writer, connIdx int) error {
+func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send func(seq uint64, now time.Time) error, conn io.Writer, connIdx int, gen uint64) error {
 	*seq++
 	*lastPingAt = time.Time{} // seq names a ping that is not sent yet: the stamp of the one before says nothing about it
 	epoch := p.wakeEpoch.Load()
@@ -465,7 +465,7 @@ func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send
 	// left the server at the wrong rate for the session. The server reads a
 	// repeat of the same word as no change; 20 bytes per tick.
 	p.sendPaceDeclaration(conn, connIdx)
-	p.sendReplaceDeclaration(conn, connIdx) // the replacement named again (groupReplaceMagic): a lost copy heals the same way
+	p.sendReplaceDeclaration(conn, connIdx, gen) // the replacement named again (groupReplaceMagic), the session's own generation: a lost copy heals the same way
 	return nil
 }
 
