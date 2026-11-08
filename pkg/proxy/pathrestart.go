@@ -205,6 +205,16 @@ func (p *Proxy) beginConnSession(connIdx int, cancel func()) uint64 {
 	}
 	p.connEpoch[connIdx] = p.pathRestart.current()
 	p.connCancel[connIdx] = cancel
+	// A new session has no relay yet: the row's relay and stamp are the
+	// PREDECESSOR's until the new hand-out records its own (the user's review
+	// of 048b944 — a mark of the old relay ended the new attempt, which had no
+	// address; the old session's end rightly leaves a row that is not its own).
+	if connIdx < len(p.connRelay) {
+		p.connRelay[connIdx] = ""
+	}
+	if connIdx < len(p.connRelaySeq) {
+		p.connRelaySeq[connIdx] = 0
+	}
 	if connIdx < len(p.connSerial) {
 		p.connSerial[connIdx]++
 		return p.connSerial[connIdx]

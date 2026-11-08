@@ -75,7 +75,7 @@ func (p *Proxy) recordHandOut(ctx context.Context, connIdx int, addr string, seq
 		return
 	}
 	if markSeq, dead := p.credPool.relayMarkedSince(addr); dead && markSeq >= seq {
-		p.endConnOnMarkedRelay(connIdx, addr)
+		p.endConnOnMarkedRelayFor(connSerialOf(ctx), connIdx, addr, seq)
 	}
 }
 
@@ -106,14 +106,26 @@ func (p *Proxy) setConnRelayFor(serial uint64, connIdx int, addr string, seq uin
 	return true
 }
 
-// endConnOnMarkedRelay cancels connIdx's running session: its relay was
+// endConnOnMarkedRelayFor cancels connIdx's running session: its relay was
 // marked UNREACHABLE between the hand-out and its record (recordHandOut).
-func (p *Proxy) endConnOnMarkedRelay(connIdx int, addr string) {
+func (p *Proxy) endConnOnMarkedRelayFor(serial uint64, connIdx int, addr string, seq uint64) {
 	if p.ctx != nil && p.ctx.Err() != nil {
 		return
 	}
 	p.connMu.Lock()
-	ended := connIdx >= 0 && connIdx < len(p.connCancel) && p.connCancel[connIdx] != nil
+	if connIdx < 0 || connIdx >= len(p.connCancel) {
+		p.connMu.Unlock()
+		return
+	}
+	// Re-checked UNDER connMu (the user's review of 048b944): the record had
+	// checked the row's owner in setConnRelayFor, then waited for the pool's
+	// lock, and ended whoever held the cancel by then — the successor that had
+	// registered and been handed its relay meanwhile. The end is about ONE
+	// session (its serial; 0 = none to check) and ONE hand-out (the relay and
+	// the stamp on the row): anything else is not this end's to cancel.
+	sameSession := serial == 0 || connIdx >= len(p.connSerial) || p.connSerial[connIdx] == serial
+	sameHandOut := connIdx < len(p.connRelay) && p.connRelay[connIdx] == addr && connIdx < len(p.connRelaySeq) && p.connRelaySeq[connIdx] == seq
+	ended := p.connCancel[connIdx] != nil && sameSession && sameHandOut
 	if ended {
 		p.connCancel[connIdx]()
 	}
