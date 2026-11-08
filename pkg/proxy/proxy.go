@@ -5097,6 +5097,9 @@ func (p *Proxy) sendGroupHello(w io.Writer, connIdx int) {
 	// just grouped (groupPaceMagic), and again behind every tick's ping
 	// (tickPing) — a lost copy heals by repetition.
 	p.sendPaceDeclaration(w, connIdx)
+	// And the connection this session replaces — its own index — so that the
+	// server ends the predecessor at once (groupReplaceMagic).
+	p.sendReplaceDeclaration(w, connIdx)
 }
 
 // sendPaceDeclaration writes the declaration of connIdx's relay's pace, where
@@ -5106,6 +5109,39 @@ func (p *Proxy) sendGroupHello(w io.Writer, connIdx int) {
 func (p *Proxy) sendPaceDeclaration(w io.Writer, connIdx int) {
 	if kib, ok := connRelayPace(connIdx); ok {
 		_, _ = w.Write(groupPaceBytes(kib))
+	}
+}
+
+// THE REPLACEMENT SENTINEL (2026-11-08, the failover run on 477 — Nov 8 §603):
+// a new session names the connection it REPLACES — its own index — behind the
+// hello and again behind every tick's ping, and the server ends the member that
+// held that index at once. Without it the server kept the forty dead members
+// of a black-holed relay until its zombie reaper (≈90 s), and its downlink hub
+// — one shared channel whose receivers are served longest-waiting first — fed
+// them the next ≈40 packets (WireGuard's handshake responses, the SYN-ACKs)
+// while the live sessions got nothing: ≈28 s of a deaf tunnel right after a
+// 1.5-s failover, the first download timed out. The hello's construction:
+// 0xff 'R' 'E' 'P' + uint16 big-endian, zero-padded to groupHelloLen; an old
+// server forwards it to WireGuard, which drops it; a repeat is a no-op there.
+var groupReplaceMagic = []byte{0xff, 'R', 'E', 'P'}
+
+// groupReplaceBytes: the sentinel naming connIdx; nil for an index the wire
+// cannot carry (negative — the probe's — or above uint16).
+func groupReplaceBytes(connIdx int) []byte {
+	if connIdx < 0 || connIdx > 0xffff {
+		return nil
+	}
+	b := make([]byte, groupHelloLen)
+	copy(b, groupReplaceMagic)
+	binary.BigEndian.PutUint16(b[4:], uint16(connIdx))
+	return b
+}
+
+// sendReplaceDeclaration writes the replacement sentinel for connIdx — behind
+// the hello (sendGroupHello) and behind every tick's ping (tickPing).
+func (p *Proxy) sendReplaceDeclaration(w io.Writer, connIdx int) {
+	if b := groupReplaceBytes(connIdx); b != nil {
+		_, _ = w.Write(b)
 	}
 }
 

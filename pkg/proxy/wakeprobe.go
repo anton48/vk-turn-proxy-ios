@@ -465,6 +465,7 @@ func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send
 	// left the server at the wrong rate for the session. The server reads a
 	// repeat of the same word as no change; 20 bytes per tick.
 	p.sendPaceDeclaration(conn, connIdx)
+	p.sendReplaceDeclaration(conn, connIdx) // the replacement named again (groupReplaceMagic): a lost copy heals the same way
 	return nil
 }
 

@@ -61,14 +61,14 @@ func TestTheHelloIsFollowedByTheRelaysPaceDeclaration(t *testing.T) {
 
 	var buf bytes.Buffer
 	p.sendGroupHello(&buf, 2)
-	want := append(append([]byte(nil), p.groupHelloBytes()...), groupPaceBytes(500)...)
+	want := append(append(append([]byte(nil), p.groupHelloBytes()...), groupPaceBytes(500)...), groupReplaceBytes(2)...)
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Fatalf("conn 2 wrote %x, want the hello then the declaration of 500: %x", buf.Bytes(), want)
 	}
 
 	buf.Reset()
 	p.sendGroupHello(&buf, 3)
-	want = append(append([]byte(nil), p.groupHelloBytes()...), groupPaceBytes(0)...)
+	want = append(append(append([]byte(nil), p.groupHelloBytes()...), groupPaceBytes(0)...), groupReplaceBytes(3)...)
 	if !bytes.Equal(buf.Bytes(), want) {
 		t.Fatalf("conn 3 wrote %x, want the hello then the declaration of no pacer: %x", buf.Bytes(), want)
 	}
@@ -76,7 +76,7 @@ func TestTheHelloIsFollowedByTheRelaysPaceDeclaration(t *testing.T) {
 	for _, idx := range []int{4, -1} {
 		buf.Reset()
 		p.sendGroupHello(&buf, idx)
-		if !bytes.Equal(buf.Bytes(), p.groupHelloBytes()) {
+		if !bytes.Equal(buf.Bytes(), append(append([]byte(nil), p.groupHelloBytes()...), groupReplaceBytes(idx)...)) {
 			t.Fatalf("conn %d (no field) wrote %x, want the hello alone", idx, buf.Bytes())
 		}
 	}
@@ -116,7 +116,7 @@ func TestTheDeclarationGoesAgainWithEveryTicksPing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	want := bytes.Repeat(groupPaceBytes(500), 3)
+	want := bytes.Repeat(append(append([]byte(nil), groupPaceBytes(500)...), groupReplaceBytes(2)...), 3)
 	if pings != 3 || !bytes.Equal(buf.Bytes(), want) {
 		t.Fatalf("after 3 ticks: %d pings, the conn got %x — want the declaration of 500 behind each ping", pings, buf.Bytes())
 	}
@@ -128,7 +128,7 @@ func TestTheDeclarationGoesAgainWithEveryTicksPing(t *testing.T) {
 	}
 	// No field: no declaration.
 	buf.Reset()
-	if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 3); err != nil || buf.Len() != 0 {
+	if err := p.tickPing(&seq, &lastPingAt, time.Now(), send, &buf, 3); err != nil || !bytes.Equal(buf.Bytes(), groupReplaceBytes(3)) {
 		t.Fatalf("a relay without the field: err %v, %d bytes written", err, buf.Len())
 	}
 }
