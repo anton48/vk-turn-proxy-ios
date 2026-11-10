@@ -570,8 +570,22 @@ func (w *worker) run() {
 			return
 		}
 		c.restarts.Add(1)
+		// A session that HELD ends the run of failures behind it HOWEVER it
+		// ended — asked here, before the exits part: the ones below that dial
+		// again without waiting (a path change, a worker parked and let go
+		// again) never reach the wait, and a reset that sat there left the
+		// next failure with what the failures of long ago had grown.
+		if !readyAt.IsZero() && time.Since(readyAt) >= heldAfter {
+			backoff = backoffBase
+		}
 		var denied *DeniedError
 		switch {
+		case errors.Is(err, ErrNoConfig):
+			// The password is right and the server has no address for it: no
+			// retry changes that, and whoever started the client must hear it.
+			c.cfg.Logf("worker %d: %v — stopping the client", w.id, err)
+			c.fail(err)
+			return
 		case errors.As(err, &denied) && denied.Fatal():
 			c.cfg.Logf("csqtt25: worker %d: %v — the client stops", w.id, err)
 			c.fail(err)
@@ -586,9 +600,6 @@ func (w *worker) run() {
 		if errors.Is(err, errPathChange) {
 			c.cfg.Logf("worker %d: session ended (%v), again now", w.id, err)
 			continue
-		}
-		if !readyAt.IsZero() && time.Since(readyAt) >= heldAfter {
-			backoff = backoffBase
 		}
 		c.cfg.Logf("csqtt25: worker %d: session ended (%v), again in %s", w.id, err, backoff)
 		t := time.NewTimer(backoff)

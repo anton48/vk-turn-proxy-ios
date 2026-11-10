@@ -109,7 +109,6 @@ func TestAPathChangeOutranksAnOlderNoticeStillPending(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	let := func() { once.Do(func() { close(release) }) }
-	t.Cleanup(let)
 	d.setHold(func(id, nth int) <-chan struct{} {
 		if id == 2 && nth == 1 {
 			return release
@@ -123,7 +122,14 @@ func TestAPathChangeOutranksAnOlderNoticeStillPending(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(c.Close)
+	// Registered behind Close, so it runs BEFORE it: a test that fails with the
+	// dial still held must let the worker go first, or Close gives up on it and
+	// the worker outlives the test — into the next one's clocks.
+	t.Cleanup(let)
 	eventually(t, "worker 2 inside its first dial", func() bool { return d.begun(2) == 1 })
+	// The server can say the notice only down a stream it knows as ready, and
+	// worker 1's READY is still on its way when Dial returns.
+	eventually(t, "the server seeing worker 1 ready", func() bool { return srv.knowsReady(1) })
 	srv.say(1, panelRestartNotice) // the older notice: it waits for worker 2
 	eventually(t, "the restart notice acted on", func() bool { return c.Stats().PanelRestarts == 1 })
 	c.OnPathChange()

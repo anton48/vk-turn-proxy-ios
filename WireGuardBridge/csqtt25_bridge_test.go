@@ -526,6 +526,23 @@ func TestCsqtt25DenialsReadAsTheSameReasonsDo(t *testing.T) {
 			t.Fatalf("the denial at the dial reads %q, want the 2.1.9 words for the reason: %q", got, want)
 		}
 	})
+	t.Run("no address at the dial", func(t *testing.T) {
+		var mints atomic.Int32
+		installFakePool(t, mintingFetch(&mints))
+		prev := csqtt25DialEngine
+		csqtt25DialEngine = func(context.Context, csqtt25.ClientConfig) (csqtt25Engine, error) {
+			return nil, csqtt25.ErrNoConfig
+		}
+		t.Cleanup(func() { csqtt25DialEngine = prev })
+		csqttSeededSettle = 0
+		h := startCsqtt(t, gen25Extra)
+		if rc := csqttWaitReadyImpl(h, 3000*time.Millisecond); rc != -1 {
+			t.Fatalf("a dial the server had no address for answered %d, want -1", rc)
+		}
+		if got, want := csqttGetErrorImpl(h), csqttReason(csqtt.ErrNoConfig); got != want {
+			t.Fatalf("NOCONF at the dial reads %q, want the 2.1.9 words for it: %q", got, want)
+		}
+	})
 	t.Run("while running", func(t *testing.T) {
 		fe := newFakeEngine()
 		h, _ := start25(t, fe, "")

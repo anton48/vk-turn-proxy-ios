@@ -29,6 +29,7 @@ type fakeServer struct {
 	limit       int          // the password's worker limit; 0 = none
 	sayWorkers  bool         // TUNCONF carries workers=
 	deny        string       // every GETCONF is answered DENIED:<this>
+	noconf      bool         // every GETCONF is answered NOCONF: the password is right, the server has no address for it
 	denyFirst   int          // …only the first so many
 	denyAbove   int          // worker ids above this get DENIED:invalid_worker_count; 0 = off
 	mute        map[int]bool // worker ids the server neither hears nor answers once they are ready
@@ -169,6 +170,10 @@ func (s *fakeServer) handle(ses *fakeSession, plain []byte) {
 		for _, n := range s.getconfs {
 			total += n
 		}
+		if s.noconf {
+			s.reply(ses, NoConfigResponse, 1)
+			return
+		}
 		switch {
 		case s.deny != "" && (s.denyFirst == 0 || total <= s.denyFirst):
 			s.reply(ses, "DENIED:"+s.deny, 1)
@@ -228,6 +233,14 @@ func (s *fakeServer) session(worker int) *fakeSession {
 		}
 	}
 	return found
+}
+
+// knowsReady says whether the server holds a ready session of the worker —
+// what say and repair need to reach it.
+func (s *fakeServer) knowsReady(worker int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.session(worker) != nil
 }
 
 // identities is the identity each worker last asked under.
