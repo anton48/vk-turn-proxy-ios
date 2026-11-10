@@ -4595,6 +4595,77 @@ do {
           "ContentView does not read csqttBoundedWrites (the NavigationView host must not re-render on it)")
 }
 
+// csqtt's protocol generation (2026-11-10): 2.1.9 and 2.5 are two protocols
+// under one name and a server answers the wrong one with silence, so the
+// profile has to SAY which one — a per-server String wired through every
+// boundary: the profile (persisted, decoded with 2.1.9 for a server stored
+// before the field), a link and a backup (2.1.9 when they name none), the
+// legacy flat keys, the tunnel config, proxy_config under the csqtt block, the
+// editor's choice and the Connect gate. A server made by hand starts with NO
+// generation and is asked; a 2.5 server is not asked for a Device ID.
+do {
+    let profile = source("VKTurnProxy/VKTurnProxy/ServerProfile.swift")
+    let store = source("VKTurnProxy/VKTurnProxy/ServerStore.swift")
+    let manager = source("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    let editor = source("VKTurnProxy/VKTurnProxy/ServerEditView.swift")
+    let content = source("VKTurnProxy/VKTurnProxy/ContentView.swift")
+    let validation = source("VKTurnProxy/VKTurnProxy/ConfigValidation.swift")
+    let appConfig = source("VKTurnProxy/VKTurnProxy/AppConfig.swift")
+    check(profile.contains("var csqttGeneration: String = \"\""), "a csqtt server made by hand starts with NO generation — it is asked, never defaulted")
+    check(profile.contains("static let v219 = \"2.1.9\"") && profile.contains("static let v25 = \"2.5\""),
+          "the two generations go by the names the bridge reads (csqtt25_bridge.go)")
+    check(profile.contains("case csqttGeneration"), "csqttGeneration is in CodingKeys (the Codable trap)")
+    if let a = profile.range(of: "if let v = try c.decodeIfPresent(Bool.self, forKey: .useCsqtt) { useCsqtt = v }"),
+       let b = profile.range(of: "if let v = try c.decodeIfPresent(String.self, forKey: .csqttGeneration) { csqttGeneration = v }\n        else if useCsqtt { csqttGeneration = CsqttGeneration.v219 }") {
+        check(a.lowerBound < b.lowerBound, "a csqtt server stored before the field decodes as 2.1.9 — decided BEHIND useCsqtt's own decode")
+    } else {
+        check(false, "init(from:) does not give a stored csqtt server its generation")
+    }
+    check(appConfig.contains("var csqttGeneration: String? = nil"), "a link can carry the generation")
+    if let a = profile.range(of: "init(link s: ConnectionSettings) {"),
+       let b = profile.range(of: "if let v = s.csqttGeneration?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty { csqttGeneration = v }\n        if useCsqtt && csqttGeneration.isEmpty { csqttGeneration = CsqttGeneration.v219 }") {
+        check(a.lowerBound < b.lowerBound, "a link's generation is taken, and a csqtt link that names none is a 2.1.9 link")
+    } else {
+        check(false, "a link import does not settle the csqtt generation")
+    }
+    check(profile.contains("var csqttGeneration: String? = nil") && profile.contains("csqttGeneration = p.csqttGeneration.isEmpty ? nil : p.csqttGeneration")
+          && profile.contains("if let v = csqttGeneration { p.csqttGeneration = v }\n        // A backup made before the field existed holds 2.1.9 servers.\n        if p.useCsqtt && p.csqttGeneration.isEmpty { p.csqttGeneration = CsqttGeneration.v219 }"),
+          "csqttGeneration survives a backup and a restore, and a backup without it restores as 2.1.9")
+    check(store.contains("if p.useCsqtt && p.csqttGeneration.isEmpty { p.csqttGeneration = CsqttGeneration.v219 }"),
+          "a csqtt config read from the legacy flat keys is 2.1.9")
+    check(manager.contains("csqttGeneration: s.csqttGeneration,"), "TunnelConfig takes csqttGeneration from the profile")
+    if let a = manager.range(of: "dict[\"use_csqtt\"] = true"), let b = manager.range(of: "dict[\"csqtt_generation\"] = config.csqttGeneration"),
+       let c = manager.range(of: "if config.useWrapS {") {
+        check(a.lowerBound < b.lowerBound && b.lowerBound < c.lowerBound, "csqtt_generation rides proxy_config inside the csqtt block only")
+    } else {
+        check(false, "csqtt_generation is not written into proxy_config")
+    }
+    if let a = editor.range(of: "if mode.wrappedValue == .csqtt {"), let b = editor.range(of: "Picker(\"Server version\", selection: $draft.csqttGeneration) {"),
+       let c = editor.range(of: "if mode.wrappedValue == .srtpWrapS {") {
+        check(a.lowerBound < b.lowerBound && b.lowerBound < c.lowerBound, "the generation's choice sits inside the editor's csqtt section")
+    } else {
+        check(false, "the editor does not offer the csqtt generation")
+    }
+    check(editor.contains("Text(\"csqtt 2.1.9\").tag(CsqttGeneration.v219)") && editor.contains("Text(\"csqtt 2.5\").tag(CsqttGeneration.v25)"),
+          "the editor offers both generations under the profile's names")
+    check(editor.contains("hint(ConfigValidation.csqttGeneration(draft.csqttGeneration))"), "the editor says so while no generation is chosen")
+    if let a = editor.range(of: "if draft.csqttGeneration != CsqttGeneration.v25 {"), let b = editor.range(of: "TextField(\"Device ID\", text: $draft.csqttDeviceID)"),
+       let c = editor.range(of: "isOn: $draft.csqttBoundedWrites"), let d = editor.range(of: "// 2.5 has no device identity and, for now, no write bound of its own.") {
+        check(a.lowerBound < b.lowerBound && b.lowerBound < c.lowerBound && c.lowerBound < d.lowerBound,
+              "the Device ID and the write bound are shown for 2.1.9 alone")
+    } else {
+        check(false, "the editor's 2.1.9-only fields are not gated on the generation")
+    }
+    check(validation.contains("static func csqttGeneration(_ s: String) -> Issue? {\n        if s.isEmpty {") && validation.contains("if !CsqttGeneration.isKnown(s) {"),
+          "a missing generation and one this build does not know are both errors")
+    if let a = content.range(of: "issues.append(ConfigValidation.csqttGeneration(s.csqttGeneration))"),
+       let b = content.range(of: "if s.csqttGeneration != CsqttGeneration.v25 {\n                issues.append(ConfigValidation.csqttDeviceID(s.csqttDeviceID))\n            }") {
+        check(a.lowerBound < b.lowerBound, "Connect is blocked until a csqtt server's generation is said; a 2.5 server is not asked for a Device ID")
+    } else {
+        check(false, "the Connect gate does not ask for the csqtt generation, or asks a 2.5 server for a Device ID")
+    }
+}
+
 // The credential cache's mode (build 441 in Go, 442 here): the pool stamps
 // creds-pool.json with "anon" / "cookie" and refuses the other mode's file. The
 // app's mirror of the file has to CARRY the field — BackupManager encodes it into

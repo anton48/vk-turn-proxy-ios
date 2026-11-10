@@ -231,8 +231,12 @@ private struct ActiveServerControls: View {
             ConfigValidation.turnOverride(s.turnServerOverride),
         ]
         if s.useCsqtt {
+            issues.append(ConfigValidation.csqttGeneration(s.csqttGeneration))
             issues.append(ConfigValidation.csqttPassword(s.csqttPassword))
-            issues.append(ConfigValidation.csqttDeviceID(s.csqttDeviceID))
+            // 2.5 has no devices: the address lives on the password.
+            if s.csqttGeneration != CsqttGeneration.v25 {
+                issues.append(ConfigValidation.csqttDeviceID(s.csqttDeviceID))
+            }
         } else if s.useWrapA {
             issues.append(ConfigValidation.wrapAPassword(s.wrapAPassword))
         } else {

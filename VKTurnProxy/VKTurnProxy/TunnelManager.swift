@@ -162,6 +162,7 @@ extension TunnelConfig {
             csqttPassword: s.csqttPassword,
             csqttDeviceID: s.csqttDeviceID,
             csqttBoundedWrites: s.csqttBoundedWrites,
+            csqttGeneration: s.csqttGeneration,
             useUDP: s.useUDP,
             forceLegacyCaptcha: d.bool(forKey: "forceLegacyCaptcha"),
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
@@ -2976,6 +2977,12 @@ class TunnelManager: ObservableObject {
             dict["csqtt_device_id"] = devID.isEmpty ? csqttFallbackDeviceID() : devID
             // Build 438: the bounded relay write (pkg/csqtt/stall.go); absent = off.
             dict["csqtt_bounded_writes"] = config.csqttBoundedWrites
+            // Which protocol the server speaks; absent = 2.1.9, what every
+            // config before the field meant (the bridge refuses a name it
+            // does not know rather than guess).
+            if !config.csqttGeneration.isEmpty {
+                dict["csqtt_generation"] = config.csqttGeneration
+            }
         }
         // SRTP-WRAP-S (samosvalishe/free-turn-proxy): obf profile + Client-ID on
         // the SRTP+WRAP data path. wrap_key_hex is already set above.
@@ -3471,6 +3478,8 @@ struct TunnelConfig {
     var csqttDeviceID: String = ""
     // csqtt, build 438: the bounded relay write — see ServerProfile.
     var csqttBoundedWrites: Bool = true
+    // csqtt: the server's protocol generation — see ServerProfile.
+    var csqttGeneration: String = ""
     // 2026-05-18 empirical: VK's new per-cred TURN allocation-rate
     // throttle (introduced ~16:00 MSK that day) applies ONLY to UDP-
     // transport allocations. 11×10 = 110 TCP-control allocations on a

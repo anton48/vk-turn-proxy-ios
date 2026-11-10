@@ -146,6 +146,9 @@ final class ServerStore: ObservableObject {
         for (key, kp, def) in intKeyPaths {
             p[keyPath: kp] = d.object(forKey: key) == nil ? def : d.integer(forKey: key)
         }
+        // The flat keys never carried a csqtt generation: what they describe
+        // is from before 2.5 could be chosen.
+        if p.useCsqtt && p.csqttGeneration.isEmpty { p.csqttGeneration = CsqttGeneration.v219 }
         return p
     }
 

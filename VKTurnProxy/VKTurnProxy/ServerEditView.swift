@@ -135,26 +135,46 @@ struct ServerEditView: View {
                             .autocapitalization(.none).disableAutocorrection(true)
                     }
                     if mode.wrappedValue == .csqtt {
+                        // WHICH protocol the server speaks (CsqttGeneration). For a server
+                        // made by hand no segment is selected until the user says: nothing
+                        // can be found out at Connect — a server answers the wrong protocol
+                        // with silence — so the profile has to carry the answer.
+                        Picker("Server version", selection: $draft.csqttGeneration) {
+                            Text("csqtt 2.1.9").tag(CsqttGeneration.v219)
+                            Text("csqtt 2.5").tag(CsqttGeneration.v25)
+                        }
+                        .pickerStyle(.segmented)
+                        hint(ConfigValidation.csqttGeneration(draft.csqttGeneration))
+                        Text("2.1.9 and 2.5 are different protocols: a server answers the wrong one with silence, so a tunnel that never comes up is what a wrong choice here looks like.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                         SecureField("Server password", text: $draft.csqttPassword)
                             .autocapitalization(.none).disableAutocorrection(true)
                         hint(ConfigValidation.csqttPassword(draft.csqttPassword))
-                        // The server binds an unbound password to this value;
-                        // a second device on the same password is refused.
-                        // Empty blocks Connect (ConfigValidation) — the id that
-                        // goes out must be the one on screen, never a hidden
-                        // fallback; onAppear below fills an empty one.
-                        TextField("Device ID", text: $draft.csqttDeviceID)
-                            .autocapitalization(.none).disableAutocorrection(true)
-                        hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID, onEditScreen: true))
-                        Text("csqtt has no key exchange: the password is the tunnel's only key, so traffic recorded today can be decrypted by anyone who learns it later (no forward secrecy). The other modes do not have this property.")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                        // Build 438: the bounded relay write (pkg/csqtt/stall.go).
-                        // Off is the write path of every build before it.
-                        Toggle("Bounded relay writes", isOn: $draft.csqttBoundedWrites)
-                        Text("A relay that stops taking bytes is restarted after a second instead of holding every connection's traffic until the liveness rule restarts it (35–60 s). Off: a write waits as long as the relay makes it (the behaviour before build 438).")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        if draft.csqttGeneration != CsqttGeneration.v25 {
+                            // The server binds an unbound password to this value;
+                            // a second device on the same password is refused.
+                            // Empty blocks Connect (ConfigValidation) — the id that
+                            // goes out must be the one on screen, never a hidden
+                            // fallback; onAppear below fills an empty one.
+                            TextField("Device ID", text: $draft.csqttDeviceID)
+                                .autocapitalization(.none).disableAutocorrection(true)
+                            hint(ConfigValidation.csqttDeviceID(draft.csqttDeviceID, onEditScreen: true))
+                            Text("csqtt has no key exchange: the password is the tunnel's only key, so traffic recorded today can be decrypted by anyone who learns it later (no forward secrecy). The other modes do not have this property.")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                            // Build 438: the bounded relay write (pkg/csqtt/stall.go).
+                            // Off is the write path of every build before it.
+                            Toggle("Bounded relay writes", isOn: $draft.csqttBoundedWrites)
+                            Text("A relay that stops taking bytes is restarted after a second instead of holding every connection's traffic until the liveness rule restarts it (35–60 s). Off: a write waits as long as the relay makes it (the behaviour before build 438).")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            // 2.5 has no device identity and, for now, no write bound of its own.
+                            Text("csqtt 2.5 has no devices: the tunnel address belongs to the password, and one password serves one device at a time. Its keys come from a DTLS handshake with the server; if the server answers none, from the password alone — and then, as with 2.1.9, traffic recorded today can be decrypted by anyone who learns the password later.")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        }
                     }
                     if mode.wrappedValue == .srtpWrapS {
                         SecureField("WRAP key (64 hex chars)", text: $draft.wrapKeyHex)

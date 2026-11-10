@@ -316,6 +316,9 @@ struct ConnectionSettings: Codable {
     /// DENIED:device_mismatch. `csqtt://connect?…&device=<id>` (our extension
     /// of his link) carries the admin's id; absent → minted on import.
     var csqttDeviceID: String? = nil
+    /// Which csqtt protocol the link's server speaks (`CsqttGeneration`). A
+    /// plain csqtt:// link names none and is 2.1.9 — set on import, not here.
+    var csqttGeneration: String? = nil
     /// Name for the server this link creates (build 179+). Importing a link now
     /// ADDS a named server instead of overwriting the current configuration.
     /// Absent (older vkturnproxy:// links, and wdtt:// which has no name field)

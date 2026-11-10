@@ -77,6 +77,15 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     /// uplink until the liveness rule does. ON by default; off is the
     /// unbounded write of the builds before 438.
     var csqttBoundedWrites: Bool = true
+    /// csqtt: WHICH protocol the server speaks — `CsqttGeneration.v219` or
+    /// `.v25`. They are two protocols under one name: a server answers the
+    /// other one with silence, so nothing can be tried and corrected at
+    /// Connect — the profile has to say. "" = not said yet: a csqtt server
+    /// made by hand is ASKED (the edit screen shows the choice unselected and
+    /// Connect is blocked until it is made — ConfigValidation). Everything that
+    /// existed before the field is 2.1.9: a stored server (init(from:)), a
+    /// plain csqtt:// link (init(link:)), a backup (ServerSettings.apply).
+    var csqttGeneration: String = ""
 
     /// Human-readable transport mode, matching the ServerMode picker labels.
     /// Used in log lines and import confirmations.
@@ -103,6 +112,7 @@ struct ServerProfile: Codable, Identifiable, Equatable {
         case wrapAPassword, deviceID
         case useCsqtt, csqttPassword, csqttDeviceID
         case csqttBoundedWrites
+        case csqttGeneration
     }
 }
 
@@ -146,6 +156,10 @@ extension ServerProfile {
         if let v = try c.decodeIfPresent(String.self, forKey: .csqttPassword) { csqttPassword = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .csqttDeviceID) { csqttDeviceID = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .csqttBoundedWrites) { csqttBoundedWrites = v }
+        // A csqtt server stored before the field existed is a 2.1.9 server —
+        // 2.5 could not be chosen then. (Behind useCsqtt's own line above.)
+        if let v = try c.decodeIfPresent(String.self, forKey: .csqttGeneration) { csqttGeneration = v }
+        else if useCsqtt { csqttGeneration = CsqttGeneration.v219 }
     }
 }
 
@@ -198,6 +212,10 @@ extension ServerProfile {
         // two people importing one link must not collide on a made-up id.
         if let v = s.csqttDeviceID?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty { csqttDeviceID = v }
         if useCsqtt && csqttDeviceID.isEmpty { csqttDeviceID = UUID().uuidString }
+        // A link says the generation by what it is: one that names none is a
+        // plain csqtt:// link, and only 2.1.9 has those.
+        if let v = s.csqttGeneration?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty { csqttGeneration = v }
+        if useCsqtt && csqttGeneration.isEmpty { csqttGeneration = CsqttGeneration.v219 }
         // SRTP-WRAP-S needs a stable per-stream Client-ID; mint one when the
         // link didn't carry it (mirrors the mode picker).
         if useWrapS && clientID.isEmpty { clientID = UUID().uuidString }
@@ -246,6 +264,7 @@ struct ServerSettings: Codable {
     var csqttPassword: String? = nil
     var csqttDeviceID: String? = nil
     var csqttBoundedWrites: Bool? = nil
+    var csqttGeneration: String? = nil
 
     init(_ p: ServerProfile) {
         serverName = p.serverName
@@ -273,6 +292,7 @@ struct ServerSettings: Codable {
         csqttPassword = p.csqttPassword
         csqttDeviceID = p.csqttDeviceID
         csqttBoundedWrites = p.csqttBoundedWrites
+        csqttGeneration = p.csqttGeneration.isEmpty ? nil : p.csqttGeneration
     }
 
     /// Rebuild a profile, filling every absent field with the ServerProfile
@@ -304,6 +324,18 @@ struct ServerSettings: Codable {
         if let v = csqttPassword { p.csqttPassword = v }
         if let v = csqttDeviceID { p.csqttDeviceID = v }
         if let v = csqttBoundedWrites { p.csqttBoundedWrites = v }
+        if let v = csqttGeneration { p.csqttGeneration = v }
+        // A backup made before the field existed holds 2.1.9 servers.
+        if p.useCsqtt && p.csqttGeneration.isEmpty { p.csqttGeneration = CsqttGeneration.v219 }
         return p
     }
+}
+
+/// The csqtt protocols this build speaks, by the names the profile and
+/// proxy_config carry (the bridge reads the same two — csqtt25_bridge.go).
+enum CsqttGeneration {
+    static let v219 = "2.1.9"
+    static let v25 = "2.5"
+    static let all = [v219, v25]
+    static func isKnown(_ s: String) -> Bool { all.contains(s) }
 }

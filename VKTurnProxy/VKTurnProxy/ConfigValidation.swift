@@ -191,6 +191,22 @@ enum ConfigValidation {
         return nil
     }
 
+    /// csqtt: the profile must SAY which protocol its server speaks — 2.1.9
+    /// and 2.5 are different protocols and a server answers the wrong one
+    /// with silence, so a wrong or missing choice shows only as a tunnel that
+    /// never comes up. Empty (a server made by hand, not yet told) blocks
+    /// Connect; so does a name this build does not know (a backup from a
+    /// newer build).
+    static func csqttGeneration(_ s: String) -> Issue? {
+        if s.isEmpty {
+            return Issue(.error, "Choose the server's csqtt version in its settings — 2.1.9 and 2.5 are different protocols, and a server answers the wrong one with silence.")
+        }
+        if !CsqttGeneration.isKnown(s) {
+            return Issue(.error, "This build does not know csqtt version \(s). Choose 2.1.9 or 2.5 in the server's settings.")
+        }
+        return nil
+    }
+
     /// csqtt: the server binds the password to ONE device id, so the id the
     /// user can SEE is the one that must go out — never a hidden fallback
     /// (2026-09-06: a cleared field connected with an invisible UUID and was
