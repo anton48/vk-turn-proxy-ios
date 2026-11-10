@@ -145,6 +145,7 @@ type Client struct {
 	dupCursor int // rotates the worker that carries the copy
 
 	gate     *startGate
+	dialHold atomic.Int64 // unix nanos: no relay dial begins before this (panelRestart)
 	anyRx    atomic.Int64 // last inbound on any worker, unix nanos
 	probes   atomic.Int64 // liveness probes marked
 	reprobes atomic.Int64 // unanswered probes sent again — by the liveness rule, and by a round that is asked again
@@ -783,6 +784,21 @@ func (c *Client) restartAll(reason string) {
 	}
 }
 
+// panelRestart acts on the server's notice that it is restarting. The
+// server that comes back holds no sessions, so every worker starts over —
+// but not yet: the server goes on answering until it is gone (three
+// quarters of a second after the notice, then its stop), and a worker
+// that asks for its configuration inside that moment is taken back by the
+// server that is about to go and forgotten with it — ready here, unknown
+// to the server that came back, until a REPAIR or the liveness rule finds
+// it half a minute later. An asked restart dials at once, so the notice
+// holds every dial for panelRestartHold, counted from the last time it
+// was said.
+func (c *Client) panelRestart() {
+	c.dialHold.Store(time.Now().Add(panelRestartHold).UnixNano())
+	c.restartAll("panel restart")
+}
+
 // monitor runs the liveness rule every livenessTick.
 func (c *Client) monitor() {
 	defer c.wg.Done()
@@ -1013,6 +1029,11 @@ const (
 var keepaliveEvery = 10 * time.Second
 
 var getconfSchedule = []time.Duration{750 * time.Millisecond, 1500 * time.Millisecond, 3 * time.Second}
+
+// panelRestartHold is how long after the server's restart notice no worker
+// dials (Client.panelRestart): the server's own delay before it stops, and
+// as much again for the stop. A variable so a test can shorten it.
+var panelRestartHold = 1500 * time.Millisecond
 
 type worker struct {
 	c      *Client
@@ -1348,9 +1369,26 @@ func (w *worker) session() error {
 	// A dead-write signal older than this allocation the same: it was about
 	// a connection that is gone already (a probe's write racing the
 	// teardown), never about this one.
-	select {
-	case <-w.kick:
-	default:
+	//
+	// The hold behind a restart notice (panelRestart) is waited out HERE,
+	// inside the gate and in front of the drain: the notice's own kick is
+	// then older than the allocation, and the drain is looked at again
+	// after every wait — a notice that lands during one is waited out too.
+	for {
+		select {
+		case <-w.kick:
+		default:
+		}
+		hold := time.Until(time.Unix(0, w.c.dialHold.Load()))
+		if hold <= 0 {
+			break
+		}
+		select {
+		case <-time.After(hold):
+		case <-ctx.Done():
+			startDone()
+			return ctx.Err()
+		}
 	}
 	select {
 	case <-w.dead:
@@ -1445,6 +1483,14 @@ attempts:
 		for {
 			select {
 			case p := <-control:
+				if IsPanelRestart(p) {
+					// Said down a stream that is not ready yet — the only one
+					// there is while the first worker dials. The same notice:
+					// every worker starts over, this one through its own kick.
+					w.c.cfg.Logf("csqtt: worker %d: server is restarting (heard in the configuration wait) — restarting every worker", w.id)
+					w.c.panelRestart()
+					continue
+				}
 				if !IsConfigResponse(p) {
 					continue
 				}
@@ -1509,7 +1555,7 @@ func (w *worker) handleControl(p []byte) {
 	switch {
 	case IsPanelRestart(p):
 		w.c.cfg.Logf("csqtt: worker %d: server is restarting — restarting every worker", w.id)
-		w.c.restartAll("panel restart")
+		w.c.panelRestart()
 	case IsConfigResponse(p):
 		if conf, err := ParseConfigResponse(p); err == nil {
 			w.c.setConfig(conf) // a pushed TUNCONF (DNS change)

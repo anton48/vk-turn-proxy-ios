@@ -45,7 +45,9 @@ type fakeServer struct {
 	getconf  []getconfSeen
 	readies  int
 	discons  int
-	withhold map[string]int // worker id → GETCONFs still to leave unanswered
+	withhold map[string]int    // worker id → GETCONFs still to leave unanswered
+	streams  map[string]string // the address a GETCONF came from → its worker id: what the server knows since it last started
+	strict   bool              // as the real server: silent to a stream it does not know (READY, data)
 	closed   chan struct{}
 }
 
@@ -124,6 +126,10 @@ func (s *fakeServer) loop() {
 			if len(f) >= 6 {
 				s.mu.Lock()
 				s.getconf = append(s.getconf, getconfSeen{gen: f[3], salt: f[4], worker: f[5]})
+				if s.streams == nil {
+					s.streams = map[string]string{}
+				}
+				s.streams[from.String()] = f[5]
 				if s.withhold[f[5]] > 0 {
 					s.withhold[f[5]]--
 					answer = false
@@ -134,6 +140,9 @@ func (s *fakeServer) loop() {
 				s.reply(from, "TUNCONF:10.66.67.3:77.88.8.8:9000:stream-v2")
 			}
 		case p == ReadyRequest:
+			if s.stranger(from) {
+				continue
+			}
 			s.mu.Lock()
 			s.readies++
 			s.mu.Unlock()
@@ -145,6 +154,9 @@ func (s *fakeServer) loop() {
 			s.reply(from, DisconnectedResponse)
 		case IsIdleKeepalive(plain):
 		default: // data: echo it back
+			if s.stranger(from) {
+				continue
+			}
 			s.mu.Lock()
 			wire, err := s.wrapper.Wrap(nil, plain)
 			s.mu.Unlock()
@@ -153,6 +165,62 @@ func (s *fakeServer) loop() {
 			}
 		}
 	}
+}
+
+// stranger says whether a strict server would ignore what comes from this
+// address: it has not asked for a configuration since the server started.
+func (s *fakeServer) stranger(from net.Addr) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, known := s.streams[from.String()]
+	return s.strict && !known
+}
+
+// sayTo sends a plaintext down every stream of the workers named (all of
+// them when none is named) that the server knows.
+func (s *fakeServer) sayTo(plain []byte, workers ...string) {
+	s.mu.Lock()
+	var to []string
+	for addr, w := range s.streams {
+		if len(workers) == 0 {
+			to = append(to, addr)
+			continue
+		}
+		for _, want := range workers {
+			if w == want {
+				to = append(to, addr)
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, addr := range to {
+		if ua, err := net.ResolveUDPAddr("udp4", addr); err == nil {
+			s.reply(ua, string(plain))
+		}
+	}
+}
+
+// forget is the server that came back after a restart: it knows none of the
+// old streams.
+func (s *fakeServer) forget() {
+	s.mu.Lock()
+	s.streams = map[string]string{}
+	s.mu.Unlock()
+}
+
+// knows says whether the server holds a stream of each of the workers.
+func (s *fakeServer) knows(workers ...string) map[string]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]bool{}
+	for _, w := range s.streams {
+		out[w] = true
+	}
+	res := map[string]bool{}
+	for _, w := range workers {
+		res[w] = out[w]
+	}
+	return res
 }
 
 func (s *fakeServer) counts() (getconfs, readies, discons int) {
