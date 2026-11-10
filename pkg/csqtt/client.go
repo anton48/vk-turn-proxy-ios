@@ -146,6 +146,7 @@ type Client struct {
 
 	gate     *startGate
 	dialHold atomic.Int64 // unix nanos: no relay dial begins before this (panelRestart)
+	noticeAt atomic.Int64 // unix nanos: when the server last said it is restarting; 0 if never (settling)
 	anyRx    atomic.Int64 // last inbound on any worker, unix nanos
 	probes   atomic.Int64 // liveness probes marked
 	reprobes atomic.Int64 // unanswered probes sent again — by the liveness rule, and by a round that is asked again
@@ -440,8 +441,18 @@ func (c *Client) judgeDeaf(now, prevTick time.Time) {
 		in.RoundOut, in.RoundIsWake, in.RoundListened = true, r.wake, time.Duration(r.listened.Load())
 		in.RoundAnswered = c.rxSeq.Load() != r.rxSeq // a FACT the read loops counted, not a comparison of clocks
 	}
+	var heard int64 // the latest real inbound on any worker
 	for _, w := range c.workers {
-		if at := w.readyAt.Load(); at != 0 && now.Sub(time.Unix(0, at)) >= readyGrace {
+		if h := w.heardAt.Load(); h > heard {
+			heard = h
+		}
+	}
+	grace := readyGrace
+	if in.Settling = c.settling(heard); in.Settling {
+		grace = settleGrace
+	}
+	for _, w := range c.workers {
+		if at := w.readyAt.Load(); at != 0 && now.Sub(time.Unix(0, at)) >= grace {
 			in.Judgeable++
 		}
 	}
@@ -795,8 +806,19 @@ func (c *Client) restartAll(reason string) {
 // holds every dial for panelRestartHold, counted from the last time it
 // was said.
 func (c *Client) panelRestart() {
-	c.dialHold.Store(time.Now().Add(panelRestartHold).UnixNano())
+	now := time.Now()
+	c.noticeAt.Store(now.UnixNano())
+	c.dialHold.Store(now.Add(panelRestartHold).UnixNano())
 	c.restartAll("panel restart")
+}
+
+// settling says whether something last really heard at `heard` (unix nanos; 0:
+// never) may still be the server that said it was restarting: nothing later
+// than settleWindow after the notice. A FACT against a moment of the far end's
+// own time — a freeze changes neither, and no clock reset can settle anybody.
+func (c *Client) settling(heard int64) bool {
+	at := c.noticeAt.Load()
+	return at != 0 && heard < at+int64(settleWindow)
 }
 
 // monitor runs the liveness rule every livenessTick.
@@ -824,7 +846,8 @@ func (c *Client) monitorStep(now time.Time) {
 	again, againHeard := 0, 0 // this tick's re-sends, and how many of them with the client hearing since the send before
 	for _, w := range c.workers {
 		in := livenessInput{Now: now, PrevTick: prev, AnyRx: anyRx,
-			ReadyAt: nanosTime(w.readyAt.Load()), LastRx: nanosTime(w.lastRx.Load())}
+			ReadyAt: nanosTime(w.readyAt.Load()), LastRx: nanosTime(w.lastRx.Load()),
+			Settling: c.settling(w.heardAt.Load())}
 		// The probe's state is ONE value, loaded once; the facts beside it are
 		// read AFTER it — the read loop counts an inbound (w.rx) before anything
 		// else, so an answer that has reached it is seen here whatever it has

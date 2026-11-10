@@ -126,6 +126,32 @@ const (
 	descheduledSlack = 5 * time.Second
 )
 
+// Behind a restart notice (Client.panelRestart). The server that said it is
+// restarting answers until it is gone, and the hold in front of the dials is
+// only as long as a stop is expected to take: a server slower than that takes
+// the first workers back and is forgotten with them — ready here, unknown to
+// the server that came back. Until a worker has really heard something later
+// than settleWindow after the notice it is not known to be on the server that
+// came back, and for such a worker the SAME rules run on shorter times. Only
+// the times: the order of the checks, the late tick that judges nothing, the
+// re-sends that count by facts and the two of them a verdict needs are the
+// rule's and stay.
+//
+// settleDeafQuiet is longer than a tick on purpose: on an idle tunnel the
+// workers that do hear are heard once a tick, as answers to the per-worker
+// probes — a total-silence threshold under that would ask everybody afresh at
+// every tick, and a fresh ask REPLACES a worker's standing probe, so the one
+// worker that does not answer would never be given up on.
+var settleWindow = 15 * time.Second // a variable so that a test can end it
+
+const (
+	settleGrace          = 2 * time.Second  // for readyGrace
+	settleProbeAfter     = 2 * time.Second  // for probeAfter, one worker's silence
+	settleDeadAfterProbe = 10 * time.Second // for deadAfterProbe; the two counted re-sends take three ticks anyway
+	settleDeafQuiet      = 8 * time.Second  // for probeAfter, everybody's silence
+	settleRoundWait      = 10 * time.Second // for deadAfterProbe, the monitor's round: asked once more, then judged
+)
+
 // livenessInput is one worker's view at a monitor tick.
 type livenessInput struct {
 	Now         time.Time
@@ -137,6 +163,7 @@ type livenessInput struct {
 	LiveProbes  int       // a FACT: re-sends of the probe that count against the worker — made while the path demonstrably worked (probeState.confirmed)
 	Answered    bool      // a FACT: THIS worker's real-inbound count has moved since its first probe went out. 🚫 Not "LastRx is fresh": that is a clock, which a wake and a late tick reset — and the read loop stamps it BEFORE it clears the probe
 	AnyRx       time.Time // last inbound on ANY worker of the client
+	Settling    bool      // a FACT: this worker's last REAL inbound is earlier than settleWindow after a restart notice (Client.settling)
 }
 
 // probeState is what is known about the probe that is out for a worker's
@@ -217,7 +244,11 @@ func livenessVerdict(in livenessInput) livenessAction {
 	if !in.PrevTick.IsZero() && in.Now.Sub(in.PrevTick) > livenessTick+descheduledSlack {
 		return livenessResetAll
 	}
-	if in.ReadyAt.IsZero() || in.Now.Sub(in.ReadyAt) < readyGrace {
+	grace, quiet, dead := readyGrace, probeAfter, deadAfterProbe
+	if in.Settling {
+		grace, quiet, dead = settleGrace, settleProbeAfter, settleDeadAfterProbe
+	}
+	if in.ReadyAt.IsZero() || in.Now.Sub(in.ReadyAt) < grace {
 		return livenessNone
 	}
 	if in.Now.Sub(in.AnyRx) >= probeAfter {
@@ -228,7 +259,7 @@ func livenessVerdict(in livenessInput) livenessAction {
 			return livenessAnswered
 		}
 		rested := in.Now.Sub(in.LastProbeAt) >= reprobeEvery
-		if rested && in.LiveProbes >= liveProbesToGiveUp && in.Now.Sub(in.ProbeSentAt) >= deadAfterProbe {
+		if rested && in.LiveProbes >= liveProbesToGiveUp && in.Now.Sub(in.ProbeSentAt) >= dead {
 			return livenessRestart
 		}
 		if rested {
@@ -236,7 +267,7 @@ func livenessVerdict(in livenessInput) livenessAction {
 		}
 		return livenessNone
 	}
-	if in.Now.Sub(in.LastRx) < probeAfter {
+	if in.Now.Sub(in.LastRx) < quiet {
 		return livenessNone
 	}
 	return livenessProbe
@@ -344,6 +375,7 @@ type deafInput struct {
 	RoundIsWake    bool          // … the wake hook's
 	RoundAnswered  bool          // a real inbound arrived, on any worker, after that round's probes went out
 	RoundListened  time.Duration // awake time observed since then — never wall time
+	Settling       bool          // a FACT: no worker has really heard anything later than settleWindow after a restart notice
 	LastRestartAll time.Time     // zero if never
 	Rounds         int           // restart-alls in the current run
 }
@@ -396,6 +428,9 @@ func deafVerdict(in deafInput) deafAction {
 	}
 	if in.RoundOut && !in.RoundAnswered {
 		wait := deadAfterProbe
+		if in.Settling {
+			wait = settleRoundWait
+		}
 		if in.RoundIsWake {
 			wait = wakeDeafAfter
 		}
@@ -410,7 +445,11 @@ func deafVerdict(in deafInput) deafAction {
 		}
 		return deafRestartAll
 	}
-	if in.Now.Sub(in.AnyRx) >= probeAfter {
+	quiet := probeAfter
+	if in.Settling {
+		quiet = settleDeafQuiet
+	}
+	if in.Now.Sub(in.AnyRx) >= quiet {
 		return deafProbeAll
 	}
 	return deafNone
