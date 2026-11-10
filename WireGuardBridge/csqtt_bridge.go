@@ -80,6 +80,10 @@ type csqttConfig struct {
 	Server   string `json:"peer_addr"`       // the csqtt server, host:port (the profile's "Proxy Server")
 	Password string `json:"csqtt_password"`  // HKDF input for the wire key AND GETCONF authentication
 	DeviceID string `json:"csqtt_device_id"` // stable per install: the server binds an unbound password to it
+	// Generation is the protocol the server speaks: "" or "2.1.9" — pkg/csqtt, as
+	// every config before the field; "2.5" — pkg/csqtt25 (csqtt25_bridge.go). The
+	// two are different protocols: a server answers the other one with silence.
+	Generation string `json:"csqtt_generation"`
 
 	VKLink                  string              `json:"vk_link"`
 	NumConns                int                 `json:"num_conns"`
@@ -185,6 +189,7 @@ type csqttEntry struct {
 	cancel  context.CancelFunc
 	pool    *proxy.CredPool
 	started time.Time
+	mtu     int // the tunnel MTU of this tunnel's generation, for the provision
 
 	dialed   chan struct{} // closed when csqttDial returned, either way
 	clientMu sync.Mutex
@@ -455,11 +460,20 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 		log.Printf("csqttStart: server (peer_addr) and csqtt_password are required")
 		return -2
 	}
-	if cfg.NumConns <= 0 {
-		cfg.NumConns = 1
+	gen25, known := csqttGeneration(cfg.Generation)
+	if !known {
+		log.Printf("csqttStart: refused — the config names a protocol generation this build does not know: %q", cfg.Generation)
+		return -2
 	}
-	if cfg.NumConns > csqtt.MaxWorkers {
-		cfg.NumConns = csqtt.MaxWorkers
+	if gen25 {
+		cfg.NumConns = csqtt25Workers(cfg.NumConns)
+	} else {
+		if cfg.NumConns <= 0 {
+			cfg.NumConns = 1
+		}
+		if cfg.NumConns > csqtt.MaxWorkers {
+			cfg.NumConns = csqtt.MaxWorkers
+		}
 	}
 
 	// The same process-wide switches wgStartVKBootstrap applies: the
@@ -500,7 +514,10 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 		TurnServers: cfg.TurnServers,
 		SeededTURN:  seed,
 	})
-	e := &csqttEntry{ctx: ctx, cancel: cancel, pool: pool, started: time.Now(), dialed: make(chan struct{})}
+	e := &csqttEntry{ctx: ctx, cancel: cancel, pool: pool, started: time.Now(), dialed: make(chan struct{}), mtu: csqttMTU}
+	if gen25 {
+		e.mtu = csqtt25MTU
+	}
 	csqttTunnelsMu.Lock()
 	e.id = csqttNextID
 	csqttNextID++
@@ -520,11 +537,21 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 	if cfg.BoundedWrites {
 		stall = csqtt.DefaultWriteStall
 	}
-	gen, salt := csqttNextIdentity(dir)
+	// 2.5 keeps no generation file: its engine takes the pair from the clock.
+	var gen uint64
+	var salt string
+	if !gen25 {
+		gen, salt = csqttNextIdentity(dir)
+	}
 	adapter := &csqttPoolAdapter{pool: pool, fatal: e.fail}
 	// Never the password: the config line Swift logs is the redacted one.
-	log.Printf("csqttStart: tunnel %d: server=%s device=%s workers=%d transport=%s write-bound=%s gen=%d cache=%v seeded=%v",
-		e.id, cfg.Server, cfg.DeviceID, cfg.NumConns, transport, stall, gen, cachePath != "", seed != nil)
+	if gen25 {
+		log.Printf("csqttStart: tunnel %d: generation 2.5 — server=%s workers=%d relay=%s keys=auto mtu=%d cache=%v seeded=%v",
+			e.id, cfg.Server, cfg.NumConns, transport, e.mtu, cachePath != "", seed != nil)
+	} else {
+		log.Printf("csqttStart: tunnel %d: server=%s device=%s workers=%d transport=%s write-bound=%s gen=%d cache=%v seeded=%v",
+			e.id, cfg.Server, cfg.DeviceID, cfg.NumConns, transport, stall, gen, cachePath != "", seed != nil)
+	}
 
 	go func() {
 		defer close(e.dialed)
@@ -540,13 +567,18 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 			e.fail(fmt.Errorf("csqtt server %q: %w", cfg.Server, err))
 			return
 		}
-		client, err := csqttDial(ctx, csqtt.Config{
-			Server: server, Password: cfg.Password, DeviceID: cfg.DeviceID,
-			Generation: gen, Salt: salt, Workers: cfg.NumConns,
-			Creds: adapter.creds, TURNTransport: transport, TURNLogLevel: logging.LogLevelWarn,
-			WriteStall: stall,
-			Logf:       log.Printf,
-		})
+		var client csqttClient
+		if gen25 {
+			client, err = csqtt25Start(ctx, cfg, server, transport, adapter.creds)
+		} else {
+			client, err = csqttDial(ctx, csqtt.Config{
+				Server: server, Password: cfg.Password, DeviceID: cfg.DeviceID,
+				Generation: gen, Salt: salt, Workers: cfg.NumConns,
+				Creds: adapter.creds, TURNTransport: transport, TURNLogLevel: logging.LogLevelWarn,
+				WriteStall: stall,
+				Logf:       log.Printf,
+			})
+		}
 		if err != nil {
 			e.fail(fmt.Errorf("csqtt: %w", err))
 			return
@@ -624,10 +656,10 @@ func csqttProvisionImpl(handle int32) string {
 	if c == nil {
 		return ""
 	}
-	return csqttProvisionJSON(c.Config())
+	return csqttProvisionJSON(c.Config(), e.mtu)
 }
 
-func csqttProvisionJSON(conf csqtt.ConfigResponse) string {
+func csqttProvisionJSON(conf csqtt.ConfigResponse, mtu int) string {
 	if conf.TunnelIP == "" {
 		return ""
 	}
@@ -636,7 +668,7 @@ func csqttProvisionJSON(conf csqtt.ConfigResponse) string {
 		DNS     string `json:"dns"`
 		MTU     int    `json:"mtu"`
 		Stream  string `json:"stream"`
-	}{Address: conf.TunnelIP + csqttPrefix, DNS: conf.DNS, MTU: csqttMTU, Stream: conf.StreamRevision}
+	}{Address: conf.TunnelIP + csqttPrefix, DNS: conf.DNS, MTU: mtu, Stream: conf.StreamRevision}
 	b, err := json.Marshal(out)
 	if err != nil {
 		return ""
@@ -730,7 +762,7 @@ func (e *csqttEntry) logStatsEvery(client csqttClient) {
 		case <-e.ctx.Done():
 			return
 		case <-tick.C:
-			log.Printf("csqtt: pathstats tick: %s", csqttStatsLine(client.Stats(), e.tunIn.Load(), e.tunOut.Load()))
+			log.Printf("csqtt: pathstats tick: %s", csqttLine(client, e.tunIn.Load(), e.tunOut.Load()))
 		}
 	}
 }
@@ -835,7 +867,7 @@ func csqttTurnOffImpl(handle int32) {
 		// a control that ends in a plain Disconnect — leaves no liveness counter
 		// in its log at all (field, 2026-09-19: a pf-block control came back
 		// without the one number that would have shown the re-sends acting).
-		log.Printf("csqtt: pathstats at stop: %s", csqttStatsLine(c.Stats(), e.tunIn.Load(), e.tunOut.Load()))
+		log.Printf("csqtt: pathstats at stop: %s", csqttLine(c, e.tunIn.Load(), e.tunOut.Load()))
 		t := time.Now()
 		_ = c.Close()
 		log.Printf("csqttTurnOff: tunnel %d client.Close took %s", e.id, time.Since(t).Round(time.Millisecond))
@@ -923,7 +955,20 @@ func csqttLogPathSnapshotImpl(handle int32, label string) {
 		log.Printf("csqtt: pathstats %s: not ready yet", label)
 		return
 	}
-	log.Printf("csqtt: pathstats %s: %s", label, csqttStatsLine(c.Stats(), e.tunIn.Load(), e.tunOut.Load()))
+	log.Printf("csqtt: pathstats %s: %s", label, csqttLine(c, e.tunIn.Load(), e.tunOut.Load()))
+}
+
+// csqttLine is the counters' line of whichever generation the client is: a
+// client that words its own (2.5's — another protocol, other counters) is
+// asked for it, every other gets csqttStatsLine. The three places that print
+// the counters all come through here.
+func csqttLine(c csqttClient, tunIn, tunOut int64) string {
+	if own, ok := c.(interface {
+		StatsLine(tunIn, tunOut int64) string
+	}); ok {
+		return own.StatsLine(tunIn, tunOut)
+	}
+	return csqttStatsLine(c.Stats(), tunIn, tunOut)
 }
 
 // csqttStatsLine is the ONE wording of the client's counters in the log: the
