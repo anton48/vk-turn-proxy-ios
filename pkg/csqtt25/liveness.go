@@ -149,8 +149,7 @@ func (s *streamWatch) tick(now time.Time, epoch uint64, unsettled bool) (act wat
 		woke = false // the same wake, already acted on
 	}
 	if froze || woke {
-		s.quiet, s.askedAt = 0, 0
-		s.wake, s.since, s.listened, s.nextAsk = true, now, 0, s.wakeAsk
+		s.open(now)
 		if froze {
 			return watchFroze, step
 		}
@@ -180,6 +179,30 @@ func (s *streamWatch) tick(now time.Time, epoch uint64, unsettled bool) (act wat
 		return watchAsk, 0
 	}
 	return watchNone, 0
+}
+
+// open starts a boundary's window at now: the silence counted so far is
+// dropped, and the stream is to be asked afresh.
+func (s *streamWatch) open(now time.Time) {
+	s.quiet, s.askedAt = 0, 0
+	s.wake, s.since, s.listened, s.nextAsk = true, now, 0, s.wakeAsk
+}
+
+// ends says whether act is a verdict: the stream's session is over.
+func (a watchAction) ends() bool {
+	return a == watchDeaf || a == watchUnsettled || a == watchWakeDeaf
+}
+
+// void takes back the verdict tick has just given: the caller's wake word was
+// said while it was being reached — the serve loop found the epoch moved when
+// it looked again before carrying the verdict out — and a verdict is about the
+// time BEFORE that word. The word is a boundary of its own, under the epoch it
+// was said with, and it is never merged into the window whose verdict it
+// voids: that window is over. The caller asks the stream, as behind any
+// boundary.
+func (s *streamWatch) void(now time.Time, epoch uint64) {
+	s.epoch = epoch
+	s.open(now)
 }
 
 // heard takes one authentic inbound, read at now. One read across a freeze

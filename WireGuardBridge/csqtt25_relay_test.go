@@ -295,3 +295,107 @@ func TestCsqtt25DialRelayTellsTheAcceptanceFirstAndStatesItsFamily(t *testing.T)
 		}
 	}
 }
+
+// pipeCtl is a control socket that really blocks: one end of a net.Pipe that
+// nobody reads, so a write waits until its deadline — the TCP connection to a
+// relay that stopped taking bytes. The FIRST clearing of the write deadline is
+// held at the socket's door until the test lets it through.
+type pipeCtl struct {
+	net.Conn
+	entered chan struct{} // closed when the first clearing has arrived
+	pass    chan struct{} // closed to let it through
+	once    sync.Once
+	mu      sync.Mutex
+	set     []time.Time
+}
+
+func (p *pipeCtl) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		first := false
+		p.once.Do(func() { first = true })
+		if first {
+			close(p.entered)
+			<-p.pass
+		}
+	}
+	p.mu.Lock()
+	p.set = append(p.set, t)
+	p.mu.Unlock()
+	return p.Conn.SetWriteDeadline(t)
+}
+
+func (p *pipeCtl) WriteTo(b []byte, _ net.Addr) (int, error) { return p.Conn.Write(b) }
+
+func (p *pipeCtl) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, err := p.Conn.Read(b)
+	return n, nil, err
+}
+
+func (p *pipeCtl) deadlines() []time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]time.Time(nil), p.set...)
+}
+
+// deallocOnClose is a relayed conn whose Close writes on the control socket,
+// as pion's does (the deallocate).
+type deallocOnClose struct {
+	net.PacketConn
+	ctl   net.PacketConn
+	began chan struct{}
+	err   error
+}
+
+func (d *deallocOnClose) Close() error {
+	close(d.began)
+	_, d.err = d.ctl.WriteTo([]byte("deallocate"), nil)
+	return nil
+}
+
+// 🚨 The clearing and the close do not take turns. A clearing that has looked
+// — no close under way — and reaches the socket only AFTER the close has set
+// its deadline there must not leave the socket without one: the deallocate
+// would wait on a relay that takes no bytes for ever, and with it the
+// session's end, its allocation and its lease.
+func TestCsqtt25RelayAClearingThatLandsBehindTheClosesDeadlineLeavesTheCloseBounded(t *testing.T) {
+	near, far := net.Pipe()
+	defer far.Close()
+	ctl := &pipeCtl{Conn: near, entered: make(chan struct{}), pass: make(chan struct{})}
+	relayed := &deallocOnClose{ctl: ctl, began: make(chan struct{})}
+	r := &csqtt25Relay{relayed: relayed, ctl: ctl}
+	r.close = func() { csqtt25CloseRelay(ctl, relayed, nil) }
+	pc := r.packetConn()
+
+	cleared := make(chan struct{})
+	go func() { // the engine, behind a write of its own
+		_ = pc.SetWriteDeadline(time.Time{})
+		close(cleared)
+	}()
+	<-ctl.entered // it has looked: no close under way — and stands at the socket's door
+
+	closed := make(chan struct{})
+	began := time.Now()
+	go func() {
+		r.Close()
+		close(closed)
+	}()
+	<-relayed.began // the close has set its deadline and is writing the deallocate
+	close(ctl.pass) // … and only now does the clearing land
+
+	select {
+	case <-closed:
+	case <-time.After(csqtt25RelayCloseBudget + 3*time.Second):
+		near.Close() // let the stuck write go: nothing may outlive the test
+		<-closed
+		t.Fatalf("the close had not returned %s after it began (its budget is %s): the clearing wiped the close's deadline and the deallocate was left unbounded",
+			time.Since(began).Round(100*time.Millisecond), csqtt25RelayCloseBudget)
+	}
+	<-cleared
+	if !errors.Is(relayed.err, os.ErrDeadlineExceeded) {
+		t.Fatalf("the deallocate's write ended with %v, want the deadline's own error", relayed.err)
+	}
+	set := ctl.deadlines()
+	if len(set) == 0 || set[len(set)-1].IsZero() {
+		t.Fatalf("the last write deadline put on the control socket is none (%d set): the close's budget has to stand there", len(set))
+	}
+}

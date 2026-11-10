@@ -265,3 +265,52 @@ func TestTheServeClockIsWallTime(t *testing.T) {
 		t.Fatalf("the serve clock's reading carries a monotonic part: %s", a)
 	}
 }
+
+// Which of the rule's answers end a session.
+func TestWhichAnswersAreVerdicts(t *testing.T) {
+	for act, want := range map[watchAction]bool{
+		watchNone: false, watchAsk: false, watchFroze: false, watchWoke: false,
+		watchDeaf: true, watchUnsettled: true, watchWakeDeaf: true,
+	} {
+		if act.ends() != want {
+			t.Errorf("action %d ends a session: %v, want %v", act, act.ends(), want)
+		}
+	}
+}
+
+// 🚨 A verdict taken back by the wake word (the serve loop found the epoch
+// moved before it carried the verdict out): the word is a boundary of its own
+// — a fresh window, however short ago the voided one began — and ONE wake: the
+// tick that follows does not open the window again for the same word.
+func TestAVoidedVerdictOpensTheWordsOwnWindow(t *testing.T) {
+	for _, merge := range []time.Duration{time.Hour, 0} { // whatever the merge time
+		at := time.Unix(1_800_200_000, 0)
+		s := fieldWatch(at)
+		s.merge = merge
+		at = at.Add(time.Second)
+		s.tick(at, 1, false) // the first word
+		if _, end, verdict := asks(run(s, &at, 5, 1, false)); end != 5 || verdict != watchWakeDeaf {
+			t.Fatalf("merge %s: the first window's verdict %d at tick %d, want %d at 5", merge, verdict, end, watchWakeDeaf)
+		}
+		s.void(at, 2)
+		if !s.wake || s.listened != 0 || s.quiet != 0 || !s.since.Equal(at) {
+			t.Fatalf("merge %s: after the void wake=%v listened=%s quiet=%s — want a window that begins now", merge, s.wake, s.listened, s.quiet)
+		}
+		asked, end, verdict := asks(run(s, &at, 5, 2, false))
+		if !sameInts(asked, []int{1, 2, 3, 4}) || end != 5 || verdict != watchWakeDeaf {
+			t.Fatalf("merge %s: behind the void asked at %v, verdict %d at tick %d — want asked at 1–4 and silent-behind-a-wake at 5: the word's own five seconds, once",
+				merge, asked, verdict, end)
+		}
+	}
+
+	// An ordinary verdict voided: a window, not another sixty seconds.
+	at := time.Unix(1_800_210_000, 0)
+	s := fieldWatch(at)
+	if _, end, verdict := asks(run(s, &at, 60, 0, false)); end != 60 || verdict != watchDeaf {
+		t.Fatalf("the ordinary verdict %d at tick %d, want %d at 60", verdict, end, watchDeaf)
+	}
+	s.void(at, 1)
+	if _, end, verdict := asks(run(s, &at, 5, 1, false)); end != 5 || verdict != watchWakeDeaf {
+		t.Fatalf("behind a voided ordinary verdict: %d at tick %d, want silent-behind-a-wake at 5", verdict, end)
+	}
+}

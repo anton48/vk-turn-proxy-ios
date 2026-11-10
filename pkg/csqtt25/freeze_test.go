@@ -1,6 +1,7 @@
 package csqtt25
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -160,5 +161,150 @@ func TestBehindAFreezeEveryStreamIsAskedAtOnce(t *testing.T) {
 	})
 	if took := time.Since(began); took > 2*time.Second {
 		t.Fatalf("the streams were asked %s behind the thaw — not at the tick that saw it", took)
+	}
+}
+
+// handClock is the serve clock entirely in the test's hand: it stands still
+// until moved, so a watch counts no listening the test did not give it.
+// arm(step, during): the NEXT reading runs during and returns a time step
+// later than the one before it. A serve loop's pass reads the clock BEHIND its
+// look at the wake epoch and IN FRONT of whatever it does with the rule's
+// answer — so during runs exactly between the two.
+type handClock struct {
+	mu     sync.Mutex
+	at     time.Time
+	armed  bool
+	step   time.Duration
+	during func()
+	fired  chan struct{}
+}
+
+// useHandClock must be called before the client is started (see useJumpClock).
+func useHandClock(t *testing.T) *handClock {
+	t.Helper()
+	h := &handClock{at: time.Unix(1_800_300_000, 0)}
+	prev := serveNow
+	serveNow = h.now
+	t.Cleanup(func() { serveNow = prev })
+	return h
+}
+
+func (h *handClock) now() time.Time {
+	h.mu.Lock()
+	var during func()
+	var fired chan struct{}
+	if h.armed {
+		h.armed = false
+		h.at = h.at.Add(h.step)
+		during, fired = h.during, h.fired
+	}
+	at := h.at
+	h.mu.Unlock()
+	if during != nil {
+		during()
+	}
+	if fired != nil {
+		close(fired)
+	}
+	return at
+}
+
+func (h *handClock) arm(t *testing.T, step time.Duration, during func()) {
+	t.Helper()
+	h.mu.Lock()
+	fired := make(chan struct{})
+	h.armed, h.step, h.during, h.fired = true, step, during, fired
+	h.mu.Unlock()
+	select {
+	case <-fired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no serve loop read the clock within 3s")
+	}
+}
+
+func mergeClock(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := wakeMerge
+	wakeMerge = d
+	t.Cleanup(func() { wakeMerge = old })
+}
+
+// oneMutedStream is a client with ONE stream, ready and then deaf to the far
+// side, on a clock that stands still.
+func oneMutedStream(t *testing.T, password string) (*Client, *dialer, *fakeServer, *handClock) {
+	t.Helper()
+	clock := useHandClock(t)
+	srv := newFakeServer(t, password)
+	c, d, _ := startClient(t, srv, 1, KeysWrap)
+	eventually(t, "the stream ready", func() bool { return c.Stats().Ready == 1 })
+	srv.set(func() { srv.mute[1] = true })
+	time.Sleep(60 * time.Millisecond) // what the server said before it fell silent has been read
+	return c, d, srv, clock
+}
+
+// 🚨 A verdict is about the time BEFORE the wake epoch it was reached under.
+// The wake word said while a pass is reaching one — behind its look at the
+// epoch, in front of the session's end — takes it back: the stream is not
+// replaced on the old window, it is asked afresh and given the word's own
+// window; and that window, left without an answer, is a verdict of its own.
+func TestAWakeWordSaidWhileAVerdictIsReachedTakesItBack(t *testing.T) {
+	quickClocks(t)
+	wakeClocks(t, 200*time.Millisecond, time.Hour, 10*time.Millisecond) // only a boundary asks
+	mergeClock(t, 50*time.Millisecond)                                  // as in the field: shorter than the window
+	c, d, srv, clock := oneMutedStream(t, "pw-void-wake")
+
+	asked := srv.readyCount(1)
+	c.Wake() // the first word: a window
+	eventually(t, "the stream asked behind the first word", func() bool { return srv.readyCount(1) > asked })
+
+	// The window's listening runs out in ONE reading of the clock — and in
+	// that same pass, behind its look at the epoch, the word is said again.
+	asked = srv.readyCount(1)
+	clock.arm(t, 200*time.Millisecond, c.Wake)
+	time.Sleep(300 * time.Millisecond)
+	if st := c.Stats(); d.count(1) != 1 || st.WakeDeaf != 0 || st.Wakes != 2 {
+		t.Fatalf("a second wake word said before the session's end: dialled %d time(s), silent-behind-a-wake verdicts %d, wake words %d — want 1 dial and no verdict: the verdict was reached under the first word",
+			d.count(1), st.WakeDeaf, st.Wakes)
+	}
+	if n := srv.readyCount(1) - asked; n < 1 {
+		t.Fatalf("the stream was asked %d time(s) behind the second word, want it asked afresh", n)
+	}
+
+	// The second word's window is a real one.
+	clock.arm(t, 200*time.Millisecond, nil)
+	eventually(t, "the stream replaced behind the second word's own window", func() bool { return d.count(1) >= 2 })
+	if st := c.Stats(); st.WakeDeaf != 1 {
+		t.Fatalf("silent-behind-a-wake verdicts %d, want 1", st.WakeDeaf)
+	}
+}
+
+// The same of a stream that fell silent while the process ran: its sixty
+// seconds are a verdict about the time before the word too.
+func TestAWakeWordTakesBackAnOrdinaryVerdictToo(t *testing.T) {
+	quickClocks(t)
+	probeAfter, deafAfter = time.Hour, 300*time.Millisecond
+	wakeClocks(t, 200*time.Millisecond, time.Hour, 10*time.Millisecond)
+	mergeClock(t, 0) // no two boundaries are ever one: the word must be ONE by itself
+	c, d, srv, clock := oneMutedStream(t, "pw-void-deaf")
+
+	asked, probes := srv.readyCount(1), c.Stats().Probes
+	clock.arm(t, 300*time.Millisecond, c.Wake)
+	eventually(t, "the stream asked behind the word", func() bool { return srv.readyCount(1) > asked })
+	time.Sleep(300 * time.Millisecond)
+	if st := c.Stats(); d.count(1) != 1 || st.WakeDeaf != 0 || st.Wakes != 1 {
+		t.Fatalf("a wake word said while the ordinary verdict was reached: dialled %d time(s), silent-behind-a-wake verdicts %d, wake words %d — want 1 dial and no verdict",
+			d.count(1), st.WakeDeaf, st.Wakes)
+	}
+	// One word, one boundary: the pass that follows finds the word's epoch
+	// already acted on and does not open the window — and ask — again. (The
+	// engine's own count of its asks says so: a second ask a moment behind the
+	// first is not written twice, so the far side cannot tell.)
+	if n, p := srv.readyCount(1)-asked, c.Stats().Probes-probes; n != 1 || p != 1 {
+		t.Fatalf("behind ONE wake word the stream was asked %d time(s) by the engine's count, %d reached the far side — want once", p, n)
+	}
+	clock.arm(t, 200*time.Millisecond, nil)
+	eventually(t, "the stream replaced behind the word's own window", func() bool { return d.count(1) >= 2 })
+	if st := c.Stats(); st.WakeDeaf != 1 {
+		t.Fatalf("silent-behind-a-wake verdicts %d, want 1: the word opened a window, not another sixty seconds", st.WakeDeaf)
 	}
 }

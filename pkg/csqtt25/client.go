@@ -938,7 +938,18 @@ func (w *worker) session() (readyAt time.Time, err error) {
 		}
 		// The rule (liveness.go). Every write it asks for goes through say: the
 		// loop never waits in a socket.
-		act, gap := watch.tick(watch.now(), c.wakeEpoch.Load(), c.unsettled(time.Unix(0, w.lastRx.Load())))
+		epoch := c.wakeEpoch.Load()
+		act, gap := watch.tick(watch.now(), epoch, c.unsettled(time.Unix(0, w.lastRx.Load())))
+		if seen := c.wakeEpoch.Load(); act.ends() && seen != epoch {
+			// The wake word was said while this verdict was being reached. A
+			// verdict is about the time before the epoch it was reached under:
+			// it is carried out only if that is still the epoch — looked at
+			// again HERE, behind the rule and in front of the session's end.
+			// Otherwise the word opens its own window, under the epoch just
+			// seen, and the stream is asked.
+			watch.void(watch.now(), seen)
+			act = watchWoke
+		}
 		switch act {
 		case watchFroze:
 			c.froze(gap, watch.late)

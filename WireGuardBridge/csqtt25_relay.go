@@ -69,11 +69,24 @@ type csqtt25RelayConn struct {
 // allocation is being closed puts the close's own budget back — the close set
 // it first, and wiped, the deallocate would be left unbounded on the very
 // socket that is stuck.
+//
+// 🚫 The clearing and the close do not take turns, so «is a close under way»
+// is asked BEHIND the clearing — as csqtt.Relay.write asks it — and not only
+// in front of it: a clearing that looked first and reached the socket after
+// the close had set its deadline there would wipe it. Asked in front as well,
+// a close already known never sees its deadline taken off even for a moment.
 func (c csqtt25RelayConn) SetWriteDeadline(t time.Time) error {
-	if t.IsZero() && c.r.closing.Load() {
+	if !t.IsZero() {
+		return c.r.ctl.SetWriteDeadline(t)
+	}
+	if c.r.closing.Load() {
 		return c.r.ctl.SetWriteDeadline(time.Now().Add(csqtt25RelayCloseBudget))
 	}
-	return c.r.ctl.SetWriteDeadline(t)
+	err := c.r.ctl.SetWriteDeadline(time.Time{})
+	if c.r.closing.Load() { // the close began beside the clearing
+		return c.r.ctl.SetWriteDeadline(time.Now().Add(csqtt25RelayCloseBudget))
+	}
+	return err
 }
 
 func csqtt25CloseRelay(ctl net.PacketConn, relayed io.Closer, tcClose func()) {
