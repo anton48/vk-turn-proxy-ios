@@ -156,6 +156,23 @@ func TestCsqttGenerationPicksTheEngine(t *testing.T) {
 				if cfg.Dial == nil || cfg.Deliver == nil || cfg.Logf == nil {
 					t.Fatalf("the 2.5 engine was handed no dial / deliver / log: %v %v %v", cfg.Dial == nil, cfg.Deliver == nil, cfg.Logf == nil)
 				}
+				// The engine's lines say whose they are themselves; the bridge
+				// writes them as they come.
+				var out lockedLog
+				prevW := log.Writer()
+				log.SetOutput(&out)
+				cfg.Logf("csqtt25: a line of the engine's, %d", 7)
+				log.SetOutput(prevW)
+				written := false
+				for _, l := range out.lines() {
+					if strings.Contains(l, "csqtt25: csqtt25:") {
+						t.Fatalf("the bridge put its own prefix in front of the engine's: %q", l)
+					}
+					written = written || strings.HasSuffix(l, "csqtt25: a line of the engine's, 7")
+				}
+				if !written {
+					t.Fatalf("the engine's line did not reach the log as it was given")
+				}
 				return
 			}
 			if oldCalls.Load() != 1 || newCalls.Load() != 0 {

@@ -128,12 +128,17 @@ type Client struct {
 	wg      sync.WaitGroup
 	workers []*worker
 
-	mu        sync.Mutex // guards gen, salt, disp, target, conf, repairSeq, panelAt, fatal
+	mu        sync.Mutex // guards gen, salt, disp, target, conf, repairSeq, panelAt, fatal, rallyAt, rallyFrom
 	disp      *Dispatcher
 	target    int
 	conf      ConfigResponse
 	repairSeq uint64
 	panelAt   time.Time // the last restart notice acted on
+	// rallyAt is when every worker was last started together — the start, a
+	// path change, a restart notice — and rallyFrom its name; zero once the
+	// client has said that all the agreed workers are ready (rallied).
+	rallyAt   time.Time
+	rallyFrom string
 	fatal     error
 
 	confOnce     chan struct{} // closed with the first TUNCONF
@@ -198,6 +203,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		cfg: cfg, gen: uint64(time.Now().UnixMilli()), salt: hex.EncodeToString(salt[:]),
 		disp: NewDispatcher(cfg.Workers), target: cfg.Workers,
 		confOnce: make(chan struct{}), done: make(chan struct{}), disconnected: make(chan struct{}, 1),
+		rallyAt: time.Now(), rallyFrom: "the start",
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	for id := 1; id <= cfg.Workers; id++ {
@@ -286,6 +292,7 @@ func (c *Client) moveTarget(agreed int, onlyDown bool) {
 	if !changed {
 		return
 	}
+	defer c.rallied()
 	c.cfg.Logf("csqtt25: the server agrees to %d worker(s) of the %d asked", agreed, c.cfg.Workers)
 	for _, w := range c.workers {
 		select {
@@ -346,6 +353,7 @@ func (c *Client) panelRestart() {
 	repeat := !c.panelAt.IsZero() && now.Sub(c.panelAt) < panelWindow
 	if !repeat {
 		c.panelAt = now
+		c.rallyAt, c.rallyFrom = now, "the server's restart notice"
 	}
 	c.mu.Unlock()
 	if repeat {
@@ -356,6 +364,37 @@ func (c *Client) panelRestart() {
 	for _, w := range c.workers {
 		w.end(errPanelRestart)
 	}
+}
+
+// rallied says, once per start-of-all, that every worker the server agreed to
+// is ready and how long that took. It is asked wherever the answer can turn
+// true: a worker has become ready, or the agreed count has come down to the
+// ones that already are. It is what gives a log its figure for «the tunnel
+// whole again» — the counters come a minute later.
+func (c *Client) rallied() {
+	c.mu.Lock()
+	if c.rallyAt.IsZero() {
+		c.mu.Unlock()
+		return
+	}
+	ready := 0
+	for _, w := range c.workers {
+		if w.ready.Load() {
+			ready++
+		}
+	}
+	if ready < c.target {
+		c.mu.Unlock()
+		return
+	}
+	target, took, from := c.target, time.Since(c.rallyAt), c.rallyFrom
+	c.rallyAt = time.Time{}
+	c.mu.Unlock()
+	asked := ""
+	if target != c.cfg.Workers {
+		asked = fmt.Sprintf(" (%d asked)", c.cfg.Workers)
+	}
+	c.cfg.Logf("csqtt25: all %d agreed workers ready%s, %v after %s", target, asked, took.Round(time.Millisecond), from)
 }
 
 // identity is the pair the client asks under now.
@@ -383,9 +422,10 @@ func (c *Client) OnPathChange() {
 		gen = c.gen + 1
 	}
 	c.gen, c.salt = gen, hex.EncodeToString(salt[:])
+	c.rallyAt, c.rallyFrom = time.Now(), "the path change"
 	c.mu.Unlock()
 	c.pathChanges.Add(1)
-	c.cfg.Logf("the path changed: a new identity, every worker starts over")
+	c.cfg.Logf("csqtt25: the path changed: a new identity, every worker starts over")
 	for _, w := range c.workers {
 		w.endNow(errPathChange)
 	}
@@ -583,7 +623,7 @@ func (w *worker) run() {
 		case errors.Is(err, ErrNoConfig):
 			// The password is right and the server has no address for it: no
 			// retry changes that, and whoever started the client must hear it.
-			c.cfg.Logf("worker %d: %v — stopping the client", w.id, err)
+			c.cfg.Logf("csqtt25: worker %d: %v — stopping the client", w.id, err)
 			c.fail(err)
 			return
 		case errors.As(err, &denied) && denied.Fatal():
@@ -598,7 +638,7 @@ func (w *worker) run() {
 			continue
 		}
 		if errors.Is(err, errPathChange) {
-			c.cfg.Logf("worker %d: session ended (%v), again now", w.id, err)
+			c.cfg.Logf("csqtt25: worker %d: session ended (%v), again now", w.id, err)
 			continue
 		}
 		c.cfg.Logf("csqtt25: worker %d: session ended (%v), again in %s", w.id, err, backoff)
@@ -719,6 +759,7 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	w.lastRx.Store(readyAt.UnixNano())
 	w.ready.Store(true)
 	c.sessions.Add(1)
+	c.rallied()
 	if w.id == 1 {
 		_ = w.send([]byte(WorkersRequest(c.cfg.Password, c.cfg.Workers)))
 	}

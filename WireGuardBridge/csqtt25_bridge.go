@@ -132,7 +132,8 @@ func csqtt25Start(ctx context.Context, cfg csqttConfig, server *net.UDPAddr, tra
 		Keys:     csqtt25.KeysAuto,
 		Dial:     a.dialer(server, transport, lease),
 		Deliver:  a.deliver,
-		Logf:     func(format string, args ...any) { log.Printf("csqtt25: "+format, args...) },
+		// The engine's lines say whose they are themselves ("csqtt25: …").
+		Logf: log.Printf,
 	})
 	if err != nil {
 		return nil, csqtt25Err(err)
