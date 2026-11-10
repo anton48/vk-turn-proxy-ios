@@ -227,6 +227,14 @@ enum ConnectionLinkPrompt {
         }
         // csqtt: say what the user is signing up for — the password is the
         // tunnel's only key, so there is no forward secrecy on this transport.
+        if created.useCsqtt && created.csqttGeneration == CsqttGeneration.v25 {
+            // A 2.5 link: no device identity, and other keys than 2.1.9's.
+            return "Add \(name) as csqtt 2.5 for \(s.peerAddress)\(extrasText) and make it active? "
+                 + "The server assigns the tunnel address and DNS; one password serves one device at a time. "
+                 + "Note: the keys come from a DTLS handshake with the server, and from the password alone "
+                 + "if the server answers none — then recorded traffic can be decrypted by anyone who learns "
+                 + "the password later."
+        }
         if created.useCsqtt {
             let dev = (s.csqttDeviceID ?? "").isEmpty
                 ? "A Device ID will be generated; if the server already binds this password to a device, "

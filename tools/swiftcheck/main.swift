@@ -4666,6 +4666,107 @@ do {
     }
 }
 
+// csqtt 2.5's connection link (2026-11-10): the 2.1.9 connect query, encrypted
+// (AES-256-GCM under a key every csqtt app carries). The Swift decoder is RUN
+// here on links made by the Go implementation — which is itself pinned to the
+// reference app's published vector — and on that vector: two decoders of one
+// format, compared on the format. And the importer's use of it is scanned: a
+// link that decrypts makes the server a 2.5 one, by its FORMAT.
+do {
+    typealias F = Csqtt25Link.Fields
+    let v1 = "csqtt://2JYR972365VL6TcRwLEHATFPb35eKBDvy5J4si-x3sebUtr1iypilGdIEEjlqUJ83nZCsuKJqJsSxYPHCx2F8AKORj04gnkAXGa6SQRU-et52RM8fboRvJ4Jm0axDgJbFCxZn526Nlns-daMDqwmoOUe"
+    let v2 = "csqtt://NkkHyOlq9t-U5_gaaE_hZWZI55-AmCNWC7Lus5XTNjXPy4RXtckxdjTCJ-Tto_x1I0YqhjN_uFVVxL9L8k46uasXLzZw3ETNZItuIGZnz1KyPLaGaIwcpqAn-buBzeyZP3hv1rEEuDkXnsPtLK4PPA"
+    let published = "csqtt://GNANVH0fhD6MisDFiWP_P0Bm_FHr-frawgfwur3Zx4ipjJx8gk-M6ZZbnDr_2clwPmzO-QS8AkiHLaMXyYO1RHyPeehXPqTc6jJi_iw72fRQJ9AR918ne5XsBRg"
+    check(Csqtt25Link.decode(v1) == F(host: "192.0.2.10", port: 46000, password: "pw-25", hashes: ["hashAAAA1111", "hashBBBB2222"]),
+          "🚨 a 2.5 link made by the Go side decodes to its host, port, password and both hashes")
+    check(Csqtt25Link.decode(v2) == F(host: "vps.example", port: 46001, password: "p w%&+x=y", hashes: []),
+          "🚨 a password with a space, % & + and = comes out as it went in; a token in place of the hashes brings none")
+    if let p = Csqtt25Link.decode(published) {
+        check(p.port == 46000 && !p.host.isEmpty && !p.password.isEmpty, "the reference app's own published link decodes")
+    } else {
+        check(false, "the reference app's own published link decodes")
+    }
+    // The other alphabet, padding, a wrapped line, the scheme in capitals.
+    let body2 = String(v2.dropFirst("csqtt://".count))
+    var std = body2.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+    std += String(repeating: "=", count: (4 - std.count % 4) % 4)
+    check(Csqtt25Link.decode("csqtt://" + std) == Csqtt25Link.decode(v2) && Csqtt25Link.decode(v2) != nil,
+          "a link in the standard base64 alphabet, padded, is the same link")
+    let half = body2.index(body2.startIndex, offsetBy: body2.count / 2)
+    check(Csqtt25Link.decode("  CSQTT://" + body2[..<half] + "\n " + body2[half...] + "\n") == Csqtt25Link.decode(v2),
+          "a link wrapped over two lines, with the scheme in capitals, is the same link")
+    // What decrypts but is not the connect query is refused, as the Go side refuses it.
+    for (name, raw) in [("another version", "csqtt://QxnK7ieyYxLX16jqKII9BDiJrK2CBv32-31plXk3jzgkZH1Ba24n99gVl5YQclxbUP2DvAljT3I12PDkifMD_skuHf5zOIj0SZJ0SIQG"), ("no host", "csqtt://Rld1Mj_VzkIJiWS9rNWmbXsKoNV8M7cHds0kruNEPdQdrxqf6VaSXE3SmWW560Fg7OXSeUIMnw8maLsSZQ"),
+                        ("a port out of range", "csqtt://jKOCoCXO6PRePBYw57i10dSLKYqvjtd9-13Lr7jSwb0K7bZFJut-mTKRG-xRiHTPmisNtRRycMbugInWA1SNoJYB7s7rRug7pzkK8XfR"), ("a broken percent escape", "csqtt://-XKVjMbj9TMZWbYhSfTE-bxVap9N0JMj2gfG_G8-VWO7Uv4vYShl-CWA3frQ0YmcXfJvfMc82ORQ9xg4hQPGY1XVKWpjKJdNTppLLLOz14w")] {
+        check(Csqtt25Link.decode(raw) == nil, "🚨 a link that decrypts to \(name) is refused")
+    }
+    check(Csqtt25Link.decode("csqtt://xTS74zTPSQp1dWYLzzRGDC2RuwmBppMZw93BSrT-qKdVLvR3QBvi5SRIhr9T8KBziL8OZ-faBzjPxFVv4fIFayZlMw") == nil,
+          "a link that decrypts to an EMPTY host is refused too, as the Go side refuses it")
+    check(Csqtt25Link.decode("csqtt://IJ1xhfcvsjYuQWsl2NzvEZz9abL2rJO95sbjRXNIPT7HNnEWN6L2eTsSmMAQvW662_zp9Uy8aqVwL4akxW396pFi29F5eVWMw1Nioik") == F(host: "vps.example", port: 46000, password: "", hashes: []),
+          "an empty password decodes as empty (the importer refuses it, with its own words)")
+    check(Csqtt25Link.decode("csqtt://B3ndQg97uU9BnNuX30Stmh2LmdGmB-16qfWsYOBe6YtVImkrvPJfvCzzIH4OWeLLe3IRdmTigoV15iPkTxPQLreboe159g3ACg") == F(host: "vps.example", port: 46002, password: "bare", hashes: []),
+          "a query without the `connect?` in front is read")
+    check(Csqtt25Link.decode("csqtt://9bhwz_bpP0BEMx4UAfrF2-2oKZzmPcI4BH1GCKOqJAMQ_aicz3Fmp_K8vRoINqCbQvYxfCmnq6s6oykwiYWnzvMb0af6ufsFyB97pPViOIY-bAwOBTFzM_YJ2z9v4cPs") == F(host: "vps.example", port: 46000, password: "a+b", hashes: ["h1", "h2", "h3"]),
+          "🚨 a `+` separates the hashes and is never a space — in a password it stays a `+`")
+    // The Go side's verdicts on two more links: a password's ends, a short body.
+    let padpw = "csqtt://QLcKU8RqVf-BhfZ_MiX_rtJkMfdmvksIQVFfjUkR0Yj9Tpllwj0x82PsP264P_P5jaKX7JGGrLRjwKAY9nhV5J0xp8X2HqU4ynIUpbxP5GVoK227sqx0ShtDFKswQoxC_72B"
+    check(Csqtt25Link.decode(padpw) == F(host: "vps.example", port: 46003, password: "pw x", hashes: ["h1"]),
+          "a password is trimmed at its ends and nowhere else, as the Go side trims it")
+    check(Csqtt25Link.decode("csqtt://QUJD") == nil, "a body too short for an IV and a tag is refused")
+    // A `#name` behind the link names the server: BackupManager cuts it off
+    // with this very split before the decoder sees the body.
+    let (bare, frag) = ConnectionLinkFragment.split(v1 + "#My server")
+    check(Csqtt25Link.decode(bare) != nil && Csqtt25Link.decode(bare) == Csqtt25Link.decode(v1)
+          && ConnectionLinkFragment.serverName(from: frag) == "My server"
+          && Csqtt25Link.decode(v1 + "#My server") == nil,
+          "🚨 a 2.5 link with a #name decodes once the name is cut off — and not before")
+    // What does not decrypt is not a 2.5 link.
+    var damaged = Array(v1)
+    damaged[70] = damaged[70] == "A" ? "B" : "A"
+    for (name, raw) in [("the plain connect form", "csqtt://connect?v=2&host=vps.example&peer=46000&password=p"),
+                        ("the plain legacy form", "csqtt://secret@vps.example:46000"),
+                        ("a link with one character changed", String(damaged)),
+                        ("a link cut short", String(v1.dropLast(8))),
+                        ("the bare scheme", "csqtt://"),
+                        ("another scheme's link", "wdtt://" + v1.dropFirst("csqtt://".count)),
+                        ("the same body behind another scheme of the same length", "https://" + v1.dropFirst("csqtt://".count))] {
+        check(Csqtt25Link.decode(raw) == nil, "🚨 \(name) is not a 2.5 link")
+    }
+
+    let linkSrc = source("VKTurnProxy/VKTurnProxy/Csqtt25Link.swift")
+    check(!linkSrc.contains("\"token\"") && !linkSrc.contains("hasToken"),
+          "🚨 the decoder never reads a link's VK token — nothing of it is kept, not even the fact")
+    let backup = source("VKTurnProxy/VKTurnProxy/BackupManager.swift")
+    if let a = backup.range(of: "if trimmed.lowercased().hasPrefix(\"csqtt://connect?\") {"),
+       let b = backup.range(of: "} else if let enc = Csqtt25Link.decode(ConnectionLinkFragment.split(trimmed).0) {"),
+       let c = backup.range(of: "guard let at = body.lastIndex(of: \"@\") else {") {
+        check(a.lowerBound < b.lowerBound && b.lowerBound < c.lowerBound,
+              "🚨 the importer tries the encrypted form behind the plain connect form and BEFORE the legacy split")
+    } else {
+        check(false, "the importer does not try the encrypted csqtt form")
+    }
+    if let f0 = backup.range(of: "static func parseCsqttLink("), let f1 = backup.range(of: "// MARK: - samosvalishe"),
+       let b = backup.range(of: "} else if let enc = Csqtt25Link.decode("), let g = backup.range(of: "generation = CsqttGeneration.v25"),
+       let c = backup.range(of: "guard let at = body.lastIndex(of: \"@\") else {") {
+        // The function's own text: the generation starts unsaid and is said in ONE place.
+        let fn = String(backup[f0.lowerBound..<f1.lowerBound])
+        check(b.lowerBound < g.lowerBound && g.lowerBound < c.lowerBound
+              && fn.contains("var generation: String? = nil")
+              && fn.components(separatedBy: "generation = ").count == 2
+              && fn.contains("if let generation { settings.csqttGeneration = generation }"),
+              "🚨 a link that decrypts makes the server a 2.5 one — and only such a link does")
+    } else {
+        check(false, "an encrypted csqtt link does not set the server's generation")
+    }
+    let importer = source("VKTurnProxy/VKTurnProxy/ConnectionLinkImport.swift")
+    if let a = importer.range(of: "if created.useCsqtt && created.csqttGeneration == CsqttGeneration.v25 {"),
+       let b = importer.range(of: "let dev = (s.csqttDeviceID ?? \"\").isEmpty") {
+        check(a.lowerBound < b.lowerBound, "a 2.5 link's confirmation is its own — it does not talk about a Device ID")
+    } else {
+        check(false, "the import confirmation has no wording for a 2.5 link")
+    }
+}
+
 // The credential cache's mode (build 441 in Go, 442 here): the pool stamps
 // creds-pool.json with "anon" / "cookie" and refuses the other mode's file. The
 // app's mirror of the file has to CARRY the field — BackupManager encodes it into

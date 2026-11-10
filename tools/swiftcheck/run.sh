@@ -69,6 +69,8 @@ SOURCES=(
     "$S/ConnectionLinkInbox.swift"
     "$S/DirectOutcome.swift"
     "$S/ConnectionReport.swift"
+    # The csqtt 2.5 link decoder (Foundation + CryptoKit): RUN on vectors.
+    "$S/Csqtt25Link.swift"
 )
 
 require_tracked "$0" "${SOURCES[@]}"

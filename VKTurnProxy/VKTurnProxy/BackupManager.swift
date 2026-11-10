@@ -601,9 +601,11 @@ enum BackupManager {
     // MARK: - amurcanov csqtt:// compat link
 
     /// Parses an amurcanov `csqtt://` link into our ConnectionLink (csqtt mode).
-    /// Two forms, both from his Android app (reference_csqtt_protocol_v3 §6):
+    /// Three forms, all from his Android app (reference_csqtt_protocol_v3 §6;
+    /// the encrypted one is csqtt 2.5's — Csqtt25Link):
     ///
     ///   csqtt://connect?v=2&host=<h>&peer=<port>&password=<p>[&hashes=<h1>+<h2>…]
+    ///   csqtt://<base64url of the same query, encrypted>   (2.5 — sets the generation)
     ///   csqtt://<password>@<host>:<port>            (legacy)
     ///
     /// host+peer → peerAddress, password → csqttPassword, the FIRST hash (a
@@ -631,6 +633,8 @@ enum BackupManager {
         }
         var host = "", port = "", password = "", firstHash = "", device = ""
         var fragment: String? = nil
+        // nil = the link does not say: a plain csqtt:// link, which is 2.1.9's.
+        var generation: String? = nil
         // The connect form is `csqtt://connect?…` — the `?` is part of the
         // test: a LEGACY link whose password starts with "connect"
         // (`csqtt://connected1@host:46000`) also starts with "csqtt://connect"
@@ -653,6 +657,19 @@ enum BackupManager {
             // `+` is the separator in his hashes list; URLComponents already
             // percent-decoded the values (a `+` stays a `+`).
             firstHash = (q["hashes"] ?? "").split(separator: "+").first.map(String.init) ?? ""
+        } else if let enc = Csqtt25Link.decode(ConnectionLinkFragment.split(trimmed).0) {
+            // csqtt 2.5: the connect form ENCRYPTED (Csqtt25Link). Tried before
+            // the legacy form — a body that authenticates under the link key is
+            // nothing else — and it settles the server's generation: only a 2.5
+            // server hands such links out. No device id: 2.5 has none. A token
+            // in place of the hashes is not read (this app has no use for it):
+            // such a link brings no call link, like a plain one without hashes.
+            fragment = ConnectionLinkFragment.split(trimmed).1
+            host = enc.host
+            port = String(enc.port)
+            password = enc.password
+            firstHash = enc.hashes.first ?? ""
+            generation = CsqttGeneration.v25
         } else {
             // csqtt://<password>@<host>:<port> — split on the LAST "@" so a
             // password containing "@" survives, then on the last ":".
@@ -692,6 +709,7 @@ enum BackupManager {
         settings.useCsqtt = true
         settings.csqttPassword = password
         if !device.isEmpty { settings.csqttDeviceID = device }
+        if let generation { settings.csqttGeneration = generation }
         settings.serverName = ConnectionLinkFragment.serverName(from: fragment)
         return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }
