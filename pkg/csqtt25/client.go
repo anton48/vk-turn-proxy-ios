@@ -522,6 +522,17 @@ func (w *worker) run() {
 // reached READY (zero if it never did).
 func (w *worker) session() (readyAt time.Time, err error) {
 	c := w.c
+	// A notice older than this session's dial is answered by the session
+	// that starts now: whoever asked wanted a fresh one. From the dial on a
+	// notice names THIS session and is kept — through the dial and the
+	// handshake into the configuration wait and the serve loop. A server
+	// that says it is restarting still answers for a moment, and a stream
+	// set up in that moment is one the server that comes back never heard
+	// of: dropped here, the notice would leave it ready on this side alone.
+	select {
+	case <-w.kick:
+	default:
+	}
 	conn, peer, closeConn, err := c.cfg.Dial(c.ctx, w.id)
 	if err != nil {
 		return readyAt, fmt.Errorf("dial: %w", err)
@@ -584,11 +595,6 @@ func (w *worker) session() (readyAt time.Time, err error) {
 		w.conn = nil
 		w.mu.Unlock()
 	}()
-	// A repair notice from before this session is not about it.
-	select {
-	case <-w.kick:
-	default:
-	}
 
 	media := split.Media()
 	conf, err := w.getconf(media, recvC)
@@ -664,6 +670,9 @@ func (w *worker) getconf(media <-chan []byte, recvC *Cipher) (ConfigResponse, er
 				return ConfigResponse{}, c.ctx.Err()
 			case <-deadline.C:
 				break waiting
+			case why := <-w.kick:
+				deadline.Stop()
+				return ConfigResponse{}, why
 			case wire, ok := <-media:
 				if !ok {
 					deadline.Stop()
@@ -675,6 +684,13 @@ func (w *worker) getconf(media <-chan []byte, recvC *Cipher) (ConfigResponse, er
 				plain, _, err := recvC.Unwrap(wire)
 				if err != nil {
 					c.authFailures.Add(1)
+					continue
+				}
+				if IsPanelRestart(plain) {
+					// Said down a stream that is not ready yet — the only one
+					// there is while the first worker dials. The same notice:
+					// every worker starts over, this one through its own kick.
+					c.panelRestart()
 					continue
 				}
 				if !IsConfigResponse(plain) {

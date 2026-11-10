@@ -36,6 +36,7 @@ type fakeServer struct {
 	echo        bool         // a data packet goes back down the stream it came up
 	getconfs    map[int]int  // GETCONF datagrams by worker id
 	readys      map[int]int  // READY datagrams by worker id
+	unanswered  map[int]int  // GETCONF datagrams it left without an answer (dropGetconf), by worker id
 	keepalives  map[int]int
 	data        []fakeData
 	disconnects []string
@@ -65,7 +66,7 @@ func newFakeServer(t *testing.T, password string) *fakeServer {
 		t.Fatal(err)
 	}
 	s := &fakeServer{t: t, sock: sock, password: password, sessions: map[string]*fakeSession{}, sayWorkers: true,
-		mute: map[int]bool{}, dropGetconf: map[int]bool{}, getconfs: map[int]int{}, readys: map[int]int{}, keepalives: map[int]int{}, echo: true}
+		mute: map[int]bool{}, dropGetconf: map[int]bool{}, getconfs: map[int]int{}, unanswered: map[int]int{}, readys: map[int]int{}, keepalives: map[int]int{}, echo: true}
 	t.Cleanup(func() { sock.Close() })
 	go s.loop()
 	return s
@@ -155,6 +156,7 @@ func (s *fakeServer) handle(ses *fakeSession, plain []byte) {
 			return
 		}
 		if id, _ := strconv.Atoi(f[4]); s.dropGetconf[id] {
+			s.unanswered[id]++
 			return
 		}
 		ses.worker, _ = strconv.Atoi(f[4])
@@ -262,10 +264,12 @@ type dialer struct {
 	dials  map[int]int
 	times  map[int][]time.Time
 	closes int
-	gates  []*gateConn       // every socket handed out, when gated is set
-	gated  bool              // hand out sockets whose writes can be parked
-	parkAt bool              // …parked from their first write
-	hang   map[int]chan bool // a dial for this worker blocks until its channel is closed, whatever the context says
+	gates  []*gateConn                             // every socket handed out, when gated is set
+	gated  bool                                    // hand out sockets whose writes can be parked
+	parkAt bool                                    // …parked from their first write
+	hang   map[int]chan bool                       // a dial for this worker blocks until its channel is closed, whatever the context says
+	hold   func(workerID, nth int) <-chan struct{} // a worker's nth dial waits for the channel this names and then goes on
+	began  map[int]int                             // dials begun, the ones still waiting among them
 }
 
 // gateConn is a socket whose writes can be made to park, as a write into a
@@ -295,7 +299,18 @@ func (g *gateConn) Close() error {
 func (d *dialer) dial(_ context.Context, workerID int) (net.PacketConn, net.Addr, func(), error) {
 	d.mu.Lock()
 	wait := d.hang[workerID]
+	if d.began == nil {
+		d.began = map[int]int{}
+	}
+	d.began[workerID]++
+	var held <-chan struct{}
+	if d.hold != nil {
+		held = d.hold(workerID, d.began[workerID])
+	}
 	d.mu.Unlock()
+	if held != nil {
+		<-held
+	}
 	if wait != nil {
 		<-wait
 		return nil, nil, nil, errors.New("the dial that ignored the stop ended")
@@ -330,6 +345,19 @@ func (d *dialer) count(workerID int) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.dials[workerID]
+}
+
+// begun is how many dials the worker has started, a held one among them.
+func (d *dialer) begun(workerID int) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.began[workerID]
+}
+
+func (d *dialer) setHold(f func(workerID, nth int) <-chan struct{}) {
+	d.mu.Lock()
+	d.hold = f
+	d.mu.Unlock()
 }
 
 // quickClocks shortens the client's clocks for a test.
@@ -1014,17 +1042,39 @@ func TestCloseDoesNotWaitForADialThatIgnoresTheStop(t *testing.T) {
 	}
 }
 
-// restartPanel is the server restarting: it says so on every stream and
-// then knows none of them.
-func (s *fakeServer) restartPanel() {
+// sayWhere sends a plaintext down every stream the predicate picks.
+func (s *fakeServer) sayWhere(plain []byte, pick func(*fakeSession) bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, ses := range s.sessions {
-		if wire, err := ses.send.Wrap(nil, panelRestartNotice); err == nil {
+		if !pick(ses) {
+			continue
+		}
+		if wire, err := ses.send.Wrap(nil, plain); err == nil {
 			_, _ = s.sock.WriteToUDP(wire, ses.addr)
 		}
 	}
+}
+
+// announceRestart is the server saying, on every stream it has heard from,
+// that it is about to restart. It goes on answering until forget — the real
+// one does for three quarters of a second.
+func (s *fakeServer) announceRestart() {
+	s.sayWhere(panelRestartNotice, func(*fakeSession) bool { return true })
+}
+
+// forget is the server that came back: it knows none of the old streams.
+func (s *fakeServer) forget() {
+	s.mu.Lock()
 	s.sessions = map[string]*fakeSession{}
+	s.mu.Unlock()
+}
+
+// restartPanel is the server restarting with nothing between the two: it
+// says so on every stream and then knows none of them.
+func (s *fakeServer) restartPanel() {
+	s.announceRestart()
+	s.forget()
 }
 
 // The server's restart notice starts every worker over at once: the server
@@ -1068,4 +1118,130 @@ func TestIsPanelRestartIsExact(t *testing.T) {
 	if IsPanelRestart(off) || IsPanelRestart(panelRestartNotice[:len(panelRestartNotice)-1]) || IsPanelRestart(append(append([]byte(nil), panelRestartNotice...), 0)) {
 		t.Fatal("something else read as the restart notice")
 	}
+}
+
+// registered says which of the workers the server holds a ready stream of.
+func (s *fakeServer) registered(ids ...int) map[int]bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[int]bool{}
+	for _, id := range ids {
+		out[id] = s.session(id) != nil
+	}
+	return out
+}
+
+// A restart notice that comes while a worker is still setting its stream up
+// is about that stream too. The server that says it is restarting goes on
+// answering for a moment, so the set-up completes — against a server that
+// is about to forget it; the worker must start over like the ready ones,
+// or it stays ready here on a stream the server that came back never heard
+// of, and everything the dispatcher hands it is lost.
+func TestARestartNoticeReachesAWorkerInItsSetUp(t *testing.T) {
+	quickClocks(t)
+	srv := newFakeServer(t, "restart-in-set-up")
+	c, d, _ := startClient(t, srv, 3, KeysWrap)
+	eventually(t, "three workers ready", func() bool { return c.Stats().Ready == 3 })
+
+	across := make(chan struct{}) // worker 3's second dial: in flight across the notice
+	behind := make(chan struct{}) // every dial behind the notice: until the server is back
+	var acrossOnce, behindOnce sync.Once
+	letAcross := func() { acrossOnce.Do(func() { close(across) }) }
+	letBehind := func() { behindOnce.Do(func() { close(behind) }) }
+	t.Cleanup(func() { letAcross(); letBehind() })
+	d.setHold(func(workerID, nth int) <-chan struct{} {
+		switch {
+		case workerID == 3 && nth == 2:
+			return across
+		case nth >= 2:
+			return behind
+		}
+		return nil
+	})
+
+	w3 := c.workers[2]
+	w3.kick <- errRepair // its session ends and the next one waits inside its dial
+	eventually(t, "worker 3 inside its second dial", func() bool { return d.begun(3) == 2 })
+	srv.announceRestart()
+	eventually(t, "the restart notice heard", func() bool { return c.Stats().PanelRestarts == 1 })
+	letAcross()
+	// The set-up the notice overlapped is over one of two ways: the worker
+	// dials again, or the old server has been told READY once more.
+	eventually(t, "worker 3 past the set-up the notice overlapped", func() bool {
+		srv.mu.Lock()
+		readys := srv.readys[3]
+		srv.mu.Unlock()
+		return d.begun(3) == 3 || readys >= 2
+	})
+	srv.forget()
+	letBehind()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		reg := srv.registered(1, 2, 3)
+		if reg[1] && reg[2] && reg[3] && c.Stats().Ready == 3 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after the restart: worker 3 dialled %d times (3 = it started over), ready here: %v, known to the server that came back: %v (workers 1, 2: %v, %v)",
+				d.begun(3), w3.ready.Load(), reg[3], reg[1], reg[2])
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// inItsWait brings worker 2 into a configuration wait that nothing answers.
+func inItsWait(t *testing.T, srv *fakeServer, c *Client, d *dialer) {
+	t.Helper()
+	eventually(t, "two workers ready", func() bool { return c.Stats().Ready == 2 })
+	srv.set(func() { srv.dropGetconf[2] = true })
+	c.workers[1].kick <- errRepair
+	eventually(t, "worker 2 waiting for a configuration", func() bool {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		return srv.unanswered[2] >= 1
+	})
+	srv.set(func() { srv.dropGetconf[2] = false }) // the next ask is answered
+}
+
+// A notice that finds a worker waiting for its configuration ends the wait
+// there and then: sitting the wait out — seconds on the real schedule —
+// only to start over is time the tunnel is short of a stream.
+func TestARestartNoticeEndsAConfigurationWaitAtOnce(t *testing.T) {
+	quickClocks(t)
+	getconfWaits = []time.Duration{3 * time.Second}
+	srv := newFakeServer(t, "restart-in-the-wait")
+	c, d, _ := startClient(t, srv, 2, KeysWrap)
+	inItsWait(t, srv, c, d)
+	if d.count(2) != 2 {
+		t.Fatalf("the fixture: worker 2 dialled %d times before the notice, want 2", d.count(2))
+	}
+	said := time.Now()
+	srv.say(1, panelRestartNotice) // heard on worker 1's stream alone
+	eventually(t, "worker 2 dialling again", func() bool { return d.count(2) == 3 })
+	if took := time.Since(said); took > time.Second {
+		t.Fatalf("worker 2 dialled again %v after the notice: it sat its configuration wait out", took.Round(10*time.Millisecond))
+	}
+	eventually(t, "both workers ready again", func() bool { return c.Stats().Ready == 2 })
+}
+
+// The notice may come down the very stream that is still being set up — the
+// only one there is while the first worker dials, and every one when all of
+// them start over together. It is the same notice.
+func TestARestartNoticeOnAStreamInItsSetUpIsHeard(t *testing.T) {
+	quickClocks(t)
+	getconfWaits = []time.Duration{3 * time.Second}
+	srv := newFakeServer(t, "restart-on-its-own-stream")
+	c, d, _ := startClient(t, srv, 2, KeysWrap)
+	inItsWait(t, srv, c, d)
+	said := time.Now()
+	srv.sayWhere(panelRestartNotice, func(ses *fakeSession) bool { return !ses.ready }) // worker 2's new stream alone
+	eventually(t, "both workers dialling again", func() bool { return d.count(1) == 2 && d.count(2) == 3 })
+	if took := time.Since(said); took > time.Second {
+		t.Fatalf("the workers dialled again %v after the notice: it was not the notice that moved them", took.Round(10*time.Millisecond))
+	}
+	if st := c.Stats(); st.PanelRestarts != 1 {
+		t.Fatalf("server restarts counted: %d, want 1", st.PanelRestarts)
+	}
+	eventually(t, "both workers ready again", func() bool { return c.Stats().Ready == 2 })
 }
