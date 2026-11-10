@@ -46,7 +46,8 @@ type credSource struct {
 	linkID        string
 	allocsPerCred int
 	cur           *proxy.TURNCreds
-	used, minted  int
+	used          int
+	minted        atomic.Int64 // read by the stats line from another goroutine
 }
 
 func (p *credSource) next() (*proxy.TURNCreds, error) {
@@ -58,8 +59,7 @@ func (p *credSource) next() (*proxy.TURNCreds, error) {
 			return nil, err
 		}
 		p.cur, p.used = c, 0
-		p.minted++
-		say("creds: set %d minted", p.minted)
+		say("creds: set %d minted", p.minted.Add(1))
 	}
 	p.used++
 	return p.cur, nil
@@ -180,11 +180,11 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 		if dt <= 0 {
 			dt = 1
 		}
-		say("%s: ready %d/%d (asked %d) | up %.2f Mbit/s, down %.2f Mbit/s | pkts tx %d rx %d | frags tx %d rx %d | sessions %d, ended %d, allocations %d, creds %d | dtls %d, fallbacks %d | probes %d, repairs %d | no-stream %d, auth-fail %d, tun-err %d, early %d",
+		say("%s: ready %d/%d (asked %d) | up %.2f Mbit/s, down %.2f Mbit/s | pkts tx %d rx %d | frags tx %d rx %d | sessions %d, ended %d, allocations %d, creds %d | dtls %d, fallbacks %d | probes %d, repairs %d, server restarts %d | no-stream %d, auth-fail %d, tun-err %d, early %d",
 			label, s.Ready, s.Target, s.Workers,
 			float64(s.TxBytes-prev.TxBytes)*8/dt/1e6, float64(s.RxBytes-prev.RxBytes)*8/dt/1e6,
-			s.TxPackets, s.RxPackets, s.FragsTx, s.FragsRx, s.Sessions, s.Restarts, allocs.Load(), creds.minted,
-			s.Handshakes, s.Fallbacks, s.Probes, s.Repairs, s.NoStream, s.AuthFailures, tunErr.Load(), early.Load())
+			s.TxPackets, s.RxPackets, s.FragsTx, s.FragsRx, s.Sessions, s.Restarts, allocs.Load(), creds.minted.Load(),
+			s.Handshakes, s.Fallbacks, s.Probes, s.Repairs, s.PanelRestarts, s.NoStream, s.AuthFailures, tunErr.Load(), early.Load())
 		prev, prevAt = s, now
 	}
 	code := 0

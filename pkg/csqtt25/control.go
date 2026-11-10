@@ -177,6 +177,10 @@ func parseStream(p, prefix []byte) (StreamCommand, bool) {
 	return cmd, true
 }
 
+// IsPanelRestart reports whether p is the server's notice that it is
+// restarting — the exact bytes, nothing that merely begins like them.
+func IsPanelRestart(p []byte) bool { return bytes.Equal(p, panelRestartNotice) }
+
 // IsIdleKeepalive is the server's own rule for a keepalive.
 func IsIdleKeepalive(p []byte) bool {
 	if len(p) == 0 {

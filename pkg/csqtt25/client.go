@@ -23,7 +23,10 @@ import (
 
 // DialFunc opens one stream's socket to the server: a PacketConn whose
 // datagrams to peer reach the server (a TURN allocation in production).
-// closeConn releases it; the client calls it exactly once per dial.
+// closeConn releases it and must end a write parked in conn; the client
+// calls it exactly once per dial — at the session's end or at the client's
+// stop, from another goroutine than the one writing. A dial should return
+// when ctx is done; one that does not delays nothing but its own worker.
 type DialFunc func(ctx context.Context, workerID int) (conn net.PacketConn, peer net.Addr, closeConn func(), err error)
 
 // KeyMode is where a stream's keys come from.
@@ -72,17 +75,20 @@ var (
 	serveTick      = time.Second
 	backoffBase    = time.Second
 	backoffMax     = 15 * time.Second
-	heldAfter      = 30 * time.Second // a session that stayed ready this long ends the run of failures
-	disconnectWait = 700 * time.Millisecond
+	heldAfter      = 30 * time.Second       // a session that stayed ready this long ends the run of failures
+	disconnectWait = 700 * time.Millisecond // Close: telling the server and hearing its answer, in all
+	stopWait       = 2 * time.Second        // Close: the workers' end once every socket is released
+	panelWindow    = 15 * time.Second       // the server's restart notices inside this are one restart
 )
 
 // ErrNoStream is Send's answer when no stream can carry a packet now.
 var ErrNoStream = errors.New("csqtt25: no stream is ready")
 
 var (
-	errParked = errors.New("csqtt25: the worker is above the agreed count")
-	errRepair = errors.New("csqtt25: the server asked for this worker again")
-	errDeaf   = errors.New("csqtt25: the stream heard nothing")
+	errParked       = errors.New("csqtt25: the worker is above the agreed count")
+	errRepair       = errors.New("csqtt25: the server asked for this worker again")
+	errPanelRestart = errors.New("csqtt25: the server is restarting")
+	errDeaf         = errors.New("csqtt25: the stream heard nothing")
 )
 
 // Stats is a snapshot of the client's counters.
@@ -93,6 +99,7 @@ type Stats struct {
 	Sessions, Restarts                     int64 // sessions that reached READY; sessions that ended
 	AuthFailures, NoStream                 int64
 	Probes, Repairs, Handshakes, Fallbacks int64
+	PanelRestarts                          int64
 }
 
 // Client is a running csqtt 2.5 client.
@@ -106,11 +113,12 @@ type Client struct {
 	wg      sync.WaitGroup
 	workers []*worker
 
-	mu        sync.Mutex // guards disp, target, conf, repairSeq, fatal
+	mu        sync.Mutex // guards disp, target, conf, repairSeq, panelAt, fatal
 	disp      *Dispatcher
 	target    int
 	conf      ConfigResponse
 	repairSeq uint64
+	panelAt   time.Time // the last restart notice acted on
 	fatal     error
 
 	confOnce     chan struct{} // closed with the first TUNCONF
@@ -125,6 +133,7 @@ type Client struct {
 	sessions, restarts                     atomic.Int64
 	authFailures, noStream                 atomic.Int64
 	probes, repairs, handshakes, fallbacks atomic.Int64
+	panelRestarts                          atomic.Int64
 }
 
 type worker struct {
@@ -140,7 +149,7 @@ type worker struct {
 	ready  atomic.Bool
 	lastTx atomic.Int64
 	lastRx atomic.Int64
-	kick   chan struct{} // a repair notice names this worker
+	kick   chan error    // the server wants this worker's session over: the reason
 	wake   chan struct{} // the agreed count changed
 	reasm  *Reassembler  // the read loop's alone
 }
@@ -175,7 +184,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	for id := 1; id <= cfg.Workers; id++ {
-		c.workers = append(c.workers, &worker{c: c, id: id, kick: make(chan struct{}, 1), wake: make(chan struct{}, 1)})
+		c.workers = append(c.workers, &worker{c: c, id: id, kick: make(chan error, 1), wake: make(chan struct{}, 1)})
 	}
 	c.start(c.workers[0])
 	select {
@@ -302,11 +311,33 @@ func (c *Client) repair(cmd StreamCommand) {
 	for _, w := range c.workers {
 		if named[w.id] && w.ready.Load() {
 			c.repairs.Add(1)
-			select {
-			case w.kick <- struct{}{}:
-			default:
-			}
+			w.end(errRepair)
 		}
+	}
+}
+
+// panelRestart acts on the server's notice that it is restarting: the
+// server that comes back holds none of these sessions, so every worker
+// starts over now — left to their silence they would be found out a worker
+// at a time, deafAfter later; one caught in its set-up starts over too (its
+// answer may have been the old server's last). The identity stays: the server is
+// empty, and a new one is for a new connection. The notice comes on every
+// stream and more than once; the copies inside panelWindow are one restart.
+func (c *Client) panelRestart() {
+	now := time.Now()
+	c.mu.Lock()
+	repeat := !c.panelAt.IsZero() && now.Sub(c.panelAt) < panelWindow
+	if !repeat {
+		c.panelAt = now
+	}
+	c.mu.Unlock()
+	if repeat {
+		return
+	}
+	c.panelRestarts.Add(1)
+	c.cfg.Logf("csqtt25: the server says it is restarting — every worker starts over")
+	for _, w := range c.workers {
+		w.end(errPanelRestart)
 	}
 }
 
@@ -350,6 +381,7 @@ func (c *Client) Stats() Stats {
 		FragsTx: c.fragsTx.Load(), FragsRx: c.fragsRx.Load(), Sessions: c.sessions.Load(), Restarts: c.restarts.Load(),
 		AuthFailures: c.authFailures.Load(), NoStream: c.noStream.Load(),
 		Probes: c.probes.Load(), Repairs: c.repairs.Load(), Handshakes: c.handshakes.Load(), Fallbacks: c.fallbacks.Load(),
+		PanelRestarts: c.panelRestarts.Load(),
 	}
 	for _, w := range c.workers {
 		if w.ready.Load() {
@@ -359,30 +391,62 @@ func (c *Client) Stats() Stats {
 	return s
 }
 
-// Close tells the server the session is over (best effort, through up to
-// three ready streams, for a bounded time) and stops every worker.
+// Close stops the client within a bounded time, whatever its streams are
+// doing. Telling the server (DISCONNECT through up to three ready streams)
+// and hearing its answer have ONE budget, disconnectWait, and nothing in it
+// is waited for beyond that — a write parked in a stream's socket holds
+// that stream's lock, so the telling is done beside Close, not by it. Then
+// the stop releases every stream's socket by itself (session) and the
+// workers get stopWait to end; one still inside a dial that ignores the
+// stop ends with its dial. Safe to call more than once.
 func (c *Client) Close() {
 	req := []byte(DisconnectRequest(c.cfg.Password, c.salt))
+	var tellers sync.WaitGroup
 	asked := 0
 	for _, w := range c.workers {
 		if asked == 3 {
 			break
 		}
-		if w.ready.Load() && w.send(req) == nil {
+		if w.ready.Load() {
 			asked++
+			tellers.Add(1)
+			go func(w *worker) {
+				defer tellers.Done()
+				_ = w.send(req)
+			}(w)
 		}
 	}
 	if asked > 0 {
-		t := time.NewTimer(disconnectWait)
+		budget := time.NewTimer(disconnectWait)
 		select {
 		case <-c.disconnected:
-		case <-t.C:
+		case <-budget.C:
 		}
-		t.Stop()
+		budget.Stop()
 	}
 	c.doneClosed.Do(func() { close(c.done) })
 	c.cancel()
-	c.wg.Wait()
+	ended := make(chan struct{})
+	go func() {
+		tellers.Wait()
+		c.wg.Wait()
+		close(ended)
+	}()
+	stop := time.NewTimer(stopWait)
+	defer stop.Stop()
+	select {
+	case <-ended:
+	case <-stop.C:
+		c.cfg.Logf("csqtt25: close: a worker is still inside its dial after %s — returning without it", stopWait)
+	}
+}
+
+// end asks the worker's session to end for a reason of the server's.
+func (w *worker) end(why error) {
+	select {
+	case w.kick <- why:
+	default:
+	}
 }
 
 // ─── a worker ────────────────────────────────────────────────────────────
@@ -462,7 +526,14 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	if err != nil {
 		return readyAt, fmt.Errorf("dial: %w", err)
 	}
-	defer closeConn()
+	// The socket is given back once — by this session's end or by the stop,
+	// whichever is first. The stop does it BY ITSELF: a write parked in the
+	// socket keeps this goroutine from ever reaching its own close, and it
+	// is the close that ends the write.
+	var once sync.Once
+	release := func() { once.Do(closeConn) }
+	defer release()
+	defer context.AfterFunc(c.ctx, release)()
 	split := NewSplitter(conn, peer)
 
 	var keys Keys
@@ -543,8 +614,8 @@ func (w *worker) session() (readyAt time.Time, err error) {
 		select {
 		case <-c.ctx.Done():
 			return readyAt, c.ctx.Err()
-		case <-w.kick:
-			return readyAt, errRepair
+		case why := <-w.kick:
+			return readyAt, why
 		case wire, ok := <-media:
 			if !ok {
 				return readyAt, errors.New("the stream's socket closed")
@@ -642,6 +713,8 @@ func (w *worker) receive(wire []byte, recvC *Cipher) {
 			case c.disconnected <- struct{}{}:
 			default:
 			}
+		case IsPanelRestart(plain):
+			c.panelRestart()
 		default:
 			if agreed, _, ok := ParseWorkers(plain); ok {
 				c.setTarget(agreed)

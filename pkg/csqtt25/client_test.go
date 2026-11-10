@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -261,14 +262,56 @@ type dialer struct {
 	dials  map[int]int
 	times  map[int][]time.Time
 	closes int
+	gates  []*gateConn       // every socket handed out, when gated is set
+	gated  bool              // hand out sockets whose writes can be parked
+	parkAt bool              // …parked from their first write
+	hang   map[int]chan bool // a dial for this worker blocks until its channel is closed, whatever the context says
+}
+
+// gateConn is a socket whose writes can be made to park, as a write into a
+// full buffer does; a parked write ends when the socket is closed.
+type gateConn struct {
+	net.PacketConn
+	stuck    atomic.Bool
+	parked   atomic.Int32
+	released chan struct{}
+	once     sync.Once
+}
+
+func (g *gateConn) WriteTo(p []byte, a net.Addr) (int, error) {
+	if g.stuck.Load() {
+		g.parked.Add(1)
+		<-g.released
+		return 0, net.ErrClosed
+	}
+	return g.PacketConn.WriteTo(p, a)
+}
+
+func (g *gateConn) Close() error {
+	g.once.Do(func() { close(g.released) })
+	return g.PacketConn.Close()
 }
 
 func (d *dialer) dial(_ context.Context, workerID int) (net.PacketConn, net.Addr, func(), error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	d.mu.Lock()
+	wait := d.hang[workerID]
+	d.mu.Unlock()
+	if wait != nil {
+		<-wait
+		return nil, nil, nil, errors.New("the dial that ignored the stop ended")
+	}
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	var conn net.PacketConn = udp
 	d.mu.Lock()
+	if d.gated {
+		g := &gateConn{PacketConn: udp, released: make(chan struct{})}
+		g.stuck.Store(d.parkAt)
+		d.gates = append(d.gates, g)
+		conn = g
+	}
 	d.dials[workerID]++
 	if d.times == nil {
 		d.times = map[int][]time.Time{}
@@ -292,7 +335,8 @@ func (d *dialer) count(workerID int) int {
 // quickClocks shortens the client's clocks for a test.
 func quickClocks(t *testing.T) {
 	t.Helper()
-	old := []any{getconfWaits, keepaliveEvery, probeAfter, deafAfter, serveTick, backoffBase, backoffMax, heldAfter, disconnectWait, handshakeTimeout}
+	old := []any{getconfWaits, keepaliveEvery, probeAfter, deafAfter, serveTick, backoffBase, backoffMax, heldAfter, disconnectWait, handshakeTimeout, stopWait}
+	stopWait = 500 * time.Millisecond
 	getconfWaits = []time.Duration{150 * time.Millisecond, 150 * time.Millisecond}
 	keepaliveEvery, probeAfter, deafAfter = 10*time.Second, 20*time.Second, 60*time.Second
 	serveTick, backoffBase, backoffMax, heldAfter = 20*time.Millisecond, 30*time.Millisecond, 100*time.Millisecond, 10*time.Second
@@ -302,6 +346,7 @@ func quickClocks(t *testing.T) {
 		keepaliveEvery, probeAfter, deafAfter = old[1].(time.Duration), old[2].(time.Duration), old[3].(time.Duration)
 		serveTick, backoffBase, backoffMax, heldAfter = old[4].(time.Duration), old[5].(time.Duration), old[6].(time.Duration), old[7].(time.Duration)
 		disconnectWait, handshakeTimeout = old[8].(time.Duration), old[9].(time.Duration)
+		stopWait = old[10].(time.Duration)
 	})
 }
 
@@ -772,12 +817,9 @@ func TestAStaleRepairDoesNotEndTheNextSession(t *testing.T) {
 	c, d, _ := startClient(t, srv, 2, KeysWrap)
 	eventually(t, "two workers ready", func() bool { return c.Stats().Ready == 2 })
 	w := c.workers[1]
-	w.kick <- struct{}{} // ends the session
+	w.kick <- errRepair // ends the session
 	eventually(t, "worker 2 between sessions", func() bool { return !w.ready.Load() })
-	select {
-	case w.kick <- struct{}{}: // left behind while nobody listens
-	default:
-	}
+	w.end(errRepair) // left behind while nobody listens
 	eventually(t, "worker 2 ready again", func() bool { return w.ready.Load() })
 	time.Sleep(300 * time.Millisecond)
 	if d.count(2) != 2 || !w.ready.Load() {
@@ -861,5 +903,169 @@ func TestTheBackOffGrowsAndASessionThatHeldEndsIt(t *testing.T) {
 	}
 	if took := time.Since(began); took > 1500*time.Millisecond {
 		t.Fatalf("six sessions that held were followed by waits that kept growing: %s in all", took)
+	}
+}
+
+// within runs f and fails the test when f has not returned in time; the
+// test itself never waits on what it is checking.
+func within(t *testing.T, limit time.Duration, what string, f func()) time.Duration {
+	t.Helper()
+	done := make(chan struct{})
+	began := time.Now()
+	go func() { f(); close(done) }()
+	select {
+	case <-done:
+		return time.Since(began)
+	case <-time.After(limit):
+		t.Fatalf("%s did not return within %s", what, limit)
+		return 0
+	}
+}
+
+// A write parked in a stream's socket does not hold the stop: Close has ONE
+// budget for telling the server and one for the workers to end, and the
+// stop itself releases every socket.
+func TestCloseIsBoundedWhenAWriteIsParked(t *testing.T) {
+	quickClocks(t)
+	srv := newFakeServer(t, "pw-parked")
+	d := &dialer{server: srv.sock.LocalAddr(), dials: map[int]int{}, gated: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, ClientConfig{Password: srv.password, Workers: 2, Keys: KeysWrap, Dial: d.dial})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "two workers ready", func() bool { return c.Stats().Ready == 2 })
+	d.mu.Lock()
+	gates := append([]*gateConn(nil), d.gates...)
+	d.mu.Unlock()
+	t.Cleanup(func() { // whatever happens, let every parked goroutine go
+		for _, g := range gates {
+			g.Close()
+		}
+	})
+	for _, g := range gates {
+		g.stuck.Store(true)
+	}
+	for i := 0; i < 2; i++ { // one writer parked in each stream, holding the stream's lock
+		go func(i int) { _ = c.Send(seqPkt(uint16(100+i), i, 100)) }(i)
+	}
+	eventually(t, "a write parked in each socket", func() bool { return gates[0].parked.Load() > 0 && gates[1].parked.Load() > 0 })
+	took := within(t, 4*time.Second, "Close with a write parked in every stream", c.Close)
+	if limit := disconnectWait + stopWait + 300*time.Millisecond; took > limit {
+		t.Fatalf("Close took %s; its budgets add up to %s", took, limit)
+	}
+	eventually(t, "every socket given back", func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.closes == 2
+	})
+}
+
+// Dial's deadline holds although the first write of the first stream is
+// parked.
+func TestDialsDeadlineHoldsWhenTheFirstWriteIsParked(t *testing.T) {
+	quickClocks(t)
+	srv := newFakeServer(t, "pw-parked-dial")
+	d := &dialer{server: srv.sock.LocalAddr(), dials: map[int]int{}, gated: true, parkAt: true}
+	t.Cleanup(func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, g := range d.gates {
+			g.Close()
+		}
+	})
+	var err error
+	took := within(t, 4*time.Second, "Dial with its first write parked", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		_, err = Dial(ctx, ClientConfig{Password: srv.password, Workers: 2, Keys: KeysWrap, Dial: d.dial})
+	})
+	if err == nil {
+		t.Fatal("Dial returned a client although nothing was ever written")
+	}
+	if limit := 200*time.Millisecond + stopWait + 300*time.Millisecond; took > limit {
+		t.Fatalf("Dial returned after %s; its deadline and the stop's budget add up to %s", took, limit)
+	}
+	eventually(t, "the socket of the parked write given back", func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.dials[1] == 1 && d.closes == 1
+	})
+}
+
+// Close does not wait for a dial that ignores the stop.
+func TestCloseDoesNotWaitForADialThatIgnoresTheStop(t *testing.T) {
+	quickClocks(t)
+	srv := newFakeServer(t, "pw-hung-dial")
+	never := make(chan bool)
+	t.Cleanup(func() { close(never) })
+	d := &dialer{server: srv.sock.LocalAddr(), dials: map[int]int{}, hang: map[int]chan bool{2: never}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, ClientConfig{Password: srv.password, Workers: 2, Keys: KeysWrap, Dial: d.dial})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "worker 1 ready", func() bool { return c.Stats().Ready == 1 })
+	took := within(t, 4*time.Second, "Close beside a dial that never returns", c.Close)
+	if limit := disconnectWait + stopWait + 300*time.Millisecond; took > limit {
+		t.Fatalf("Close took %s; its budgets add up to %s", took, limit)
+	}
+}
+
+// restartPanel is the server restarting: it says so on every stream and
+// then knows none of them.
+func (s *fakeServer) restartPanel() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ses := range s.sessions {
+		if wire, err := ses.send.Wrap(nil, panelRestartNotice); err == nil {
+			_, _ = s.sock.WriteToUDP(wire, ses.addr)
+		}
+	}
+	s.sessions = map[string]*fakeSession{}
+}
+
+// The server's restart notice starts every worker over at once: the server
+// that comes back knows none of the old streams, and waiting to find that
+// out by their silence costs a minute.
+func TestAPanelRestartStartsEveryWorkerOver(t *testing.T) {
+	quickClocks(t)
+	srv := newFakeServer(t, "pw-panel")
+	c, d, got := startClient(t, srv, 3, KeysWrap)
+	eventually(t, "three workers ready", func() bool { return c.Stats().Ready == 3 })
+	srv.restartPanel()
+	eventually(t, "every worker dialled again", func() bool { return d.count(1) == 2 && d.count(2) == 2 && d.count(3) == 2 })
+	eventually(t, "three workers ready again", func() bool { return c.Stats().Ready == 3 })
+	if st := c.Stats(); st.PanelRestarts != 1 {
+		t.Fatalf("one restart, said on three streams, was counted %d time(s)", st.PanelRestarts)
+	}
+	select {
+	case <-c.Done():
+		t.Fatal("the client ended at the server's restart")
+	default:
+	}
+	// The same restart, said again a moment later, is the same restart.
+	c.panelRestart()
+	time.Sleep(200 * time.Millisecond)
+	if st := c.Stats(); st.PanelRestarts != 1 || d.count(1) != 2 {
+		t.Fatalf("a repeated notice started the workers over again: %+v, worker 1 dialled %d times", st, d.count(1))
+	}
+	// And the tunnel carries packets again.
+	if err := c.Send(seqPkt(4242, 1, 100)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "a packet through the restarted server", func() bool { return got.n() == 1 })
+}
+
+func TestIsPanelRestartIsExact(t *testing.T) {
+	if !IsPanelRestart(panelRestartNotice) {
+		t.Fatal("the notice itself")
+	}
+	off := append([]byte(nil), panelRestartNotice...)
+	off[len(off)-1] ^= 1
+	if IsPanelRestart(off) || IsPanelRestart(panelRestartNotice[:len(panelRestartNotice)-1]) || IsPanelRestart(append(append([]byte(nil), panelRestartNotice...), 0)) {
+		t.Fatal("something else read as the restart notice")
 	}
 }
