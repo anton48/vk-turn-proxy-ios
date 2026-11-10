@@ -14,12 +14,12 @@ package main
 //     allocation the moment the relay accepts it, of a refusal with the moment
 //     the dial began, and is given back right behind the relay's close;
 //   - what the server sends down is queued for the TUN pump, bounded;
-//   - a path change reaches the engine (a new identity, every stream again).
-//
-// NOT here yet, said so that nobody reads their absence as a decision: the
-// wake hook does nothing (the engine has no freeze rules — a clock that stood
-// still reads as silence there), and a write the relay does not take is not
-// bounded. Both are the next items of this stage.
+//   - a path change reaches the engine (a new identity, every stream again);
+//   - the wake hook reaches it too (a freeze boundary: every ready stream is
+//     asked afresh — the engine's own rules, pkg/csqtt25/liveness.go);
+//   - a stream's write is BOUNDED (csqtt25.DefaultWriteBound): the socket the
+//     engine gets is the bridge's own allocation, whose write deadline is real
+//     (csqtt25_relay.go — pion's relayed conn ignores one).
 
 import (
 	"context"
@@ -29,8 +29,6 @@ import (
 	"net"
 	"sync/atomic"
 	"time"
-
-	"github.com/pion/logging"
 
 	"github.com/cacggghp/vk-turn-proxy/pkg/csqtt"
 	"github.com/cacggghp/vk-turn-proxy/pkg/csqtt25"
@@ -89,6 +87,7 @@ type csqtt25Engine interface {
 	Stats() csqtt25.Stats
 	Config() csqtt25.ConfigResponse
 	OnPathChange()
+	Wake()
 	Done() <-chan struct{}
 	Err() error
 }
@@ -103,14 +102,16 @@ var csqtt25DialEngine = func(ctx context.Context, cfg csqtt25.ClientConfig) (csq
 }
 
 // csqtt25OpenRelay opens one stream's TURN allocation toward the server —
-// csqtt.DialRelay, the allocation the 2.1.9 workers ride (the relay knows
-// nothing of what it carries). Behind a variable for the tests.
+// the same kind of allocation the 2.1.9 workers ride (the relay knows nothing
+// of what it carries), opened by the bridge's own dial (csqtt25_relay.go) and
+// handed over as a conn whose write deadline is real: the engine bounds every
+// write with it. Behind a variable for the tests.
 var csqtt25OpenRelay = func(creds csqtt.TURNCredentials, server *net.UDPAddr, transport string, allocated func()) (net.PacketConn, func(), error) {
-	r, err := csqtt.DialRelay(creds, server, transport, logging.LogLevelWarn, allocated)
+	r, err := csqtt25DialRelay(creds, server, transport, allocated)
 	if err != nil {
 		return nil, nil, err
 	}
-	return r.Conn, r.Close, nil
+	return r.packetConn(), r.Close, nil
 }
 
 // csqtt25Client is a csqtt25 engine as the bridge's csqttClient.
@@ -132,6 +133,9 @@ func csqtt25Start(ctx context.Context, cfg csqttConfig, server *net.UDPAddr, tra
 		Keys:     csqtt25.KeysAuto,
 		Dial:     a.dialer(server, transport, lease),
 		Deliver:  a.deliver,
+		// Always bounded: a relay that stops taking bytes costs its own stream
+		// the bound once, never the TUN pump until somebody notices.
+		WriteBound: csqtt25.DefaultWriteBound,
 		// The engine's lines say whose they are themselves ("csqtt25: …").
 		Logf: log.Printf,
 	})
@@ -216,9 +220,10 @@ func (a *csqtt25Client) Stats() csqtt.Stats {
 // path-event snapshot, the once-a-minute line and the stop line (csqttLine).
 func (a *csqtt25Client) StatsLine(tunIn, tunOut int64) string {
 	s := a.eng.Stats()
-	return fmt.Sprintf("2.5: workers %d/%d ready (%d heard from lately; %d asked), sessions %d, ended %d, dtls %d, fallbacks %d, probes %d, repairs %d, server restarts %d (found out behind one %d), path changes %d, no stream %d, auth failures %d, fragments tx=%d rx=%d, dropped %d; tun in=%d out=%d",
+	return fmt.Sprintf("2.5: workers %d/%d ready (%d heard from lately; %d asked), sessions %d, ended %d, dtls %d, fallbacks %d, probes %d, repairs %d, server restarts %d (found out behind one %d), path changes %d, freezes %d, wakes %d (silent behind either %d), write stalls %d, dead writes %d, no stream %d, auth failures %d, fragments tx=%d rx=%d, dropped %d; tun in=%d out=%d",
 		s.Ready, s.Target, s.Live, s.Workers, s.Sessions, s.Restarts, s.Handshakes, s.Fallbacks, s.Probes, s.Repairs,
-		s.PanelRestarts, s.Unsettled, s.PathChanges, s.NoStream, s.AuthFailures, s.FragsTx, s.FragsRx, a.dropped.Load(), tunIn, tunOut)
+		s.PanelRestarts, s.Unsettled, s.PathChanges, s.Freezes, s.Wakes, s.WakeDeaf, s.WriteStalls, s.DeadWrites,
+		s.NoStream, s.AuthFailures, s.FragsTx, s.FragsRx, a.dropped.Load(), tunIn, tunOut)
 }
 
 func (a *csqtt25Client) Config() csqtt.ConfigResponse {
@@ -228,8 +233,9 @@ func (a *csqtt25Client) Config() csqtt.ConfigResponse {
 
 func (a *csqtt25Client) OnPathChange() { a.eng.OnPathChange() }
 
-// WakeHealthCheck does nothing yet: see the file's header.
-func (a *csqtt25Client) WakeHealthCheck() {}
+// WakeHealthCheck is the app's wake hook: the engine's freeze boundary. It
+// never waits (csqtt25.Client.Wake).
+func (a *csqtt25Client) WakeHealthCheck() { a.eng.Wake() }
 
 func (a *csqtt25Client) Done() <-chan struct{} { return a.eng.Done() }
 func (a *csqtt25Client) Err() error            { return csqtt25Err(a.eng.Err()) }

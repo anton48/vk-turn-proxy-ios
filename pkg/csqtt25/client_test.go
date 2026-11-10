@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -299,22 +300,48 @@ type dialer struct {
 }
 
 // gateConn is a socket whose writes can be made to park, as a write into a
-// full buffer does; a parked write ends when the socket is closed.
+// full buffer does; a parked write ends when the socket is closed — or, as a
+// real socket's does, when the write deadline set before it passes. Its
+// writes can also be made to fail with an error of the caller's choosing.
 type gateConn struct {
 	net.PacketConn
 	stuck    atomic.Bool
 	parked   atomic.Int32
 	released chan struct{}
 	once     sync.Once
+	deadline atomic.Int64          // the write deadline, unix nanos; 0: none
+	sets     atomic.Int32          // SetWriteDeadline calls
+	fail     atomic.Pointer[error] // every write fails with this
 }
 
 func (g *gateConn) WriteTo(p []byte, a net.Addr) (int, error) {
+	if e := g.fail.Load(); e != nil {
+		return 0, *e
+	}
 	if g.stuck.Load() {
 		g.parked.Add(1)
-		<-g.released
-		return 0, net.ErrClosed
+		var expired <-chan time.Time
+		if dl := g.deadline.Load(); dl != 0 {
+			expired = time.After(time.Until(time.Unix(0, dl)))
+		}
+		select {
+		case <-g.released:
+			return 0, net.ErrClosed
+		case <-expired:
+			return 0, &net.OpError{Op: "write", Net: "udp", Err: os.ErrDeadlineExceeded}
+		}
 	}
 	return g.PacketConn.WriteTo(p, a)
+}
+
+func (g *gateConn) SetWriteDeadline(t time.Time) error {
+	g.sets.Add(1)
+	if t.IsZero() {
+		g.deadline.Store(0)
+	} else {
+		g.deadline.Store(t.UnixNano())
+	}
+	return nil
 }
 
 func (g *gateConn) Close() error {

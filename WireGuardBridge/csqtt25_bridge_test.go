@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,7 @@ type fakeEngine struct {
 	conf    csqtt25.ConfigResponse
 	stats   csqtt25.Stats
 	pathChg atomic.Int32
+	wakes   atomic.Int32
 }
 
 func newFakeEngine() *fakeEngine {
@@ -44,7 +46,8 @@ func newFakeEngine() *fakeEngine {
 		// Every counter another number, so that a line or a key that takes the
 		// wrong one says so.
 		stats: csqtt25.Stats{Workers: 30, Target: 18, Ready: 17, Live: 15, TxBytes: 1111, RxBytes: 2222, Sessions: 40, Restarts: 22,
-			Handshakes: 39, Fallbacks: 1, Probes: 86, Repairs: 2, PanelRestarts: 9, Unsettled: 3, PathChanges: 4, NoStream: 5, AuthFailures: 6, FragsTx: 7, FragsRx: 8},
+			Handshakes: 39, Fallbacks: 1, Probes: 86, Repairs: 2, PanelRestarts: 9, Unsettled: 3, PathChanges: 4, NoStream: 5, AuthFailures: 6, FragsTx: 7, FragsRx: 8,
+			Freezes: 11, Wakes: 12, WakeDeaf: 13, WriteStalls: 14, DeadWrites: 16},
 	}
 }
 
@@ -64,6 +67,7 @@ func (f *fakeEngine) Close() {
 func (f *fakeEngine) Stats() csqtt25.Stats           { return f.stats }
 func (f *fakeEngine) Config() csqtt25.ConfigResponse { return f.conf }
 func (f *fakeEngine) OnPathChange()                  { f.pathChg.Add(1) }
+func (f *fakeEngine) Wake()                          { f.wakes.Add(1) }
 func (f *fakeEngine) Done() <-chan struct{}          { return f.done }
 func (f *fakeEngine) Err() error                     { f.errMu.Lock(); defer f.errMu.Unlock(); return f.err }
 func (f *fakeEngine) stop(err error)                 { f.errMu.Lock(); f.err = err; f.errMu.Unlock(); f.Close() }
@@ -478,7 +482,7 @@ func TestCsqtt25StatsReachTheAppAndTheLog(t *testing.T) {
 	}
 	csqttLogPathSnapshotImpl(h, "probe")
 	csqttTurnOffImpl(h)
-	const counters = "2.5: workers 17/18 ready (15 heard from lately; 30 asked), sessions 40, ended 22, dtls 39, fallbacks 1, probes 86, repairs 2, server restarts 9 (found out behind one 3), path changes 4, no stream 5, auth failures 6, fragments tx=7 rx=8, dropped 0; tun in=0 out=0"
+	const counters = "2.5: workers 17/18 ready (15 heard from lately; 30 asked), sessions 40, ended 22, dtls 39, fallbacks 1, probes 86, repairs 2, server restarts 9 (found out behind one 3), path changes 4, freezes 11, wakes 12 (silent behind either 13), write stalls 14, dead writes 16, no stream 5, auth failures 6, fragments tx=7 rx=8, dropped 0; tun in=0 out=0"
 	var atEvent, atStop bool
 	for _, l := range out.lines() {
 		if strings.HasSuffix(l, "csqtt: pathstats probe: "+counters) {
@@ -493,18 +497,49 @@ func TestCsqtt25StatsReachTheAppAndTheLog(t *testing.T) {
 	}
 }
 
-// A path change reaches the engine; the wake hook does nothing yet and must
-// not be mistaken for one.
-func TestCsqtt25PathChangeReachesTheEngineAndTheWakeDoesNothingYet(t *testing.T) {
+// A path change and a wake each reach the engine as what they are: a wake is
+// not a path change (it replaces nobody that answers), a path change is not a
+// wake.
+func TestCsqtt25PathChangeAndWakeReachTheEngineEachAsItself(t *testing.T) {
 	fe := newFakeEngine()
 	h, _ := start25(t, fe, "")
 	csqttWakeHealthCheckImpl(h)
-	if n := fe.pathChg.Load(); n != 0 {
-		t.Fatalf("a wake was told to the engine as %d path change(s)", n)
+	if p, w := fe.pathChg.Load(), fe.wakes.Load(); p != 0 || w != 1 {
+		t.Fatalf("a wake reached the engine as %d path change(s) and %d wake(s), want 0 and 1", p, w)
 	}
 	csqttPathChangedImpl(h)
-	if n := fe.pathChg.Load(); n != 1 {
-		t.Fatalf("a path change reached the engine %d time(s), want 1", n)
+	if p, w := fe.pathChg.Load(), fe.wakes.Load(); p != 1 || w != 1 {
+		t.Fatalf("a path change then: %d path change(s) and %d wake(s) at the engine, want 1 and 1", p, w)
+	}
+}
+
+// The engine is given a bound for its writes and a socket whose write deadline
+// is real — the relayed conn's own is a stub, and a bound set on it bounds
+// nothing.
+func TestCsqtt25WritesAreBoundedOnASocketThatHonoursTheBound(t *testing.T) {
+	src, err := os.ReadFile("csqtt25_bridge.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	if !strings.Contains(s, "r, err := csqtt25DialRelay(creds, server, transport, allocated)") ||
+		!strings.Contains(s, "return r.packetConn(), r.Close, nil") || strings.Contains(s, "csqtt.DialRelay(") {
+		t.Fatal("the engine's socket is not the bridge's own allocation with a real write deadline (csqtt25_relay.go)")
+	}
+	var got csqtt25.ClientConfig
+	prev := csqtt25DialEngine
+	t.Cleanup(func() { csqtt25DialEngine = prev })
+	csqtt25DialEngine = func(_ context.Context, cfg csqtt25.ClientConfig) (csqtt25Engine, error) {
+		got = cfg
+		return newFakeEngine(), nil
+	}
+	c, err := csqtt25Start(context.Background(), csqttConfig{Password: "pw", NumConns: 3}, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 46000}, "tcp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if got.WriteBound != csqtt25.DefaultWriteBound || got.WriteBound <= 0 {
+		t.Fatalf("the engine's write bound is %s, want %s", got.WriteBound, csqtt25.DefaultWriteBound)
 	}
 }
 

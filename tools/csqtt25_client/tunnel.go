@@ -113,6 +113,9 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 	t0 := time.Now()
 	client, err := csqtt25.Dial(dctx, csqtt25.ClientConfig{
 		Password: o.link.Password, Workers: o.workers, Mode: o.mode, Keys: o.keys, Dial: dial, Deliver: deliver,
+		// No WriteBound: this tool rides csqtt.DialRelay's allocation, whose
+		// relayed conn ignores a write deadline — a bound here would bound
+		// nothing. The app's bridge has its own dial for it (csqtt25_relay.go).
 		Logf: func(format string, args ...any) { say("%s", maskLine(fmt.Sprintf(format, args...))) },
 	})
 	cancel()
@@ -180,11 +183,12 @@ func runTunnel(ctx context.Context, o tunnelOptions) int {
 		if dt <= 0 {
 			dt = 1
 		}
-		say("%s: ready %d/%d (asked %d) | up %.2f Mbit/s, down %.2f Mbit/s | pkts tx %d rx %d | frags tx %d rx %d | sessions %d, ended %d, allocations %d, creds %d | dtls %d, fallbacks %d | probes %d, repairs %d, server restarts %d | no-stream %d, auth-fail %d, tun-err %d, early %d | found out behind a restart %d",
+		say("%s: ready %d/%d (asked %d) | up %.2f Mbit/s, down %.2f Mbit/s | pkts tx %d rx %d | frags tx %d rx %d | sessions %d, ended %d, allocations %d, creds %d | dtls %d, fallbacks %d | probes %d, repairs %d, server restarts %d | no-stream %d, auth-fail %d, tun-err %d, early %d | found out behind a restart %d | freezes %d, silent behind one %d, write stalls %d, dead writes %d",
 			label, s.Ready, s.Target, s.Workers,
 			float64(s.TxBytes-prev.TxBytes)*8/dt/1e6, float64(s.RxBytes-prev.RxBytes)*8/dt/1e6,
 			s.TxPackets, s.RxPackets, s.FragsTx, s.FragsRx, s.Sessions, s.Restarts, allocs.Load(), creds.minted.Load(),
-			s.Handshakes, s.Fallbacks, s.Probes, s.Repairs, s.PanelRestarts, s.NoStream, s.AuthFailures, tunErr.Load(), early.Load(), s.Unsettled)
+			s.Handshakes, s.Fallbacks, s.Probes, s.Repairs, s.PanelRestarts, s.NoStream, s.AuthFailures, tunErr.Load(), early.Load(), s.Unsettled,
+			s.Freezes, s.WakeDeaf, s.WriteStalls, s.DeadWrites)
 		prev, prevAt = s, now
 	}
 	code := 0

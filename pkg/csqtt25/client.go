@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,11 +16,13 @@ import (
 // The client: N streams ("workers") to one server under one identity, an
 // uplink dispatcher over them, and whatever comes down handed to Deliver.
 //
-// This is the console's engine. It restarts a stream that fails, asks a
-// silent one whether it is alive and replaces it when it is not, follows the
-// worker count the server agrees to and its repair notices. It does NOT
-// carry the freeze rules pkg/csqtt grew for a phone that the system
-// suspends (a clock that stood still is read here as silence).
+// It restarts a stream that fails, asks a silent one whether it is alive and
+// replaces it when it is not, follows the worker count the server agrees to
+// and its repair notices. A stream's silence is judged as LISTENING, with a
+// freeze of the process as a boundary (liveness.go), and a write the relay
+// does not take is bounded (ClientConfig.WriteBound): a phone suspends the
+// process for minutes at a time, and a relay that stops taking bytes must
+// cost its own stream and nothing else.
 
 // DialFunc opens one stream's socket to the server: a PacketConn whose
 // datagrams to peer reach the server (a TURN allocation in production).
@@ -27,6 +30,11 @@ import (
 // calls it exactly once per dial — at the session's end or at the client's
 // stop, from another goroutine than the one writing. A dial should return
 // when ctx is done; one that does not delays nothing but its own worker.
+//
+// With ClientConfig.WriteBound set, conn's SetWriteDeadline has to be REAL: a
+// WriteTo the far side has not taken by the deadline returns
+// os.ErrDeadlineExceeded. (A TURN library's relayed conn commonly ignores a
+// deadline — it belongs on the socket under it.)
 type DialFunc func(ctx context.Context, workerID int) (conn net.PacketConn, peer net.Addr, closeConn func(), err error)
 
 // KeyMode is where a stream's keys come from.
@@ -64,6 +72,11 @@ type ClientConfig struct {
 	Deliver   func(pkt []byte)
 	Logf      func(format string, args ...any)
 	LocalPort string // echoed by the server; "9000" when empty
+	// WriteBound is how long a stream's socket may take over ONE datagram. A
+	// write it has not taken by then is a stall: the datagram is dropped, the
+	// stream is not ready from that moment and is replaced — the caller of Send
+	// waited the bound once, not until somebody noticed. 0: no bound.
+	WriteBound time.Duration
 }
 
 // The client's clocks; variables so that a test can shorten them.
@@ -115,6 +128,9 @@ type Stats struct {
 	Unsettled                              int64 // streams replaced for their silence behind a restart notice
 	PanelRestarts                          int64
 	PathChanges                            int64
+	WriteStalls, DeadWrites                int64 // writes the relay did not take within the bound; writes that found the connection gone
+	Freezes, Wakes                         int64 // late ticks taken for a suspension of the process (one per suspension); the caller's wake words
+	WakeDeaf                               int64 // streams replaced for their silence behind a freeze or a wake
 }
 
 // Client is a running csqtt 2.5 client.
@@ -128,7 +144,7 @@ type Client struct {
 	wg      sync.WaitGroup
 	workers []*worker
 
-	mu        sync.Mutex // guards gen, salt, disp, target, conf, repairSeq, panelAt, fatal, rallyAt, rallyFrom
+	mu        sync.Mutex // guards gen, salt, disp, target, conf, repairSeq, panelAt, fatal, rallyAt, rallyFrom, frozeAt
 	disp      *Dispatcher
 	target    int
 	conf      ConfigResponse
@@ -139,6 +155,7 @@ type Client struct {
 	// client has said that all the agreed workers are ready (rallied).
 	rallyAt   time.Time
 	rallyFrom string
+	frozeAt   time.Time // when a freeze was last said (froze): the streams see one suspension a tick apart
 	fatal     error
 
 	confOnce     chan struct{} // closed with the first TUNCONF
@@ -156,6 +173,9 @@ type Client struct {
 	panelRestarts                          atomic.Int64
 	pathChanges                            atomic.Int64
 	unsettledN                             atomic.Int64
+	writeStalls, deadWrites                atomic.Int64
+	freezes, wakes, wakeDeaf               atomic.Int64
+	wakeEpoch                              atomic.Uint64 // moved by Wake; every serve loop compares its own copy at each pass (a level, not an edge)
 }
 
 type worker struct {
@@ -174,6 +194,13 @@ type worker struct {
 	kick   chan error    // the server wants this worker's session over: the reason
 	wake   chan struct{} // the agreed count changed
 	reasm  *Reassembler  // the read loop's alone
+	nudge  chan struct{} // the caller's wake word: look at the wake epoch now, not at the next tick
+	// closing: this session's socket is being given back (its end, or the
+	// stop). A write that fails from here on failed because of the close.
+	closing atomic.Bool
+	// saying: one control datagram of the serve loop's — an ask, a keepalive —
+	// is in its write (say).
+	saying atomic.Bool
 }
 
 // Dial starts worker 1 and returns once the server has answered it with a
@@ -207,7 +234,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	for id := 1; id <= cfg.Workers; id++ {
-		c.workers = append(c.workers, &worker{c: c, id: id, kick: make(chan error, 1), wake: make(chan struct{}, 1)})
+		c.workers = append(c.workers, &worker{c: c, id: id, kick: make(chan error, 1), wake: make(chan struct{}, 1), nudge: make(chan struct{}, 1)})
 	}
 	c.start(c.workers[0])
 	select {
@@ -431,6 +458,47 @@ func (c *Client) OnPathChange() {
 	}
 }
 
+// Wake is the caller's word that the process may just have been suspended —
+// the app's wake hook; on a phone it comes with every wake of the device and
+// every change of the path's state. It is a freeze boundary for every ready
+// stream (liveness.go): each is asked at once, again while it stays silent,
+// and replaced after wakeDeafAfter of listening without a word. It never
+// waits: it moves an epoch and nudges the serve loops, which act on the
+// epoch — a nudge that finds its channel full is not lost, the loop compares
+// the epoch at its next tick anyway.
+func (c *Client) Wake() {
+	c.wakeEpoch.Add(1)
+	c.wakes.Add(1)
+	ready := 0
+	for _, w := range c.workers {
+		if w.ready.Load() {
+			ready++
+		}
+		select {
+		case w.nudge <- struct{}{}:
+		default:
+		}
+	}
+	c.cfg.Logf("csqtt25: wake — %d ready stream(s) asked afresh", ready)
+}
+
+// froze says, once per suspension, that a serve loop's tick came late: every
+// stream sees the same gap, a tick apart (late: the gap that makes a tick late).
+func (c *Client) froze(gap, late time.Duration) {
+	now := time.Now()
+	c.mu.Lock()
+	said := !c.frozeAt.IsZero() && now.Sub(c.frozeAt) < late
+	if !said {
+		c.frozeAt = now
+	}
+	c.mu.Unlock()
+	if said {
+		return
+	}
+	c.freezes.Add(1)
+	c.cfg.Logf("csqtt25: the process did not run for %s — what was heard before it counts for nothing, every ready stream is asked afresh", gap.Round(100*time.Millisecond))
+}
+
 // unsettled says whether a stream last heard at `heard` may still be one of
 // the server that said it was restarting. The restart on the notice is
 // right only if that server is gone when a worker asks again, and nothing
@@ -488,6 +556,11 @@ func (c *Client) Stats() Stats {
 		PanelRestarts: c.panelRestarts.Load(),
 		PathChanges:   c.pathChanges.Load(),
 		Unsettled:     c.unsettledN.Load(),
+		WriteStalls:   c.writeStalls.Load(),
+		DeadWrites:    c.deadWrites.Load(),
+		Freezes:       c.freezes.Load(),
+		Wakes:         c.wakes.Load(),
+		WakeDeaf:      c.wakeDeaf.Load(),
 	}
 	now := time.Now().UnixNano()
 	for _, w := range c.workers {
@@ -584,13 +657,78 @@ func (w *worker) send(plain []byte) error {
 		return err
 	}
 	w.wireBuf = wire[:0]
-	if _, err := w.conn.WriteTo(wire, w.peer); err != nil {
+	// The bound goes on and comes off around the ONE write: whatever else
+	// writes to the socket under this conn (a TURN client's refreshes, its
+	// deallocate) must never meet a deadline that has passed.
+	bound := w.c.cfg.WriteBound
+	if bound > 0 {
+		_ = w.conn.SetWriteDeadline(time.Now().Add(bound))
+	}
+	_, err = w.conn.WriteTo(wire, w.peer)
+	if bound > 0 {
+		_ = w.conn.SetWriteDeadline(time.Time{})
+	}
+	if err != nil {
+		w.failedWrite(err, bound)
 		return err
 	}
 	w.lastTx.Store(time.Now().UnixNano())
 	w.c.txPackets.Add(1)
 	w.c.txBytes.Add(int64(len(plain)))
 	return nil
+}
+
+// failedWrite is the verdict on a write's error, under w.mu from send —
+// whoever wrote: the caller of Send, an ask, a keepalive. Two errors end the
+// stream, and at once: the bound's own expiry (the relay took no bytes — a
+// stall) and the connection gone (a reset, a broken pipe, the kernel's own
+// give-up: over a TCP relay leg the next WRITE is the only thing that notices).
+// The stream is not ready from this moment — the dispatcher gives it nothing
+// more — and its session is told to end; the dial that follows waits the
+// failure back-off like any other failure of the relay path. Anything else —
+// a moment's refusal, a route that is away for now — is the caller's error
+// and nothing more; and a write that failed because this session's socket is
+// being given back failed because of the close.
+//
+// 🚫 The bound's expiry is os.ErrDeadlineExceeded and nothing else: a
+// net.Error's Timeout() is also true of the kernel's ETIMEDOUT, which is the
+// connection gone, and of EAGAIN, which is nothing.
+func (w *worker) failedWrite(err error, bound time.Duration) {
+	if w.closing.Load() {
+		return
+	}
+	c := w.c
+	switch {
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		c.writeStalls.Add(1)
+		w.ready.Store(false)
+		c.cfg.Logf("csqtt25: worker %d: the relay took no bytes for %s — a stalled write, the stream is replaced", w.id, bound)
+		w.end(errStalled)
+	case connGone(err):
+		c.deadWrites.Add(1)
+		w.ready.Store(false)
+		c.cfg.Logf("csqtt25: worker %d: the write found the connection gone (%s) — the stream is replaced", w.id, causeOf(err))
+		w.end(errConnGone)
+	}
+}
+
+// say writes one control datagram of the serve loop's — an ask, a keepalive —
+// WITHOUT holding the loop: over a TCP relay leg a write into a full buffer
+// waits, and a serve loop that waits with it reads no notice, hears no
+// answer, and arrives late at its own next tick — which reads as a freeze.
+// One at a time: a second one while the first is still in its write is not
+// queued behind it (it would say the same thing). The write's own verdict is
+// send's (failedWrite).
+func (w *worker) say(p []byte) {
+	if !w.saying.CompareAndSwap(false, true) {
+		return
+	}
+	w.c.wg.Add(1) // from the serve loop, itself counted: never from zero
+	go func() {
+		defer w.c.wg.Done()
+		defer w.saying.Store(false)
+		_ = w.send(p)
+	}()
 }
 
 func (w *worker) run() {
@@ -691,8 +829,14 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	// whichever is first. The stop does it BY ITSELF: a write parked in the
 	// socket keeps this goroutine from ever reaching its own close, and it
 	// is the close that ends the write.
+	w.closing.Store(false)
 	var once sync.Once
-	release := func() { once.Do(closeConn) }
+	release := func() {
+		once.Do(func() {
+			w.closing.Store(true) // before the close: a write it ends must know why it ended (failedWrite)
+			closeConn()
+		})
+	}
 	defer release()
 	defer context.AfterFunc(c.ctx, release)()
 	split := NewSplitter(conn, peer)
@@ -741,6 +885,11 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	w.reasm = NewReassembler()
 	defer func() {
 		w.ready.Store(false)
+		// The socket goes FIRST, the lock after: a write parked in the socket
+		// holds the lock, and only the close ends it — taken in the other
+		// order, a session whose relay had stopped taking bytes could not end
+		// on anybody's word until that write came back by itself.
+		release()
 		w.mu.Lock()
 		w.conn = nil
 		w.mu.Unlock()
@@ -766,7 +915,7 @@ func (w *worker) session() (readyAt time.Time, err error) {
 
 	tick := time.NewTicker(serveTick)
 	defer tick.Stop()
-	var probedAt time.Time
+	watch := newStreamWatch(c.wakeEpoch.Load())
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -777,33 +926,38 @@ func (w *worker) session() (readyAt time.Time, err error) {
 			if !ok {
 				return readyAt, errors.New("the stream's socket closed")
 			}
-			w.receive(wire, recvC)
-		case now := <-tick.C:
-			if w.id > c.targetNow() {
-				return readyAt, errParked
+			if w.receive(wire, recvC) {
+				watch.heard(watch.now())
 			}
-			heard := time.Unix(0, w.lastRx.Load())
-			silent := now.Sub(heard)
-			ask, give, gone := probeAfter, deafAfter, errDeaf
-			if c.unsettled(heard) {
-				ask, give, gone = settleProbeAfter, settleDeafAfter, errUnsettled
-			}
-			switch {
-			case silent >= give:
-				if gone == errUnsettled {
-					c.unsettledN.Add(1)
-				}
-				return readyAt, gone
-			case silent >= ask && now.Sub(probedAt) >= ask/2:
-				probedAt = now
-				c.probes.Add(1)
-				if err := w.send([]byte(ReadyRequest)); err != nil {
-					return readyAt, fmt.Errorf("probe: %w", err)
-				}
-			case now.Sub(time.Unix(0, w.lastTx.Load())) >= keepaliveEvery:
-				if err := w.send(IdleKeepalive); err != nil {
-					return readyAt, fmt.Errorf("keepalive: %w", err)
-				}
+			continue
+		case <-w.nudge: // the wake word: a pass now — it finds the epoch moved, or it is a short tick
+		case <-tick.C:
+		}
+		if w.id > c.targetNow() {
+			return readyAt, errParked
+		}
+		// The rule (liveness.go). Every write it asks for goes through say: the
+		// loop never waits in a socket.
+		act, gap := watch.tick(watch.now(), c.wakeEpoch.Load(), c.unsettled(time.Unix(0, w.lastRx.Load())))
+		switch act {
+		case watchFroze:
+			c.froze(gap, watch.late)
+			c.probes.Add(1)
+			w.say([]byte(ReadyRequest))
+		case watchWoke, watchAsk:
+			c.probes.Add(1)
+			w.say([]byte(ReadyRequest))
+		case watchDeaf:
+			return readyAt, errDeaf
+		case watchUnsettled:
+			c.unsettledN.Add(1)
+			return readyAt, errUnsettled
+		case watchWakeDeaf:
+			c.wakeDeaf.Add(1)
+			return readyAt, errWakeDeaf
+		default:
+			if time.Since(time.Unix(0, w.lastTx.Load())) >= watch.idle {
+				w.say(IdleKeepalive)
 			}
 		}
 	}
@@ -864,18 +1018,25 @@ func (w *worker) getconf(media <-chan []byte, recvC *Cipher) (ConfigResponse, er
 	return ConfigResponse{}, errors.New("no answer to GETCONF (a server gives silence to keys it cannot use)")
 }
 
-// receive handles one datagram of a ready stream.
-func (w *worker) receive(wire []byte, recvC *Cipher) {
-	c := w.c
+// receive handles one datagram of a ready stream and says whether it was the
+// server's: it opened under the stream's key.
+func (w *worker) receive(wire []byte, recvC *Cipher) bool {
 	if !IsRTP(wire) {
-		return
+		return false
 	}
 	plain, _, err := recvC.Unwrap(wire)
 	if err != nil {
-		c.authFailures.Add(1)
-		return
+		w.c.authFailures.Add(1)
+		return false
 	}
 	w.lastRx.Store(time.Now().UnixNano())
+	w.take(plain)
+	return true
+}
+
+// take handles one authentic plaintext of a ready stream.
+func (w *worker) take(plain []byte) {
+	c := w.c
 	// Control first: several control strings begin with a byte that reads
 	// as an IP version.
 	if IsControl(plain) {
