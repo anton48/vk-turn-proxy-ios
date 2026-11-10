@@ -42,9 +42,13 @@ const (
 	csqttGen25  = "2.5"
 )
 
-// csqtt25MTU is the tunnel MTU 2.5 runs at — the reference's: a packet above
-// csqtt25.WholeMax travels as two datagrams on one stream and is put together
-// on the far side. The user's explicit MTU still wins on the Swift side.
+// csqtt25MTU is the tunnel MTU 2.5 is PROVISIONED with — the reference's: a
+// packet above csqtt25.WholeMax travels as two datagrams on one stream and is
+// put together on the far side. It is not what the interface gets: the app
+// bounds a provisioned MTU as it bounds the user's own (TunnelMTU, 1000…1400),
+// so a phone runs 2.5 at 1400 unless the user set a lower one by hand, which
+// wins — and at anything above WholeMax every full-size packet is two
+// datagrams.
 const csqtt25MTU = 1500
 
 // csqtt25DownQueue bounds what waits between the streams' read loops and the
