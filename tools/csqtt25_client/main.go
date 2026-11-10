@@ -72,6 +72,13 @@ func main() {
 	dnsName := flag.String("dns-name", "example.com", "name asked of the tunnel's DNS server in one UDP query (empty = skip)")
 	stay := flag.Duration("stay", 0, "keep the session open this long before DISCONNECT, answering nothing but keepalives")
 	turnTransport := flag.String("turn-transport", "udp", "control transport to the VK relay: udp or tcp")
+	tunMode := flag.Bool("tun", false, "stage two: -workers workers, a TUN interface and -route through it (needs root; -keys wrap, dtls or auto)")
+	tunName := flag.String("tun-name", defaultTunName, "-tun: interface name")
+	mtu := flag.Int("mtu", 1500, "-tun: interface MTU (the server's is 1500; a packet above 1280 bytes travels as two fragments)")
+	routes := flag.String("route", "", "-tun: comma-separated hosts or prefixes to send through the tunnel (the default route is never touched)")
+	duration := flag.Duration("duration", 0, "-tun: stop after this long (0 = until a signal)")
+	statsEvery := flag.Duration("stats-every", 10*time.Second, "-tun: stats line interval")
+	allocsPerCred := flag.Int("allocs-per-cred", 8, "-tun: workers served by one minted VK credential before the next is minted")
 	flag.Parse()
 	if *linkFile == "" {
 		fail("-link-file is required")
@@ -117,6 +124,24 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if *tunMode {
+		keyMode, err := csqtt25.ParseKeyMode(*keysArm)
+		if err != nil {
+			fail("-tun takes -keys wrap, dtls or auto")
+		}
+		var list []string
+		for _, r := range strings.Split(*routes, ",") {
+			if r = strings.TrimSpace(r); r != "" {
+				list = append(list, r)
+			}
+		}
+		say("tun mode: %d worker(s), keys %q, mode %s, %s to the relay", *workers, *keysArm, *modeName, *turnTransport)
+		os.Exit(runTunnel(ctx, tunnelOptions{
+			link: link, peer: peer, linkID: linkID, workers: *workers, keys: keyMode, mode: mode, turnTransport: *turnTransport,
+			allocsPerCred: *allocsPerCred, tunName: *tunName, mtu: *mtu, routes: list, duration: *duration, statsEvery: *statsEvery,
+		}))
+	}
 
 	// ── credentials and the allocation ───────────────────────────────────
 	t0 := time.Now()

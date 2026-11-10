@@ -1,0 +1,668 @@
+package csqtt25
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// The client: N streams ("workers") to one server under one identity, an
+// uplink dispatcher over them, and whatever comes down handed to Deliver.
+//
+// This is the console's engine. It restarts a stream that fails, asks a
+// silent one whether it is alive and replaces it when it is not, follows the
+// worker count the server agrees to and its repair notices. It does NOT
+// carry the freeze rules pkg/csqtt grew for a phone that the system
+// suspends (a clock that stood still is read here as silence).
+
+// DialFunc opens one stream's socket to the server: a PacketConn whose
+// datagrams to peer reach the server (a TURN allocation in production).
+// closeConn releases it; the client calls it exactly once per dial.
+type DialFunc func(ctx context.Context, workerID int) (conn net.PacketConn, peer net.Addr, closeConn func(), err error)
+
+// KeyMode is where a stream's keys come from.
+type KeyMode int
+
+const (
+	KeysAuto KeyMode = iota // a DTLS handshake, password-derived keys if it fails (the reference's default)
+	KeysDTLS                // a DTLS handshake or nothing
+	KeysWrap                // password-derived keys, no handshake
+)
+
+// ParseKeyMode accepts the reference client's names.
+func ParseKeyMode(s string) (KeyMode, error) {
+	switch s {
+	case "auto", "":
+		return KeysAuto, nil
+	case "dtls", "dtls-srtp":
+		return KeysDTLS, nil
+	case "wrap", "wrap-srtp":
+		return KeysWrap, nil
+	}
+	return 0, errors.New("csqtt25: unknown key mode " + s)
+}
+
+// ClientConfig is what a client is made of.
+type ClientConfig struct {
+	Password string
+	Workers  int // streams asked for, 1..MaxWorkers; the server may agree to fewer
+	Mode     Mode
+	Keys     KeyMode
+	Dial     DialFunc
+	// Deliver takes one whole IP packet from the server. It is called from
+	// the streams' read loops — concurrently across streams — and owns the
+	// slice.
+	Deliver   func(pkt []byte)
+	Logf      func(format string, args ...any)
+	LocalPort string // echoed by the server; "9000" when empty
+}
+
+// The client's clocks; variables so that a test can shorten them.
+var (
+	getconfWaits   = []time.Duration{400 * time.Millisecond, 800 * time.Millisecond, 1600 * time.Millisecond, 3000 * time.Millisecond}
+	keepaliveEvery = 10 * time.Second // an idle stream says so this often
+	probeAfter     = 20 * time.Second // a stream that heard nothing this long is asked (READY)
+	deafAfter      = 60 * time.Second // …and replaced when it heard nothing this long
+	serveTick      = time.Second
+	backoffBase    = time.Second
+	backoffMax     = 15 * time.Second
+	heldAfter      = 30 * time.Second // a session that stayed ready this long ends the run of failures
+	disconnectWait = 700 * time.Millisecond
+)
+
+// ErrNoStream is Send's answer when no stream can carry a packet now.
+var ErrNoStream = errors.New("csqtt25: no stream is ready")
+
+var (
+	errParked = errors.New("csqtt25: the worker is above the agreed count")
+	errRepair = errors.New("csqtt25: the server asked for this worker again")
+	errDeaf   = errors.New("csqtt25: the stream heard nothing")
+)
+
+// Stats is a snapshot of the client's counters.
+type Stats struct {
+	Workers, Target, Ready                 int
+	TxPackets, TxBytes, RxPackets, RxBytes int64
+	FragsTx, FragsRx                       int64
+	Sessions, Restarts                     int64 // sessions that reached READY; sessions that ended
+	AuthFailures, NoStream                 int64
+	Probes, Repairs, Handshakes, Fallbacks int64
+}
+
+// Client is a running csqtt 2.5 client.
+type Client struct {
+	cfg  ClientConfig
+	gen  uint64
+	salt string
+
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	workers []*worker
+
+	mu        sync.Mutex // guards disp, target, conf, repairSeq, fatal
+	disp      *Dispatcher
+	target    int
+	conf      ConfigResponse
+	repairSeq uint64
+	fatal     error
+
+	confOnce     chan struct{} // closed with the first TUNCONF
+	confClosed   sync.Once
+	done         chan struct{} // closed when the client is over: a fatal denial, or Close
+	doneClosed   sync.Once
+	disconnected chan struct{}
+	fragID       atomic.Uint32
+
+	txPackets, txBytes, rxPackets, rxBytes atomic.Int64
+	fragsTx, fragsRx                       atomic.Int64
+	sessions, restarts                     atomic.Int64
+	authFailures, noStream                 atomic.Int64
+	probes, repairs, handshakes, fallbacks atomic.Int64
+}
+
+type worker struct {
+	c  *Client
+	id int
+
+	mu      sync.Mutex // guards conn, peer, wrapper, wireBuf: one sender at a time
+	conn    net.PacketConn
+	peer    net.Addr
+	wrapper *Wrapper
+	wireBuf []byte
+
+	ready  atomic.Bool
+	lastTx atomic.Int64
+	lastRx atomic.Int64
+	kick   chan struct{} // a repair notice names this worker
+	wake   chan struct{} // the agreed count changed
+	reasm  *Reassembler  // the read loop's alone
+}
+
+// Dial starts worker 1 and returns once the server has answered it with a
+// configuration; the other workers start behind it. ctx bounds only that
+// wait.
+func Dial(ctx context.Context, cfg ClientConfig) (*Client, error) {
+	if cfg.Password == "" || cfg.Dial == nil {
+		return nil, errors.New("csqtt25: Password and Dial are required")
+	}
+	if cfg.Workers < 1 || cfg.Workers > MaxWorkers {
+		return nil, fmt.Errorf("csqtt25: Workers must be 1..%d", MaxWorkers)
+	}
+	if cfg.Logf == nil {
+		cfg.Logf = func(string, ...any) {}
+	}
+	if cfg.Deliver == nil {
+		cfg.Deliver = func([]byte) {}
+	}
+	if cfg.LocalPort == "" {
+		cfg.LocalPort = "9000"
+	}
+	var salt [8]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return nil, err
+	}
+	c := &Client{
+		cfg: cfg, gen: uint64(time.Now().UnixMilli()), salt: hex.EncodeToString(salt[:]),
+		disp: NewDispatcher(cfg.Workers), target: cfg.Workers,
+		confOnce: make(chan struct{}), done: make(chan struct{}), disconnected: make(chan struct{}, 1),
+	}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	for id := 1; id <= cfg.Workers; id++ {
+		c.workers = append(c.workers, &worker{c: c, id: id, kick: make(chan struct{}, 1), wake: make(chan struct{}, 1)})
+	}
+	c.start(c.workers[0])
+	select {
+	case <-c.confOnce:
+	case <-c.done:
+		err := c.Err()
+		c.Close()
+		return nil, err
+	case <-ctx.Done():
+		c.Close()
+		return nil, fmt.Errorf("csqtt25: no configuration from the server: %w", ctx.Err())
+	}
+	for _, w := range c.workers[1:] {
+		c.start(w)
+	}
+	return c, nil
+}
+
+func (c *Client) start(w *worker) {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		w.run()
+	}()
+}
+
+// Config is the latest configuration the server sent.
+func (c *Client) Config() ConfigResponse {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conf
+}
+
+// Done is closed when the client is over; Err says why (nil after Close).
+func (c *Client) Done() <-chan struct{} { return c.done }
+
+// Err is the denial that ended the client, if one did.
+func (c *Client) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fatal
+}
+
+func (c *Client) fail(err error) {
+	c.mu.Lock()
+	if c.fatal == nil {
+		c.fatal = err
+	}
+	c.mu.Unlock()
+	c.doneClosed.Do(func() { close(c.done) })
+	c.cancel()
+}
+
+func (c *Client) targetNow() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.target
+}
+
+// setTarget follows the count the server agreed to: never above what was
+// asked, never below one.
+func (c *Client) setTarget(agreed int) { c.moveTarget(agreed, false) }
+
+// lowerTarget takes a refusal of one worker's number as a count: it can only
+// lower what stands (two refused workers answer in any order — the higher
+// one's must not raise what the lower one's set).
+func (c *Client) lowerTarget(to int) { c.moveTarget(to, true) }
+
+func (c *Client) moveTarget(agreed int, onlyDown bool) {
+	if agreed < 1 {
+		agreed = 1
+	}
+	if agreed > c.cfg.Workers {
+		agreed = c.cfg.Workers
+	}
+	c.mu.Lock()
+	changed := c.target != agreed && !(onlyDown && agreed > c.target)
+	if changed {
+		c.target = agreed
+	}
+	c.mu.Unlock()
+	if !changed {
+		return
+	}
+	c.cfg.Logf("csqtt25: the server agrees to %d worker(s) of the %d asked", agreed, c.cfg.Workers)
+	for _, w := range c.workers {
+		select {
+		case w.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *Client) setConfig(conf ConfigResponse) {
+	c.mu.Lock()
+	changed := c.conf.Raw != conf.Raw
+	c.conf = conf
+	c.mu.Unlock()
+	if conf.Workers > 0 {
+		c.setTarget(conf.Workers)
+	}
+	if changed {
+		c.cfg.Logf("csqtt25: configuration: tunnel %s, stream %q, workers=%d", conf.TunnelIP, conf.Stream, conf.Workers)
+	}
+	c.confClosed.Do(func() { close(c.confOnce) })
+}
+
+// repair restarts the READY workers a repair notice names: the server does
+// not see them although they think they are up. A notice is acted on once.
+func (c *Client) repair(cmd StreamCommand) {
+	c.mu.Lock()
+	fresh := cmd.Sequence > c.repairSeq
+	if fresh {
+		c.repairSeq = cmd.Sequence
+	}
+	c.mu.Unlock()
+	if !fresh {
+		return
+	}
+	named := make(map[int]bool, len(cmd.Workers))
+	for _, id := range cmd.Workers {
+		named[id] = true
+	}
+	for _, w := range c.workers {
+		if named[w.id] && w.ready.Load() {
+			c.repairs.Add(1)
+			select {
+			case w.kick <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+// Send hands one IP packet to the server: whole up to WholeMax bytes, as
+// fragments on one stream above it. Callers send one at a time (the order of
+// a flow's packets is the order of the calls).
+func (c *Client) Send(pkt []byte) error {
+	datagrams := 1
+	if len(pkt) > WholeMax {
+		datagrams = (len(pkt) + FragMax - 1) / FragMax
+	}
+	c.mu.Lock()
+	idx, ok := c.disp.Pick(pkt, datagrams, func(i int) bool { return c.workers[i].ready.Load() }, time.Now())
+	c.mu.Unlock()
+	if !ok {
+		c.noStream.Add(1)
+		return ErrNoStream
+	}
+	w := c.workers[idx]
+	if datagrams == 1 {
+		return w.send(pkt)
+	}
+	frags := Fragment(uint16(c.fragID.Add(1)), pkt)
+	if frags == nil {
+		return errors.New("csqtt25: the packet is too large to travel")
+	}
+	for _, f := range frags {
+		if err := w.send(f); err != nil {
+			return err
+		}
+		c.fragsTx.Add(1)
+	}
+	return nil
+}
+
+// Stats is a snapshot of the counters.
+func (c *Client) Stats() Stats {
+	s := Stats{
+		Workers: len(c.workers), Target: c.targetNow(),
+		TxPackets: c.txPackets.Load(), TxBytes: c.txBytes.Load(), RxPackets: c.rxPackets.Load(), RxBytes: c.rxBytes.Load(),
+		FragsTx: c.fragsTx.Load(), FragsRx: c.fragsRx.Load(), Sessions: c.sessions.Load(), Restarts: c.restarts.Load(),
+		AuthFailures: c.authFailures.Load(), NoStream: c.noStream.Load(),
+		Probes: c.probes.Load(), Repairs: c.repairs.Load(), Handshakes: c.handshakes.Load(), Fallbacks: c.fallbacks.Load(),
+	}
+	for _, w := range c.workers {
+		if w.ready.Load() {
+			s.Ready++
+		}
+	}
+	return s
+}
+
+// Close tells the server the session is over (best effort, through up to
+// three ready streams, for a bounded time) and stops every worker.
+func (c *Client) Close() {
+	req := []byte(DisconnectRequest(c.cfg.Password, c.salt))
+	asked := 0
+	for _, w := range c.workers {
+		if asked == 3 {
+			break
+		}
+		if w.ready.Load() && w.send(req) == nil {
+			asked++
+		}
+	}
+	if asked > 0 {
+		t := time.NewTimer(disconnectWait)
+		select {
+		case <-c.disconnected:
+		case <-t.C:
+		}
+		t.Stop()
+	}
+	c.doneClosed.Do(func() { close(c.done) })
+	c.cancel()
+	c.wg.Wait()
+}
+
+// ─── a worker ────────────────────────────────────────────────────────────
+
+func (w *worker) send(plain []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.conn == nil {
+		return ErrNoStream
+	}
+	wire, err := w.wrapper.Wrap(w.wireBuf, plain)
+	if err != nil {
+		return err
+	}
+	w.wireBuf = wire[:0]
+	if _, err := w.conn.WriteTo(wire, w.peer); err != nil {
+		return err
+	}
+	w.lastTx.Store(time.Now().UnixNano())
+	w.c.txPackets.Add(1)
+	w.c.txBytes.Add(int64(len(plain)))
+	return nil
+}
+
+func (w *worker) run() {
+	c := w.c
+	backoff := backoffBase
+	for c.ctx.Err() == nil {
+		if w.id > c.targetNow() {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-w.wake:
+			}
+			continue
+		}
+		readyAt, err := w.session()
+		if c.ctx.Err() != nil {
+			return
+		}
+		c.restarts.Add(1)
+		var denied *DeniedError
+		switch {
+		case errors.As(err, &denied) && denied.Fatal():
+			c.cfg.Logf("csqtt25: worker %d: %v — the client stops", w.id, err)
+			c.fail(err)
+			return
+		case errors.As(err, &denied) && denied.Reason == "invalid_worker_count":
+			// The server holds fewer streams than this worker's number.
+			c.lowerTarget(w.id - 1)
+			continue
+		case errors.Is(err, errParked):
+			continue
+		}
+		if !readyAt.IsZero() && time.Since(readyAt) >= heldAfter {
+			backoff = backoffBase
+		}
+		c.cfg.Logf("csqtt25: worker %d: session ended (%v), again in %s", w.id, err, backoff)
+		t := time.NewTimer(backoff)
+		select {
+		case <-c.ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		if backoff *= 2; backoff > backoffMax {
+			backoff = backoffMax
+		}
+	}
+}
+
+// session is one stream from its dial to its end. readyAt is when it
+// reached READY (zero if it never did).
+func (w *worker) session() (readyAt time.Time, err error) {
+	c := w.c
+	conn, peer, closeConn, err := c.cfg.Dial(c.ctx, w.id)
+	if err != nil {
+		return readyAt, fmt.Errorf("dial: %w", err)
+	}
+	defer closeConn()
+	split := NewSplitter(conn, peer)
+
+	var keys Keys
+	switch c.cfg.Keys {
+	case KeysWrap:
+		wrap, err := WrapKey(c.cfg.Password)
+		if err != nil {
+			return readyAt, err
+		}
+		keys = WrapKeys(wrap)
+		split.Seal()
+	default:
+		keys, err = Handshake(c.ctx, split)
+		if err == nil {
+			c.handshakes.Add(1)
+			break
+		}
+		if c.cfg.Keys == KeysDTLS || c.ctx.Err() != nil {
+			return readyAt, err
+		}
+		c.fallbacks.Add(1)
+		c.cfg.Logf("csqtt25: worker %d: no DTLS handshake (%v) — password-derived keys", w.id, err)
+		wrap, werr := WrapKey(c.cfg.Password)
+		if werr != nil {
+			return readyAt, werr
+		}
+		keys = WrapKeys(wrap)
+	}
+	sendC, err := NewCipher(keys.Client)
+	if err != nil {
+		return readyAt, err
+	}
+	recvC, err := NewCipher(keys.Server)
+	if err != nil {
+		return readyAt, err
+	}
+	wrapper, err := NewWrapper(sendC, c.cfg.Mode)
+	if err != nil {
+		return readyAt, err
+	}
+	w.mu.Lock()
+	w.conn, w.peer, w.wrapper = conn, peer, wrapper
+	w.mu.Unlock()
+	w.reasm = NewReassembler()
+	defer func() {
+		w.ready.Store(false)
+		w.mu.Lock()
+		w.conn = nil
+		w.mu.Unlock()
+	}()
+	// A repair notice from before this session is not about it.
+	select {
+	case <-w.kick:
+	default:
+	}
+
+	media := split.Media()
+	conf, err := w.getconf(media, recvC)
+	if err != nil {
+		return readyAt, err
+	}
+	c.setConfig(conf)
+	if err := w.send([]byte(ReadyRequest)); err != nil {
+		return readyAt, fmt.Errorf("READY: %w", err)
+	}
+	readyAt = time.Now()
+	w.lastRx.Store(readyAt.UnixNano())
+	w.ready.Store(true)
+	c.sessions.Add(1)
+	if w.id == 1 {
+		_ = w.send([]byte(WorkersRequest(c.cfg.Password, c.cfg.Workers)))
+	}
+
+	tick := time.NewTicker(serveTick)
+	defer tick.Stop()
+	var probedAt time.Time
+	for {
+		select {
+		case <-c.ctx.Done():
+			return readyAt, c.ctx.Err()
+		case <-w.kick:
+			return readyAt, errRepair
+		case wire, ok := <-media:
+			if !ok {
+				return readyAt, errors.New("the stream's socket closed")
+			}
+			w.receive(wire, recvC)
+		case now := <-tick.C:
+			if w.id > c.targetNow() {
+				return readyAt, errParked
+			}
+			silent := now.Sub(time.Unix(0, w.lastRx.Load()))
+			switch {
+			case silent >= deafAfter:
+				return readyAt, errDeaf
+			case silent >= probeAfter && now.Sub(probedAt) >= probeAfter/2:
+				probedAt = now
+				c.probes.Add(1)
+				if err := w.send([]byte(ReadyRequest)); err != nil {
+					return readyAt, fmt.Errorf("probe: %w", err)
+				}
+			case now.Sub(time.Unix(0, w.lastTx.Load())) >= keepaliveEvery:
+				if err := w.send(IdleKeepalive); err != nil {
+					return readyAt, fmt.Errorf("keepalive: %w", err)
+				}
+			}
+		}
+	}
+}
+
+// getconf asks for the configuration on the reference's schedule: the
+// request twice, then a wait, four times over.
+func (w *worker) getconf(media <-chan []byte, recvC *Cipher) (ConfigResponse, error) {
+	c := w.c
+	req := []byte(ConfigRequest(c.cfg.LocalPort, c.cfg.Password, c.gen, c.salt, w.id, c.cfg.Workers))
+	for _, wait := range getconfWaits {
+		for i := 0; i < 2; i++ {
+			if err := w.send(req); err != nil {
+				return ConfigResponse{}, fmt.Errorf("GETCONF: %w", err)
+			}
+		}
+		deadline := time.NewTimer(wait)
+	waiting:
+		for {
+			select {
+			case <-c.ctx.Done():
+				deadline.Stop()
+				return ConfigResponse{}, c.ctx.Err()
+			case <-deadline.C:
+				break waiting
+			case wire, ok := <-media:
+				if !ok {
+					deadline.Stop()
+					return ConfigResponse{}, errors.New("the stream's socket closed")
+				}
+				if !IsRTP(wire) {
+					continue
+				}
+				plain, _, err := recvC.Unwrap(wire)
+				if err != nil {
+					c.authFailures.Add(1)
+					continue
+				}
+				if !IsConfigResponse(plain) {
+					continue
+				}
+				deadline.Stop()
+				return ParseConfigResponse(plain)
+			}
+		}
+	}
+	return ConfigResponse{}, errors.New("no answer to GETCONF (a server gives silence to keys it cannot use)")
+}
+
+// receive handles one datagram of a ready stream.
+func (w *worker) receive(wire []byte, recvC *Cipher) {
+	c := w.c
+	if !IsRTP(wire) {
+		return
+	}
+	plain, _, err := recvC.Unwrap(wire)
+	if err != nil {
+		c.authFailures.Add(1)
+		return
+	}
+	w.lastRx.Store(time.Now().UnixNano())
+	// Control first: several control strings begin with a byte that reads
+	// as an IP version.
+	if IsControl(plain) {
+		switch {
+		case IsConfigResponse(plain):
+			if conf, err := ParseConfigResponse(plain); err == nil {
+				c.setConfig(conf)
+			}
+		case string(plain) == DisconnectedResponse:
+			select {
+			case c.disconnected <- struct{}{}:
+			default:
+			}
+		default:
+			if agreed, _, ok := ParseWorkers(plain); ok {
+				c.setTarget(agreed)
+			} else if cmd, ok := ParseStreamRepair(plain); ok {
+				c.repair(cmd)
+			}
+		}
+		return
+	}
+	if IsFragment(plain) {
+		c.fragsRx.Add(1)
+		whole, done := w.reasm.Push(plain, time.Now())
+		if !done {
+			return
+		}
+		plain = whole
+	}
+	if len(plain) == 0 || (plain[0]>>4 != 4 && plain[0]>>4 != 6) {
+		return
+	}
+	c.rxPackets.Add(1)
+	c.rxBytes.Add(int64(len(plain)))
+	c.cfg.Deliver(plain)
+}

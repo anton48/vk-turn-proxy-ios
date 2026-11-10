@@ -2,6 +2,7 @@ package csqtt25
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strconv"
@@ -137,6 +138,43 @@ func ParseWorkers(p []byte) (agreed, limit int, ok bool) {
 		return n, n, true
 	}
 	return 0, 0, false
+}
+
+// StreamCommand is a STREAM_REPAIR or STREAM_ALIVE notice: the worker ids the
+// server has not seen (REPAIR) or sees (ALIVE).
+type StreamCommand struct {
+	Sequence uint64
+	Desired  int
+	Workers  []int
+}
+
+// ParseStreamRepair parses a STREAM_REPAIR notice.
+func ParseStreamRepair(p []byte) (StreamCommand, bool) { return parseStream(p, streamRepairPrefix) }
+
+// ParseStreamAlive parses a STREAM_ALIVE notice.
+func ParseStreamAlive(p []byte) (StreamCommand, bool) { return parseStream(p, streamAlivePrefix) }
+
+// prefix ‖ sequence u64 ‖ desired u16 ‖ count u8 ‖ count × worker id u16, all
+// big-endian.
+func parseStream(p, prefix []byte) (StreamCommand, bool) {
+	rest, ok := bytes.CutPrefix(p, prefix)
+	if !ok || len(rest) < 11 {
+		return StreamCommand{}, false
+	}
+	cmd := StreamCommand{Sequence: binary.BigEndian.Uint64(rest[0:8]), Desired: int(binary.BigEndian.Uint16(rest[8:10]))}
+	count := int(rest[10])
+	ids := rest[11:]
+	if cmd.Sequence == 0 || cmd.Desired == 0 || cmd.Desired > MaxWorkers || count == 0 || len(ids) != count*2 {
+		return StreamCommand{}, false
+	}
+	for i := 0; i < count; i++ {
+		id := int(binary.BigEndian.Uint16(ids[i*2:]))
+		if id == 0 || id > cmd.Desired {
+			return StreamCommand{}, false
+		}
+		cmd.Workers = append(cmd.Workers, id)
+	}
+	return cmd, true
 }
 
 // IsIdleKeepalive is the server's own rule for a keepalive.
