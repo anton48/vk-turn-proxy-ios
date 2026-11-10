@@ -1,6 +1,7 @@
 package csqtt
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -138,4 +139,39 @@ func TestARestartNoticeInAConfigurationWaitIsHeard(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	waitFor(t, "both workers ready again", func() bool { return c.Stats().Ready == 2 })
+}
+
+// The fixture's own promise: dialReady hands a client over only when every
+// worker has heard the answer to its READY. Returned earlier, the last
+// READY_OK is still in the read loop and answers the next round a test asks
+// of deafened workers.
+func TestDialReadyWaitsForTheLastAnswer(t *testing.T) {
+	hold := make(chan struct{})
+	var seen atomic.Int32
+	hook := func(w *worker) {
+		if w.id == 2 && seen.Add(1) == 2 { // worker 2's second inbound: its READY_OK
+			<-hold
+		}
+	}
+	readLoopStamped.Store(&hook)
+	t.Cleanup(func() { readLoopStamped.Store(nil) })
+	srv := newFakeServer(t)
+	loopbackRelay(t, nil)
+	cfg := testConfig(srv, 2, (&lease{}).creds)
+	back := make(chan *Client, 1)
+	go func() { back <- dialReady(t, cfg) }()
+	select {
+	case c := <-back:
+		close(hold)
+		c.Close()
+		t.Fatal("dialReady returned while worker 2's READY_OK was still inside its read loop")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(hold)
+	select {
+	case c := <-back:
+		c.Close()
+	case <-time.After(3 * time.Second):
+		t.Fatal("dialReady did not return once the READY_OK was heard")
+	}
 }

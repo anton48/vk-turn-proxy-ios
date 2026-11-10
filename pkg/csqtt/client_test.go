@@ -320,6 +320,25 @@ func dialReady(t *testing.T, cfg Config) *Client {
 		t.Fatalf("Dial: %v", err)
 	}
 	waitFor(t, "every worker ready", func() bool { return c.Stats().Ready == cfg.Workers })
+	// …and every worker has HEARD the server's answer to its READY. A worker
+	// is ready the moment it has sent READY; the READY_OK is still on its way,
+	// and a test that deafens the workers right here races it: counted behind
+	// the blackhole check it passed, it answers whatever round the test asks
+	// next — the round then stands, and the test waits for a drop or a verdict
+	// that cannot come.
+	waitFor(t, "every worker hearing the answer to its READY", func() bool {
+		var counted int64
+		for _, w := range c.workers {
+			n := w.rx.Load()
+			if n < 2 { // its TUNCONF and its READY_OK
+				return false
+			}
+			counted += n
+		}
+		// …all the way through the read loop: a worker counts an inbound first
+		// and the client last, and a round is answered by the client's count.
+		return c.rxSeq.Load() == uint64(counted)
+	})
 	return c
 }
 
