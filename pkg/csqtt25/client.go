@@ -79,6 +79,13 @@ var (
 	disconnectWait = 700 * time.Millisecond // Close: telling the server and hearing its answer, in all
 	stopWait       = 2 * time.Second        // Close: the workers' end once every socket is released
 	panelWindow    = 15 * time.Second       // the server's restart notices inside this are one restart
+	// A server that says it is restarting goes on answering until it is gone,
+	// so a stream can be set up on it behind the notice. Until a stream has
+	// heard something later than restartSettle after the notice it is not
+	// known to be on the server that came back, and its silence is short.
+	restartSettle    = 15 * time.Second
+	settleProbeAfter = 2 * time.Second // such a stream is asked (READY) after this much silence
+	settleDeafAfter  = 5 * time.Second // …and replaced after this much
 )
 
 // ErrNoStream is Send's answer when no stream can carry a packet now.
@@ -88,6 +95,7 @@ var (
 	errParked       = errors.New("csqtt25: the worker is above the agreed count")
 	errRepair       = errors.New("csqtt25: the server asked for this worker again")
 	errPanelRestart = errors.New("csqtt25: the server is restarting")
+	errUnsettled    = errors.New("silent behind the server's restart notice: a stream of the server that went")
 	errDeaf         = errors.New("csqtt25: the stream heard nothing")
 )
 
@@ -99,6 +107,7 @@ type Stats struct {
 	Sessions, Restarts                     int64 // sessions that reached READY; sessions that ended
 	AuthFailures, NoStream                 int64
 	Probes, Repairs, Handshakes, Fallbacks int64
+	Unsettled                              int64 // streams replaced for their silence behind a restart notice
 	PanelRestarts                          int64
 }
 
@@ -134,6 +143,7 @@ type Client struct {
 	authFailures, noStream                 atomic.Int64
 	probes, repairs, handshakes, fallbacks atomic.Int64
 	panelRestarts                          atomic.Int64
+	unsettledN                             atomic.Int64
 }
 
 type worker struct {
@@ -341,6 +351,20 @@ func (c *Client) panelRestart() {
 	}
 }
 
+// unsettled says whether a stream last heard at `heard` may still be one of
+// the server that said it was restarting. The restart on the notice is
+// right only if that server is gone when a worker asks again, and nothing
+// says when it goes: a worker whose back-off ran out behind the notice, or
+// every worker when the server is slow to stop, is taken back by it and
+// then forgotten with it. What tells such a stream from one on the server
+// that came back is an answer later than the old server can have given.
+func (c *Client) unsettled(heard time.Time) bool {
+	c.mu.Lock()
+	at := c.panelAt
+	c.mu.Unlock()
+	return heard.Before(at.Add(restartSettle))
+}
+
 // Send hands one IP packet to the server: whole up to WholeMax bytes, as
 // fragments on one stream above it. Callers send one at a time (the order of
 // a flow's packets is the order of the calls).
@@ -382,6 +406,7 @@ func (c *Client) Stats() Stats {
 		AuthFailures: c.authFailures.Load(), NoStream: c.noStream.Load(),
 		Probes: c.probes.Load(), Repairs: c.repairs.Load(), Handshakes: c.handshakes.Load(), Fallbacks: c.fallbacks.Load(),
 		PanelRestarts: c.panelRestarts.Load(),
+		Unsettled:     c.unsettledN.Load(),
 	}
 	for _, w := range c.workers {
 		if w.ready.Load() {
@@ -631,11 +656,19 @@ func (w *worker) session() (readyAt time.Time, err error) {
 			if w.id > c.targetNow() {
 				return readyAt, errParked
 			}
-			silent := now.Sub(time.Unix(0, w.lastRx.Load()))
+			heard := time.Unix(0, w.lastRx.Load())
+			silent := now.Sub(heard)
+			ask, give, gone := probeAfter, deafAfter, errDeaf
+			if c.unsettled(heard) {
+				ask, give, gone = settleProbeAfter, settleDeafAfter, errUnsettled
+			}
 			switch {
-			case silent >= deafAfter:
-				return readyAt, errDeaf
-			case silent >= probeAfter && now.Sub(probedAt) >= probeAfter/2:
+			case silent >= give:
+				if gone == errUnsettled {
+					c.unsettledN.Add(1)
+				}
+				return readyAt, gone
+			case silent >= ask && now.Sub(probedAt) >= ask/2:
 				probedAt = now
 				c.probes.Add(1)
 				if err := w.send([]byte(ReadyRequest)); err != nil {

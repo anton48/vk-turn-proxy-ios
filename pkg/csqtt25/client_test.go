@@ -1245,3 +1245,92 @@ func TestARestartNoticeOnAStreamInItsSetUpIsHeard(t *testing.T) {
 	}
 	eventually(t, "both workers ready again", func() bool { return c.Stats().Ready == 2 })
 }
+
+// settleClocks shortens the clocks of the rule for streams set up around a
+// server restart.
+func settleClocks(t *testing.T, settle, ask, give time.Duration) {
+	t.Helper()
+	a, b, c := restartSettle, settleProbeAfter, settleDeafAfter
+	restartSettle, settleProbeAfter, settleDeafAfter = settle, ask, give
+	t.Cleanup(func() { restartSettle, settleProbeAfter, settleDeafAfter = a, b, c })
+}
+
+// Which streams are not yet known to be on the server that came back.
+func TestWhichStreamsAreUnsettledBehindARestartNotice(t *testing.T) {
+	settleClocks(t, 15*time.Second, 2*time.Second, 5*time.Second)
+	at := time.Now()
+	c := &Client{}
+	if c.unsettled(at) {
+		t.Fatal("without a restart notice a stream is unsettled")
+	}
+	c.panelAt = at
+	for _, row := range []struct {
+		heard time.Duration // after the notice
+		want  bool
+	}{
+		{-time.Second, true}, // heard before the notice: the server that is about to go
+		{time.Second, true},
+		{15*time.Second - time.Millisecond, true},
+		{15 * time.Second, false}, // later than the old server can have answered
+		{time.Hour, false},
+	} {
+		if got := c.unsettled(at.Add(row.heard)); got != row.want {
+			t.Errorf("a stream last heard %v after the notice: unsettled = %v, want %v", row.heard, got, row.want)
+		}
+	}
+}
+
+// Starting over on the notice is right only if the server is gone by the
+// time a worker asks again — and it answers until it is. A stream it takes
+// back behind its own notice is forgotten with it: ready here, unknown to
+// the server that came back. Such a stream is found out by a short silence,
+// not by the minute an ordinary one is given; and once a stream has heard
+// the server later than the old one can have answered, it is an ordinary
+// stream again.
+func TestAStreamTakenBackByTheServerThatIsAboutToGoIsFoundOutSoon(t *testing.T) {
+	quickClocks(t)
+	settleClocks(t, 1500*time.Millisecond, 60*time.Millisecond, 250*time.Millisecond)
+	srv := newFakeServer(t, "restart-slow-to-go")
+	c, d, _ := startClient(t, srv, 2, KeysWrap)
+	eventually(t, "two workers ready", func() bool { return c.Stats().Ready == 2 })
+
+	said := time.Now()
+	srv.announceRestart() // …and it goes on answering
+	eventually(t, "both workers taken back by the server that is about to go", func() bool {
+		srv.mu.Lock()
+		r1, r2 := srv.readys[1], srv.readys[2]
+		srv.mu.Unlock()
+		return d.count(1) == 2 && d.count(2) == 2 && r1 >= 2 && r2 >= 2 && c.Stats().Ready == 2
+	})
+	srv.forget() // the server that came back knows neither
+	went := time.Now()
+	for {
+		reg := srv.registered(1, 2)
+		if reg[1] && reg[2] && c.Stats().Ready == 2 {
+			break
+		}
+		if time.Since(went) > 2*time.Second {
+			t.Fatalf("%v after the old server went: workers 1, 2 dialled %d, %d times (3 = found out), ready here: %d, known to the server that came back: %v, %v",
+				time.Since(went).Round(10*time.Millisecond), d.count(1), d.count(2), c.Stats().Ready, reg[1], reg[2])
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st := c.Stats(); st.Unsettled != 2 {
+		t.Fatalf("streams replaced for their silence behind the notice: %d, want 2 (which rule found them out?)", st.Unsettled)
+	}
+
+	// Past the settle time the streams have heard the server that came back:
+	// the asking stops and nobody is replaced.
+	for time.Since(said) < restartSettle+300*time.Millisecond {
+		time.Sleep(20 * time.Millisecond)
+	}
+	asked := c.Stats().Probes
+	time.Sleep(400 * time.Millisecond)
+	st := c.Stats()
+	if st.Probes != asked {
+		t.Fatalf("settled streams were asked %d more times in 400 ms", st.Probes-asked)
+	}
+	if st.Unsettled != 2 || st.Ready != 2 || d.count(1) != 3 || d.count(2) != 3 {
+		t.Fatalf("a stream on the server that came back was not left alone: replaced %d, ready %d, dials %d and %d", st.Unsettled, st.Ready, d.count(1), d.count(2))
+	}
+}
