@@ -42,6 +42,7 @@ type fakeServer struct {
 	disconnects []string
 	workersAsks int
 	dtlsSeen    int
+	idents      map[int]string // the identity of each worker's latest GETCONF: generation|salt
 }
 
 type fakeSession struct {
@@ -66,7 +67,7 @@ func newFakeServer(t *testing.T, password string) *fakeServer {
 		t.Fatal(err)
 	}
 	s := &fakeServer{t: t, sock: sock, password: password, sessions: map[string]*fakeSession{}, sayWorkers: true,
-		mute: map[int]bool{}, dropGetconf: map[int]bool{}, getconfs: map[int]int{}, unanswered: map[int]int{}, readys: map[int]int{}, keepalives: map[int]int{}, echo: true}
+		mute: map[int]bool{}, dropGetconf: map[int]bool{}, getconfs: map[int]int{}, unanswered: map[int]int{}, readys: map[int]int{}, keepalives: map[int]int{}, idents: map[int]string{}, echo: true}
 	t.Cleanup(func() { sock.Close() })
 	go s.loop()
 	return s
@@ -161,6 +162,7 @@ func (s *fakeServer) handle(ses *fakeSession, plain []byte) {
 		}
 		ses.worker, _ = strconv.Atoi(f[4])
 		ses.salt = f[3]
+		s.idents[ses.worker] = f[2] + "|" + f[3]
 		asked, _ := strconv.Atoi(f[5])
 		s.getconfs[ses.worker]++
 		total := 0
@@ -226,6 +228,17 @@ func (s *fakeServer) session(worker int) *fakeSession {
 		}
 	}
 	return found
+}
+
+// identities is the identity each worker last asked under.
+func (s *fakeServer) identities() map[int]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[int]string, len(s.idents))
+	for id, v := range s.idents {
+		out[id] = v
+	}
+	return out
 }
 
 // say sends an arbitrary plaintext down worker `via`'s stream.

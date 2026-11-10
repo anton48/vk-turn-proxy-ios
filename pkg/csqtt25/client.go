@@ -86,6 +86,9 @@ var (
 	restartSettle    = 15 * time.Second
 	settleProbeAfter = 2 * time.Second // such a stream is asked (READY) after this much silence
 	settleDeafAfter  = 5 * time.Second // …and replaced after this much
+	// A ready stream counts as live while it has heard something this lately
+	// (an idle one is asked after probeAfter, so a healthy one always has).
+	liveWindow = 45 * time.Second
 )
 
 // ErrNoStream is Send's answer when no stream can carry a packet now.
@@ -96,12 +99,14 @@ var (
 	errRepair       = errors.New("csqtt25: the server asked for this worker again")
 	errPanelRestart = errors.New("csqtt25: the server is restarting")
 	errUnsettled    = errors.New("silent behind the server's restart notice: a stream of the server that went")
+	errPathChange   = errors.New("the path changed")
 	errDeaf         = errors.New("csqtt25: the stream heard nothing")
 )
 
 // Stats is a snapshot of the client's counters.
 type Stats struct {
 	Workers, Target, Ready                 int
+	Live                                   int // of the ready ones, heard from within liveWindow: what a screen shows as connections
 	TxPackets, TxBytes, RxPackets, RxBytes int64
 	FragsTx, FragsRx                       int64
 	Sessions, Restarts                     int64 // sessions that reached READY; sessions that ended
@@ -109,6 +114,7 @@ type Stats struct {
 	Probes, Repairs, Handshakes, Fallbacks int64
 	Unsettled                              int64 // streams replaced for their silence behind a restart notice
 	PanelRestarts                          int64
+	PathChanges                            int64
 }
 
 // Client is a running csqtt 2.5 client.
@@ -122,7 +128,7 @@ type Client struct {
 	wg      sync.WaitGroup
 	workers []*worker
 
-	mu        sync.Mutex // guards disp, target, conf, repairSeq, panelAt, fatal
+	mu        sync.Mutex // guards gen, salt, disp, target, conf, repairSeq, panelAt, fatal
 	disp      *Dispatcher
 	target    int
 	conf      ConfigResponse
@@ -143,6 +149,7 @@ type Client struct {
 	authFailures, noStream                 atomic.Int64
 	probes, repairs, handshakes, fallbacks atomic.Int64
 	panelRestarts                          atomic.Int64
+	pathChanges                            atomic.Int64
 	unsettledN                             atomic.Int64
 }
 
@@ -351,6 +358,39 @@ func (c *Client) panelRestart() {
 	}
 }
 
+// identity is the pair the client asks under now.
+func (c *Client) identity() (gen uint64, salt string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gen, c.salt
+}
+
+// OnPathChange is the caller's word that the network under the streams has
+// changed — another interface, another address: every stream's socket is on
+// a path that is gone. The client takes a NEW identity (the server replaces
+// a password's older sessions when a later pair arrives, so it stops sending
+// into the dead streams with the first worker that registers) and every
+// worker starts over at once: this is an asked restart, not a failure — it
+// neither waits nor lengthens the next wait (run), and it ends the wait of a
+// worker that is between sessions. A worker in its set-up dialled on the old
+// path and starts over too.
+func (c *Client) OnPathChange() {
+	var salt [8]byte
+	_, _ = rand.Read(salt[:])
+	c.mu.Lock()
+	gen := uint64(time.Now().UnixMilli())
+	if gen <= c.gen {
+		gen = c.gen + 1
+	}
+	c.gen, c.salt = gen, hex.EncodeToString(salt[:])
+	c.mu.Unlock()
+	c.pathChanges.Add(1)
+	c.cfg.Logf("the path changed: a new identity, every worker starts over")
+	for _, w := range c.workers {
+		w.endNow(errPathChange)
+	}
+}
+
 // unsettled says whether a stream last heard at `heard` may still be one of
 // the server that said it was restarting. The restart on the notice is
 // right only if that server is gone when a worker asks again, and nothing
@@ -406,11 +446,16 @@ func (c *Client) Stats() Stats {
 		AuthFailures: c.authFailures.Load(), NoStream: c.noStream.Load(),
 		Probes: c.probes.Load(), Repairs: c.repairs.Load(), Handshakes: c.handshakes.Load(), Fallbacks: c.fallbacks.Load(),
 		PanelRestarts: c.panelRestarts.Load(),
+		PathChanges:   c.pathChanges.Load(),
 		Unsettled:     c.unsettledN.Load(),
 	}
+	now := time.Now().UnixNano()
 	for _, w := range c.workers {
 		if w.ready.Load() {
 			s.Ready++
+			if now-w.lastRx.Load() < int64(liveWindow) {
+				s.Live++
+			}
 		}
 	}
 	return s
@@ -425,7 +470,8 @@ func (c *Client) Stats() Stats {
 // workers get stopWait to end; one still inside a dial that ignores the
 // stop ends with its dial. Safe to call more than once.
 func (c *Client) Close() {
-	req := []byte(DisconnectRequest(c.cfg.Password, c.salt))
+	_, salt := c.identity()
+	req := []byte(DisconnectRequest(c.cfg.Password, salt))
 	var tellers sync.WaitGroup
 	asked := 0
 	for _, w := range c.workers {
@@ -472,6 +518,17 @@ func (w *worker) end(why error) {
 	case w.kick <- why:
 	default:
 	}
+}
+
+// endNow is end for this side's own word: it takes the place of a notice
+// that is still waiting (a worker in its set-up has not looked yet), so that
+// the session ends for THIS reason.
+func (w *worker) endNow(why error) {
+	select {
+	case <-w.kick:
+	default:
+	}
+	w.end(why)
 }
 
 // ─── a worker ────────────────────────────────────────────────────────────
@@ -526,16 +583,33 @@ func (w *worker) run() {
 		case errors.Is(err, errParked):
 			continue
 		}
+		if errors.Is(err, errPathChange) {
+			c.cfg.Logf("worker %d: session ended (%v), again now", w.id, err)
+			continue
+		}
 		if !readyAt.IsZero() && time.Since(readyAt) >= heldAfter {
 			backoff = backoffBase
 		}
 		c.cfg.Logf("csqtt25: worker %d: session ended (%v), again in %s", w.id, err, backoff)
 		t := time.NewTimer(backoff)
-		select {
-		case <-c.ctx.Done():
-			t.Stop()
-			return
-		case <-t.C:
+	waiting:
+		for {
+			select {
+			case <-c.ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+				break waiting
+			case why := <-w.kick:
+				// Nothing to end between sessions — but a path change ends the
+				// wait: it was earned on the path that is gone. Any other notice
+				// is older than the session that follows, as session's own look
+				// would find it.
+				if errors.Is(why, errPathChange) {
+					t.Stop()
+					break waiting
+				}
+			}
 		}
 		if backoff *= 2; backoff > backoffMax {
 			backoff = backoffMax
@@ -687,7 +761,8 @@ func (w *worker) session() (readyAt time.Time, err error) {
 // request twice, then a wait, four times over.
 func (w *worker) getconf(media <-chan []byte, recvC *Cipher) (ConfigResponse, error) {
 	c := w.c
-	req := []byte(ConfigRequest(c.cfg.LocalPort, c.cfg.Password, c.gen, c.salt, w.id, c.cfg.Workers))
+	gen, salt := c.identity()
+	req := []byte(ConfigRequest(c.cfg.LocalPort, c.cfg.Password, gen, salt, w.id, c.cfg.Workers))
 	for _, wait := range getconfWaits {
 		for i := 0; i < 2; i++ {
 			if err := w.send(req); err != nil {
