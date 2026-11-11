@@ -1,7 +1,6 @@
 package csqtt25
 
 import (
-	"context"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,53 +97,74 @@ func TestAPathChangeEndsAWaitBetweenSessions(t *testing.T) {
 	}
 }
 
-// A notice of the server's that is still waiting for a worker in its set-up
-// must not turn the path change into a failure: the path change takes its
-// place, and the worker starts over at once.
+// A notice of the server's that is still waiting for a worker must not turn
+// the path change into something the worker passes over: the path change
+// takes its place.
 //
-// The dial here is one the path change cannot end — it comes back with its
-// stream all the same, as a dial does that had its answer the moment it was
-// told (a dial that CAN be ended returns the path change by itself and never
-// looks at the notice: setup_test.go). Then the notice is all the session has
-// to go by, in its configuration wait, and it has to be the path change.
+// The worker here is one that is not looking: it stands in the END of its
+// session, giving its socket back — which through a relay takes the close's
+// budget. (A worker in its set-up is ended by the set-up's own end and never
+// looks at the notice: setup_test.go.) The server's notice reaches it there,
+// then the path change. What it finds when it looks — in the wait in front of
+// its next dial — has to be the path change, which ends that wait, and not
+// the older notice, which that wait passes over.
 func TestAPathChangeOutranksAnOlderNoticeStillPending(t *testing.T) {
 	quickClocks(t)
 	longBackOff(t)
 	srv := newFakeServer(t, "pw-path-3")
-	d := &dialer{server: srv.sock.LocalAddr(), dials: map[int]int{}, deaf: true}
+	c, d, _ := startClient(t, srv, 2, KeysWrap)
+	eventually(t, "both streams ready", func() bool { return c.Stats().Ready == 2 })
 	release := make(chan struct{})
 	var once sync.Once
 	let := func() { once.Do(func() { close(release) }) }
-	d.setHold(func(id, nth int) <-chan struct{} {
-		if id == 2 && nth == 1 {
+	// Registered behind Close, so it runs BEFORE it: a test that fails with the
+	// close still held must let the worker go first, or Close gives up on it and
+	// the worker outlives the test — into the next one's clocks.
+	t.Cleanup(let)
+	d.mu.Lock()
+	d.holdClose = func(id int) <-chan struct{} {
+		if id == 2 {
 			return release
 		}
 		return nil
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	c, err := Dial(ctx, ClientConfig{Password: srv.password, Workers: 2, Keys: KeysWrap, Dial: d.dial})
-	if err != nil {
-		t.Fatalf("dial: %v", err)
 	}
-	t.Cleanup(c.Close)
-	// Registered behind Close, so it runs BEFORE it: a test that fails with the
-	// dial still held must let the worker go first, or Close gives up on it and
-	// the worker outlives the test — into the next one's clocks.
-	t.Cleanup(let)
-	eventually(t, "worker 2 inside its first dial", func() bool { return d.begun(2) == 1 })
-	// The server can say the notice only down a stream it knows as ready, and
-	// worker 1's READY is still on its way when Dial returns.
-	eventually(t, "the server seeing worker 1 ready", func() bool { return srv.knowsReady(1) })
+	d.mu.Unlock()
+	c.workers[1].kick <- errRepair // worker 2's session ends — and stands in its close
+	eventually(t, "worker 2 giving its socket back", func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.closes >= 1
+	})
+	// The server can say the notice only down a stream it knows as ready.
+	eventually(t, "the server knows worker 1 as ready", func() bool { return srv.knowsReady(1) })
 	srv.say(1, panelRestartNotice) // the older notice: it waits for worker 2
-	eventually(t, "the restart notice acted on", func() bool { return c.Stats().PanelRestarts == 1 })
+	eventually(t, "the restart notice heard", func() bool { return c.Stats().PanelRestarts == 1 })
 	c.OnPathChange()
 	let()
 	t0 := time.Now()
-	eventually(t, "worker 2 dialling again", func() bool { return d.begun(2) == 2 })
+	eventually(t, "worker 2 dials again", func() bool { return d.begun(2) >= 2 })
 	if took := time.Since(t0); took > time.Second {
-		t.Fatalf("worker 2 dialled again %v after its dial came back: the older notice made the path change a failure (it waits %v)", took.Round(time.Millisecond), backoffBase)
+		t.Fatalf("worker 2 dialled again %v after its close came back: the older notice stood in the path change's place and the wait ran on (it waits %v)", took.Round(time.Millisecond), backoffBase)
 	}
+}
+
+// A worker in its configuration wait is not ready and is past its set-up: the
+// notice is how it hears of the path change — there and then, not when the
+// wait runs out.
+func TestAPathChangeEndsAConfigurationWaitAtOnce(t *testing.T) {
+	quickClocks(t)
+	getconfWaits = []time.Duration{3 * time.Second}
+	srv := newFakeServer(t, "pw-path-wait")
+	c, d, _ := startClient(t, srv, 2, KeysWrap)
+	inItsWait(t, srv, c, d)
+	before := d.begun(2)
+	began := time.Now()
+	c.OnPathChange()
+	eventually(t, "worker 2 dials anew", func() bool { return d.begun(2) > before })
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("worker 2 dialled anew %v after the path change, want at once: it sat its configuration wait out (%v)", took.Round(10*time.Millisecond), getconfWaits[0])
+	}
+	eventually(t, "both streams ready again", func() bool { return c.Stats().Ready == 2 })
 }
 
 // Live is the ready streams heard from lately, not the ready ones: a stream

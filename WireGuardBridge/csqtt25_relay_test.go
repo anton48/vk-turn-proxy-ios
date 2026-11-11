@@ -544,3 +544,106 @@ func TestCsqtt25EndWaitsOnClosesAgainAndAgainUntilStopped(t *testing.T) {
 		t.Fatalf("closed %d time(s) for a dial that was already over", n)
 	}
 }
+
+// permTap stands in front of a relay over UDP and, once told, lets no
+// CreatePermission request through: a relay that has stopped answering the
+// one thing a first write waits for, while a deallocate still reaches it.
+type permTap struct {
+	front, back *net.UDPConn
+	drop        atomic.Bool
+	dropped     atomic.Int32
+}
+
+func newPermTap(t *testing.T, relay string) *permTap {
+	t.Helper()
+	raddr, err := net.ResolveUDPAddr("udp4", relay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	front, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := net.DialUDP("udp4", nil, raddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &permTap{front: front, back: back}
+	var client atomic.Pointer[net.UDPAddr]
+	go func() { // client → relay
+		buf := make([]byte, 2048)
+		for {
+			n, from, err := front.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			client.Store(from)
+			if p.drop.Load() && n >= 2 && buf[0] == 0x00 && buf[1] == 0x08 { // a CreatePermission request
+				p.dropped.Add(1)
+				continue
+			}
+			_, _ = back.Write(buf[:n])
+		}
+	}()
+	go func() { // relay → client
+		buf := make([]byte, 2048)
+		for {
+			n, err := back.Read(buf)
+			if err != nil {
+				return
+			}
+			if to := client.Load(); to != nil {
+				_, _ = front.WriteToUDP(buf[:n], to)
+			}
+		}
+	}()
+	t.Cleanup(func() { _ = front.Close(); _ = back.Close() })
+	return p
+}
+
+// 🚨 The first write through a fresh allocation waits in PION, not in the
+// socket: pion v5.0.2's Client.CreatePermission is a bare transaction the
+// relayed conn does not learn of, so that write asks for a permission of its
+// own and waits for the relay's answer — through pion's whole ladder of
+// repeats when the relay has stopped answering. What ends it is the
+// allocation's Close, and the engine counts on that: a set-up that is ended
+// gives its allocation back there and then, so that a handshake whose write
+// is parked like this comes back with it (pkg/csqtt25, session).
+func TestCsqtt25RelayCloseEndsAWriteWaitingForItsPermission(t *testing.T) {
+	relayAddr := relayTURN(t, "udp")
+	tap := newPermTap(t, relayAddr)
+	server := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	r, err := csqtt25DialRelay(context.Background(), csqtt.TURNCredentials{Username: "u", Password: "pw", Address: tap.front.LocalAddr().String()}, server, "udp", nil)
+	if err != nil {
+		t.Fatalf("the dial through the tap: %v", err)
+	}
+	defer r.Close()
+	tap.drop.Store(true) // from here the relay answers no permission
+	pc := r.packetConn()
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := pc.WriteTo([]byte("first"), server)
+		wrote <- err
+	}()
+	select {
+	case err := <-wrote:
+		t.Fatalf("the first write came back by itself (%v): it did not wait for a permission, the stand holds nothing", err)
+	case <-time.After(400 * time.Millisecond):
+	}
+	if tap.dropped.Load() == 0 {
+		t.Fatalf("the first write asked for no permission of its own")
+	}
+	closed := time.Now()
+	r.Close()
+	select {
+	case err := <-wrote:
+		if err == nil {
+			t.Fatalf("the write waiting for its permission came back without an error at the Close")
+		}
+		if took := time.Since(closed); took > time.Second {
+			t.Fatalf("the write came back %v after the allocation's Close, want at once", took.Round(10*time.Millisecond))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the write waiting for its permission did not come back within 5s of the allocation's Close")
+	}
+}

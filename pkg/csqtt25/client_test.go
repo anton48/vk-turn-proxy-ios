@@ -303,6 +303,8 @@ type dialer struct {
 	hold   func(workerID, nth int) <-chan struct{} // a worker's nth dial waits for the channel this names and then goes on
 	began  map[int]int                             // dials begun, the ones still waiting among them
 	deaf   bool                                    // a held dial does not hear its context: let go, it comes back WITH its socket
+	// a worker's socket is closed only once the channel this names is: a close that takes its time
+	holdClose func(workerID int) <-chan struct{}
 }
 
 // gateConn is a socket whose writes can be made to park, as a write into a
@@ -407,7 +409,13 @@ func (d *dialer) dial(ctx context.Context, workerID int) (net.PacketConn, net.Ad
 	return conn, d.server, func() {
 		d.mu.Lock()
 		d.closes++
+		held := d.holdClose
 		d.mu.Unlock()
+		if held != nil {
+			if wait := held(workerID); wait != nil {
+				<-wait
+			}
+		}
 		conn.Close()
 	}, nil
 }
@@ -1286,7 +1294,7 @@ func inItsWait(t *testing.T, srv *fakeServer, c *Client, d *dialer) {
 	eventually(t, "worker 2 waiting for a configuration", func() bool {
 		srv.mu.Lock()
 		defer srv.mu.Unlock()
-		return srv.unanswered[2] >= 1
+		return srv.unanswered[2] >= 2 // BOTH copies of the ask: let through after the first, the second is answered and the worker is ready, not waiting
 	})
 	srv.set(func() { srv.dropGetconf[2] = false }) // the next ask is answered
 }

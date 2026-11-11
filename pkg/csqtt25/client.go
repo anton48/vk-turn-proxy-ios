@@ -664,7 +664,8 @@ func (w *worker) endNow(why error) {
 // setting up, if it is: it was begun on a path that is gone, and its own
 // timers — a relay that does not answer, a handshake nobody completes — are
 // seconds. Once the stream has its keys there is nothing left for it to end:
-// the configuration wait and the serve loop hear the notice themselves. (At
+// the configuration wait and the serve loop hear the notice themselves. A
+// socket the dial has already returned is given back with it (session). (At
 // the client's stop a set-up ends the same way; the worker's loop looks at
 // the stop first.)
 func (w *worker) endSetup() {
@@ -878,6 +879,13 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	}
 	defer release()
 	defer context.AfterFunc(c.ctx, release)()
+	// While the set-up lasts, its END gives the socket back as well — there
+	// and then, not when this goroutine gets to it: the handshake stands on
+	// this socket, and a write of its parked there (through a relay the first
+	// write asks for a permission of its own and waits for the answer) is
+	// ended by the close and by nothing else — the DTLS side takes no write
+	// deadline, and the handshake does not return while its writer is out.
+	setupOver := context.AfterFunc(sctx, release)
 	split := NewSplitter(conn, peer)
 
 	var keys Keys
@@ -908,6 +916,14 @@ func (w *worker) session() (readyAt time.Time, err error) {
 			return readyAt, werr
 		}
 		keys = WrapKeys(wrap)
+	}
+	// The set-up is over: from here a path change is the notice's — the
+	// configuration wait and the serve loop hear it — and the socket is this
+	// session's until its own end. If the set-up's end came FIRST (a dial
+	// that came back with its stream as it was told, a handshake that
+	// completed as it was), the socket is gone already: an ended set-up.
+	if !setupOver() {
+		return readyAt, errPathChange
 	}
 	sendC, err := NewCipher(keys.Client)
 	if err != nil {
