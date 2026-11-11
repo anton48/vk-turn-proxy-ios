@@ -237,7 +237,7 @@ func installStallRelays(t *testing.T) *stallRelays {
 		if allocated != nil {
 			allocated()
 		}
-		return &Relay{Conn: sc, Local: sc.LocalAddr(), ctl: sc, close: func() { closeRelayBounded(sc, deallocating{sc}, nil) }}, nil
+		return &Relay{Conn: sc, Local: sc.LocalAddr(), ctl: sc, close: func() { closeRelayBounded(sc, deallocating{sc}, nil, nil) }}, nil
 	}
 	t.Cleanup(func() { dialRelay = prev })
 	return g

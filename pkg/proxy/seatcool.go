@@ -213,6 +213,14 @@ var wallClock = func() time.Time { return time.Now().Round(0) }
 // at the latest. 🚫 No give-back is noted: a 486 behind it is not the relay's
 // second, and benches the slot as any other.
 func (cp *credPool) holdSeatUntil(slot int, creds *TURNCreds, addr string, until time.Time) {
+	cp.holdSeat(slot, creds, addr, until, "its deallocate was answered 437")
+}
+
+// holdSeat is holdSeatUntil with the reason SAID: a native session's is the 437
+// (above); a csqtt lease's (CredPool.ReleaseHeld) may also be a deallocate the
+// relay never answered. ONE body: the count, the line and the release by the
+// wall clock are the same whoever holds.
+func (cp *credPool) holdSeat(slot int, creds *TURNCreds, addr string, until time.Time, why string) {
 	if cp == nil || slot < 0 || creds == nil {
 		return
 	}
@@ -226,8 +234,8 @@ func (cp *credPool) holdSeatUntil(slot int, creds *TURNCreds, addr string, until
 	n := cp.seat.heldOut
 	cp.mu.Unlock()
 	if say {
-		log.Printf("credpool: slot %d keeps a seat counted for %s more — its deallocate was answered 437: if the allocation lives on under another mapping it holds the seat until it expires (%d such seat(s) since the start)",
-			slot, until.Sub(now).Round(time.Second), n)
+		log.Printf("credpool: slot %d keeps a seat counted for %s more — %s: if the allocation lives on under another mapping it holds the seat until it expires (%d such seat(s) since the start)",
+			slot, until.Sub(now).Round(time.Second), why, n)
 	}
 	cp.releaseAt(slot, creds, addr, until.Round(0))
 }

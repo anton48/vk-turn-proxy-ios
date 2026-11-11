@@ -219,6 +219,14 @@ type Credential struct {
 	// once per Creds; before READY, and before Failed if the session fails
 	// behind its Allocate.
 	Allocated func(began time.Time)
+	// OutOfReach, when set, is called at most once, BEFORE Release, when the
+	// allocation was closed over a UDP leg and the relay did not confirm that
+	// it released it: it answered the deallocate with 437 (it knows no
+	// allocation for this socket — the mapping changed, and the allocation
+	// may live on under the old one) or with nothing at all. why says which.
+	// The seat may then stay taken at the relay until the allocation expires;
+	// what to do about it is the pool's (dealloc.go).
+	OutOfReach func(why string)
 }
 
 // dialRelay is DialRelay, replaceable by tests with a loopback relay.
@@ -1463,6 +1471,12 @@ func (w *worker) session() error {
 		// worker whose relay stopped taking bytes must not wait behind the
 		// write it is meant to end. Then the fields, under the lock.
 		relay.Close()
+		// What the relay said to the close's deallocate goes to the lease
+		// BEFORE its release (deferred above, so run behind this): a seat the
+		// relay may still hold is not handed to the next worker.
+		if v, _ := relay.Deallocate(); v.OutOfReach() && cred.OutOfReach != nil {
+			cred.OutOfReach(v.Why())
+		}
 		w.mu.Lock()
 		w.relay, w.wrapper = nil, nil
 		w.mu.Unlock()

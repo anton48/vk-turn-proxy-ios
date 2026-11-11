@@ -108,7 +108,7 @@ func TestCsqtt25RelayClosesInOrderUnderItsBudgetAndOnce(t *testing.T) {
 	r := &csqtt25Relay{relayed: relayed, ctl: ctl}
 	r.close = func() {
 		closes++
-		csqtt25CloseRelay(ctl, relayed, func() { order = append(order, "client") })
+		csqtt25CloseRelay(ctl, relayed, func() { order = append(order, "client") }, nil)
 	}
 	before := time.Now()
 	r.Close()
@@ -365,7 +365,7 @@ func TestCsqtt25RelayAClearingThatLandsBehindTheClosesDeadlineLeavesTheCloseBoun
 	ctl := &pipeCtl{Conn: near, entered: make(chan struct{}), pass: make(chan struct{})}
 	relayed := &deallocOnClose{ctl: ctl, began: make(chan struct{})}
 	r := &csqtt25Relay{relayed: relayed, ctl: ctl}
-	r.close = func() { csqtt25CloseRelay(ctl, relayed, nil) }
+	r.close = func() { csqtt25CloseRelay(ctl, relayed, nil, nil) }
 	pc := r.packetConn()
 
 	cleared := make(chan struct{})

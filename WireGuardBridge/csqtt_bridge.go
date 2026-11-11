@@ -309,6 +309,28 @@ func csqttLookup(handle int32) *csqttEntry {
 type csqttPoolAdapter struct {
 	pool  *proxy.CredPool
 	fatal func(error)
+	// sleep knows whether the process slept longer than an allocation lives
+	// (csqtt_ghost.go); nil = never (a test that has no clock to drive).
+	sleep *csqttSleepWatch
+	// hold and clock are the tests': zero and nil = csqttGhostHold and the wall
+	// clock. Fields of THIS adapter, not package variables — the leases of a
+	// client that outlived its test read them from other goroutines.
+	hold  time.Duration
+	clock func() time.Time
+}
+
+func (a *csqttPoolAdapter) wallNow() time.Time {
+	if a.clock != nil {
+		return a.clock()
+	}
+	return csqttWallClock()
+}
+
+func (a *csqttPoolAdapter) ghostHold() time.Duration {
+	if a.hold > 0 {
+		return a.hold
+	}
+	return csqttGhostHold
 }
 
 // creds is csqtt.Config.Creds. Worker ids are 1-based, the pool's connIdx
@@ -333,6 +355,8 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 		if err == nil {
 			var once sync.Once
 			var allocated atomic.Bool
+			var madeAt atomic.Int64               // when the relay accepted the allocation, wall clock
+			var outOfReach atomic.Pointer[string] // why the relay did not confirm the deallocate, if it did not
 			return csqtt.Credential{
 				TURNCredentials: csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: addr},
 				// A worker releases its lease right behind closing its relay — the
@@ -340,17 +364,29 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 				// a second more, so a lease that HELD an allocation is released
 				// behind that second (the pool goes on counting the seat); one whose
 				// allocation never came about is released at once (seatcool.go).
+				//
+				// And one whose allocation the relay did not confirm released (a UDP
+				// leg: the deallocate answered 437, or not at all) keeps its seat
+				// counted for as long as that allocation can live on — csqtt_ghost.go.
 				Release: func() {
 					once.Do(func() {
-						if allocated.Load() {
+						switch why := outOfReach.Load(); {
+						case !allocated.Load():
+							a.pool.Release(slot, creds, addr)
+						case why != nil:
+							csqttReleaseOutOfReach[*proxy.TURNCreds](a.pool, a.sleep, workerID, slot, creds, addr, time.Unix(0, madeAt.Load()), a.wallNow(), a.ghostHold(), *why)
+						default:
 							a.pool.ReleaseGivenBack(slot, creds, addr, time.Now())
-							return
 						}
-						a.pool.Release(slot, creds, addr)
 					})
 				},
-				Failed:    func(err error, began time.Time) { a.refused(workerID, idx, slot, creds, addr, began, err) },
-				Allocated: func(began time.Time) { allocated.Store(true); a.pool.NoteAllocatedAt(slot, creds, addr, began) },
+				Failed: func(err error, began time.Time) { a.refused(workerID, idx, slot, creds, addr, began, err) },
+				Allocated: func(began time.Time) {
+					madeAt.Store(a.wallNow().UnixNano())
+					allocated.Store(true)
+					a.pool.NoteAllocatedAt(slot, creds, addr, began)
+				},
+				OutOfReach: func(why string) { outOfReach.Store(&why) },
 			}, nil
 		}
 		if terminal := csqttTerminalCredError(err); terminal != nil {
@@ -543,7 +579,8 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 	if !gen25 {
 		gen, salt = csqttNextIdentity(dir)
 	}
-	adapter := &csqttPoolAdapter{pool: pool, fatal: e.fail}
+	adapter := &csqttPoolAdapter{pool: pool, fatal: e.fail, sleep: &csqttSleepWatch{}}
+	go adapter.sleep.run(ctx, csqttSleepStep)
 	// Never the password: the config line Swift logs is the redacted one.
 	if gen25 {
 		log.Printf("csqttStart: tunnel %d: generation 2.5 — server=%s workers=%d relay=%s keys=auto mtu=%d cache=%v seeded=%v",

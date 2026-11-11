@@ -195,6 +195,16 @@ func (a *csqtt25Client) dialer(server *net.UDPAddr, transport string,
 		a.allocRTT.Store(int64(time.Since(began)))
 		return conn, server, func() {
 			closeRelay()
+			// What the relay said to the close's deallocate goes to the lease
+			// before its release, as the 2.1.9 worker does it: a seat the relay
+			// may still hold is not handed to the next stream.
+			if d, ok := conn.(interface {
+				deallocated() (csqtt.Deallocate, bool)
+			}); ok && cred.OutOfReach != nil {
+				if v, _ := d.deallocated(); v.OutOfReach() {
+					cred.OutOfReach(v.Why())
+				}
+			}
 			cred.Release()
 		}, nil
 	}

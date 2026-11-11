@@ -645,7 +645,7 @@ func installBlockableRelays(t *testing.T) *blockableRelays {
 		}
 		// The production close order over the fake: the deallocate write
 		// through the (blockable) control socket, then the socket.
-		return &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { closeRelayBounded(bc, deallocating{bc}, nil) }}, nil
+		return &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { closeRelayBounded(bc, deallocating{bc}, nil, nil) }}, nil
 	}
 	t.Cleanup(func() { dialRelay = prev })
 	return r
@@ -673,7 +673,7 @@ func TestRelayCloseIsBoundedWhenTheDeallocateBlocks(t *testing.T) {
 	}
 	bc := newBlockableConn(uc)
 	bc.block.Store(true)
-	r := &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { closeRelayBounded(bc, deallocating{bc}, nil) }}
+	r := &Relay{Conn: bc, Local: uc.LocalAddr(), close: func() { closeRelayBounded(bc, deallocating{bc}, nil, nil) }}
 	done := make(chan struct{})
 	t0 := time.Now()
 	go func() { r.Close(); close(done) }()

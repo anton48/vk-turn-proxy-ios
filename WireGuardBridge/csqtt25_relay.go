@@ -45,6 +45,17 @@ type csqtt25Relay struct {
 	closing atomic.Bool // Close under way: a deadline cleared now leaves the close's own in place
 	close   func()
 	once    sync.Once
+	// dealloc is what the relay said to the close's confirmed deallocate, plus
+	// one — 0 while nothing was asked (a TCP leg, a close not yet made).
+	dealloc atomic.Int32
+}
+
+// deallocated reports what the relay said when the close ASKED it to release
+// the allocation — csqtt.Relay.Deallocate's twin; asked is false over TCP and
+// before Close has returned.
+func (r *csqtt25Relay) deallocated() (v csqtt.Deallocate, asked bool) {
+	n := r.dealloc.Load()
+	return csqtt.Deallocate(n - 1), n != 0
 }
 
 // Close ends the allocation: the deallocate under a bounded write, the TURN
@@ -64,6 +75,10 @@ type csqtt25RelayConn struct {
 	net.PacketConn
 	r *csqtt25Relay
 }
+
+// deallocated is the allocation's word for whoever closes it through the
+// engine's closer and holds only this conn (csqtt25_bridge.go's dialer).
+func (c csqtt25RelayConn) deallocated() (csqtt.Deallocate, bool) { return c.r.deallocated() }
 
 // SetWriteDeadline puts the deadline on the control socket. The engine sets
 // it before a write and clears it behind it; a clearing that comes while the
@@ -90,8 +105,16 @@ func (c csqtt25RelayConn) SetWriteDeadline(t time.Time) error {
 	return err
 }
 
-func csqtt25CloseRelay(ctl net.PacketConn, relayed io.Closer, tcClose func()) {
+// csqtt25CloseRelay is csqtt.closeRelayBounded's twin: the write budget, then —
+// over a UDP leg — the relay ASKED whether it released the allocation (confirm,
+// under its own budget, the write budget set anew behind it), then the relayed
+// conn's own close, the TURN client, the control socket.
+func csqtt25CloseRelay(ctl net.PacketConn, relayed io.Closer, tcClose func(), confirm func()) {
 	_ = ctl.SetWriteDeadline(time.Now().Add(csqtt25RelayCloseBudget))
+	if confirm != nil {
+		confirm()
+		_ = ctl.SetWriteDeadline(time.Now().Add(csqtt25RelayCloseBudget))
+	}
 	_ = relayed.Close()
 	if tcClose != nil {
 		tcClose()
@@ -181,7 +204,7 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 		// Accepted, and ended: the seat was used — it is given back, under the
 		// close's budget, and no permission is asked on a dial that is over.
 		stop()
-		csqtt25CloseRelay(ctl, relayed, tc.Close)
+		csqtt25CloseRelay(ctl, relayed, tc.Close, nil) // an ended dial waits for no answer
 		return nil, fmt.Errorf("relay dial ended behind its allocation: %w", context.Cause(ctx))
 	}
 	if err := tc.CreatePermission(server); err != nil {
@@ -191,11 +214,16 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 		_ = ctl.Close()
 		return nil, fmt.Errorf("turn create permission: %w", err)
 	}
-	return &csqtt25Relay{
-		relayed: relayed,
-		ctl:     ctl,
-		close:   func() { csqtt25CloseRelay(ctl, relayed, tc.Close) },
-	}, nil
+	r := &csqtt25Relay{relayed: relayed, ctl: ctl}
+	// Over UDP the close asks the relay whether it released the allocation and
+	// keeps the answer for the lease (csqtt_ghost.go); over TCP the connection's
+	// close does it. The conversation is pkg/csqtt's (csqtt.ConfirmDeallocate).
+	var confirm func()
+	if transport == "udp" {
+		confirm = func() { r.dealloc.Store(int32(csqtt.ConfirmDeallocate(tc, creds.Username, creds.Password)) + 1) }
+	}
+	r.close = func() { csqtt25CloseRelay(ctl, relayed, tc.Close, confirm) }
+	return r, nil
 }
 
 // csqtt25DialEndEvery: how often an ended dial's waits are failed again.

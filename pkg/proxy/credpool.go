@@ -225,6 +225,18 @@ func (p *CredPool) ReleaseGivenBack(slot int, creds *TURNCreds, addr string, at 
 	p.cp.releaseGivenBack(slot, creds, addr, at)
 }
 
+// ReleaseHeld is Release for a lease whose allocation is OUT OF REACH: the relay
+// answered its deallocate with 437, or not at all (why says which, for the
+// log). Either way the allocation may live on at the relay — under another
+// mapping of the caller's socket — and hold its seat on the identity's quota
+// until it expires, so the pool keeps counting the seat until `until`, a
+// WALL-clock moment (seatcool.go, holdSeat). No give-back is noted: a 486
+// behind a held seat is not the relay's second and benches the slot as any
+// other. A caller that KNOWS the allocation has expired goes through Release.
+func (p *CredPool) ReleaseHeld(slot int, creds *TURNCreds, addr string, until time.Time, why string) {
+	p.cp.holdSeat(slot, creds, addr, until, why)
+}
+
 // MarkSaturated records a 486 (allocation quota reached) from relay addr on
 // creds, the credential the caller leased from slot, and returns the cooldown
 // applied — on THAT relay (relayhist.go); zero when the slot no longer holds

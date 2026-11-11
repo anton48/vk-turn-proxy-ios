@@ -39,6 +39,18 @@ type Relay struct {
 	closing atomic.Bool // Close under way: a write ending now puts the close's own deadline back (write)
 	close   func()
 	once    sync.Once
+	// dealloc is what the relay said to the close's confirmed deallocate, plus
+	// one — 0 while nothing was asked (a TCP leg, a close not yet made, a
+	// fixture). Written by the close, read by Deallocate.
+	dealloc atomic.Int32
+}
+
+// Deallocate reports what the relay said when this allocation's close ASKED it
+// to release the allocation (dealloc.go) — asked is false when the close asked
+// nothing: over TCP, or before Close has returned.
+func (r *Relay) Deallocate() (v Deallocate, asked bool) {
+	n := r.dealloc.Load()
+	return Deallocate(n - 1), n != 0
 }
 
 // Close tears down the relayed conn, the TURN client and the control socket.
@@ -114,8 +126,18 @@ const relayCloseWriteBudget = 500 * time.Millisecond
 // the TURN client, then the control socket — in that order, so a healthy
 // relay still hears the deallocate and a dead one costs at most the budget.
 // The deadline also frees a data write blocked on the same socket.
-func closeRelayBounded(ctl net.PacketConn, relayConn io.Closer, tcClose func()) {
+//
+// confirm, when not nil (a UDP leg), ASKS the relay first and waits for its
+// answer under its own budget (dealloc.go) — in front of the relayed conn's
+// Close, whose deallocate nobody listens to, and behind the deadline: its
+// requests are writes on the control socket too. The deadline is set anew
+// behind it: the wait may have used it up.
+func closeRelayBounded(ctl net.PacketConn, relayConn io.Closer, tcClose func(), confirm func()) {
 	_ = ctl.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
+	if confirm != nil {
+		confirm()
+		_ = ctl.SetWriteDeadline(time.Now().Add(relayCloseWriteBudget))
+	}
 	_ = relayConn.Close()
 	if tcClose != nil {
 		tcClose()
@@ -195,12 +217,19 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 		_ = ctl.Close()
 		return nil, fmt.Errorf("turn create permission: %w", err)
 	}
-	return &Relay{
+	r := &Relay{
 		Conn:  relay,
 		Local: ctl.LocalAddr(),
 		ctl:   ctl,
-		close: func() { closeRelayBounded(ctl, relay, tc.Close) },
-	}, nil
+	}
+	// Over UDP the close asks the relay whether it released the allocation and
+	// keeps the answer for the lease; over TCP the connection's close does it.
+	var confirm func()
+	if transport == "udp" {
+		confirm = func() { r.dealloc.Store(int32(ConfirmDeallocate(tc, creds.Username, creds.Password)) + 1) }
+	}
+	r.close = func() { closeRelayBounded(ctl, relay, tc.Close, confirm) }
+	return r, nil
 }
 
 func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
