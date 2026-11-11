@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"reflect"
@@ -280,6 +281,8 @@ func TestCsqtt25CloseAsksTheRelayBeforeItClosesTheAllocation(t *testing.T) {
 type ghostTap struct {
 	front, back *net.UDPConn
 	deaf        atomic.Bool
+	deafAfter   atomic.Int32 // > 0: pass this many answers down, then no more
+	down        atomic.Int32
 	mu          sync.Mutex
 	client      *net.UDPAddr
 }
@@ -323,6 +326,9 @@ func newGhostTap(t *testing.T, relay string) *ghostTap {
 			p.mu.Lock()
 			to := p.client
 			p.mu.Unlock()
+			if after := p.deafAfter.Load(); after > 0 && p.down.Add(1) > after {
+				continue
+			}
 			if to != nil && !p.deaf.Load() {
 				_, _ = front.WriteToUDP(buf[:n], to)
 			}
@@ -420,6 +426,13 @@ func TestCsqtt25DialRelayEndedBehindAnAllocationWaitsForNoAnswer(t *testing.T) {
 	if err == nil {
 		t.Fatal("an ended dial returned a relay")
 	}
+	// …and it SAYS that the allocation it gave back was not confirmed released:
+	// the deallocate left through a path that is gone, the relay may hold the
+	// allocation on, and the lease has to hear it.
+	var left *csqtt.UnreleasedError
+	if !errors.As(err, &left) || left.Deallocate != csqtt.DeallocateNotAwaited || !left.Deallocate.OutOfReach() {
+		t.Fatalf("the ended dial failed with %T, want an UnreleasedError whose deallocate's answer was not waited for", err)
+	}
 	if took := time.Since(ended); took > 300*time.Millisecond {
 		t.Fatalf("the ended dial returned %v behind its end: it waited for the relay's word on the deallocate (budget %v)", took.Round(time.Millisecond), csqtt.DeallocateConfirmBudget)
 	}
@@ -475,5 +488,173 @@ func TestCsqtt25CloserTellsTheLeaseOfAnAllocationOutOfReachBeforeItsRelease(t *t
 				t.Fatalf("the closer did %v, want %v", events, c.want)
 			}
 		})
+	}
+}
+
+// A 2.5 dial that fails BEHIND its allocation — the permission refused — asks
+// the relay as a close does: confirmed, the failure is the plain one; not
+// answered, it says so; and a permission wait that was ENDED waits for no
+// answer and says that its release was not confirmed.
+func TestCsqtt25DialRelayThatFailsBehindItsAllocationSaysWhatBecameOfIt(t *testing.T) {
+	old := csqtt.DeallocateConfirmBudget
+	csqtt.DeallocateConfirmBudget = 150 * time.Millisecond
+	t.Cleanup(func() { csqtt.DeallocateConfirmBudget = old })
+	creds := func(addr string) csqtt.TURNCredentials {
+		return csqtt.TURNCredentials{Username: "u", Password: "pw", Address: addr}
+	}
+	t.Run("the relay confirms", func(t *testing.T) {
+		relay := newPermissionRefusingRelay(t, 0)
+		accepted := false
+		_, err := csqtt25DialRelay(context.Background(), creds(relay.addr), ghostPeer(t), "udp", func() { accepted = true })
+		var left *csqtt.UnreleasedError
+		if err == nil || !accepted || errors.As(err, &left) {
+			t.Fatalf("the dial returned %v (accepted %v, unreleased %v) — want the plain failure behind an accepted allocation", err, accepted, left != nil)
+		}
+	})
+	t.Run("the relay does not answer the deallocate", func(t *testing.T) {
+		relay := newPermissionRefusingRelay(t, 0)
+		tap := newGhostTap(t, relay.addr)
+		tap.deafAfter.Store(3) // the challenge, the allocation, the permission's refusal — and no more
+		_, err := csqtt25DialRelay(context.Background(), creds(tap.front.LocalAddr().String()), ghostPeer(t), "udp", nil)
+		var left *csqtt.UnreleasedError
+		if !errors.As(err, &left) || left.Deallocate != csqtt.DeallocateUnanswered {
+			t.Fatalf("the dial failed with %T, want an UnreleasedError whose deallocate was not answered", err)
+		}
+	})
+	t.Run("tcp: an ended dial is the plain failure", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		_, err := csqtt25DialRelay(ctx, creds(relayTURN(t, "tcp")), ghostPeer(t), "tcp", func() { cancel() })
+		var left *csqtt.UnreleasedError
+		if err == nil || errors.As(err, &left) {
+			t.Fatalf("a TCP dial ended behind its allocation returned %v (unreleased: %v) — over TCP the connection's close frees the allocation", err, left != nil)
+		}
+	})
+	t.Run("a permission wait that is ended", func(t *testing.T) {
+		tap := newGhostTap(t, relayTURN(t, "udp"))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var ended time.Time
+		_, err := csqtt25DialRelay(ctx, creds(tap.front.LocalAddr().String()), ghostPeer(t), "udp", func() {
+			tap.deaf.Store(true) // accepted — and nothing more is heard: the permission's answer never comes
+			time.AfterFunc(100*time.Millisecond, func() { ended = time.Now(); cancel() })
+		})
+		took := time.Since(ended)
+		var left *csqtt.UnreleasedError
+		if !errors.As(err, &left) || left.Deallocate != csqtt.DeallocateNotAwaited {
+			t.Fatalf("the ended dial failed with %T, want an UnreleasedError whose deallocate's answer was not waited for", err)
+		}
+		if took > 300*time.Millisecond {
+			t.Fatalf("the ended dial returned %v behind its end: it waited for the relay", took.Round(time.Millisecond))
+		}
+	})
+}
+
+// The 2.5 dialer hands a failed dial's word on its allocation to the lease —
+// behind Failed and BEFORE the release, and for an ENDED dial too (which tells
+// the lease of no failure).
+func TestCsqtt25DialerTellsTheLeaseOfAnAllocationLeftBehindAFailedDial(t *testing.T) {
+	failure := errors.New("turn create permission: refused")
+	unreleased := &csqtt.UnreleasedError{Err: failure, Deallocate: csqtt.DeallocateNotAwaited}
+	cases := []struct {
+		name  string
+		err   error
+		ended bool
+		want  []string
+	}{
+		{"unreleased", unreleased, false, []string{"failed", "out of reach: its deallocate's answer was not waited for", "released"}},
+		{"unreleased, the dial ended", unreleased, true, []string{"out of reach: its deallocate's answer was not waited for", "released"}},
+		{"plain", failure, false, []string{"failed", "released"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var events []string
+			prev := csqtt25OpenRelay
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			csqtt25OpenRelay = func(context.Context, csqtt.TURNCredentials, *net.UDPAddr, string, func()) (net.PacketConn, func(), error) {
+				if c.ended {
+					cancel()
+				}
+				return nil, nil, c.err
+			}
+			t.Cleanup(func() { csqtt25OpenRelay = prev })
+			lease := func(context.Context, int) (csqtt.Credential, error) {
+				return csqtt.Credential{
+					Allocated:  func(time.Time) {},
+					Failed:     func(error, time.Time) { events = append(events, "failed") },
+					Release:    func() { events = append(events, "released") },
+					OutOfReach: func(why string) { events = append(events, "out of reach: "+why) },
+				}, nil
+			}
+			server := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+			if _, _, _, err := (&csqtt25Client{}).dialer(server, "udp", lease)(ctx, 1); err == nil {
+				t.Fatal("the failed dial returned a stream")
+			}
+			if !reflect.DeepEqual(events, c.want) {
+				t.Fatalf("the lease heard %v, want %v", events, c.want)
+			}
+		})
+	}
+}
+
+// Through the real dial and a real pool: a dial ENDED behind an accepted
+// allocation, its deallocate's answer never heard — the seat stays counted for
+// the hold, not for the relay's second (the review of the ghost rule: the pool
+// handed that seat out again 1.2 s later, with a hold of three seconds set).
+func TestCsqtt25AnEndedDialBehindItsAllocationKeepsItsSeatForTheHold(t *testing.T) {
+	const hold = 2500 * time.Millisecond
+	tap := newGhostTap(t, relayTURN(t, "udp"))
+	addr := tap.front.LocalAddr().String()
+	fetch := func(bool, int) (string, *proxy.TURNCreds, error) {
+		return addr, &proxy.TURNCreds{Username: "u", Password: "pw", Address: addr, Addresses: []string{addr}}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := proxy.NewCredPool(ctx, proxy.CredPoolConfig{VKLink: "abc", NumConns: 10, Fetch: fetch})
+	defer pool.Close()
+	a := &csqttPoolAdapter{pool: pool, fatal: func(err error) { t.Errorf("fatal: %v", err) }, sleep: &csqttSleepWatch{}, hold: hold}
+	for k := 1; k <= 9; k++ { // nine seats of the identity are out
+		if _, err := a.creds(ctx, k); err != nil {
+			t.Fatalf("lease %d: %v", k, err)
+		}
+	}
+	// The tenth goes through the dial — which is ended the moment the relay has
+	// accepted its allocation, on a path that passes nothing back any more.
+	dctx, end := context.WithCancel(ctx)
+	defer end()
+	lease := func(cctx context.Context, workerID int) (csqtt.Credential, error) {
+		c, err := a.creds(cctx, workerID)
+		if err != nil {
+			return c, err
+		}
+		allocated := c.Allocated
+		c.Allocated = func(began time.Time) {
+			allocated(began)
+			tap.deaf.Store(true)
+			end()
+		}
+		return c, nil
+	}
+	if _, _, _, err := (&csqtt25Client{}).dialer(ghostPeer(t), "udp", lease)(dctx, 10); err == nil {
+		t.Fatal("the ended dial returned a stream")
+	}
+	// The pool is asked for that identity's seat again, over and over (asked
+	// directly: what is under test is WHEN the pool lets the seat go, not how a
+	// parked worker is woken).
+	released := time.Now()
+	for {
+		_, _, _, err := pool.Acquire(9)
+		took := time.Since(released)
+		if err == nil {
+			if took < 2400*time.Millisecond {
+				t.Fatalf("the seat of an allocation left behind an ended dial was handed out again after %v, want the hold (%v) — the relay may still hold that allocation", took.Round(10*time.Millisecond), hold)
+			}
+			return
+		}
+		if took > 8*time.Second {
+			t.Fatal("the held seat was never let go")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

@@ -145,7 +145,7 @@ func TestTheConfirmedDeallocateEndsAtItsBudget(t *testing.T) {
 // two answers behind which the allocation may live on. A confirmation is the
 // opposite; another refusal is about the request.
 func TestOutOfReachIsTheRelaysDisowningOrItsSilence(t *testing.T) {
-	want := map[Deallocate]bool{DeallocateConfirmed: false, DeallocateGone: true, DeallocateRefused: false, DeallocateUnanswered: true}
+	want := map[Deallocate]bool{DeallocateConfirmed: false, DeallocateGone: true, DeallocateRefused: false, DeallocateUnanswered: true, DeallocateNotAwaited: true}
 	said := map[string]Deallocate{}
 	for v, out := range want {
 		if v.OutOfReach() != out {
@@ -236,10 +236,13 @@ func loopbackTURNUDP(t *testing.T) (addr string, allocations func() int) {
 }
 
 // udpTap stands between one client socket and the relay and can stop passing
-// the relay's answers down — a relay this side no longer hears.
+// the relay's answers down — a relay this side no longer hears: at once (deaf),
+// or behind the first deafAfter answers.
 type udpTap struct {
 	front, back *net.UDPConn
 	deaf        atomic.Bool
+	deafAfter   atomic.Int32 // > 0: pass this many answers down, then no more
+	down        atomic.Int32
 	mu          sync.Mutex
 	client      *net.UDPAddr
 }
@@ -283,6 +286,9 @@ func newUDPTap(t *testing.T, relay string) *udpTap {
 			p.mu.Lock()
 			to := p.client
 			p.mu.Unlock()
+			if after := p.deafAfter.Load(); after > 0 && p.down.Add(1) > after {
+				continue
+			}
 			if to != nil && !p.deaf.Load() {
 				_, _ = front.WriteToUDP(buf[:n], to)
 			}
@@ -419,6 +425,164 @@ func TestAWorkerTellsItsLeaseOfAnAllocationOutOfReachBeforeItsRelease(t *testing
 			defer mu.Unlock()
 			if !reflect.DeepEqual(events, c.want) {
 				t.Fatalf("the lease heard %v, want %v", events, c.want)
+			}
+		})
+	}
+}
+
+// refusingTURN is a pion TURN server (u / pw) that accepts every Allocate and
+// refuses every permission — over UDP and over TCP.
+func refusingTURN(t *testing.T) (udp, tcp string, allocations func() int) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen := &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"}
+	no := func(net.Addr, net.IP) bool { return false }
+	key := turn.GenerateAuthKey("u", "okcdn.ru", "pw")
+	srv, err := turn.NewServer(turn.ServerConfig{
+		Realm:             "okcdn.ru",
+		AuthHandler:       func(*turn.RequestAttributes) (string, []byte, bool) { return "u", key, true },
+		PacketConnConfigs: []turn.PacketConnConfig{{PacketConn: pc, RelayAddressGenerator: gen, PermissionHandler: no}},
+		ListenerConfigs:   []turn.ListenerConfig{{Listener: ln, RelayAddressGenerator: gen, PermissionHandler: no}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		deadline := time.Now().Add(2 * time.Second)
+		for srv.AllocationCount() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		_ = srv.Close()
+	})
+	return pc.LocalAddr().String(), ln.Addr().String(), srv.AllocationCount
+}
+
+// A dial that fails BEHIND an accepted allocation gives that allocation back —
+// and over UDP it ASKS the relay too, as a close does: confirmed, the failure is
+// the plain one and the allocation is gone when the dial returns; not answered,
+// the failure says so (an UnreleasedError, worded as the failure it wraps) for
+// the lease to hear. Over TCP nothing is asked.
+func TestADialThatFailsBehindItsAllocationAsksTheRelayOverUDP(t *testing.T) {
+	old := DeallocateConfirmBudget
+	DeallocateConfirmBudget = 150 * time.Millisecond
+	t.Cleanup(func() { DeallocateConfirmBudget = old })
+	creds := func(addr string) TURNCredentials {
+		return TURNCredentials{Username: "u", Password: "pw", Address: addr}
+	}
+
+	t.Run("udp: the relay confirms", func(t *testing.T) {
+		udp, _, allocations := refusingTURN(t)
+		accepted := false
+		_, err := DialRelay(creds(udp), loopbackPeer(t), "udp", logging.LogLevelError, func() { accepted = true })
+		if err == nil || !accepted {
+			t.Fatalf("fixture: the dial returned %v with the allocation accepted: %v — want a permission refused behind an accepted allocation", err, accepted)
+		}
+		var left *UnreleasedError
+		if errors.As(err, &left) {
+			t.Fatalf("a release the relay confirmed was called unconfirmed (%s)", left.Deallocate.Why())
+		}
+		if n := allocations(); n != 0 {
+			t.Fatalf("%d allocation(s) at the relay when the failed dial returned, want 0 — its release was not waited for", n)
+		}
+	})
+	t.Run("udp: the relay does not answer the deallocate", func(t *testing.T) {
+		udp, _, _ := refusingTURN(t)
+		plain := ""
+		if _, err := DialRelay(creds(udp), loopbackPeer(t), "udp", logging.LogLevelError, nil); err != nil {
+			plain = err.Error()
+		}
+		tap := newUDPTap(t, udp)
+		tap.deafAfter.Store(3) // the challenge, the allocation, the permission's refusal — and no more
+		_, err := DialRelay(creds(tap.front.LocalAddr().String()), loopbackPeer(t), "udp", logging.LogLevelError, nil)
+		var left *UnreleasedError
+		if !errors.As(err, &left) || left.Deallocate != DeallocateUnanswered || !left.Deallocate.OutOfReach() {
+			t.Fatalf("the dial failed with %T (%v), want an UnreleasedError whose deallocate was not answered", err, err)
+		}
+		if err.Error() != plain || plain == "" {
+			t.Fatalf("the unreleased failure reads %q, the plain one %q — the pool reads a failed dial by its text", err.Error(), plain)
+		}
+		if !errors.Is(err, left.Err) || errors.Unwrap(left.Err) == nil {
+			t.Fatalf("the unreleased failure does not unwrap to the dial's own failure and its cause — whoever asks what the socket said is answered by the label")
+		}
+	})
+	t.Run("tcp: nothing is asked", func(t *testing.T) {
+		_, tcp, _ := refusingTURN(t)
+		_, err := DialRelay(creds(tcp), loopbackPeer(t), "tcp", logging.LogLevelError, nil)
+		var left *UnreleasedError
+		if err == nil || errors.As(err, &left) {
+			t.Fatalf("a TCP dial that failed behind its allocation returned %v (unreleased: %v) — want the plain failure", err, left != nil)
+		}
+	})
+}
+
+// The worker hands an unreleased failure's word to its lease — behind Failed and
+// BEFORE the release; a plain failure says nothing.
+func TestAWorkerTellsItsLeaseOfAnAllocationLeftBehindAFailedDial(t *testing.T) {
+	failure := errors.New("turn create permission: refused")
+	cases := []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{"unreleased", &UnreleasedError{Err: failure, Deallocate: DeallocateUnanswered},
+			[]string{"allocated", "failed: turn create permission: refused", "out of reach: its deallocate was not answered", "released"}},
+		{"plain", failure, []string{"allocated", "failed: turn create permission: refused", "released"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := newFakeServer(t)
+			prev := dialRelay
+			var dials atomic.Int32
+			dialRelay = func(_ TURNCredentials, _ *net.UDPAddr, _ string, _ logging.LogLevel, allocated func()) (*Relay, error) {
+				if allocated != nil {
+					allocated()
+				}
+				if dials.Add(1) == 1 {
+					return nil, c.err // the first dial fails behind its allocation
+				}
+				uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+				if err != nil {
+					return nil, err
+				}
+				return &Relay{Conn: uc, Local: uc.LocalAddr(), close: func() { uc.Close() }}, nil
+			}
+			t.Cleanup(func() { dialRelay = prev })
+			var mu sync.Mutex
+			var events []string
+			leases := 0
+			creds := func(context.Context, int) (Credential, error) {
+				mu.Lock()
+				leases++
+				first := leases == 1
+				mu.Unlock()
+				note := func(s string) {
+					if first {
+						mu.Lock()
+						events = append(events, s)
+						mu.Unlock()
+					}
+				}
+				return Credential{
+					TURNCredentials: TURNCredentials{Username: "u", Password: "p", Address: "127.0.0.1:1"},
+					Allocated:       func(time.Time) { note("allocated") },
+					Failed:          func(err error, _ time.Time) { note("failed: " + err.Error()) },
+					OutOfReach:      func(why string) { note("out of reach: " + why) },
+					Release:         func() { note("released") },
+				}, nil
+			}
+			c2 := dialReady(t, testConfig(srv, 1, creds))
+			defer c2.Close()
+			mu.Lock()
+			defer mu.Unlock()
+			if !reflect.DeepEqual(events, c.want) {
+				t.Fatalf("the first lease heard %v, want %v", events, c.want)
 			}
 		})
 	}

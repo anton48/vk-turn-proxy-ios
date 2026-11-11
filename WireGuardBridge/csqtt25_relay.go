@@ -205,14 +205,28 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 		// close's budget, and no permission is asked on a dial that is over.
 		stop()
 		csqtt25CloseRelay(ctl, relayed, tc.Close, nil) // an ended dial waits for no answer
-		return nil, fmt.Errorf("relay dial ended behind its allocation: %w", context.Cause(ctx))
+		return nil, csqtt25Unreleased(transport, csqtt.DeallocateNotAwaited, fmt.Errorf("relay dial ended behind its allocation: %w", context.Cause(ctx)))
 	}
 	if err := tc.CreatePermission(server); err != nil {
 		stop()
-		_ = relayed.Close()
-		tc.Close()
-		_ = ctl.Close()
-		return nil, fmt.Errorf("turn create permission: %w", err)
+		failure := fmt.Errorf("turn create permission: %w", err)
+		if transport != "udp" {
+			_ = relayed.Close()
+			tc.Close()
+			_ = ctl.Close()
+			return nil, failure
+		}
+		// The allocation was accepted: it holds a seat whether a stream ever
+		// rode it or not. A dial that was ENDED gives it back and waits for no
+		// answer; one that failed by itself has no hurry and asks the relay, as
+		// a close does. Either way a release the relay did not confirm is SAID.
+		v := csqtt.DeallocateNotAwaited
+		if ctx.Err() != nil {
+			csqtt25CloseRelay(ctl, relayed, tc.Close, nil)
+		} else {
+			csqtt25CloseRelay(ctl, relayed, tc.Close, func() { v = csqtt.ConfirmDeallocate(tc, creds.Username, creds.Password) })
+		}
+		return nil, csqtt25Unreleased(transport, v, failure)
 	}
 	r := &csqtt25Relay{relayed: relayed, ctl: ctl}
 	// Over UDP the close asks the relay whether it released the allocation and
@@ -224,6 +238,18 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 	}
 	r.close = func() { csqtt25CloseRelay(ctl, relayed, tc.Close, confirm) }
 	return r, nil
+}
+
+// csqtt25Unreleased is a dial's failure behind an ACCEPTED allocation, with what
+// became of that allocation's deallocate: over UDP a release the relay did not
+// confirm (v out of reach) makes the failure a csqtt.UnreleasedError — worded as
+// the failure itself — for the dialer to tell the lease; a confirmed release,
+// and every failure over TCP, is the plain failure.
+func csqtt25Unreleased(transport string, v csqtt.Deallocate, failure error) error {
+	if transport == "udp" && v.OutOfReach() {
+		return &csqtt.UnreleasedError{Err: failure, Deallocate: v}
+	}
+	return failure
 }
 
 // csqtt25DialEndEvery: how often an ended dial's waits are failed again.

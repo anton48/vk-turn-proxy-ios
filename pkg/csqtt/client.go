@@ -1448,6 +1448,13 @@ func (w *worker) session() error {
 		if cred.Failed != nil {
 			cred.Failed(err, t0)
 		}
+		// …and a dial that failed BEHIND its allocation over UDP says whether
+		// the relay confirmed that it released it (UnreleasedError): if not,
+		// the lease hears that too, before its release.
+		var left *UnreleasedError
+		if errors.As(err, &left) && cred.OutOfReach != nil {
+			cred.OutOfReach(left.Deallocate.Why())
+		}
 		return err
 	}
 	w.c.allocRTT.Store(int64(time.Since(t0)))

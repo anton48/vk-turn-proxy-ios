@@ -212,10 +212,7 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 		allocated()
 	}
 	if err := tc.CreatePermission(peer); err != nil {
-		_ = relay.Close()
-		tc.Close()
-		_ = ctl.Close()
-		return nil, fmt.Errorf("turn create permission: %w", err)
+		return nil, giveBackBehindAFailure(ctl, relay, tc, creds, transport, fmt.Errorf("turn create permission: %w", err))
 	}
 	r := &Relay{
 		Conn:  relay,
@@ -230,6 +227,29 @@ func DialRelay(creds TURNCredentials, peer *net.UDPAddr, transport string, logLe
 	}
 	r.close = func() { closeRelayBounded(ctl, relay, tc.Close, confirm) }
 	return r, nil
+}
+
+// giveBackBehindAFailure gives back an allocation the relay ACCEPTED and the
+// dial could not use (a step behind the Allocate failed) and returns the dial's
+// failure. Over UDP the relay is asked, as a close asks it (closeRelayBounded,
+// dealloc.go): a dial that failed has no hurry, and an allocation that was
+// accepted holds a seat whether a stream ever rode it or not. A release the
+// relay did not confirm makes the failure an UnreleasedError — worded as the
+// failure itself — so that the worker can tell its lease. Over TCP the
+// connection's close frees the allocation, and the close is the old one.
+func giveBackBehindAFailure(ctl net.PacketConn, relay io.Closer, tc *turn.Client, creds TURNCredentials, transport string, failure error) error {
+	if transport != "udp" {
+		_ = relay.Close()
+		tc.Close()
+		_ = ctl.Close()
+		return failure
+	}
+	v := DeallocateConfirmed
+	closeRelayBounded(ctl, relay, tc.Close, func() { v = ConfirmDeallocate(tc, creds.Username, creds.Password) })
+	if v.OutOfReach() {
+		return &UnreleasedError{Err: failure, Deallocate: v}
+	}
+	return failure
 }
 
 func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {

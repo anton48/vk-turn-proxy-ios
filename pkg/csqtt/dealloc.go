@@ -54,14 +54,29 @@ const (
 	DeallocateGone                         // 437: the relay holds no allocation for this socket — released already, or the mapping has changed and it cannot be reached from here
 	DeallocateRefused                      // another error answer
 	DeallocateUnanswered                   // nothing came back within the budget, or the request could not be written
+	DeallocateNotAwaited                   // the deallocate was written and its answer NOT waited for — a dial that was ended (csqtt 2.5)
 )
 
+// UnreleasedError is a relay dial's failure BEHIND an allocation the relay had
+// accepted, over a UDP leg, when the relay did not confirm that it released
+// that allocation: the dial is over, and the allocation may live on at the
+// relay. It reads as the failure it wraps — whoever reads a failed dial's text
+// reads the same text — and carries what became of the deallocate, for the
+// lease (Credential.OutOfReach).
+type UnreleasedError struct {
+	Err        error
+	Deallocate Deallocate
+}
+
+func (e *UnreleasedError) Error() string { return e.Err.Error() }
+func (e *UnreleasedError) Unwrap() error { return e.Err }
+
 // OutOfReach reports whether the allocation may live on at the relay where
-// this side cannot end it: the relay disowned it for this socket, or said
-// nothing at all. A refusal with another error is an answer about the request,
-// not about the allocation's whereabouts.
+// this side cannot end it: the relay disowned it for this socket, said nothing
+// at all, or was not waited for. A refusal with another error is an answer
+// about the request, not about the allocation's whereabouts.
 func (d Deallocate) OutOfReach() bool {
-	return d == DeallocateGone || d == DeallocateUnanswered
+	return d == DeallocateGone || d == DeallocateUnanswered || d == DeallocateNotAwaited
 }
 
 // Why is the verdict in words, for a log line.
@@ -73,6 +88,8 @@ func (d Deallocate) Why() string {
 		return "its deallocate was answered 437"
 	case DeallocateRefused:
 		return "its deallocate was refused"
+	case DeallocateNotAwaited:
+		return "its deallocate's answer was not waited for"
 	default:
 		return "its deallocate was not answered"
 	}

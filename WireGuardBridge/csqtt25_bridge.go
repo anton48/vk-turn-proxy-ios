@@ -189,6 +189,14 @@ func (a *csqtt25Client) dialer(server *net.UDPAddr, transport string,
 			if ctx.Err() == nil {
 				cred.Failed(err, began)
 			}
+			// A dial that failed — or was ended — BEHIND an accepted allocation
+			// over UDP says whether the relay confirmed that it released it; if
+			// not, the lease hears it before its release, ended dial or not: the
+			// seat may still be taken at the relay.
+			var left *csqtt.UnreleasedError
+			if errors.As(err, &left) && cred.OutOfReach != nil {
+				cred.OutOfReach(left.Deallocate.Why())
+			}
 			cred.Release()
 			return nil, nil, nil, err
 		}
