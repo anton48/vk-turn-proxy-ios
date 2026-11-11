@@ -177,6 +177,10 @@ type handClock struct {
 	step   time.Duration
 	during func()
 	fired  chan struct{}
+	// then: the reading that FOLLOWS the armed one returns a time this much
+	// later still — in a pass that takes its verdict back, that is the
+	// reading the new window is opened at.
+	then, follow time.Duration
 }
 
 // useHandClock must be called before the client is started (see useJumpClock).
@@ -197,6 +201,10 @@ func (h *handClock) now() time.Time {
 		h.armed = false
 		h.at = h.at.Add(h.step)
 		during, fired = h.during, h.fired
+		h.follow, h.then = h.then, 0
+	} else if h.follow != 0 {
+		h.at = h.at.Add(h.follow)
+		h.follow = 0
 	}
 	at := h.at
 	h.mu.Unlock()
@@ -306,5 +314,41 @@ func TestAWakeWordTakesBackAnOrdinaryVerdictToo(t *testing.T) {
 	eventually(t, "the stream replaced behind the word's own window", func() bool { return d.count(1) >= 2 })
 	if st := c.Stats(); st.WakeDeaf != 1 {
 		t.Fatalf("silent-behind-a-wake verdicts %d, want 1: the word opened a window, not another sixty seconds", st.WakeDeaf)
+	}
+}
+
+// 🚨 The word's own window counts only its OWN listening. The pass that takes
+// a verdict back reads the clock twice — for the rule, and again for the
+// window it opens — and what lies between the two readings is before the new
+// boundary: the stream had not even been asked again yet. Half a window of
+// listening behind the boundary is no verdict, whatever the pass itself took.
+func TestAVoidedVerdictsWindowCountsOnlyItsOwnListening(t *testing.T) {
+	quickClocks(t)
+	wakeClocks(t, 200*time.Millisecond, time.Hour, 10*time.Millisecond)
+	mergeClock(t, 50*time.Millisecond)
+	c, d, srv, clock := oneMutedStream(t, "pw-void-own-listening")
+
+	asked := srv.readyCount(1)
+	c.Wake()
+	eventually(t, "the stream asked behind the first word", func() bool { return srv.readyCount(1) > asked })
+
+	// The verdict's reading says the second word; the reading the new window
+	// is opened at comes 100 ms behind it.
+	clock.mu.Lock()
+	clock.then = 100 * time.Millisecond
+	clock.mu.Unlock()
+	clock.arm(t, 200*time.Millisecond, c.Wake)
+	time.Sleep(100 * time.Millisecond)
+
+	clock.arm(t, 100*time.Millisecond, nil) // half the new window's listening
+	time.Sleep(300 * time.Millisecond)
+	if st := c.Stats(); d.count(1) != 1 || st.WakeDeaf != 0 {
+		t.Fatalf("100ms of listening behind the second word's boundary (its window is 200ms): dialled %d time(s), silent-behind-a-wake verdicts %d — want 1 dial and no verdict: the time between the pass's two readings of the clock is before the boundary",
+			d.count(1), st.WakeDeaf)
+	}
+	clock.arm(t, 100*time.Millisecond, nil) // … and the other half
+	eventually(t, "the stream replaced when the word's own window had run out", func() bool { return d.count(1) >= 2 })
+	if st := c.Stats(); st.WakeDeaf != 1 {
+		t.Fatalf("silent-behind-a-wake verdicts %d, want 1", st.WakeDeaf)
 	}
 }

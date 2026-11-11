@@ -314,3 +314,33 @@ func TestAVoidedVerdictOpensTheWordsOwnWindow(t *testing.T) {
 		t.Fatalf("behind a voided ordinary verdict: %d at tick %d, want silent-behind-a-wake at 5", verdict, end)
 	}
 }
+
+// 🚨 The window a voided verdict opens begins at the reading it was opened at
+// — not at the pass's earlier reading for the rule: what lies between the two
+// is before the boundary and is no part of the new window's listening.
+func TestAVoidedVerdictsWindowBeginsAtItsOwnReading(t *testing.T) {
+	at := time.Unix(1_800_220_000, 0)
+	s := fieldWatch(at)
+	at = at.Add(time.Second)
+	s.tick(at, 1, false)
+	if _, end, verdict := asks(run(s, &at, 5, 1, false)); end != 5 || verdict != watchWakeDeaf {
+		t.Fatalf("the first window's verdict %d at tick %d, want %d at 5", verdict, end, watchWakeDeaf)
+	}
+	at = at.Add(2 * time.Second) // the pass's second reading, two seconds behind its first
+	s.void(at, 2)
+	asked, end, verdict := asks(run(s, &at, 5, 2, false))
+	if !sameInts(asked, []int{1, 2, 3, 4}) || end != 5 || verdict != watchWakeDeaf {
+		t.Fatalf("behind a void opened 2s after the pass's first reading: asked at %v, verdict %d at tick %d — want asked at 1–4 and the verdict at 5, five seconds of listening behind the NEW boundary",
+			asked, verdict, end)
+	}
+	// … and an inbound a moment behind the void is not one «read across a freeze».
+	s = fieldWatch(at)
+	run(s, &at, 60, 0, false)
+	at = at.Add(2500 * time.Millisecond)
+	s.void(at, 1)
+	at = at.Add(time.Second)
+	s.heard(at)
+	if s.wake {
+		t.Fatalf("an answer a second behind the void did not end its window: it was taken for one read across a freeze")
+	}
+}

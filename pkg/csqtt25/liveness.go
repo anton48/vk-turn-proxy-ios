@@ -200,7 +200,13 @@ func (a watchAction) ends() bool {
 // was said with, and it is never merged into the window whose verdict it
 // voids: that window is over. The caller asks the stream, as behind any
 // boundary.
+//
+// now is a reading of its own, later than the one tick was given, and the
+// watch moves to it whole: what lies between the two readings is before the
+// boundary — the stream had not been asked again yet — and is no part of the
+// new window's listening, nor of the gap an inbound is judged by.
 func (s *streamWatch) void(now time.Time, epoch uint64) {
+	s.prev = now
 	s.epoch = epoch
 	s.open(now)
 }
