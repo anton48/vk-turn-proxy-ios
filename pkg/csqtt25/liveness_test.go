@@ -344,3 +344,34 @@ func TestAVoidedVerdictsWindowBeginsAtItsOwnReading(t *testing.T) {
 		t.Fatalf("an answer a second behind the void did not end its window: it was taken for one read across a freeze")
 	}
 }
+
+// What «heard from lately» is counted in: the listening since the last
+// inbound. A boundary drops the silence the rule judges (quiet) and not this;
+// a late tick adds nothing to it; an inbound ends it.
+func TestHeardFromLatelyIsCountedInListening(t *testing.T) {
+	s := newStreamWatch(0)
+	at := s.prev
+	tick := func(d time.Duration) {
+		at = at.Add(d)
+		s.tick(at, 0, false)
+	}
+	for i := 0; i < 3; i++ {
+		tick(time.Second)
+	}
+	if s.mute != 3*time.Second {
+		t.Fatalf("three seconds of listening: %v counted", s.mute)
+	}
+	tick(10 * time.Minute) // the process did not run
+	if s.mute != 3*time.Second || !s.wake {
+		t.Fatalf("behind a ten-minute late tick: %v counted (want the 3s of before), window open %v (want true)", s.mute, s.wake)
+	}
+	tick(time.Second) // listening again, inside the boundary's window
+	if s.mute != 4*time.Second || s.quiet != 0 {
+		t.Fatalf("a second of listening behind the boundary: %v counted (want 4s), the rule's silence %v (want 0: the boundary dropped it)", s.mute, s.quiet)
+	}
+	at = at.Add(300 * time.Millisecond)
+	s.heard(at)
+	if s.mute != 0 {
+		t.Fatalf("behind an inbound: %v counted, want 0", s.mute)
+	}
+}

@@ -245,9 +245,9 @@ func (a *csqtt25Client) Stats() csqtt.Stats {
 // path-event snapshot, the once-a-minute line and the stop line (csqttLine).
 func (a *csqtt25Client) StatsLine(tunIn, tunOut int64) string {
 	s := a.eng.Stats()
-	return fmt.Sprintf("2.5: workers %d/%d ready (%d heard from lately; %d asked), sessions %d, ended %d, dtls %d, fallbacks %d, probes %d, repairs %d, server restarts %d (found out behind one %d), path changes %d, freezes %d, wakes %d (silent behind either %d), write stalls %d, dead writes %d, no stream %d, auth failures %d, fragments tx=%d rx=%d, dropped %d; tun in=%d out=%d",
+	return fmt.Sprintf("2.5: workers %d/%d ready (%d heard from lately; %d asked), sessions %d, ended %d, dtls %d, fallbacks %d, probes %d, repairs %d, server restarts %d (found out behind one %d), path changes %d, freezes %d, wakes %d (silent behind either %d, verdicts taken back %d), write stalls %d, dead writes %d, no stream %d, auth failures %d, fragments tx=%d rx=%d, dropped %d; tun in=%d out=%d",
 		s.Ready, s.Target, s.Live, s.Workers, s.Sessions, s.Restarts, s.Handshakes, s.Fallbacks, s.Probes, s.Repairs,
-		s.PanelRestarts, s.Unsettled, s.PathChanges, s.Freezes, s.Wakes, s.WakeDeaf, s.WriteStalls, s.DeadWrites,
+		s.PanelRestarts, s.Unsettled, s.PathChanges, s.Freezes, s.Wakes, s.WakeDeaf, s.Voided, s.WriteStalls, s.DeadWrites,
 		s.NoStream, s.AuthFailures, s.FragsTx, s.FragsRx, a.dropped.Load(), tunIn, tunOut)
 }
 

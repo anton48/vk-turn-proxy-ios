@@ -47,7 +47,7 @@ func newFakeEngine() *fakeEngine {
 		// wrong one says so.
 		stats: csqtt25.Stats{Workers: 30, Target: 18, Ready: 17, Live: 15, TxBytes: 1111, RxBytes: 2222, Sessions: 40, Restarts: 22,
 			Handshakes: 39, Fallbacks: 1, Probes: 86, Repairs: 2, PanelRestarts: 9, Unsettled: 3, PathChanges: 4, NoStream: 5, AuthFailures: 6, FragsTx: 7, FragsRx: 8,
-			Freezes: 11, Wakes: 12, WakeDeaf: 13, WriteStalls: 14, DeadWrites: 16},
+			Freezes: 11, Wakes: 12, WakeDeaf: 13, Voided: 19, WriteStalls: 14, DeadWrites: 16},
 	}
 }
 
@@ -509,7 +509,7 @@ func TestCsqtt25StatsReachTheAppAndTheLog(t *testing.T) {
 	}
 	csqttLogPathSnapshotImpl(h, "probe")
 	csqttTurnOffImpl(h)
-	const counters = "2.5: workers 17/18 ready (15 heard from lately; 30 asked), sessions 40, ended 22, dtls 39, fallbacks 1, probes 86, repairs 2, server restarts 9 (found out behind one 3), path changes 4, freezes 11, wakes 12 (silent behind either 13), write stalls 14, dead writes 16, no stream 5, auth failures 6, fragments tx=7 rx=8, dropped 0; tun in=0 out=0"
+	const counters = "2.5: workers 17/18 ready (15 heard from lately; 30 asked), sessions 40, ended 22, dtls 39, fallbacks 1, probes 86, repairs 2, server restarts 9 (found out behind one 3), path changes 4, freezes 11, wakes 12 (silent behind either 13, verdicts taken back 19), write stalls 14, dead writes 16, no stream 5, auth failures 6, fragments tx=7 rx=8, dropped 0; tun in=0 out=0"
 	var atEvent, atStop bool
 	for _, l := range out.lines() {
 		if strings.HasSuffix(l, "csqtt: pathstats probe: "+counters) {

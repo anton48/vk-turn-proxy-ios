@@ -130,7 +130,7 @@ var (
 // Stats is a snapshot of the client's counters.
 type Stats struct {
 	Workers, Target, Ready                 int
-	Live                                   int // of the ready ones, heard from within liveWindow: what a screen shows as connections
+	Live                                   int // of the ready ones, heard from within liveWindow of LISTENING (time the process did not run is no silence): what a screen shows as connections
 	TxPackets, TxBytes, RxPackets, RxBytes int64
 	FragsTx, FragsRx                       int64
 	Sessions, Restarts                     int64 // sessions that reached READY; sessions that ended
@@ -142,6 +142,7 @@ type Stats struct {
 	WriteStalls, DeadWrites                int64 // writes the relay did not take within the bound; writes that found the connection gone
 	Freezes, Wakes                         int64 // late ticks taken for a suspension of the process (one per suspension); the caller's wake words
 	WakeDeaf                               int64 // streams replaced for their silence behind a freeze or a wake
+	Voided                                 int64 // verdicts taken back: the wake word was said while they were being reached, and the stream was asked anew instead
 }
 
 // Client is a running csqtt 2.5 client.
@@ -186,6 +187,8 @@ type Client struct {
 	unsettledN                             atomic.Int64
 	writeStalls, deadWrites                atomic.Int64
 	freezes, wakes, wakeDeaf               atomic.Int64
+	voided                                 atomic.Int64  // verdicts a wake word took back (tookBack)
+	voidSaid                               atomic.Uint64 // the wake epoch whose taken-back verdicts the log has been told of: once per word
 	wakeEpoch                              atomic.Uint64 // moved by Wake; every serve loop compares its own copy at each pass (a level, not an edge)
 }
 
@@ -202,6 +205,7 @@ type worker struct {
 	ready  atomic.Bool
 	lastTx atomic.Int64
 	lastRx atomic.Int64
+	mute   atomic.Int64  // the stream's listening since its last inbound (streamWatch.mute), written by its serve loop: Stats reads Live off it
 	kick   chan error    // the server wants this worker's session over: the reason
 	wake   chan struct{} // the agreed count changed
 	reasm  *Reassembler  // the read loop's alone
@@ -515,6 +519,17 @@ func (c *Client) froze(gap, late time.Duration) {
 	c.cfg.Logf("csqtt25: the process did not run for %s — what was heard before it counts for nothing, every ready stream is asked afresh", gap.Round(100*time.Millisecond))
 }
 
+// tookBack counts a verdict the wake word took back (the serve loop found the
+// epoch moved between its rule and the session's end) and says so ONCE per
+// word: at a wake every stream can be at its verdict in the same pass, and
+// the number is on the counters' line.
+func (c *Client) tookBack(id int, seen uint64) {
+	c.voided.Add(1)
+	if prev := c.voidSaid.Load(); prev != seen && c.voidSaid.CompareAndSwap(prev, seen) {
+		c.cfg.Logf("csqtt25: a wake word was said while a stream was being given up on (worker %d) — the verdict is taken back and the stream asked anew; said once per word, counted on the counters' line", id)
+	}
+}
+
 // unsettled says whether a stream last heard at `heard` may still be one of
 // the server that said it was restarting. The restart on the notice is
 // right only if that server is gone when a worker asks again, and nothing
@@ -577,12 +592,16 @@ func (c *Client) Stats() Stats {
 		Freezes:       c.freezes.Load(),
 		Wakes:         c.wakes.Load(),
 		WakeDeaf:      c.wakeDeaf.Load(),
+		Voided:        c.voided.Load(),
 	}
-	now := time.Now().UnixNano()
 	for _, w := range c.workers {
 		if w.ready.Load() {
 			s.Ready++
-			if now-w.lastRx.Load() < int64(liveWindow) {
+			// In the stream's LISTENING, as the rule counts silence — not by the
+			// wall clock: read right behind a suspension longer than the window,
+			// the wall clock makes every stream one not heard from lately, and a
+			// screen shows no connection where thirty are about to answer.
+			if time.Duration(w.mute.Load()) < liveWindow {
 				s.Live++
 			}
 		}
@@ -989,6 +1008,7 @@ func (w *worker) session() (readyAt time.Time, err error) {
 			}
 			if w.receive(wire, recvC) {
 				watch.heard(watch.now())
+				w.mute.Store(int64(watch.mute))
 			}
 			continue
 		case <-w.nudge: // the wake word: a pass now — it finds the epoch moved, or it is a short tick
@@ -1001,6 +1021,7 @@ func (w *worker) session() (readyAt time.Time, err error) {
 		// loop never waits in a socket.
 		epoch := c.wakeEpoch.Load()
 		act, gap := watch.tick(watch.now(), epoch, c.unsettled(time.Unix(0, w.lastRx.Load())))
+		w.mute.Store(int64(watch.mute))
 		if seen := c.wakeEpoch.Load(); act.ends() && seen != epoch {
 			// The wake word was said while this verdict was being reached. A
 			// verdict is about the time before the epoch it was reached under:
@@ -1008,6 +1029,7 @@ func (w *worker) session() (readyAt time.Time, err error) {
 			// again HERE, behind the rule and in front of the session's end.
 			// Otherwise the word opens its own window, under the epoch just
 			// seen, and the stream is asked.
+			c.tookBack(w.id, seen)
 			watch.void(watch.now(), seen)
 			act = watchWoke
 		}

@@ -124,6 +124,7 @@ type streamWatch struct {
 	prev    time.Time     // the previous tick
 	epoch   uint64        // the client's wake epoch this watch has acted on
 	quiet   time.Duration // LISTENING since the last inbound or the last boundary
+	mute    time.Duration // LISTENING since the last inbound, boundaries or not: a late tick adds nothing to it — what «heard from lately» is counted in
 	askedAt time.Duration // quiet at the latest ask of this silence; 0: not asked
 
 	wake     bool          // a boundary's window stands
@@ -143,6 +144,9 @@ func (s *streamWatch) tick(now time.Time, epoch uint64, unsettled bool) (act wat
 	}
 	s.prev = now
 	froze := step > s.late
+	if !froze {
+		s.mute += step
+	}
 	woke := epoch != s.epoch
 	s.epoch = epoch
 	if woke && !froze && s.wake && now.Sub(s.since) < s.merge {
@@ -219,7 +223,7 @@ func (s *streamWatch) heard(now time.Time) {
 	if now.Sub(s.prev) > s.late {
 		return
 	}
-	s.quiet, s.askedAt = 0, 0
+	s.quiet, s.askedAt, s.mute = 0, 0, 0
 	if s.wake && now.Sub(s.since) >= s.answerFloor {
 		s.wake = false
 	}

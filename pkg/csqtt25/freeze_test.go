@@ -1,6 +1,7 @@
 package csqtt25
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -381,5 +382,100 @@ func TestTheWakeWindowIsTheConfigsWhenItNamesOne(t *testing.T) {
 	eventually(t, "the stream replaced when the config's window had run out", func() bool { return d.count(1) >= 2 })
 	if st := c.Stats(); st.WakeDeaf != 1 {
 		t.Fatalf("silent-behind-a-wake verdicts %d, want 1", st.WakeDeaf)
+	}
+}
+
+// A verdict the wake word takes back leaves a trace: it is counted, and the
+// log is told — once per word, whatever the number of streams that were at
+// their verdict when it was said.
+func TestATakenBackVerdictIsCountedAndSaidOncePerWord(t *testing.T) {
+	quickClocks(t)
+	wakeClocks(t, 200*time.Millisecond, time.Hour, 10*time.Millisecond)
+	mergeClock(t, 50*time.Millisecond)
+	var mu sync.Mutex
+	said := 0
+	c, d, srv, clock := oneMutedStreamCfg(t, "pw-void-said", func(cfg *ClientConfig) {
+		cfg.Logf = func(format string, _ ...any) {
+			if strings.Contains(format, "the verdict is taken back") {
+				mu.Lock()
+				said++
+				mu.Unlock()
+			}
+		}
+	})
+	lines := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return said
+	}
+	asked := srv.readyCount(1)
+	c.Wake()
+	eventually(t, "the stream asked behind the first word", func() bool { return srv.readyCount(1) > asked })
+	if st := c.Stats(); st.Voided != 0 || lines() != 0 {
+		t.Fatalf("before any verdict: %d taken back, %d line(s)", st.Voided, lines())
+	}
+	clock.arm(t, 200*time.Millisecond, c.Wake) // the window runs out, and the word is said in that pass
+	eventually(t, "the taken-back verdict counted", func() bool { return c.Stats().Voided == 1 })
+	if n := lines(); n != 1 || d.count(1) != 1 {
+		t.Fatalf("one verdict taken back: %d line(s) in the log (want 1), %d dial(s) (want 1)", n, d.count(1))
+	}
+
+	// Once per word, however many streams: the count takes every one, the log
+	// the first of each word.
+	var told []int
+	k := &Client{cfg: ClientConfig{Logf: func(_ string, a ...any) { told = append(told, a[0].(int)) }}}
+	k.tookBack(4, 7)
+	k.tookBack(9, 7)
+	k.tookBack(2, 8)
+	if k.voided.Load() != 3 || len(told) != 2 || told[0] != 4 || told[1] != 2 {
+		t.Fatalf("three verdicts taken back under two words: counted %d (want 3), said for workers %v (want [4 2])", k.voided.Load(), told)
+	}
+}
+
+// 🚨 «Heard from lately» is counted in the stream's LISTENING, as the rule
+// counts silence. Time in which the process did not run is no silence: read
+// by the wall clock right behind a suspension longer than the window, every
+// stream was one not heard from lately — a screen showed no connection where
+// all of them were about to answer.
+func TestASuspensionIsNotSilenceOnTheScreenEither(t *testing.T) {
+	quickClocks(t)
+	wakeClocks(t, time.Hour, time.Hour, 10*time.Millisecond) // no window's verdict in this test
+	old := liveWindow
+	liveWindow = 150 * time.Millisecond
+	t.Cleanup(func() { liveWindow = old })
+	c, _, _, clock := oneMutedStream(t, "pw-live-freeze")
+
+	// The serve clock stands still: the stream has not listened for a moment
+	// since it was last heard, however long the wall clock ran.
+	time.Sleep(liveWindow + 100*time.Millisecond)
+	if st := c.Stats(); st.Ready != 1 || st.Live != 1 {
+		t.Fatalf("ready %d, heard from lately %d with no listening behind its last inbound — want 1 and 1: the wall clock's time is not the stream's", st.Ready, st.Live)
+	}
+	clock.arm(t, 10*time.Minute, nil) // a suspension
+	eventually(t, "the suspension seen", func() bool { return c.Stats().Freezes == 1 })
+	if st := c.Stats(); st.Live != 1 {
+		t.Fatalf("heard from lately %d right behind a ten-minute suspension, want 1: a suspension is not silence", st.Live)
+	}
+	clock.arm(t, 200*time.Millisecond, nil) // on time, and longer than the window: that IS silence
+	eventually(t, "the stream no longer heard from lately", func() bool { return c.Stats().Live == 0 })
+}
+
+// An inbound makes its stream one heard from THEN: a screen does not wait
+// for the stream's next tick — a second, in the field — to show it.
+func TestAnInboundIsHeardFromAtOnce(t *testing.T) {
+	quickClocks(t)
+	serveTick = 1500 * time.Millisecond // a slow tick: what shows between two of them is the inbound's own doing
+	old := liveWindow
+	liveWindow = 150 * time.Millisecond
+	t.Cleanup(func() { liveWindow = old })
+	srv := newFakeServer(t, "pw-live-inbound")
+	c, _, _ := startClient(t, srv, 1, KeysWrap)
+	eventually(t, "the stream ready", func() bool { return c.Stats().Ready == 1 })
+	eventually(t, "the stream not heard from lately (at its first tick)", func() bool { return c.Stats().Live == 0 })
+	srv.say(1, IdleKeepalive)
+	said := time.Now()
+	eventually(t, "the stream heard from", func() bool { return c.Stats().Live == 1 })
+	if took := time.Since(said); took > 500*time.Millisecond {
+		t.Fatalf("the stream read as heard from %v after its inbound, want at once (its next tick is %v away)", took.Round(10*time.Millisecond), serveTick)
 	}
 }

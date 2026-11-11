@@ -4664,6 +4664,16 @@ do {
     } else {
         check(false, "the Connect gate does not ask for the csqtt generation, or asks a 2.5 server for a Device ID")
     }
+    // The transport's label — the app's log lines and an import's confirmation
+    // — names the generation: «csqtt» alone does not say which engine ran.
+    if let a = profile.range(of: "var modeLabel: String {"), let b = profile.range(of: "if useWrapS", range: a.upperBound..<profile.endIndex) {
+        let body = String(profile[a.upperBound..<b.lowerBound])
+        check(body.contains("csqtt \\(csqttGeneration)") && !body.contains("if useCsqtt { return \"csqtt\" }"),
+              "a csqtt server's label names its generation (2.1.9 and 2.5 are told apart in the log)")
+        check(body.contains("csqttGeneration.isEmpty ? \"csqtt\""), "a csqtt server not asked its generation yet is labelled without one")
+    } else {
+        check(false, "the transport's label (modeLabel) was not found")
+    }
 }
 
 // csqtt 2.5's connection link (2026-11-10): the 2.1.9 connect query, encrypted

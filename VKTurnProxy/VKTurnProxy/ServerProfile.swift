@@ -90,7 +90,11 @@ struct ServerProfile: Codable, Identifiable, Equatable {
     /// Human-readable transport mode, matching the ServerMode picker labels.
     /// Used in log lines and import confirmations.
     var modeLabel: String {
-        if useCsqtt { return "csqtt" }
+        // A csqtt server says its generation: 2.1.9 and 2.5 are different
+        // protocols behind one switch, and a line that names «csqtt» alone does
+        // not say which engine ran. A server made by hand and not asked yet
+        // has none.
+        if useCsqtt { return csqttGeneration.isEmpty ? "csqtt" : "csqtt \(csqttGeneration)" }
         if useWrapS { return "SRTP-WRAP-S" }
         if useWrapA { return "SRTP-WRAP-A" }
         if useSrtp { return "SRTP" }
