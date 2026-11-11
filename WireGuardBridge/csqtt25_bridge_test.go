@@ -394,7 +394,7 @@ func TestCsqtt25DialLeasesTellsAndGivesBackInTheWorkersOrder(t *testing.T) {
 		var leased, told, opened time.Time
 		conn, _ := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		defer conn.Close()
-		csqtt25OpenRelay = func(creds csqtt.TURNCredentials, to *net.UDPAddr, transport string, allocated func()) (net.PacketConn, func(), error) {
+		csqtt25OpenRelay = func(_ context.Context, creds csqtt.TURNCredentials, to *net.UDPAddr, transport string, allocated func()) (net.PacketConn, func(), error) {
 			opened = time.Now()
 			l.add("open " + creds.Username + "@" + creds.Address + " " + transport + " to the server: " + fmt.Sprint(to == server))
 			time.Sleep(30 * time.Millisecond)
@@ -429,7 +429,7 @@ func TestCsqtt25DialLeasesTellsAndGivesBackInTheWorkersOrder(t *testing.T) {
 		var l leaseLog
 		var leased, told time.Time
 		refusal := errors.New("the relay said no")
-		csqtt25OpenRelay = func(csqtt.TURNCredentials, *net.UDPAddr, string, func()) (net.PacketConn, func(), error) {
+		csqtt25OpenRelay = func(context.Context, csqtt.TURNCredentials, *net.UDPAddr, string, func()) (net.PacketConn, func(), error) {
 			l.add("open")
 			return nil, nil, refusal
 		}
@@ -446,9 +446,36 @@ func TestCsqtt25DialLeasesTellsAndGivesBackInTheWorkersOrder(t *testing.T) {
 		}
 	})
 
+	t.Run("ended", func(t *testing.T) {
+		// A dial ended by its context — the path changed under it — is not the
+		// relay's failure: the lease goes back and hears of none.
+		var l leaseLog
+		var leased, told time.Time
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		csqtt25OpenRelay = func(ctx context.Context, _ csqtt.TURNCredentials, _ *net.UDPAddr, _ string, _ func()) (net.PacketConn, func(), error) {
+			l.add("open")
+			cancel()
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+				t.Errorf("the relay's opener was not given the dial's context")
+			}
+			return nil, nil, fmt.Errorf("turn allocate: %w", context.Canceled)
+		}
+		a := &csqtt25Client{eng: newFakeEngine(), down: make(chan []byte, 1)}
+		_, _, closeConn, err := a.dialer(server, "tcp", newLease(&l, &leased, &told))(ctx, 5)
+		if err == nil || closeConn != nil {
+			t.Fatalf("an ended dial returned %v (a closer: %v)", err, closeConn != nil)
+		}
+		if want := "lease 5 → open → released"; l.all() != want {
+			t.Fatalf("the lease heard %q, want %q: an ended dial says nothing about the relay", l.all(), want)
+		}
+	})
+
 	t.Run("no lease", func(t *testing.T) {
 		opened := false
-		csqtt25OpenRelay = func(csqtt.TURNCredentials, *net.UDPAddr, string, func()) (net.PacketConn, func(), error) {
+		csqtt25OpenRelay = func(context.Context, csqtt.TURNCredentials, *net.UDPAddr, string, func()) (net.PacketConn, func(), error) {
 			opened = true
 			return nil, nil, errors.New("unreachable")
 		}
@@ -522,7 +549,7 @@ func TestCsqtt25WritesAreBoundedOnASocketThatHonoursTheBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(src)
-	if !strings.Contains(s, "r, err := csqtt25DialRelay(creds, server, transport, allocated)") ||
+	if !strings.Contains(s, "r, err := csqtt25DialRelay(ctx, creds, server, transport, allocated)") ||
 		!strings.Contains(s, "return r.packetConn(), r.Close, nil") || strings.Contains(s, "csqtt.DialRelay(") {
 		t.Fatal("the engine's socket is not the bridge's own allocation with a real write deadline (csqtt25_relay.go)")
 	}
@@ -602,4 +629,31 @@ func TestCsqtt25DenialsReadAsTheSameReasonsDo(t *testing.T) {
 		want := csqttReason(&csqtt.DeniedError{Reason: "expired"})
 		waitFor(t, "the denial to reach Swift", func() bool { return csqttGetErrorImpl(h) == want })
 	})
+}
+
+// On a TCP relay leg the window a stream has to answer in behind a wake is
+// ten seconds — the kernel's repeats of what was written into a link still
+// coming back need most of that; on a UDP leg it is the engine's own.
+func TestCsqtt25WakeWindowIsLongerOnATCPLeg(t *testing.T) {
+	if csqtt25WakeWindowTCP != 10*time.Second {
+		t.Fatalf("the TCP leg's wake window is %s, want 10s", csqtt25WakeWindowTCP)
+	}
+	var got csqtt25.ClientConfig
+	prev := csqtt25DialEngine
+	t.Cleanup(func() { csqtt25DialEngine = prev })
+	csqtt25DialEngine = func(_ context.Context, cfg csqtt25.ClientConfig) (csqtt25Engine, error) {
+		got = cfg
+		return newFakeEngine(), nil
+	}
+	server := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 46000}
+	for transport, want := range map[string]time.Duration{"tcp": 10 * time.Second, "udp": 0} {
+		c, err := csqtt25Start(context.Background(), csqttConfig{Password: "pw", NumConns: 3}, server, transport, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+		if got.WakeWindow != want {
+			t.Fatalf("over %s the engine is given a wake window of %s, want %s", transport, got.WakeWindow, want)
+		}
+	}
 }

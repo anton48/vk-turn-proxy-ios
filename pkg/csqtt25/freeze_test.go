@@ -241,9 +241,14 @@ func mergeClock(t *testing.T, d time.Duration) {
 // side, on a clock that stands still.
 func oneMutedStream(t *testing.T, password string) (*Client, *dialer, *fakeServer, *handClock) {
 	t.Helper()
+	return oneMutedStreamCfg(t, password, nil)
+}
+
+func oneMutedStreamCfg(t *testing.T, password string, tweak func(*ClientConfig)) (*Client, *dialer, *fakeServer, *handClock) {
+	t.Helper()
 	clock := useHandClock(t)
 	srv := newFakeServer(t, password)
-	c, d, _ := startClient(t, srv, 1, KeysWrap)
+	c, d, _ := startClientCfg(t, srv, 1, KeysWrap, tweak)
 	eventually(t, "the stream ready", func() bool { return c.Stats().Ready == 1 })
 	srv.set(func() { srv.mute[1] = true })
 	time.Sleep(60 * time.Millisecond) // what the server said before it fell silent has been read
@@ -348,6 +353,32 @@ func TestAVoidedVerdictsWindowCountsOnlyItsOwnListening(t *testing.T) {
 	}
 	clock.arm(t, 100*time.Millisecond, nil) // … and the other half
 	eventually(t, "the stream replaced when the word's own window had run out", func() bool { return d.count(1) >= 2 })
+	if st := c.Stats(); st.WakeDeaf != 1 {
+		t.Fatalf("silent-behind-a-wake verdicts %d, want 1", st.WakeDeaf)
+	}
+}
+
+// The window behind a boundary is the config's when it names one: over a TCP
+// relay leg the asks of a link's first dead seconds wait in the kernel behind
+// its own repeats, and a stream that is alive needs longer than five seconds
+// to say so.
+func TestTheWakeWindowIsTheConfigsWhenItNamesOne(t *testing.T) {
+	quickClocks(t)
+	wakeClocks(t, 200*time.Millisecond, time.Hour, 10*time.Millisecond) // the package's own window: 200 ms
+	mergeClock(t, 50*time.Millisecond)
+	c, d, srv, clock := oneMutedStreamCfg(t, "pw-wake-window", func(cfg *ClientConfig) { cfg.WakeWindow = 600 * time.Millisecond })
+
+	asked := srv.readyCount(1)
+	c.Wake()
+	eventually(t, "the stream asked behind the word", func() bool { return srv.readyCount(1) > asked })
+
+	clock.arm(t, 300*time.Millisecond, nil) // past the package's window, inside the config's
+	time.Sleep(200 * time.Millisecond)
+	if st := c.Stats(); d.count(1) != 1 || st.WakeDeaf != 0 {
+		t.Fatalf("300ms of listening behind the word with a 600ms window: dialled %d time(s), silent-behind-a-wake verdicts %d — want 1 dial and no verdict", d.count(1), st.WakeDeaf)
+	}
+	clock.arm(t, 300*time.Millisecond, nil)
+	eventually(t, "the stream replaced when the config's window had run out", func() bool { return d.count(1) >= 2 })
 	if st := c.Stats(); st.WakeDeaf != 1 {
 		t.Fatalf("silent-behind-a-wake verdicts %d, want 1", st.WakeDeaf)
 	}

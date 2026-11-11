@@ -28,8 +28,11 @@ import (
 // datagrams to peer reach the server (a TURN allocation in production).
 // closeConn releases it and must end a write parked in conn; the client
 // calls it exactly once per dial — at the session's end or at the client's
-// stop, from another goroutine than the one writing. A dial should return
-// when ctx is done; one that does not delays nothing but its own worker.
+// stop, from another goroutine than the one writing. ctx is the set-up's: it
+// is done at the client's stop and when a path change ends a set-up begun on
+// the path that is gone. A dial should return when it is done — an ended dial
+// is not a failure of whatever it dialled; one that does not return delays
+// nothing but its own worker.
 //
 // With ClientConfig.WriteBound set, conn's SetWriteDeadline has to be REAL: a
 // WriteTo the far side has not taken by the deadline returns
@@ -77,6 +80,14 @@ type ClientConfig struct {
 	// stream is not ready from that moment and is replaced — the caller of Send
 	// waited the bound once, not until somebody noticed. 0: no bound.
 	WriteBound time.Duration
+	// WakeWindow is how much listening behind a freeze or the wake word a
+	// stream has to answer in before it is replaced; 0: wakeDeafAfter. Over a
+	// TCP relay leg an ask is not a datagram: what was written into a link
+	// that is still coming back waits in the kernel, the asks that follow
+	// queue behind it, and the kernel repeats on its own schedule — the window
+	// has to outlast that, or a live stream is replaced for the link's first
+	// seconds.
+	WakeWindow time.Duration
 }
 
 // The client's clocks; variables so that a test can shorten them.
@@ -201,6 +212,10 @@ type worker struct {
 	// saying: one control datagram of the serve loop's — an ask, a keepalive —
 	// is in its write (say).
 	saying atomic.Bool
+	// setup ends the dial and the handshake of the session being set up, when
+	// there is one (endSetup): a path change does not wait for a set-up begun
+	// on the path that is gone.
+	setup atomic.Pointer[context.CancelFunc]
 }
 
 // Dial starts worker 1 and returns once the server has answered it with a
@@ -455,6 +470,7 @@ func (c *Client) OnPathChange() {
 	c.cfg.Logf("csqtt25: the path changed: a new identity, every worker starts over")
 	for _, w := range c.workers {
 		w.endNow(errPathChange)
+		w.endSetup()
 	}
 }
 
@@ -644,6 +660,19 @@ func (w *worker) endNow(why error) {
 	w.end(why)
 }
 
+// endSetup ends the dial or the handshake of the session this worker is
+// setting up, if it is: it was begun on a path that is gone, and its own
+// timers — a relay that does not answer, a handshake nobody completes — are
+// seconds. Once the stream has its keys there is nothing left for it to end:
+// the configuration wait and the serve loop hear the notice themselves. (At
+// the client's stop a set-up ends the same way; the worker's loop looks at
+// the stop first.)
+func (w *worker) endSetup() {
+	if end := w.setup.Load(); end != nil {
+		(*end)()
+	}
+}
+
 // ─── a worker ────────────────────────────────────────────────────────────
 
 func (w *worker) send(plain []byte) error {
@@ -817,12 +846,22 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	// that says it is restarting still answers for a moment, and a stream
 	// set up in that moment is one the server that comes back never heard
 	// of: dropped here, the notice would leave it ready on this side alone.
+	//
+	// The set-up's own context is registered BEFORE that look: a path change
+	// from here on ends the dial and the handshake at once (endSetup) — it
+	// does not wait for a relay that will not answer on the path that is gone.
+	sctx, endSetup := context.WithCancel(c.ctx)
+	defer endSetup()
+	w.setup.Store(&endSetup) // left standing: ending a set-up that is over ends nothing
 	select {
 	case <-w.kick:
 	default:
 	}
-	conn, peer, closeConn, err := c.cfg.Dial(c.ctx, w.id)
+	conn, peer, closeConn, err := c.cfg.Dial(sctx, w.id)
 	if err != nil {
+		if sctx.Err() != nil {
+			return readyAt, errPathChange // ended, not failed: no failure wait in front of the next dial
+		}
 		return readyAt, fmt.Errorf("dial: %w", err)
 	}
 	// The socket is given back once — by this session's end or by the stop,
@@ -851,10 +890,13 @@ func (w *worker) session() (readyAt time.Time, err error) {
 		keys = WrapKeys(wrap)
 		split.Seal()
 	default:
-		keys, err = Handshake(c.ctx, split)
+		keys, err = Handshake(sctx, split)
 		if err == nil {
 			c.handshakes.Add(1)
 			break
+		}
+		if sctx.Err() != nil {
+			return readyAt, errPathChange // ended, not failed: no falling back to the password's keys
 		}
 		if c.cfg.Keys == KeysDTLS || c.ctx.Err() != nil {
 			return readyAt, err
@@ -916,6 +958,9 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	tick := time.NewTicker(serveTick)
 	defer tick.Stop()
 	watch := newStreamWatch(c.wakeEpoch.Load())
+	if c.cfg.WakeWindow > 0 {
+		watch.wakeDeaf = c.cfg.WakeWindow
+	}
 	for {
 		select {
 		case <-c.ctx.Done():

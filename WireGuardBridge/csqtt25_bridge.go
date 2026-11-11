@@ -106,12 +106,30 @@ var csqtt25DialEngine = func(ctx context.Context, cfg csqtt25.ClientConfig) (csq
 // of what it carries), opened by the bridge's own dial (csqtt25_relay.go) and
 // handed over as a conn whose write deadline is real: the engine bounds every
 // write with it. Behind a variable for the tests.
-var csqtt25OpenRelay = func(creds csqtt.TURNCredentials, server *net.UDPAddr, transport string, allocated func()) (net.PacketConn, func(), error) {
-	r, err := csqtt25DialRelay(creds, server, transport, allocated)
+var csqtt25OpenRelay = func(ctx context.Context, creds csqtt.TURNCredentials, server *net.UDPAddr, transport string, allocated func()) (net.PacketConn, func(), error) {
+	r, err := csqtt25DialRelay(ctx, creds, server, transport, allocated)
 	if err != nil {
 		return nil, nil, err
 	}
 	return r.packetConn(), r.Close, nil
+}
+
+// csqtt25WakeWindowTCP is how long a stream on a TCP relay leg may take to
+// answer behind a wake before it is replaced — the engine's own window is five
+// seconds, and right for datagrams. Over TCP what is written into a link that
+// is still coming back (a Wi-Fi re-joining behind the wake) waits in the
+// kernel, the repeated asks queue behind it, and the kernel repeats on its
+// own doubling schedule: an answer can need most of ten seconds from a stream
+// with nothing wrong with it (seen in the field: 24 of 30 live streams
+// replaced behind a 17-second sleep). A connection that is really gone is
+// found by its first failed write, not by this window.
+const csqtt25WakeWindowTCP = 10 * time.Second
+
+func csqtt25WakeWindow(transport string) time.Duration {
+	if transport == "tcp" {
+		return csqtt25WakeWindowTCP
+	}
+	return 0 // the engine's own
 }
 
 // csqtt25Client is a csqtt25 engine as the bridge's csqttClient.
@@ -136,6 +154,7 @@ func csqtt25Start(ctx context.Context, cfg csqttConfig, server *net.UDPAddr, tra
 		// Always bounded: a relay that stops taking bytes costs its own stream
 		// the bound once, never the TUN pump until somebody notices.
 		WriteBound: csqtt25.DefaultWriteBound,
+		WakeWindow: csqtt25WakeWindow(transport),
 		// The engine's lines say whose they are themselves ("csqtt25: …").
 		Logf: log.Printf,
 	})
@@ -161,9 +180,15 @@ func (a *csqtt25Client) dialer(server *net.UDPAddr, transport string,
 			return nil, nil, nil, err
 		}
 		began := time.Now()
-		conn, closeRelay, err := csqtt25OpenRelay(cred.TURNCredentials, server, transport, func() { cred.Allocated(began) })
+		conn, closeRelay, err := csqtt25OpenRelay(ctx, cred.TURNCredentials, server, transport, func() { cred.Allocated(began) })
 		if err != nil {
-			cred.Failed(err, began)
+			// A dial that was ENDED — its context done: the path changed under
+			// it, the client is stopping — says nothing about the relay, and
+			// the lease is not told of a failure: the relay's health is judged
+			// by what the lease hears.
+			if ctx.Err() == nil {
+				cred.Failed(err, began)
+			}
 			cred.Release()
 			return nil, nil, nil, err
 		}

@@ -33,6 +33,7 @@ type fakeServer struct {
 	noconf      bool         // every GETCONF is answered NOCONF: the password is right, the server has no address for it
 	denyFirst   int          // …only the first so many
 	denyAbove   int          // worker ids above this get DENIED:invalid_worker_count; 0 = off
+	muteWorkers bool         // GETWORKERS is not answered: the count is learnt from the refusals alone
 	mute        map[int]bool // worker ids the server neither hears nor answers once they are ready
 	dropGetconf map[int]bool // worker ids whose GETCONF gets no answer: they stay in their set-up
 	echo        bool         // a data packet goes back down the stream it came up
@@ -198,6 +199,9 @@ func (s *fakeServer) handle(ses *fakeSession, plain []byte) {
 		s.reply(ses, ReadyOK, 1)
 	case strings.HasPrefix(text, "GETWORKERS:"):
 		s.workersAsks++
+		if s.muteWorkers {
+			return
+		}
 		_, count, _ := strings.Cut(strings.TrimPrefix(text, "GETWORKERS:"), "|")
 		asked, _ := strconv.Atoi(count)
 		agreed := asked
@@ -286,6 +290,7 @@ func (s *fakeServer) repair(via int, seq uint64, ids ...int) {
 
 // dialer hands every worker a loopback socket to the fake server and counts.
 type dialer struct {
+	refuse map[int]int // worker → how many of its next dials fail by themselves
 	server net.Addr
 	mu     sync.Mutex
 	dials  map[int]int
@@ -297,6 +302,7 @@ type dialer struct {
 	hang   map[int]chan bool                       // a dial for this worker blocks until its channel is closed, whatever the context says
 	hold   func(workerID, nth int) <-chan struct{} // a worker's nth dial waits for the channel this names and then goes on
 	began  map[int]int                             // dials begun, the ones still waiting among them
+	deaf   bool                                    // a held dial does not hear its context: let go, it comes back WITH its socket
 }
 
 // gateConn is a socket whose writes can be made to park, as a write into a
@@ -349,20 +355,32 @@ func (g *gateConn) Close() error {
 	return g.PacketConn.Close()
 }
 
-func (d *dialer) dial(_ context.Context, workerID int) (net.PacketConn, net.Addr, func(), error) {
+func (d *dialer) dial(ctx context.Context, workerID int) (net.PacketConn, net.Addr, func(), error) {
 	d.mu.Lock()
 	wait := d.hang[workerID]
 	if d.began == nil {
 		d.began = map[int]int{}
 	}
 	d.began[workerID]++
+	if d.refuse[workerID] > 0 { // this dial fails by itself, at once
+		d.refuse[workerID]--
+		d.mu.Unlock()
+		return nil, nil, nil, errors.New("the relay said no")
+	}
 	var held <-chan struct{}
 	if d.hold != nil {
 		held = d.hold(workerID, d.began[workerID])
 	}
+	deaf := d.deaf
 	d.mu.Unlock()
-	if held != nil {
-		<-held
+	if held != nil && deaf {
+		<-held // the dial that had its answer as it was being ended: it returns a stream all the same
+	} else if held != nil {
+		select {
+		case <-held:
+		case <-ctx.Done(): // a held dial is one that waits for its far side: it ends with its context
+			return nil, nil, nil, ctx.Err()
+		}
 	}
 	if wait != nil {
 		<-wait
@@ -462,11 +480,21 @@ func eventually(t *testing.T, what string, cond func() bool) {
 
 func startClient(t *testing.T, srv *fakeServer, workers int, keys KeyMode) (*Client, *dialer, *delivered) {
 	t.Helper()
+	return startClientCfg(t, srv, workers, keys, nil)
+}
+
+// startClientCfg is startClient with a hand on the config.
+func startClientCfg(t *testing.T, srv *fakeServer, workers int, keys KeyMode, tweak func(*ClientConfig)) (*Client, *dialer, *delivered) {
+	t.Helper()
 	d := &dialer{server: srv.sock.LocalAddr(), dials: map[int]int{}}
 	got := &delivered{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c, err := Dial(ctx, ClientConfig{Password: srv.password, Workers: workers, Keys: keys, Dial: d.dial, Deliver: got.take})
+	cfg := ClientConfig{Password: srv.password, Workers: workers, Keys: keys, Dial: d.dial, Deliver: got.take}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	c, err := Dial(ctx, cfg)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -624,10 +652,16 @@ func TestTheClientFollowsTheAgreedWorkerCount(t *testing.T) {
 
 // A worker the server refuses for its number is parked, not asked again and
 // again; the ones below it carry on.
+//
+// The server here says no count at all — neither in its configuration nor to
+// GETWORKERS: the refusals are all the client has. (A server that refused
+// worker 3 and then answered GETWORKERS with four would raise the count back
+// behind the refusals whenever its answer came last, and the refused workers
+// would dial once more: the fake did, and under load that order came up.)
 func TestAWorkerRefusedForItsNumberIsParked(t *testing.T) {
 	quickClocks(t)
 	srv := newFakeServer(t, "pw-above")
-	srv.set(func() { srv.sayWorkers, srv.denyAbove = false, 2 })
+	srv.set(func() { srv.sayWorkers, srv.denyAbove, srv.muteWorkers = false, 2, true })
 	c, d, _ := startClient(t, srv, 4, KeysWrap)
 	eventually(t, "the count settles at two", func() bool { st := c.Stats(); return st.Ready == 2 && st.Target == 2 })
 	time.Sleep(400 * time.Millisecond)

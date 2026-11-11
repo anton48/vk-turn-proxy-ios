@@ -101,11 +101,17 @@ func TestAPathChangeEndsAWaitBetweenSessions(t *testing.T) {
 // A notice of the server's that is still waiting for a worker in its set-up
 // must not turn the path change into a failure: the path change takes its
 // place, and the worker starts over at once.
+//
+// The dial here is one the path change cannot end — it comes back with its
+// stream all the same, as a dial does that had its answer the moment it was
+// told (a dial that CAN be ended returns the path change by itself and never
+// looks at the notice: setup_test.go). Then the notice is all the session has
+// to go by, in its configuration wait, and it has to be the path change.
 func TestAPathChangeOutranksAnOlderNoticeStillPending(t *testing.T) {
 	quickClocks(t)
 	longBackOff(t)
 	srv := newFakeServer(t, "pw-path-3")
-	d := &dialer{server: srv.sock.LocalAddr(), dials: map[int]int{}}
+	d := &dialer{server: srv.sock.LocalAddr(), dials: map[int]int{}, deaf: true}
 	release := make(chan struct{})
 	var once sync.Once
 	let := func() { once.Do(func() { close(release) }) }

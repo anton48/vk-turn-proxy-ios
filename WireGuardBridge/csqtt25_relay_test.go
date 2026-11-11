@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -209,7 +211,7 @@ func dialCarryAndBound(t *testing.T, transport string) {
 	}
 	defer server.Close()
 	allocated := 0
-	r, err := csqtt25DialRelay(csqtt.TURNCredentials{Username: "u", Password: "pw", Address: relayAddr},
+	r, err := csqtt25DialRelay(context.Background(), csqtt.TURNCredentials{Username: "u", Password: "pw", Address: relayAddr},
 		server.LocalAddr().(*net.UDPAddr), transport, func() { allocated++ })
 	if err != nil {
 		t.Fatalf("the dial: %v", err)
@@ -251,7 +253,7 @@ func dialCarryAndBound(t *testing.T, transport string) {
 // opened is given back.
 func TestCsqtt25DialRelaySaysItsFailuresAsThe219DialDoes(t *testing.T) {
 	server := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
-	if _, err := csqtt25DialRelay(csqtt.TURNCredentials{}, server, "sctp", nil); err == nil || err.Error() != `unknown TURN transport "sctp"` {
+	if _, err := csqtt25DialRelay(context.Background(), csqtt.TURNCredentials{}, server, "sctp", nil); err == nil || err.Error() != `unknown TURN transport "sctp"` {
 		t.Fatalf("an unknown transport: %v", err)
 	}
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -260,13 +262,13 @@ func TestCsqtt25DialRelaySaysItsFailuresAsThe219DialDoes(t *testing.T) {
 	}
 	dead := ln.Addr().String()
 	ln.Close() // nobody listens there now
-	_, err = csqtt25DialRelay(csqtt.TURNCredentials{Username: "u", Password: "pw", Address: dead}, server, "tcp", nil)
+	_, err = csqtt25DialRelay(context.Background(), csqtt.TURNCredentials{Username: "u", Password: "pw", Address: dead}, server, "tcp", nil)
 	if err == nil || len(err.Error()) < 18 || err.Error()[:18] != "dial tcp to relay:" {
 		t.Fatalf("a relay that refuses the connection: %v", err)
 	}
 	// A credential the relay does not know: refused at the Allocate, and the acceptance is never told.
 	told := 0
-	_, err = csqtt25DialRelay(csqtt.TURNCredentials{Username: "nobody", Password: "x", Address: relayTURN(t, "tcp")}, server, "tcp", func() { told++ })
+	_, err = csqtt25DialRelay(context.Background(), csqtt.TURNCredentials{Username: "nobody", Password: "x", Address: relayTURN(t, "tcp")}, server, "tcp", func() { told++ })
 	if err == nil || len(err.Error()) < 14 || err.Error()[:14] != "turn allocate:" || told != 0 {
 		t.Fatalf("a refused Allocate: %v (the acceptance told %d time(s))", err, told)
 	}
@@ -289,7 +291,7 @@ func TestCsqtt25DialRelayTellsTheAcceptanceFirstAndStatesItsFamily(t *testing.T)
 	if alloc < 0 || told < 0 || perm < 0 || !(alloc < told && told < perm) {
 		t.Fatalf("the Allocate at %d, the acceptance told at %d, the permission at %d — want them in that order", alloc, told, perm)
 	}
-	for _, want := range []string{`net.ListenUDP("udp4",`, `.Dial("tcp4", creds.Address)`, "RequestedAddressFamily: family,"} {
+	for _, want := range []string{`net.ListenUDP("udp4",`, `.DialContext(ctx, "tcp4", creds.Address)`, "RequestedAddressFamily: family,"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("the dial does not state its address family: %s is gone", want)
 		}
@@ -397,5 +399,148 @@ func TestCsqtt25RelayAClearingThatLandsBehindTheClosesDeadlineLeavesTheCloseBoun
 	set := ctl.deadlines()
 	if len(set) == 0 || set[len(set)-1].IsZero() {
 		t.Fatalf("the last write deadline put on the control socket is none (%d set): the close's budget has to stand there", len(set))
+	}
+}
+
+// blackHole is a relay that takes the connection — or the datagram — and never
+// answers: the path that is gone, as a dial sees it.
+func blackHole(t *testing.T, transport string) string {
+	t.Helper()
+	if transport == "udp" {
+		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = pc.Close() })
+		return pc.LocalAddr().String()
+	}
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var taken []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			taken = append(taken, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		for _, c := range taken {
+			_ = c.Close()
+		}
+		mu.Unlock()
+	})
+	return ln.Addr().String()
+}
+
+// 🚨 A dial ends with its context: a path change does not wait for a relay
+// that will not answer on the path that is gone. Left alone, an Allocate
+// nobody answers runs pion's whole ladder of repeats — tens of seconds.
+func TestCsqtt25DialRelayIsEndedByItsContext(t *testing.T) {
+	server := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+	for _, transport := range []string{"tcp", "udp"} {
+		t.Run(transport, func(t *testing.T) {
+			addr := blackHole(t, transport)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			told := 0
+			done := make(chan error, 1)
+			go func() {
+				_, err := csqtt25DialRelay(ctx, csqtt.TURNCredentials{Username: "u", Password: "pw", Address: addr}, server, transport, func() { told++ })
+				done <- err
+			}()
+			time.Sleep(150 * time.Millisecond) // the dial is waiting for the relay's answer
+			ended := time.Now()
+			cancel()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatalf("a dial whose relay never answered returned no error")
+				}
+				if took := time.Since(ended); took > time.Second {
+					t.Fatalf("the dial returned %s after its context was done, want at once", took.Round(10*time.Millisecond))
+				}
+				if told != 0 {
+					t.Fatalf("an allocation nobody accepted was told %d time(s)", told)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("the dial had not returned 5s after its context was done: it goes on waiting for the relay")
+			}
+		})
+	}
+}
+
+// An allocation the relay had ACCEPTED when the dial was ended used a seat:
+// it is told (the lease has to know), and it is given back — the relay holds
+// nothing of it afterwards (relayTURN's cleanup counts the allocations left).
+func TestCsqtt25DialRelayEndedBehindAnAcceptedAllocationGivesItBack(t *testing.T) {
+	for _, transport := range []string{"tcp", "udp"} {
+		t.Run(transport, func(t *testing.T) {
+			relayAddr := relayTURN(t, transport)
+			server := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			told := 0
+			r, err := csqtt25DialRelay(ctx, csqtt.TURNCredentials{Username: "u", Password: "pw", Address: relayAddr}, server, transport,
+				func() { told++; cancel() }) // the path changes the moment the relay has accepted
+			if r != nil || !errors.Is(err, context.Canceled) {
+				if r != nil {
+					r.Close()
+				}
+				t.Fatalf("a dial ended behind its accepted allocation returned (relay: %v) %v, want none and the context's own error", r != nil, err)
+			}
+			if told != 1 {
+				t.Fatalf("the acceptance was told %d time(s), want once: the seat was used", told)
+			}
+		})
+	}
+}
+
+type closeCounter struct{ n atomic.Int32 }
+
+func (c *closeCounter) Close() { c.n.Add(1) }
+
+// The waits of an ended dial are failed AGAIN AND AGAIN until the dial is
+// over — once is not enough: a transaction that begins a moment behind the
+// one close would wait out its whole ladder — never before the context is
+// done, and never after stop.
+func TestCsqtt25EndWaitsOnClosesAgainAndAgainUntilStopped(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var tc closeCounter
+	stop := csqtt25EndWaitsOn(ctx, &tc)
+	time.Sleep(60 * time.Millisecond)
+	if n := tc.n.Load(); n != 0 {
+		t.Fatalf("closed %d time(s) before the context was done", n)
+	}
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+	if n := tc.n.Load(); n < 3 {
+		t.Fatalf("closed %d time(s) in 200ms behind the context's end, want again and again (every %s)", n, csqtt25DialEndEvery)
+	}
+	stop()
+	stop() // twice is as good as once
+	n := tc.n.Load()
+	time.Sleep(80 * time.Millisecond)
+	if got := tc.n.Load(); got != n {
+		t.Fatalf("closed %d more time(s) after stop", got-n)
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	var tc2 closeCounter
+	stop2 := csqtt25EndWaitsOn(ctx2, &tc2)
+	stop2() // the dial was over before its context ended
+	cancel2()
+	time.Sleep(60 * time.Millisecond)
+	if n := tc2.n.Load(); n != 0 {
+		t.Fatalf("closed %d time(s) for a dial that was already over", n)
 	}
 }

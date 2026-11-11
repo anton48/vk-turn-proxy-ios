@@ -16,6 +16,7 @@ package main
 // conn with its write deadline put there.
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -112,7 +113,14 @@ func csqtt25CloseRelay(ctl net.PacketConn, relayed io.Closer, tcClose func()) {
 //
 // The errors are worded as csqtt.DialRelay words them: whoever reads a
 // failed dial's text reads the same text for either protocol.
-func csqtt25DialRelay(creds csqtt.TURNCredentials, server *net.UDPAddr, transport string, allocated func()) (*csqtt25Relay, error) {
+//
+// 🚫 ctx ENDS the dial — the one thing csqtt.DialRelay has no counterpart of:
+// a path change must not wait for a relay that will not answer on the path
+// that is gone (a TCP connect: five seconds; an Allocate: pion's whole ladder
+// of repeats). An ended dial fails like any other — whoever ended it knows by
+// its own context that this was no word about the relay — and an allocation
+// the relay had already accepted is given back under the close's budget.
+func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *net.UDPAddr, transport string, allocated func()) (*csqtt25Relay, error) {
 	var ctl net.PacketConn
 	switch transport {
 	case "udp":
@@ -122,7 +130,7 @@ func csqtt25DialRelay(creds csqtt.TURNCredentials, server *net.UDPAddr, transpor
 		}
 		ctl = uc
 	case "tcp":
-		tcp, err := (&net.Dialer{Timeout: 5 * time.Second}).Dial("tcp4", creds.Address)
+		tcp, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp4", creds.Address)
 		if err != nil {
 			return nil, fmt.Errorf("dial tcp to relay: %w", err)
 		}
@@ -155,8 +163,13 @@ func csqtt25DialRelay(creds csqtt.TURNCredentials, server *net.UDPAddr, transpor
 		_ = ctl.Close()
 		return nil, fmt.Errorf("turn listen: %w", err)
 	}
+	// From here the dial waits for the relay's answers: once ctx is done those
+	// waits are failed, for as long as the dial lasts.
+	stop := csqtt25EndWaitsOn(ctx, tc)
+	defer stop()
 	relayed, err := tc.Allocate()
 	if err != nil {
+		stop()
 		tc.Close()
 		_ = ctl.Close()
 		return nil, fmt.Errorf("turn allocate: %w", err)
@@ -164,7 +177,15 @@ func csqtt25DialRelay(creds csqtt.TURNCredentials, server *net.UDPAddr, transpor
 	if allocated != nil {
 		allocated()
 	}
+	if ctx.Err() != nil {
+		// Accepted, and ended: the seat was used — it is given back, under the
+		// close's budget, and no permission is asked on a dial that is over.
+		stop()
+		csqtt25CloseRelay(ctl, relayed, tc.Close)
+		return nil, fmt.Errorf("relay dial ended behind its allocation: %w", context.Cause(ctx))
+	}
 	if err := tc.CreatePermission(server); err != nil {
+		stop()
 		_ = relayed.Close()
 		tc.Close()
 		_ = ctl.Close()
@@ -175,4 +196,40 @@ func csqtt25DialRelay(creds csqtt.TURNCredentials, server *net.UDPAddr, transpor
 		ctl:     ctl,
 		close:   func() { csqtt25CloseRelay(ctl, relayed, tc.Close) },
 	}, nil
+}
+
+// csqtt25DialEndEvery: how often an ended dial's waits are failed again.
+const csqtt25DialEndEvery = 20 * time.Millisecond
+
+// csqtt25EndWaitsOn fails the TURN client's waiting transactions once ctx is
+// done — and again every csqtt25DialEndEvery until stop. Again, because pion's
+// Close fails what waits at that moment and nothing registered a moment later:
+// an Allocate is two transactions, a permission follows it, and one that
+// begins behind a single Close would run its whole ladder of repeats. stop
+// returns when nothing more will be closed; it may be called more than once.
+func csqtt25EndWaitsOn(ctx context.Context, tc interface{ Close() }) (stop func()) {
+	done, exited := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(exited)
+		select {
+		case <-ctx.Done():
+		case <-done:
+			return
+		}
+		again := time.NewTicker(csqtt25DialEndEvery)
+		defer again.Stop()
+		for {
+			tc.Close()
+			select {
+			case <-done:
+				return
+			case <-again.C:
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-exited
+	}
 }
