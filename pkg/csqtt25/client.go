@@ -220,6 +220,9 @@ type worker struct {
 	// there is one (endSetup): a path change does not wait for a set-up begun
 	// on the path that is gone.
 	setup atomic.Pointer[context.CancelFunc]
+	// took is what the set-up of the session that is ready now took, stretch
+	// by stretch (stages.go) — for the «all ready» line.
+	took atomic.Pointer[streamSetup]
 }
 
 // Dial starts worker 1 and returns once the server has answered it with a
@@ -424,23 +427,28 @@ func (c *Client) rallied() {
 		return
 	}
 	ready := 0
+	var last *streamSetup // the stream that became ready last: the one that set the figure
+	lastID := 0
 	for _, w := range c.workers {
 		if w.ready.Load() {
 			ready++
+			if s := w.took.Load(); s != nil && (last == nil || s.ready.After(last.ready)) {
+				last, lastID = s, w.id
+			}
 		}
 	}
 	if ready < c.target {
 		c.mu.Unlock()
 		return
 	}
-	target, took, from := c.target, time.Since(c.rallyAt), c.rallyFrom
+	target, since, took, from := c.target, c.rallyAt, time.Since(c.rallyAt), c.rallyFrom
 	c.rallyAt = time.Time{}
 	c.mu.Unlock()
 	asked := ""
 	if target != c.cfg.Workers {
 		asked = fmt.Sprintf(" (%d asked)", c.cfg.Workers)
 	}
-	c.cfg.Logf("csqtt25: all %d agreed workers ready%s, %v after %s", target, asked, took.Round(time.Millisecond), from)
+	c.cfg.Logf("csqtt25: all %d agreed workers ready%s, %v after %s%s", target, asked, took.Round(time.Millisecond), from, last.words(lastID, since))
 }
 
 // identity is the pair the client asks under now.
@@ -877,6 +885,7 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	case <-w.kick:
 	default:
 	}
+	began := time.Now()
 	conn, peer, closeConn, err := c.cfg.Dial(sctx, w.id)
 	if err != nil {
 		if sctx.Err() != nil {
@@ -884,6 +893,9 @@ func (w *worker) session() (readyAt time.Time, err error) {
 		}
 		return readyAt, fmt.Errorf("dial: %w", err)
 	}
+	// What the set-up takes, stretch by stretch, for the «all ready» line.
+	stages := dialStages(conn, time.Since(began))
+	keysFrom := time.Now()
 	// The socket is given back once — by this session's end or by the stop,
 	// whichever is first. The stop does it BY ITSELF: a write parked in the
 	// socket keeps this goroutine from ever reaching its own close, and it
@@ -936,6 +948,8 @@ func (w *worker) session() (readyAt time.Time, err error) {
 		}
 		keys = WrapKeys(wrap)
 	}
+	stages = append(stages, Stage{Name: keysStage(c.cfg.Keys), Took: time.Since(keysFrom)})
+	confFrom := time.Now()
 	// The set-up is over: from here a path change is the notice's — the
 	// configuration wait and the serve loop hear it — and the socket is this
 	// session's until its own end. If the set-up's end came FIRST (a dial
@@ -977,12 +991,14 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	if err != nil {
 		return readyAt, err
 	}
+	stages = append(stages, Stage{Name: "configuration", Took: time.Since(confFrom)})
 	c.setConfig(conf)
 	if err := w.send([]byte(ReadyRequest)); err != nil {
 		return readyAt, fmt.Errorf("READY: %w", err)
 	}
 	readyAt = time.Now()
 	w.lastRx.Store(readyAt.UnixNano())
+	w.took.Store(&streamSetup{began: began, ready: readyAt, stages: stages}) // before ready: whoever counts this stream ready finds it
 	w.ready.Store(true)
 	c.sessions.Add(1)
 	c.rallied()

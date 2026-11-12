@@ -27,6 +27,7 @@ import (
 	"github.com/pion/turn/v5"
 
 	"github.com/cacggghp/vk-turn-proxy/pkg/csqtt"
+	"github.com/cacggghp/vk-turn-proxy/pkg/csqtt25"
 )
 
 // csqtt25RelayCloseBudget bounds the ONE write pion makes when an allocation
@@ -52,7 +53,40 @@ type csqtt25Relay struct {
 	// the log when it does.
 	gone atomic.Bool
 	said atomic.Pointer[func()]
+	// stages is what the dial took, stretch by stretch — the connect (TCP), the
+	// allocation, the permission — set before the dial returns; leased is the
+	// wait for the credential in front of it, the dialer's to say (noteLease).
+	// Together they are the conn's DialStages: the engine puts the last-ready
+	// stream's into its «all ready» line.
+	stages []csqtt25.Stage
+	leased atomic.Pointer[time.Duration]
 }
+
+// csqtt25StageClock times a dial's stretches: each mark closes the stretch that
+// began at the mark before it (or at the clock's start).
+type csqtt25StageClock struct {
+	from time.Time
+	list []csqtt25.Stage
+}
+
+func (c *csqtt25StageClock) mark(name string, now time.Time) {
+	c.list = append(c.list, csqtt25.Stage{Name: name, Took: now.Sub(c.from)})
+	c.from = now
+}
+
+// DialStages is csqtt25.DialStager: the wait for this stream's credential, when
+// the dialer has said it, then the dial's own stretches.
+func (c csqtt25RelayConn) DialStages() []csqtt25.Stage {
+	out := make([]csqtt25.Stage, 0, len(c.r.stages)+1)
+	if d := c.r.leased.Load(); d != nil {
+		out = append(out, csqtt25.Stage{Name: "lease", Took: *d})
+	}
+	return append(out, c.r.stages...)
+}
+
+// noteLease is the dialer's word on how long this stream waited for its
+// credential — a pool's pause behind a path change, a park.
+func (c csqtt25RelayConn) noteLease(d time.Duration) { c.r.leased.Store(&d) }
 
 // deallocated reports what the relay said when the close ASKED it to release
 // the allocation — csqtt.Relay.Deallocate's twin; asked is false over TCP and
@@ -149,6 +183,7 @@ func csqtt25CloseRelay(ctl net.PacketConn, relayed io.Closer, tcClose func(), co
 // the relay had already accepted is given back under the close's budget.
 func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *net.UDPAddr, transport string, allocated func()) (*csqtt25Relay, error) {
 	var ctl net.PacketConn
+	clock := csqtt25StageClock{from: time.Now()}
 	switch transport {
 	case "udp":
 		uc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
@@ -162,6 +197,7 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 			return nil, fmt.Errorf("dial tcp to relay: %w", err)
 		}
 		ctl = turn.NewSTUNConn(tcp)
+		clock.mark("connect", time.Now())
 	default:
 		return nil, fmt.Errorf("unknown TURN transport %q", transport)
 	}
@@ -202,6 +238,7 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 		_ = ctl.Close()
 		return nil, fmt.Errorf("turn allocate: %w", err)
 	}
+	clock.mark("allocation", time.Now())
 	if allocated != nil {
 		allocated()
 	}
@@ -233,7 +270,8 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 		}
 		return nil, csqtt25Unreleased(transport, v, failure)
 	}
-	r := &csqtt25Relay{relayed: relayed, ctl: ctl}
+	clock.mark("permission", time.Now())
+	r := &csqtt25Relay{relayed: relayed, ctl: ctl, stages: clock.list}
 	// Over UDP the close asks the relay whether it released the allocation and
 	// keeps the answer for the lease (csqtt_ghost.go); over TCP the connection's
 	// close does it. The conversation is pkg/csqtt's (csqtt.ConfirmDeallocate).

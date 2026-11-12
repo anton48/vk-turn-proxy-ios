@@ -175,6 +175,7 @@ func csqtt25Start(ctx context.Context, cfg csqttConfig, server *net.UDPAddr, tra
 func (a *csqtt25Client) dialer(server *net.UDPAddr, transport string,
 	lease func(context.Context, int) (csqtt.Credential, error)) csqtt25.DialFunc {
 	return func(ctx context.Context, workerID int) (net.PacketConn, net.Addr, func(), error) {
+		asked := time.Now()
 		cred, err := lease(ctx, workerID)
 		if err != nil {
 			return nil, nil, nil, err
@@ -201,6 +202,11 @@ func (a *csqtt25Client) dialer(server *net.UDPAddr, transport string,
 			return nil, nil, nil, err
 		}
 		a.allocRTT.Store(int64(time.Since(began)))
+		// How long the stream waited for its credential is the first stretch of
+		// its set-up: the conn says it with the dial's own (csqtt25.DialStager).
+		if n, ok := conn.(interface{ noteLease(time.Duration) }); ok {
+			n.noteLease(began.Sub(asked))
+		}
 		// A relay that says it has no allocation for this stream's socket ends
 		// the stream by itself (csqtt25_noalloc.go); whose stream it was is said
 		// here, where the worker is known.
