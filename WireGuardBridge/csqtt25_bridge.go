@@ -201,6 +201,14 @@ func (a *csqtt25Client) dialer(server *net.UDPAddr, transport string,
 			return nil, nil, nil, err
 		}
 		a.allocRTT.Store(int64(time.Since(began)))
+		// A relay that says it has no allocation for this stream's socket ends
+		// the stream by itself (csqtt25_noalloc.go); whose stream it was is said
+		// here, where the worker is known.
+		if h, ok := conn.(interface{ onNoAllocation(func()) }); ok {
+			h.onNoAllocation(func() {
+				log.Printf("csqtt25: worker %d: the relay answered a permission refresh with 400 — it has NO allocation for this stream's socket (the mapping changed, or the allocation ran out): the stream ends now", workerID)
+			})
+		}
 		return conn, server, func() {
 			closeRelay()
 			// What the relay said to the close's deallocate goes to the lease

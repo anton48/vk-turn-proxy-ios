@@ -283,10 +283,23 @@ func (l *allocLife) heardError(msg string) {
 		l.refreshEnded() // no answer at all: whether a copy was granted stays unknown — but none leaves later
 		return
 	}
-	if !strings.HasPrefix(msg, pionPermissionRefreshFailed) || !strings.Contains(msg, relayAnswered400) {
+	if !RelayHoldsNoAllocation(msg) {
 		return
 	}
 	l.outOfReach("its permission refresh was answered 400")
+}
+
+// RelayHoldsNoAllocation reports whether msg — a Warn / Error line of pion's TURN
+// client — is a permission refresh the relay answered 400: the relay saying that
+// the socket the request arrived from has NO allocation (the header: it has
+// expired, or the socket's mapping changed and the allocation lives on under the
+// old one). ONE predicate for whoever listens to pion — a native session
+// (heardError) and the bridge's csqtt 2.5 relay (csqtt25_noalloc.go): the words
+// are pion's, read in its source by TestPionStillSaysWhatThisBuildListensFor.
+// Anchored on pion's prefix and on the error-code form — a bare "400" is a port
+// number as often as not.
+func RelayHoldsNoAllocation(msg string) bool {
+	return strings.HasPrefix(msg, pionPermissionRefreshFailed) && strings.Contains(msg, relayAnswered400)
 }
 
 // outOfReach is called when the relay has answered for this socket as for one

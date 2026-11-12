@@ -24,7 +24,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
 
 	"github.com/cacggghp/vk-turn-proxy/pkg/csqtt"
@@ -48,6 +47,11 @@ type csqtt25Relay struct {
 	// dealloc is what the relay said to the close's confirmed deallocate, plus
 	// one — 0 while nothing was asked (a TCP leg, a close not yet made).
 	dealloc atomic.Int32
+	// gone: the relay has said that this socket has no allocation
+	// (csqtt25_noalloc.go) — once; said is what the stream's owner wants put in
+	// the log when it does.
+	gone atomic.Bool
+	said atomic.Pointer[func()]
 }
 
 // deallocated reports what the relay said when the close ASKED it to release
@@ -161,8 +165,9 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 	default:
 		return nil, fmt.Errorf("unknown TURN transport %q", transport)
 	}
-	lf := logging.NewDefaultLoggerFactory()
-	lf.DefaultLogLevel = logging.LogLevelWarn
+	// pion's lines go out as before, and are LISTENED to: a permission refresh
+	// answered 400 ends the stream there and then (csqtt25_noalloc.go).
+	ear := csqtt25NewRelayEar()
 	family := turn.RequestedAddressFamilyIPv4
 	if server != nil && server.IP.To4() == nil {
 		family = turn.RequestedAddressFamilyIPv6
@@ -174,7 +179,7 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 		Password:               creds.Password,
 		Realm:                  "okcdn.ru",
 		Software:               "vk-turn-srtp",
-		LoggerFactory:          lf,
+		LoggerFactory:          ear,
 		RequestedAddressFamily: family,
 	})
 	if err != nil {
@@ -237,6 +242,7 @@ func csqtt25DialRelay(ctx context.Context, creds csqtt.TURNCredentials, server *
 		confirm = func() { r.dealloc.Store(int32(csqtt.ConfirmDeallocate(tc, creds.Username, creds.Password)) + 1) }
 	}
 	r.close = func() { csqtt25CloseRelay(ctl, relayed, tc.Close, confirm) }
+	ear.relay.Store(r) // behind r.close: whoever the ear tells closes a relay that is whole
 	return r, nil
 }
 
