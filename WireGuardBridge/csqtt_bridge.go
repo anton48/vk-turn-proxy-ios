@@ -31,7 +31,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -599,7 +598,7 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 				return
 			}
 		}
-		server, err := net.ResolveUDPAddr("udp4", cfg.Server)
+		server, err := csqttResolveServer(e.id, cfg.Server)
 		if err != nil {
 			e.fail(fmt.Errorf("csqtt server %q: %w", cfg.Server, err))
 			return
