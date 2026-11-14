@@ -190,6 +190,7 @@ type Client struct {
 	voided                                 atomic.Int64  // verdicts a wake word took back (tookBack)
 	voidSaid                               atomic.Uint64 // the wake epoch whose taken-back verdicts the log has been told of: once per word
 	wakeEpoch                              atomic.Uint64 // moved by Wake; every serve loop compares its own copy at each pass (a level, not an edge)
+	wire                                   wireClock     // the rhythm on the wire: every datagram written and heard notes itself here (wire.go)
 }
 
 type worker struct {
@@ -255,6 +256,7 @@ func Dial(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		rallyAt: time.Now(), rallyFrom: "the start",
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.wire.begin(time.Now().UnixNano())
 	for id := 1; id <= cfg.Workers; id++ {
 		c.workers = append(c.workers, &worker{c: c, id: id, kick: make(chan error, 1), wake: make(chan struct{}, 1), nudge: make(chan struct{}, 1)})
 	}
@@ -729,7 +731,9 @@ func (w *worker) send(plain []byte) error {
 		w.failedWrite(err, bound)
 		return err
 	}
-	w.lastTx.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	w.lastTx.Store(now)
+	w.c.wire.note(now, true)
 	w.c.txPackets.Add(1)
 	w.c.txBytes.Add(int64(len(plain)))
 	return nil
@@ -1139,7 +1143,9 @@ func (w *worker) receive(wire []byte, recvC *Cipher) bool {
 		w.c.authFailures.Add(1)
 		return false
 	}
-	w.lastRx.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	w.lastRx.Store(now)
+	w.c.wire.note(now, false)
 	w.take(plain)
 	return true
 }

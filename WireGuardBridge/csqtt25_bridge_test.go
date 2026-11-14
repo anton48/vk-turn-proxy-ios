@@ -37,6 +37,8 @@ type fakeEngine struct {
 	stats   csqtt25.Stats
 	pathChg atomic.Int32
 	wakes   atomic.Int32
+	quiet   csqtt25.WireQuiet // what a take of the wire measure hands out
+	takes   atomic.Int32      // how often it was taken
 }
 
 func newFakeEngine() *fakeEngine {
@@ -68,6 +70,7 @@ func (f *fakeEngine) Stats() csqtt25.Stats           { return f.stats }
 func (f *fakeEngine) Config() csqtt25.ConfigResponse { return f.conf }
 func (f *fakeEngine) OnPathChange()                  { f.pathChg.Add(1) }
 func (f *fakeEngine) Wake()                          { f.wakes.Add(1) }
+func (f *fakeEngine) WireQuiet() csqtt25.WireQuiet   { f.takes.Add(1); return f.quiet }
 func (f *fakeEngine) Done() <-chan struct{}          { return f.done }
 func (f *fakeEngine) Err() error                     { f.errMu.Lock(); defer f.errMu.Unlock(); return f.err }
 func (f *fakeEngine) stop(err error)                 { f.errMu.Lock(); f.err = err; f.errMu.Unlock(); f.Close() }

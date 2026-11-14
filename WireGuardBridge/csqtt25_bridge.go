@@ -85,6 +85,7 @@ type csqtt25Engine interface {
 	Send(pkt []byte) error
 	Close()
 	Stats() csqtt25.Stats
+	WireQuiet() csqtt25.WireQuiet
 	Config() csqtt25.ConfigResponse
 	OnPathChange()
 	Wake()
@@ -281,6 +282,20 @@ func (a *csqtt25Client) StatsLine(tunIn, tunOut int64) string {
 		s.Ready, s.Target, s.Live, s.Workers, s.Sessions, s.Restarts, s.Handshakes, s.Fallbacks, s.Probes, s.Repairs,
 		s.PanelRestarts, s.Unsettled, s.PathChanges, s.Freezes, s.Wakes, s.WakeDeaf, s.Voided, s.WriteStalls, s.DeadWrites,
 		s.NoStream, s.AuthFailures, s.FragsTx, s.FragsRx, a.dropped.Load(), tunIn, tunOut)
+}
+
+// WireLine is the minute's rhythm on the wire, in words: how many datagrams the
+// streams wrote and heard since the line before, the longest stretch without
+// one, and how many stretches of csqtt25.QuietFloor and more there were — what
+// a phone's radio and its sleep see of an idle tunnel, which the counters do
+// not say. 🚨 It TAKES the measure (csqtt25.Client.WireQuiet): the next line's
+// stretch begins here, so it has one caller — the once-a-minute tick
+// (csqttWireLine) — and is never part of the counters' line, which a path
+// event and the stop print too.
+func (a *csqtt25Client) WireLine() string {
+	q := a.eng.WireQuiet()
+	return fmt.Sprintf("csqtt25: wire, the last %v: %d datagram(s) out, %d in; the longest stretch without one %v, %d of %v and more",
+		q.Span.Round(time.Second), q.Out, q.In, q.Longest.Round(100*time.Millisecond), q.Quiet, csqtt25.QuietFloor)
 }
 
 func (a *csqtt25Client) Config() csqtt.ConfigResponse {

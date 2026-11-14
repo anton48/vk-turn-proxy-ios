@@ -799,6 +799,9 @@ func (e *csqttEntry) logStatsEvery(client csqttClient) {
 			return
 		case <-tick.C:
 			log.Printf("csqtt: pathstats tick: %s", csqttLine(client, e.tunIn.Load(), e.tunOut.Load()))
+			if wire := csqttWireLine(client); wire != "" {
+				log.Print(wire)
+			}
 		}
 	}
 }
@@ -1005,6 +1008,17 @@ func csqttLine(c csqttClient, tunIn, tunOut int64) string {
 		return own.StatsLine(tunIn, tunOut)
 	}
 	return csqttStatsLine(c.Stats(), tunIn, tunOut)
+}
+
+// csqttWireLine is the tick's second line: the rhythm on the wire since the
+// tick before, for a client that measures it (2.5's adapter); "" for one that
+// does not. The tick's alone — the measure is a take, and the path-event
+// snapshot and the stop must not start its next stretch.
+func csqttWireLine(c csqttClient) string {
+	if own, ok := c.(interface{ WireLine() string }); ok {
+		return own.WireLine()
+	}
+	return ""
 }
 
 // csqttStatsLine is the ONE wording of the client's counters in the log: the
