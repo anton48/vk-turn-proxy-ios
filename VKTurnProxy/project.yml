@@ -160,6 +160,11 @@ targets:
       # sink: providerConfiguration carries whatever ended up in UserDefaults,
       # and an imported backup is not a trusted source.
       - path: VKTurnProxy/TunnelMTU.swift
+      # EndToEndCheck.swift — the once-a-minute question «does the internet
+      # answer through the tunnel»: its line, its round, its DNS question. Under
+      # VKTurnProxy/ for DirectRouteSync's reason — tools/swiftcheck compiles the
+      # real source; the sockets are PacketTunnel/EndToEndProber.swift.
+      - path: VKTurnProxy/EndToEndCheck.swift
     info:
       path: PacketTunnel/Info.plist
       properties:

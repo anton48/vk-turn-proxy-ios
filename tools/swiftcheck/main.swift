@@ -4147,10 +4147,10 @@ print("The provider's cross-queue state — the watchdog slots behind the lock, 
 do {
     let provider = codeWithoutComments("VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift")
 
-    // (a) The two slots exist, and are reached ONLY as swapWatchdog's key path —
+    // (a) The timer slots exist, and are reached ONLY as swapWatchdog's key path —
     //     one install from the start, one clear from the stop; no bare cancel
     //     or store anywhere (that is the race).
-    for slot in ["_authErrorTimer", "_csqttWatchdog"] {
+    for slot in ["_authErrorTimer", "_csqttWatchdog", "_endToEndTimer"] {
         check(provider.contains("private var \(slot): DispatchSourceTimer?"),
               "the \(slot) slot is declared as a stored optional timer")
         let mentions = provider.components(separatedBy: slot).count - 1
@@ -4193,8 +4193,8 @@ do {
             check(false, "could not find \(start) in the provider")
         }
     }
-    check(provider.components(separatedBy: "timer.resume()").count - 1 == 2,
-          "exactly two timer.resume() calls in the provider (one per watchdog) — the order pins above are not satisfied by a duplicate")
+    check(provider.components(separatedBy: "timer.resume()").count - 1 == 3,
+          "exactly three timer.resume() calls in the provider (the two watchdogs and the end-to-end check, whose own order is pinned in its section) — the order pins above are not satisfied by a duplicate")
 
     // (b) The SSID-fetch callback hops back onto pathMonitorQueue BEFORE it
     //     stores the SSID and runs the event; the path state is written on
@@ -4947,6 +4947,145 @@ do {
     let resolve = tm.range(of: "let overrideHosts = TunnelConfig.turnOverrideHosts(config.turnServerOverrides)")
     check(written != nil && resolve != nil && written!.lowerBound < resolve!.lowerBound, "🚨 the connect logs the override as written before anything acts on the list")
     check(tm.contains("as written in the settings: \\(config.turnServerOverrideText"), "🚨 the line says the field's text, not the parsed list")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// END TO END: does the internet answer THROUGH the tunnel? The extension asks
+// once a minute of awake time (EndToEndCheck — RUN here; EndToEndProber and the
+// provider's wiring — pinned by SHAPE: they compile only with NetworkExtension).
+// What must hold: one line a round, in one order; the first outcome of a
+// question stands; a round speaks once; a round a sleep cut has NO verdict; and
+// every connection of the prober goes through the tunnel's interface — one that
+// does not leaves by the physical network and answers whatever the tunnel does.
+print("")
+print("end to end: the once-a-minute check through the tunnel")
+do {
+    typealias E = EndToEndCheck
+    let all: [E.Probe: E.Outcome] = [.udp: .answered(milliseconds: 48, detail: ""),
+                                     .tls: .answered(milliseconds: 412, detail: "dns 31ms, tcp 70ms, tls 190ms"),
+                                     .tcp: .answered(milliseconds: 63, detail: "")]
+    check(E.line(all, cutBefore: 0) == "end to end: tcp 1.1.1.1:443 answered in 63ms; tls gateway.icloud.com:443 answered in 412ms (dns 31ms, tcp 70ms, tls 190ms); udp dns answered in 48ms",
+          "the line of an answered round: tcp, tls, udp in that order, the set-up's stretches behind tls")
+    let bad: [E.Probe: E.Outcome] = [.tcp: .answered(milliseconds: 63, detail: ""),
+                                     .tls: .unanswered(state: "preparing"),
+                                     .udp: .notAsked(why: "no resolver in the tunnel's settings")]
+    check(E.line(bad, cutBefore: 2) == "end to end: tcp 1.1.1.1:443 answered in 63ms; tls gateway.icloud.com:443 NO ANSWER in 10s (preparing); udp dns not asked (no resolver in the tunnel's settings) — 2 round(s) before it cut by a sleep",
+          "an unanswered question says where it stood, one not asked says why, the rounds a sleep cut are counted")
+    check(E.line([:], cutBefore: 0).components(separatedBy: "NO ANSWER in 10s (no word)").count - 1 == 3,
+          "🚨 a question with no outcome reads as unanswered, never as answered")
+    check(!E.line(all, cutBefore: 0).contains("cut by a sleep"), "no word of cut rounds when there were none")
+    check(E.skipLine("the tunnel is in DIRECT mode") == "end to end: not asked — the tunnel is in DIRECT mode",
+          "the line that says why nothing is asked")
+    check(E.period == 60 && E.patience == 10 && E.patience < E.period,
+          "a round every 60 s of awake time, its patience 10 s — shorter than the period, so two rounds never overlap")
+
+    // A round speaks when its LAST question is answered, once.
+    let round = EndToEndRound(cutBefore: 0)
+    check(round.note(.tcp, .answered(milliseconds: 5, detail: "")) == nil
+          && round.note(.udp, .answered(milliseconds: 7, detail: "")) == nil, "no line before the last answer")
+    check(round.note(.tcp, .unanswered(state: "failed posix 61")) == nil,
+          "a second outcome of one question does not complete the round")
+    check(round.note(.tls, .answered(milliseconds: 9, detail: "")) == "end to end: tcp 1.1.1.1:443 answered in 5ms; tls gateway.icloud.com:443 answered in 9ms; udp dns answered in 7ms",
+          "🚨 the last answer gives the line, and the FIRST outcome of each question is the one in it")
+    check(round.note(.tls, .answered(milliseconds: 1, detail: "")) == nil && round.expire([:]) == nil && round.cut() == false,
+          "a round that has spoken says nothing more and is not there to be cut")
+
+    // Patience over: what is open is unanswered, with the state it stood in.
+    let late = EndToEndRound(cutBefore: 1)
+    _ = late.note(.tcp, .answered(milliseconds: 5, detail: ""))
+    check(late.expire([.tls: "waiting posix 50"]) == "end to end: tcp 1.1.1.1:443 answered in 5ms; tls gateway.icloud.com:443 NO ANSWER in 10s (waiting posix 50); udp dns NO ANSWER in 10s (no word) — 1 round(s) before it cut by a sleep",
+          "at the end of its patience a round says what answered and where the rest stood")
+    check(late.expire([:]) == nil && late.note(.udp, .answered(milliseconds: 3, detail: "")) == nil,
+          "an expired round speaks once and takes no late answer")
+
+    // A sleep: no verdict.
+    let cut = EndToEndRound(cutBefore: 0)
+    _ = cut.note(.tcp, .answered(milliseconds: 5, detail: ""))
+    check(cut.cut() == true && cut.cut() == false, "a sleep cuts an open round, once")
+    check(cut.note(.tls, .answered(milliseconds: 1, detail: "")) == nil
+          && cut.note(.udp, .answered(milliseconds: 1, detail: "")) == nil
+          && cut.expire([:]) == nil,
+          "🚨 a round a sleep cut never speaks — no verdict, least of all «no answer»")
+
+    // The DNS question, byte for byte, and what counts as its answer.
+    let want: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 7] + Array("gateway".utf8)
+        + [6] + Array("icloud".utf8) + [3] + Array("com".utf8) + [0, 0, 1, 0, 1]
+    check(E.dnsQuestion(id: 0x1234, name: "gateway.icloud.com").map { [UInt8]($0) } == want,
+          "the DNS question: the id, recursion desired, one question, the labels, type A, class IN")
+    let label63 = String(repeating: "a", count: 63)
+    check(E.dnsQuestion(id: 1, name: label63 + ".com") != nil, "a label of 63 bytes is a name")
+    for name in ["", "a..b", ".a", "a.", label63 + "a.com", [String](repeating: String(repeating: "a", count: 60), count: 5).joined(separator: ".")] {
+        check(E.dnsQuestion(id: 1, name: name) == nil, "no question for a name that is not one (\(name.count) characters)")
+    }
+    var reply = [UInt8](repeating: 0, count: 12)
+    reply[0] = 0x12; reply[1] = 0x34; reply[2] = 0x81; reply[3] = 0x83
+    check(E.dnsAnswers(Data(reply), id: 0x1234), "any response to the question's id is an answer — the resolver spoke, whatever its code")
+    check(!E.dnsAnswers(Data(reply), id: 0x1235), "a response to another id is none")
+    var echo = reply
+    echo[2] = 0x01
+    check(!E.dnsAnswers(Data(echo), id: 0x1234), "🚨 the question come back unchanged is no answer")
+    check(!E.dnsAnswers(Data(reply.prefix(11)), id: 0x1234), "eleven bytes are no DNS message")
+    check(E.dnsAnswers(Data([9, 9] + reply).dropFirst(2), id: 0x1234), "a slice of a larger buffer is read from its own start")
+
+    check(E.firstResolver("192.0.2.1, 192.0.2.2") == "192.0.2.1" && E.firstResolver(" , 192.0.2.2") == "192.0.2.2"
+          && E.firstResolver("") == nil && E.firstResolver(" , ") == nil,
+          "the resolver asked is the first one the tunnel's settings name")
+    check(E.milliseconds(from: 1_000_000_000, to: 1_063_400_000) == 63 && E.milliseconds(from: 5, to: 5) == 0
+          && E.milliseconds(from: 9, to: 5) == 0, "whole milliseconds; a clock read backwards is zero")
+
+    // The prober: EVERY connection through the tunnel's interface; codes, not texts.
+    let prober = codeWithoutComments("VKTurnProxy/PacketTunnel/EndToEndProber.swift")
+    let made = prober.components(separatedBy: "NWConnection(").count - 1
+    let bound = prober.components(separatedBy: "using: through(").count - 1
+    check(made == 3 && bound == 3,
+          "🚨 the prober makes three connections and every one `using: through(…)` (\(made) made, \(bound) bound)")
+    if let f = prober.range(of: "private func through(") {
+        check(String(prober[f.upperBound...].prefix(200)).contains("requiredInterface = interface"),
+              "🚨 through() requires the tunnel's interface — without it a connection leaves by the physical network")
+    } else {
+        check(false, "the prober has no through()")
+    }
+    check(!prober.contains("localizedDescription") && !prober.contains("debugDescription") && !prober.contains("\\(error)") && !prober.contains("\\(e)"),
+          "the prober says a state word and a numeric code, never an error's text")
+    check(prober.contains("round?.cut() == true") && prober.contains("cutBefore += 1"),
+          "a round the sleep cut is counted for the next line")
+
+    // The provider: the timer in swapWatchdog's discipline (its slot is pinned
+    // with the two others above), the sleep that cuts, the stop that ends, the
+    // start behind the tunnel's own, the tick that asks nothing in DIRECT mode.
+    let provider = codeWithoutComments("VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift")
+    if let s = provider.range(of: "override func sleep("), let w = provider.range(of: "override func wake()") {
+        check(String(provider[s.upperBound..<w.lowerBound]).contains("currentEndToEndProber()?.cutBySleep()"),
+              "🚨 sleep() cuts the round under way — a round across a sleep would read as «no answer»")
+    } else {
+        check(false, "the provider's sleep() / wake() were not found")
+    }
+    if let s = provider.range(of: "override func stopTunnel("), let e = provider.range(of: "backend.turnOff()", range: s.upperBound..<provider.endIndex) {
+        check(String(provider[s.upperBound..<e.lowerBound]).contains("stopEndToEndCheck()"),
+              "stopTunnel ends the check before the backend is turned off")
+    } else {
+        check(false, "the provider's stopTunnel was not found")
+    }
+    check(inOrder(provider, ["self.startCsqttWatchdog(backend)", "completionHandler(nil)", "self.startEndToEndCheck()"]),
+          "the check starts behind the tunnel's own start, for every transport")
+    if let f = provider.range(of: "private func startEndToEndCheck()"), let g = provider.range(of: "private func stopEndToEndCheck()") {
+        let body = String(provider[f.upperBound..<g.lowerBound])
+        check(body.contains("#available(iOS 18.0, *)") && body.contains("virtualInterface"),
+              "the tunnel's interface is asked of the provider, where the system exposes it")
+        check(body.contains("directSync.applied") && body.contains("prober.skip("),
+              "in DIRECT mode nothing is asked, and the log says so")
+        check(body.contains("EndToEndCheck.period") && body.contains("swapWatchdog(\\._endToEndTimer, timer)") && inOrder(body, ["swapWatchdog(\\._endToEndTimer, timer)", "timer.resume()"]),
+              "the timer runs on the check's period and is installed before it is resumed")
+    } else {
+        check(false, "the provider has no startEndToEndCheck / stopEndToEndCheck")
+    }
+    let yml = source("VKTurnProxy/project.yml")
+    if let a = yml.range(of: "\n  PacketTunnel:"), let b = yml.range(of: "\n    info:", range: a.upperBound..<yml.endIndex) {
+        check(String(yml[a.upperBound..<b.lowerBound]).contains("- path: VKTurnProxy/EndToEndCheck.swift"),
+              "EndToEndCheck.swift is compiled into the extension")
+    } else {
+        check(false, "the extension's source list was not found in project.yml")
+    }
 }
 
 print("")

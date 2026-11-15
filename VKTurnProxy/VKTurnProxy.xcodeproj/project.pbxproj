@@ -57,6 +57,7 @@
 		9AF94263F91A1841F2B88B04 /* AdvancedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC23EC10E8345DCDF502ACA0 /* AdvancedView.swift */; };
 		9FC59D2A14AA5E66C86F6C95 /* OSLogReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = B579DDFDDB7800E681CAC9C4 /* OSLogReader.swift */; };
 		A02BF48D27F1B0BCFADA8912 /* ConnectionLinkInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BFB01AD2F5F70DE3F7A4A8C /* ConnectionLinkInbox.swift */; };
+		A043177420000E7D55F20098 /* EndToEndProber.swift in Sources */ = {isa = PBXBuildFile; fileRef = 210F5774B62B2C9C5881E88C /* EndToEndProber.swift */; };
 		A5F981BC28E1E88C8DE0F804 /* SessionServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A54CED450E2D5EC00BF655D8 /* SessionServer.swift */; };
 		A91D8A56BEB9208F5DB59DD6 /* SpeedTestServerPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C7ECFED5F30EC971C412EFC /* SpeedTestServerPicker.swift */; };
 		AACB3A08FC4C5ACF9B5D9FE0 /* VPNActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 284043E2EA6CAC284FF241D3 /* VPNActivityAttributes.swift */; };
@@ -70,6 +71,7 @@
 		C9769AD0AB647DBA7F10F174 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C3A5B4FA5218B9A32CDB5F78 /* SwiftUI.framework */; };
 		CA36FC232FE8100B98B119BA /* TurnOverrideEntry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93F0D4EA1E67023513E43348 /* TurnOverrideEntry.swift */; };
 		CBF9B6203060C546C778DABA /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD358E048E7135E1596359E1 /* AppConfig.swift */; };
+		CE0C468117F9E0FE5E0B3B17 /* EndToEndCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A80C3DC3E88F2B800F79C22 /* EndToEndCheck.swift */; };
 		CFADBA590C4935186A057FB9 /* LiveActivityIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFF216A96C8B2716DA861C50 /* LiveActivityIntents.swift */; };
 		D2419180C3D80C56401E8C88 /* UnseededStartPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A267ADEB4BF4BEA7C448CE /* UnseededStartPolicy.swift */; };
 		D51B685C21E726518A413AF3 /* ConnectionLinkImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 975F526A4188951C5B37166D /* ConnectionLinkImport.swift */; };
@@ -78,6 +80,7 @@
 		E81C2A079BD562EA18ED30FF /* DirectRouteSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1282B32632D21838CCD72924 /* DirectRouteSync.swift */; };
 		EB460C0EF55043B900C0A58A /* DirectOutcome.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E39A2C99999A2CD35D462DF /* DirectOutcome.swift */; };
 		EC655ABF39382FEE687B5F44 /* TunnelBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0637E9F13ED224A520932604 /* TunnelBackend.swift */; };
+		ECC531549ED74B7885A804A9 /* EndToEndCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A80C3DC3E88F2B800F79C22 /* EndToEndCheck.swift */; };
 		EED41432670F89B23A9658A9 /* VKTurnProxyWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 196C853F06BE5F3D3202EA2D /* VKTurnProxyWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		F0801AAE2F21FAF8BBED6622 /* VKCallsAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB18A0573ABD15BB23B9E7D7 /* VKCallsAPI.swift */; };
 		F11AED7C7036E8FA47F81179 /* AppEntitlements.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0725E9EC1D6D9B4E406EB36B /* AppEntitlements.swift */; };
@@ -134,6 +137,7 @@
 		17FC00C95995BA91DADA2EB3 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		196C853F06BE5F3D3202EA2D /* VKTurnProxyWidget.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = VKTurnProxyWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		1C7C4C08873404E9AB6C562A /* ProxyConfigRedaction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyConfigRedaction.swift; sourceTree = "<group>"; };
+		210F5774B62B2C9C5881E88C /* EndToEndProber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndToEndProber.swift; sourceTree = "<group>"; };
 		265AEB27D8C6B50F6E1B6CB8 /* ConnectButtonAction.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectButtonAction.swift; sourceTree = "<group>"; };
 		284043E2EA6CAC284FF241D3 /* VPNActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VPNActivityAttributes.swift; sourceTree = "<group>"; };
 		2842251868A37320A5C238F2 /* UplinkPaceSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UplinkPaceSync.swift; sourceTree = "<group>"; };
@@ -160,6 +164,7 @@
 		6D9ADA67065E63261009BBE2 /* KeyboardDismisser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardDismisser.swift; sourceTree = "<group>"; };
 		6F8FEAB45E642DBC5ACA8FF7 /* SpeedTestLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeedTestLog.swift; sourceTree = "<group>"; };
 		7342F754F29FF238732D4C8A /* VKTurnProxy.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = VKTurnProxy.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		7A80C3DC3E88F2B800F79C22 /* EndToEndCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EndToEndCheck.swift; sourceTree = "<group>"; };
 		7C7ECFED5F30EC971C412EFC /* SpeedTestServerPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeedTestServerPicker.swift; sourceTree = "<group>"; };
 		833BDC3A0FA5D02DCB09DB59 /* ServerProfile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerProfile.swift; sourceTree = "<group>"; };
 		8B1A512B35CE1D505CB1A3CD /* LiveActivityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityController.swift; sourceTree = "<group>"; };
@@ -236,6 +241,7 @@
 			isa = PBXGroup;
 			children = (
 				ABD27AB0E7EC764C51D52D10 /* BridgeHeader.h */,
+				210F5774B62B2C9C5881E88C /* EndToEndProber.swift */,
 				F16CAECB3D91AC18F93D32C0 /* Info.plist */,
 				A01BE3EACAF5D00A44A0D32E /* PacketTunnel.entitlements */,
 				4D06132B25271A4E9DA8F0C6 /* PacketTunnelProvider.swift */,
@@ -287,6 +293,7 @@
 				0E39A2C99999A2CD35D462DF /* DirectOutcome.swift */,
 				1282B32632D21838CCD72924 /* DirectRouteSync.swift */,
 				146B18C17C1A93DCF5F73315 /* DisconnectReason.swift */,
+				7A80C3DC3E88F2B800F79C22 /* EndToEndCheck.swift */,
 				3979E0E80EBC90588B51D4A5 /* Info.plist */,
 				0A5D9D1DEEA757D3BF48825B /* InternetRTTReading.swift */,
 				6D9ADA67065E63261009BBE2 /* KeyboardDismisser.swift */,
@@ -477,6 +484,8 @@
 			files = (
 				F11AED7C7036E8FA47F81179 /* AppEntitlements.swift in Sources */,
 				E81C2A079BD562EA18ED30FF /* DirectRouteSync.swift in Sources */,
+				ECC531549ED74B7885A804A9 /* EndToEndCheck.swift in Sources */,
+				A043177420000E7D55F20098 /* EndToEndProber.swift in Sources */,
 				90CBABBC0C21BE682CF22ACF /* OSLogReader.swift in Sources */,
 				B1B5B221672B08CCCC35BE51 /* PacketTunnelProvider.swift in Sources */,
 				69634039BA6025FF5BECEBF7 /* ProxyConfigRedaction.swift in Sources */,
@@ -518,6 +527,7 @@
 				EB460C0EF55043B900C0A58A /* DirectOutcome.swift in Sources */,
 				50AF389CBE3BAA5A56C452A6 /* DirectRouteSync.swift in Sources */,
 				5A51F39BC5B490E741582E37 /* DisconnectReason.swift in Sources */,
+				CE0C468117F9E0FE5E0B3B17 /* EndToEndCheck.swift in Sources */,
 				26B8F561161C551CA5FB8A9B /* InternetRTTReading.swift in Sources */,
 				E0F6CA7385F3718A0A9CD3FC /* KeyboardDismisser.swift in Sources */,
 				C272EDFB69425D4F95736DE9 /* LiveActivityController.swift in Sources */,
