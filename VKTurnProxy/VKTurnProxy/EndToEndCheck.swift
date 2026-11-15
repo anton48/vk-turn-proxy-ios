@@ -22,6 +22,14 @@
 // 🚨 A round the phone went to sleep under has NO verdict. It is cut, counted,
 // and the count is said by the next line that completes — never «no answer»: a
 // process that did not run heard nothing for a reason of its own.
+// 🚨 Behind a sleep() NO round begins before wake(). The timer's tick reaches
+// the check by a hop through another queue, so a tick that fired before the
+// sleep can arrive behind it — and a round begun then has nobody left to cut it.
+// 🚨 A round the routes change under has no verdict either: DIRECT mode takes
+// the default route out of the tunnel, and what a connection met in between is
+// the change, not the tunnel. It is dropped where the re-apply BEGINS, not at
+// the next minute's tick.
+// (EndToEndDesk below keeps these rules; the sockets only follow it.)
 // 🚨 The line carries state words and numeric codes, never an error's text.
 // 🚨 The period is AWAKE time: the timer's clock stands still while the phone
 // sleeps, so a sleeping night has a round now and then and an awake stretch has
@@ -88,6 +96,17 @@ enum EndToEndCheck {
     static func skipLine(_ why: String) -> String {
         "end to end: not asked — \(why)"
     }
+
+    /// The line of a round that ended without a verdict while the process ran
+    /// (a sleep's cut says nothing at the time — it is counted for the next line).
+    static func droppedLine(_ why: String) -> String {
+        "end to end: a round under way dropped without a verdict — \(why)"
+    }
+
+    /// Why nothing is asked between a sleep() and its wake().
+    static let asleepWhy = "sleep() was called and no wake() since"
+    /// Why a round under way is dropped when DIRECT mode is switched.
+    static let routesWhy = "the routes are being re-applied"
 
     /// Whole milliseconds between two readings of one clock in nanoseconds; a
     /// reading that went backwards is zero.
@@ -167,5 +186,104 @@ final class EndToEndRound {
         guard !closed else { return false }
         closed = true
         return true
+    }
+}
+
+/// WHEN a round may begin and what ends one without a verdict — the check's
+/// bookkeeping between rounds. The prober owns one and only follows it: its
+/// sockets live exactly as long as `round` is there.
+///
+/// Not thread-safe on purpose: every call comes from its owner's ONE serial
+/// queue, in the order the events were handed to that queue. That order is the
+/// guarantee — a sleep() handed over before a late tick is seen before it.
+final class EndToEndDesk {
+    /// The round under way, or nil.
+    private(set) var round: EndToEndRound?
+    /// Rounds a sleep cut since the last line that completed.
+    private var cutBySleep = 0
+    private var saidSkip: String?
+    /// Between sleep() and wake(): no round begins.
+    private var asleep = false
+    private var saidAsleep = false
+    private var stopped = false
+
+    /// A tick: the round to ask — or none, with the line to say if there is one.
+    func begin() -> (round: EndToEndRound?, say: String?) {
+        guard !stopped, round == nil else { return (nil, nil) }
+        if asleep {
+            // Said once a sleep: a wake() that never comes must not read as a
+            // check that simply went quiet.
+            guard !saidAsleep else { return (nil, nil) }
+            saidAsleep = true
+            return (nil, EndToEndCheck.skipLine(EndToEndCheck.asleepWhy))
+        }
+        saidSkip = nil
+        let fresh = EndToEndRound(cutBefore: cutBySleep)
+        round = fresh
+        return (fresh, nil)
+    }
+
+    /// Nothing is asked this minute. A round still under way ends without a
+    /// verdict — what it would say is no longer about the tunnel. The lines to
+    /// say; the reason itself once, until a round runs again.
+    func skip(_ why: String) -> [String] {
+        guard !stopped else { return [] }
+        var lines: [String] = []
+        if drop() { lines.append(EndToEndCheck.droppedLine(why)) }
+        if saidSkip != why {
+            saidSkip = why
+            lines.append(EndToEndCheck.skipLine(why))
+        }
+        return lines
+    }
+
+    /// sleep(): the round under way ends without a verdict and is counted, and
+    /// none begins until woke().
+    func slept() {
+        if drop() { cutBySleep += 1 }
+        asleep = true
+    }
+
+    /// wake(): rounds may begin again.
+    func woke() {
+        asleep = false
+        saidAsleep = false
+    }
+
+    /// The routes are about to be re-applied. The line to say when a round was
+    /// under way.
+    func routesChanging() -> String? {
+        drop() ? EndToEndCheck.droppedLine(EndToEndCheck.routesWhy) : nil
+    }
+
+    /// stopTunnel: no more rounds, no line from the one under way.
+    func stop() {
+        stopped = true
+        _ = drop()
+    }
+
+    /// An outcome of one of `current`'s questions; the round's line when it was
+    /// the last one missing. A round that is no longer the one under way was
+    /// cut when it left (drop) and says nothing — that is the round's own rule.
+    func note(_ current: EndToEndRound, _ probe: EndToEndCheck.Probe, _ outcome: EndToEndCheck.Outcome) -> String? {
+        current.note(probe, outcome).map(spoke)
+    }
+
+    /// `current`'s patience is over; its line — nothing for a round that was cut.
+    func expire(_ current: EndToEndRound, _ states: [EndToEndCheck.Probe: String]) -> String? {
+        current.expire(states).map(spoke)
+    }
+
+    private func spoke(_ line: String) -> String {
+        round = nil
+        cutBySleep = 0
+        return line
+    }
+
+    /// Ends the round under way without a verdict. True when there was one.
+    private func drop() -> Bool {
+        guard let open = round else { return false }
+        round = nil
+        return open.cut()
     }
 }

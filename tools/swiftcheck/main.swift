@@ -5008,8 +5008,15 @@ do {
           "🚨 a round a sleep cut never speaks — no verdict, least of all «no answer»")
 
     // The DNS question, byte for byte, and what counts as its answer.
-    let want: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 7] + Array("gateway".utf8)
-        + [6] + Array("icloud".utf8) + [3] + Array("com".utf8) + [0, 0, 1, 0, 1]
+    // Built by appends, never as one sum of arrays: a chain of `+` over array
+    // literals is an expression some compilers give up on («unable to type-check
+    // this expression in reasonable time») — and then the whole harness does not build.
+    var want: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]
+    for label in ["gateway", "icloud", "com"] {
+        want.append(UInt8(label.utf8.count))
+        want.append(contentsOf: Array(label.utf8))
+    }
+    want.append(contentsOf: [0, 0, 1, 0, 1])
     check(E.dnsQuestion(id: 0x1234, name: "gateway.icloud.com").map { [UInt8]($0) } == want,
           "the DNS question: the id, recursion desired, one question, the labels, type A, class IN")
     let label63 = String(repeating: "a", count: 63)
@@ -5033,6 +5040,134 @@ do {
     check(E.milliseconds(from: 1_000_000_000, to: 1_063_400_000) == 63 && E.milliseconds(from: 5, to: 5) == 0
           && E.milliseconds(from: 9, to: 5) == 0, "whole milliseconds; a clock read backwards is zero")
 
+    // The desk: WHEN a round may begin and what ends one without a verdict.
+    let three: [(E.Probe, E.Outcome)] = [(.tcp, .answered(milliseconds: 5, detail: "")),
+                                         (.tls, .answered(milliseconds: 9, detail: "")),
+                                         (.udp, .answered(milliseconds: 7, detail: ""))]
+    func answerAll(_ desk: EndToEndDesk, _ round: EndToEndRound) -> [String] {
+        three.compactMap { desk.note(round, $0.0, $0.1) }
+    }
+    let plain = "end to end: tcp 1.1.1.1:443 answered in 5ms; tls gateway.icloud.com:443 answered in 9ms; udp dns answered in 7ms"
+    // A round the desk owes at this point. A desk that gives none FAILS here and
+    // the block goes on with a stand-in — a trap would end the harness with no
+    // FAIL line, and a run without one is not a verdict.
+    func owed(_ round: EndToEndRound?, _ what: String) -> EndToEndRound {
+        if let round = round { return round }
+        check(false, what)
+        return EndToEndRound(cutBefore: 0)
+    }
+    check(E.droppedLine("the routes are being re-applied") == "end to end: a round under way dropped without a verdict — the routes are being re-applied",
+          "the line of a round dropped while the process ran")
+
+    do {  // one round at a time; a round that spoke makes room for the next
+        let desk = EndToEndDesk()
+        let first = desk.begin()
+        check(first.round != nil && first.say == nil && desk.round === first.round, "a tick begins a round")
+        let second = desk.begin()
+        check(second.round == nil && second.say == nil && desk.round === first.round, "no second round beside one under way")
+        if let round = first.round {
+            check(answerAll(desk, round) == [plain] && desk.round == nil, "the last answer gives the line and the round is over")
+            check(desk.expire(round, [:]) == nil, "the patience of a round that has spoken says nothing")
+        }
+        check(desk.begin().round != nil, "behind a round that spoke the next tick begins one")
+    }
+
+    do {  // 🚨 the late tick: sleep() first, the tick that fired before it behind it
+        let desk = EndToEndDesk()
+        desk.slept()
+        let late = desk.begin()
+        check(late.round == nil && desk.round == nil,
+              "🚨 a tick that arrives behind a sleep() begins NO round — nobody would be left to cut it")
+        check(late.say == "end to end: not asked — sleep() was called and no wake() since",
+              "the first tick refused in a sleep says why")
+        let again = desk.begin()
+        check(again.round == nil && again.say == nil, "… and the next one in the same sleep says nothing more")
+        desk.woke()
+        let awake = desk.begin()
+        check(awake.round != nil && awake.say == nil, "behind wake() a tick begins a round again")
+        if let round = awake.round {
+            check(answerAll(desk, round) == [plain], "a tick refused in a sleep was no round: nothing is counted as cut")
+        }
+        desk.slept()
+        desk.woke()
+        desk.slept()
+        check(desk.begin().say == "end to end: not asked — sleep() was called and no wake() since",
+              "every sleep says it once — the word is taken back by wake()")
+    }
+
+    do {  // a sleep under a round: cut, counted, said by the next line that completes
+        let desk = EndToEndDesk()
+        let round = owed(desk.begin().round, "no round")
+        _ = desk.note(round, .tcp, .answered(milliseconds: 5, detail: ""))
+        desk.slept()
+        check(desk.round == nil, "a sleep ends the round under way")
+        check(desk.note(round, .tls, .answered(milliseconds: 9, detail: "")) == nil
+              && desk.note(round, .udp, .answered(milliseconds: 7, detail: "")) == nil
+              && desk.expire(round, [.tls: "preparing"]) == nil,
+              "🚨 a round a sleep cut never speaks, whatever arrives behind the thaw")
+        desk.woke()
+        let next = owed(desk.begin().round, "no round behind the wake")
+        check(answerAll(desk, next) == [plain + " — 1 round(s) before it cut by a sleep"],
+              "the cut round is counted by the next line that completes")
+        let third = owed(desk.begin().round, "no third round")
+        check(answerAll(desk, third) == [plain], "… and counted once")
+    }
+
+    do {  // 🚨 DIRECT in the middle of a round
+        let desk = EndToEndDesk()
+        let round = owed(desk.begin().round, "no round")
+        _ = desk.note(round, .tcp, .answered(milliseconds: 5, detail: ""))
+        check(desk.routesChanging() == "end to end: a round under way dropped without a verdict — the routes are being re-applied"
+              && desk.round == nil,
+              "🚨 a re-apply of the routes drops the round under way, there and then, and says so")
+        check(desk.note(round, .tls, .unanswered(state: "failed posix 50")) == nil
+              && desk.note(round, .udp, .unanswered(state: "failed posix 50")) == nil
+              && desk.expire(round, [.tls: "waiting posix 50"]) == nil,
+              "🚨 what the dropped round's connections meet afterwards makes no line — least of all «NO ANSWER»")
+        check(desk.routesChanging() == nil, "a re-apply with no round under way says nothing")
+        let next = owed(desk.begin().round, "no round behind the re-apply")
+        check(answerAll(desk, next) == [plain], "a round the routes dropped is not counted as cut by a sleep")
+    }
+
+    do {  // 🚨 skip() with a round still under way
+        let desk = EndToEndDesk()
+        let round = owed(desk.begin().round, "no round")
+        let why = "the tunnel is in DIRECT mode or between two modes"
+        check(desk.skip(why) == ["end to end: a round under way dropped without a verdict — " + why,
+                                 "end to end: not asked — " + why] && desk.round == nil,
+              "🚨 «nothing is asked» ends a round still under way — it does not only say so")
+        check(answerAll(desk, round) == [] && desk.expire(round, [:]) == nil,
+              "🚨 the skipped round's late outcomes make no line")
+        check(desk.skip(why) == [], "the reason is said once …")
+        check(desk.skip("another") == ["end to end: not asked — another"], "… a new one again")
+        let next = owed(desk.begin().round, "no round behind the skip")
+        _ = answerAll(desk, next)
+        check(desk.skip("another") == ["end to end: not asked — another"],
+              "… and behind a round that ran the reason said LAST is said anew")
+    }
+
+    do {  // the stop
+        let desk = EndToEndDesk()
+        let round = owed(desk.begin().round, "no round")
+        desk.stop()
+        check(desk.round == nil && answerAll(desk, round) == [] && desk.expire(round, [:]) == nil,
+              "a stop ends the round under way without a line")
+        check(desk.begin().round == nil && desk.begin().say == nil && desk.skip("x") == [] && desk.routesChanging() == nil,
+              "behind a stop nothing begins and nothing is said")
+    }
+
+    do {  // an old round's patience running out under a new one
+        let desk = EndToEndDesk()
+        let old = owed(desk.begin().round, "no round")
+        desk.slept()
+        desk.woke()
+        let fresh = owed(desk.begin().round, "no fresh round")
+        check(desk.expire(old, [:]) == nil && desk.round === fresh,
+              "the patience of a round that was cut leaves the one under way alone")
+        check(desk.expire(fresh, [.tcp: "preparing"])?.hasSuffix("— 1 round(s) before it cut by a sleep") == true && desk.round == nil,
+              "a round's own patience ends it with its line")
+    }
+
     // The prober: EVERY connection through the tunnel's interface; codes, not texts.
     let prober = codeWithoutComments("VKTurnProxy/PacketTunnel/EndToEndProber.swift")
     let made = prober.components(separatedBy: "NWConnection(").count - 1
@@ -5047,8 +5182,27 @@ do {
     }
     check(!prober.contains("localizedDescription") && !prober.contains("debugDescription") && !prober.contains("\\(error)") && !prober.contains("\\(e)"),
           "the prober says a state word and a numeric code, never an error's text")
-    check(prober.contains("round?.cut() == true") && prober.contains("cutBefore += 1"),
-          "a round the sleep cut is counted for the next line")
+    check(!prober.contains("EndToEndRound(") && prober.contains("private let desk = EndToEndDesk()"),
+          "🚨 the prober makes no round of its own — when one may begin is the desk's rule")
+    // One function of the prober, to its closing brace — a scan's window is the
+    // construct, never a length.
+    func proberBody(_ name: String) -> String {
+        guard let f = prober.range(of: "func \(name)("),
+              let e = prober.range(of: "\n    }\n", range: f.upperBound..<prober.endIndex) else { return "" }
+        return String(prober[f.upperBound..<e.lowerBound])
+    }
+    check(proberBody("tick").contains("self.begin()"), "a tick asks the desk for a round")
+    for (name, call) in [("skip", "self.desk.skip("), ("cutBySleep", "self.desk.slept()"),
+                         ("routesChanging", "self.desk.routesChanging()"), ("stop", "self.desk.stop()")] {
+        check(inOrder(proberBody(name), [call, "self.settle()"]),
+              "🚨 \(name)() reaches the desk, and behind it the sockets are settled — a dropped round's connections do not live on")
+    }
+    check(proberBody("woke").contains("self.desk.woke()"), "🚨 woke() reaches the desk")
+    check(inOrder(proberBody("settle"), ["guard desk.round == nil else { return }", "connections.forEach { $0.cancel() }", "connections = []"]),
+          "🚨 with no round under way no connection is left open — and none is closed under a round")
+    check(prober.components(separatedBy: "desk.round === current").count - 1 >= 2
+          && prober.contains("self.desk.expire(current, self.states)") && prober.contains("desk.note(current, probe, outcome)"),
+          "a connection's news counts only for the round under way; outcomes and the patience go through the desk")
 
     // The provider: the timer in swapWatchdog's discipline (its slot is pinned
     // with the two others above), the sleep that cuts, the stop that ends, the
@@ -5060,6 +5214,20 @@ do {
     } else {
         check(false, "the provider's sleep() / wake() were not found")
     }
+    if let w = provider.range(of: "override func wake()"), let e = provider.range(of: "override func stopTunnel(", range: w.upperBound..<provider.endIndex) {
+        check(String(provider[w.upperBound..<e.lowerBound]).contains("currentEndToEndProber()?.woke()"),
+              "🚨 wake() lets the rounds begin again — without it the first sleep would end the check for good")
+    } else {
+        check(false, "the provider's wake() / stopTunnel were not found")
+    }
+    if let a = provider.range(of: "private func performDirectApply("), let b = provider.range(of: "private func afterDirectApply(", range: a.upperBound..<provider.endIndex) {
+        check(inOrder(String(provider[a.upperBound..<b.lowerBound]), ["currentEndToEndProber()?.routesChanging()", "setTunnelNetworkSettings(settings)"]),
+              "🚨 a round under way is dropped BEFORE the routes are re-applied, not at the next minute's tick")
+    } else {
+        check(false, "the provider's performDirectApply / afterDirectApply were not found")
+    }
+    check(provider.components(separatedBy: "setTunnelNetworkSettings(").count - 1 == 2,
+          "the routes are applied in two places — the start (before the check runs) and the DIRECT applier; a third must drop the round too")
     if let s = provider.range(of: "override func stopTunnel("), let e = provider.range(of: "backend.turnOff()", range: s.upperBound..<provider.endIndex) {
         check(String(provider[s.upperBound..<e.lowerBound]).contains("stopEndToEndCheck()"),
               "stopTunnel ends the check before the backend is turned off")

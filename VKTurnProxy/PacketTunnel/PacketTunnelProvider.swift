@@ -922,13 +922,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // when thawed, the watchdog (in Go) detects any actually-dead tunnels
         // via lastRecvTime and forces a reconnect. Short freezes don't kill
         // anything because TURN/DTLS state persists across them.
-        // A round of the end-to-end check under way has no verdict across a sleep.
+        // A round of the end-to-end check under way has no verdict across a
+        // sleep, and none begins before wake(): a tick that fired before this
+        // call can still arrive behind it.
         currentEndToEndProber()?.cutBySleep()
         logMsg("sleep() — ignored (connections persist through iOS freeze)")
         completionHandler()
     }
 
     override func wake() {
+        // The end-to-end check may ask again (sleep() stopped it).
+        currentEndToEndProber()?.woke()
         logMsg("wake() — running fast-path health check")
 
         // Ask Go to do a quick tunnel-health check with tighter thresholds
@@ -1480,6 +1484,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // "outside the tunnel" mean "nowhere". Hand DNS back to the system.
             settings.dnsSettings = nil
         }
+
+        // The default route is about to move in or out of the tunnel: a round
+        // of the end-to-end check under way would report the move, not the
+        // tunnel. Dropped HERE — the minute's tick looks at the mode only when
+        // it fires, and a round lasts ten seconds.
+        currentEndToEndProber()?.routesChanging()
 
         let t0 = Date()
         setTunnelNetworkSettings(settings) { [weak self] error in
