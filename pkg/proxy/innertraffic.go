@@ -26,15 +26,29 @@ import (
 // this counts what the phone itself asked and what came back:
 //
 //	tcp  — connections asked (a first SYN), answered (a SYN-ACK), refused (an
-//	       RST to the SYN), silent (asked, and nothing for 10 s of listening);
+//	       RST to the SYN), silent (asked, and nothing for 10 s of listening) —
+//	       and of the silent ones: how many different hosts they were asked
+//	       of, how many over IPv4 and IPv6, how many on the https port, the
+//	       http port and any other;
 //	dns  — questions asked over UDP 53, answered, silent (5 s);
-//	udp  — every other UDP flow that sent, how many heard anything back, how
-//	       many heard nothing for 10 s; the flows to port 443 (QUIC) apart;
+//	udp  — every other UDP flow that sent, how many heard anything back in the
+//	       period, how many were NEVER answered (10 s of listening since the
+//	       flow's first packet and not one packet back); the flows to port 443
+//	       (QUIC) apart;
 //	icmp — what came in, the «unreachable» ones apart.
 //
 // 🚨 It reads headers only — the addresses and ports to tell one flow from
 // another, never a payload beyond a DNS message's two-byte id — and it SAYS
-// counts only: no address, no port, no name reaches the log.
+// counts only: no address, no port, no name reaches the log. Whom the silent
+// connections were asked of is said as counts too: one dead destination and a
+// deaf path read alike in «N silent» and apart in «1 host(s)» / «40 host(s)».
+//
+// 🚨 A flow whose LAST packet was the phone's is an ordinary flow: nearly every
+// QUIC connection ends with an acknowledgement or a close nobody answers. So
+// a UDP flow is given up on only if nothing EVER came back on it — a flow
+// that heard once is never «never answered», whatever it sends later (the
+// first cut counted «sent and nothing heard since» and called seven of ten
+// flows of a healthy run silent).
 //
 // 🚨 «Silent» is counted in LISTENING, never on the wall clock: a process that
 // did not run heard nothing for a reason of its own. The runner steps once a
@@ -52,8 +66,9 @@ const (
 	innerEvery = 60 * time.Second
 	// innerStep: the runner's step — the grain of listening.
 	innerStep = time.Second
-	// innerTCPSilent / innerUDPSilent / innerDNSSilent: listening after which
-	// an unanswered ask is said to be silent.
+	// innerTCPSilent / innerDNSSilent: listening after which an unanswered ask
+	// is said to be silent. innerUDPSilent: listening since a flow's first
+	// packet after which a flow nothing came back on is said never answered.
 	innerTCPSilent = 10 * time.Second
 	innerUDPSilent = 10 * time.Second
 	innerDNSSilent = 5 * time.Second
@@ -86,9 +101,53 @@ type innerPending struct {
 type innerFlow struct {
 	out, in uint32        // packets in the period under way
 	seen    time.Duration // the listening clock at its last packet either way
-	owed    bool          // sent, and nothing heard since
-	since   time.Duration // the listening clock at the first packet still owed
-	said    bool          // already counted as silent
+	first   time.Duration // the listening clock at its first packet
+	heard   bool          // a packet came back on it, at any time in its life
+	said    bool          // already counted as never answered
+}
+
+// innerHost is a far host as the tables keep it.
+type innerHost struct {
+	addr [16]byte
+	v6   bool
+}
+
+// innerSilentSplit says, in counts, whom the connections just found silent
+// were asked of. Counts — never a host, never a port.
+type innerSilentSplit struct {
+	hosts              map[innerHost]struct{}
+	v4, v6             uint64
+	https, http, other uint64
+}
+
+func (s *innerSilentSplit) add(key innerKey) {
+	if s.hosts == nil {
+		s.hosts = map[innerHost]struct{}{}
+	}
+	s.hosts[innerHost{addr: key.remote, v6: key.v6}] = struct{}{}
+	if key.v6 {
+		s.v6++
+	} else {
+		s.v4++
+	}
+	switch key.rport {
+	case 443:
+		s.https++
+	case 80:
+		s.http++
+	default:
+		s.other++
+	}
+}
+
+// String: the split as the line says it; nothing when no connection was found
+// silent.
+func (s *innerSilentSplit) String() string {
+	if s.v4+s.v6 == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d host(s); %d v4 / %d v6; %d https / %d http / %d other)",
+		len(s.hosts), s.v4, s.v6, s.https, s.http, s.other)
 }
 
 // innerPacket is what one inner packet's headers say.
@@ -280,14 +339,11 @@ func (t *InnerTraffic) Out(p []byte) {
 				t.untracked++
 				return
 			}
-			f = &innerFlow{}
+			f = &innerFlow{first: t.listened}
 			t.udp[key] = f
 		}
 		f.out++
 		f.seen = t.listened
-		if !f.owed {
-			f.owed, f.since, f.said = true, t.listened, false
-		}
 	case protoICMP, protoICMPv6:
 	default:
 		t.other++
@@ -341,7 +397,7 @@ func (t *InnerTraffic) In(p []byte) {
 		if f := t.udp[key]; f != nil {
 			f.in++
 			f.seen = t.listened
-			f.owed, f.said = false, false
+			f.heard = true
 		}
 	case protoICMP:
 		t.icmpIn++
@@ -380,12 +436,13 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 	awake := t.listened - t.lastTake
 	t.lastTake = t.listened
 
-	silent := func(table map[innerKey]*innerPending, after time.Duration) (n uint64) {
+	silent := func(table map[innerKey]*innerPending, after time.Duration, each func(innerKey)) (n uint64) {
 		for key, ask := range table {
 			age := t.listened - ask.asked
 			if !ask.said && age >= after {
 				ask.said = true
 				n++
+				each(key)
 			}
 			if age >= innerForget {
 				delete(table, key)
@@ -393,8 +450,9 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 		}
 		return n
 	}
-	tcpSilent := silent(t.tcp, innerTCPSilent)
-	dnsSilent := silent(t.dns, innerDNSSilent)
+	var split innerSilentSplit
+	tcpSilent := silent(t.tcp, innerTCPSilent, split.add)
+	dnsSilent := silent(t.dns, innerDNSSilent, func(innerKey) {})
 
 	var sent, heard, udpSilent, quicSent, quicHeard, quicSilent uint64
 	for key, f := range t.udp {
@@ -411,7 +469,7 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 				}
 			}
 		}
-		if f.owed && !f.said && t.listened-f.since >= innerUDPSilent {
+		if !f.heard && !f.said && t.listened-f.first >= innerUDPSilent {
 			f.said = true
 			udpSilent++
 			if quic {
@@ -445,11 +503,11 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "inner, the last %s: %d pkt out / %d in", span, t.pktOut, t.pktIn)
-	fmt.Fprintf(&b, "; tcp: %d asked (%d SYN), %d answered%s, %d refused, %d silent %s+, %d RST in",
-		t.tcpAsked, t.syn, t.tcpAnswered, late(t.tcpLate), t.tcpRefused, tcpSilent, innerTCPSilent, t.rstIn)
+	fmt.Fprintf(&b, "; tcp: %d asked (%d SYN), %d answered%s, %d refused, %d silent %s+%s, %d RST in",
+		t.tcpAsked, t.syn, t.tcpAnswered, late(t.tcpLate), t.tcpRefused, tcpSilent, innerTCPSilent, split.String(), t.rstIn)
 	fmt.Fprintf(&b, "; dns: %d asked (%d sent), %d answered%s, %d silent %s+",
 		t.dnsAsked, t.dnsSent, t.dnsAnswered, late(t.dnsLate), dnsSilent, innerDNSSilent)
-	fmt.Fprintf(&b, "; udp: %d flows sent, %d heard, %d silent %s+ (quic %d / %d / %d)",
+	fmt.Fprintf(&b, "; udp: %d flows sent, %d heard, %d never answered %s+ (quic %d / %d / %d)",
 		sent, heard, udpSilent, innerUDPSilent, quicSent, quicHeard, quicSilent)
 	fmt.Fprintf(&b, "; icmp in: %d", t.icmpIn)
 	if t.icmpUnreach > 0 {

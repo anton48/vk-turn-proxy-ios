@@ -20,6 +20,9 @@ var (
 	innerFar4b  = []byte{203, 0, 113, 8}
 	innerPhone6 = append([]byte{0xfd, 0}, append(make([]byte, 13), 2)...)
 	innerFar6   = append([]byte{0x20, 0x01, 0x0d, 0xb8}, append(make([]byte, 11), 7)...)
+	// innerFar6twin: an IPv6 address whose first four bytes are innerFar4's and
+	// the rest zero — the same sixteen bytes a table keeps for the IPv4 host.
+	innerFar6twin = append([]byte{203, 0, 113, 7}, make([]byte, 12)...)
 )
 
 func ip4(proto byte, src, dst, l4 []byte) []byte {
@@ -67,6 +70,14 @@ func dnsMsg(id uint16) []byte {
 func syn(port uint16) []byte { return ip4(protoTCP, innerPhone4, innerFar4, tcpSeg(port, 443, tcpSYN)) }
 func synAck(port uint16) []byte {
 	return ip4(protoTCP, innerFar4, innerPhone4, tcpSeg(443, port, tcpSYN|tcpACK))
+}
+
+// synTo: a connection asked of `far` on `dport`, over the family the address has.
+func synTo(port uint16, far []byte, dport uint16) []byte {
+	if len(far) == 16 {
+		return ip6(protoTCP, innerPhone6, far, tcpSeg(port, dport, tcpSYN))
+	}
+	return ip4(protoTCP, innerPhone4, far, tcpSeg(port, dport, tcpSYN))
 }
 func rstTo(port uint16) []byte {
 	return ip4(protoTCP, innerFar4, innerPhone4, tcpSeg(443, port, tcpRST|tcpACK))
@@ -162,7 +173,7 @@ func TestATCPConnectionIsAskedOnceAndAnsweredRefusedOrSilent(t *testing.T) {
 	}
 	// One more second of listening: the two nobody answered are silent — said once.
 	listen(tr, 1)
-	if line := tr.Take(60 * time.Second); !strings.Contains(line, "tcp: 0 asked (0 SYN), 0 answered, 0 refused, 2 silent 10s+, 0 RST in") {
+	if line := tr.Take(60 * time.Second); !strings.Contains(line, "tcp: 0 asked (0 SYN), 0 answered, 0 refused, 2 silent 10s+ (1 host(s); 2 v4 / 0 v6; 2 https / 0 http / 0 other), 0 RST in") {
 		t.Fatalf("at 10 s of listening the two unanswered asks must be silent: %q", line)
 	}
 	tr.Out(syn(50002)) // still asking — a repeat, a packet, not a new connection
@@ -185,7 +196,7 @@ func TestSilenceIsCountedInListeningNotOnTheWallClock(t *testing.T) {
 	// A suspension: one step five minutes late, then the line. Nothing was listened to.
 	tr.Step(5*time.Minute, time.Second)
 	line := tr.Take(5*time.Minute + time.Second)
-	for _, want := range []string{"0 silent 10s+, 0 RST in", "0 silent 5s+", "udp: 1 flows sent, 0 heard, 0 silent 10s+"} {
+	for _, want := range []string{"0 silent 10s+, 0 RST in", "0 silent 5s+", "udp: 1 flows sent, 0 heard, 0 never answered 10s+"} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("across a suspension nothing may be called silent\n got %q\nwant it to hold %q", line, want)
 		}
@@ -205,8 +216,8 @@ func TestSilenceIsCountedInListeningNotOnTheWallClock(t *testing.T) {
 		t.Fatalf("at 5 s of listening the question is silent and the connection is not yet: %q", line)
 	}
 	listen(tr, 5)
-	if line := tr.Take(time.Minute); !strings.Contains(line, "tcp: 0 asked (0 SYN), 0 answered, 0 refused, 1 silent 10s+") || !strings.Contains(line, "udp: 0 flows sent, 0 heard, 1 silent 10s+ (quic 0 / 0 / 1)") {
-		t.Fatalf("at 10 s of listening the connection and the flow are silent: %q", line)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "tcp: 0 asked (0 SYN), 0 answered, 0 refused, 1 silent 10s+") || !strings.Contains(line, "udp: 0 flows sent, 0 heard, 1 never answered 10s+ (quic 0 / 0 / 1)") {
+		t.Fatalf("at 10 s of listening the connection is silent and the flow never answered: %q", line)
 	}
 }
 
@@ -225,12 +236,12 @@ func TestADNSQuestionIsMatchedByItsPortItsServerAndItsID(t *testing.T) {
 	if want := "dns: 3 asked (4 sent), 1 answered, 2 silent 5s+"; !strings.Contains(line, want) {
 		t.Fatalf("\n got %q\nwant it to hold %q", line, want)
 	}
-	if !strings.Contains(line, "udp: 0 flows sent, 0 heard, 0 silent 10s+ (quic 0 / 0 / 0)") {
+	if !strings.Contains(line, "udp: 0 flows sent, 0 heard, 0 never answered 10s+ (quic 0 / 0 / 0)") {
 		t.Fatalf("a DNS question is not one of the other UDP flows: %q", line)
 	}
 }
 
-func TestOtherUDPFlowsSentHeardAndSilent(t *testing.T) {
+func TestOtherUDPFlowsSentHeardAndNeverAnswered(t *testing.T) {
 	tr := newInnerTraffic()
 	tr.Out(quicOut(41000))
 	tr.Out(quicOut(41000))
@@ -238,24 +249,106 @@ func TestOtherUDPFlowsSentHeardAndSilent(t *testing.T) {
 	tr.Out(ip4(protoUDP, innerPhone4, innerFar4, udpSeg(42000, 3478, make([]byte, 20))))
 	tr.In(quicIn(41000))
 	tr.In(quicIn(49999)) // for a flow that never sent: not a flow of ours
-	listen(tr, 10)
-	line := tr.Take(time.Minute)
-	if want := "udp: 3 flows sent, 1 heard, 2 silent 10s+ (quic 2 / 1 / 1)"; !strings.Contains(line, want) {
-		t.Fatalf("\n got %q\nwant it to hold %q", line, want)
-	}
-	// Heard at last: no longer owed; sending again starts a new wait.
-	tr.In(quicIn(41001))
-	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 0 flows sent, 0 heard, 0 silent 10s+") {
-		t.Fatalf("an answer alone is no flow that sent: %q", line)
-	}
-	tr.Out(quicOut(41001))
 	listen(tr, 9)
-	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 1 flows sent, 0 heard, 0 silent 10s+") {
-		t.Fatalf("an answer ends the wait, a new packet begins another: %q", line)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 3 flows sent, 1 heard, 0 never answered 10s+ (quic 2 / 1 / 0)") {
+		t.Fatalf("at 9 s of listening no flow is given up on yet: %q", line)
 	}
 	listen(tr, 1)
-	if line := tr.Take(time.Minute); !strings.Contains(line, "0 flows sent, 0 heard, 1 silent 10s+ (quic 0 / 0 / 1)") {
-		t.Fatalf("the new wait runs out by itself: %q", line)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 0 flows sent, 0 heard, 2 never answered 10s+ (quic 0 / 0 / 1)") {
+		t.Fatalf("at 10 s of listening since their first packet the two that heard nothing: %q", line)
+	}
+	// Said once, however long the flow goes on sending into silence.
+	tr.Out(ip4(protoUDP, innerPhone4, innerFar4, udpSeg(42000, 3478, make([]byte, 20))))
+	listen(tr, 30)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 1 flows sent, 0 heard, 0 never answered 10s+") {
+		t.Fatalf("a flow nobody answers is said once: %q", line)
+	}
+	// An answer alone is no flow that sent.
+	tr.In(quicIn(41001))
+	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 0 flows sent, 0 heard, 0 never answered 10s+") {
+		t.Fatalf("an answer alone is no flow that sent: %q", line)
+	}
+}
+
+// 🚨 The ordinary life of a flow: it opens, exchanges, and ENDS with a packet of
+// the phone's that nobody answers (an acknowledgement, a close). That is not a
+// flow nobody answered — on a phone it was seven of ten flows of a healthy run.
+func TestAFlowThatHeardAnAnswerIsNeverSaidUnanswered(t *testing.T) {
+	tr := newInnerTraffic()
+	tr.Out(quicOut(43000))
+	tr.In(quicIn(43000))
+	tr.Out(quicOut(43000))
+	tr.In(quicIn(43000))
+	tr.Out(quicOut(43000)) // its last word: the phone's
+	tr.Out(quicOut(43000))
+	listen(tr, 60)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 1 flows sent, 1 heard, 0 never answered 10s+ (quic 1 / 1 / 0)") {
+		t.Fatalf("a flow that ended the ordinary way was called unanswered: %q", line)
+	}
+	// Minutes later it speaks again into silence: still a flow that was answered.
+	tr.Out(quicOut(43000))
+	listen(tr, 60)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 1 flows sent, 0 heard, 0 never answered 10s+ (quic 1 / 0 / 0)") {
+		t.Fatalf("a flow that was answered once is not «never answered» later: %q", line)
+	}
+	// The ten seconds run from the flow's FIRST packet, not from its latest.
+	tr.Out(quicOut(44000))
+	listen(tr, 6)
+	tr.Out(quicOut(44000))
+	listen(tr, 3)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "udp: 1 flows sent, 0 heard, 0 never answered 10s+") {
+		t.Fatalf("nine seconds of listening since a flow's first packet is too early to give it up: %q", line)
+	}
+	listen(tr, 1)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "1 never answered 10s+ (quic 0 / 0 / 1)") {
+		t.Fatalf("ten seconds of listening since a flow's first packet with nothing heard: %q", line)
+	}
+	// A flow nobody used for two minutes is forgotten: the same ports later are a
+	// new flow, and a new flow nobody answers is said.
+	listen(tr, 120)
+	tr.Take(time.Minute)
+	tr.Out(quicOut(44000))
+	listen(tr, 10)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "1 never answered 10s+ (quic 1 / 0 / 1)") {
+		t.Fatalf("a forgotten flow's ports are a new flow: %q", line)
+	}
+}
+
+// 🚨 Whom the silent connections were asked of — as counts: one dead host and a
+// deaf path read the same in «N silent» and apart here.
+func TestSilentConnectionsAreSplitByHostFamilyAndPortClass(t *testing.T) {
+	tr := newInnerTraffic()
+	tr.Out(synTo(50000, innerFar4, 443))
+	tr.Out(synTo(50001, innerFar4, 443))
+	tr.Out(synTo(50002, innerFar4, 443))
+	tr.Out(synTo(50003, innerFar4b, 80))
+	tr.Out(synTo(50004, innerFar4b, 8080))
+	tr.Out(synTo(50005, innerFar6, 443))
+	tr.Out(synTo(50006, innerFar6twin, 443))
+	tr.In(synAck(50000)) // one of the seven is answered
+	listen(tr, 10)
+	line := tr.Take(time.Minute)
+	want := "tcp: 7 asked (7 SYN), 1 answered, 0 refused, 6 silent 10s+ (4 host(s); 4 v4 / 2 v6; 4 https / 1 http / 1 other), 0 RST in"
+	if !strings.Contains(line, want) {
+		t.Fatalf("\n got %q\nwant it to hold %q", line, want)
+	}
+	for _, leak := range []string{"203.0.113", "2001:", "50003", "8080", "443", ":80"} {
+		if strings.Contains(line, leak) {
+			t.Fatalf("the split carries %q — it must say counts only: %q", leak, line)
+		}
+	}
+	// The split is of the asks found silent in THIS line: said once, like them.
+	tr.Out(synTo(50007, innerFar4b, 80))
+	listen(tr, 10)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "1 silent 10s+ (1 host(s); 1 v4 / 0 v6; 0 https / 1 http / 0 other), 0 RST in") {
+		t.Fatalf("the next line's split is its own: %q", line)
+	}
+	// No silent connection, no split — and a DNS question going silent adds
+	// nothing to the connections' split.
+	tr.Out(dnsAsk(40000, 1))
+	listen(tr, 5)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "0 silent 10s+, 0 RST in; dns: 1 asked (1 sent), 0 answered, 1 silent 5s+;") {
+		t.Fatalf("a silent question is no silent connection: %q", line)
 	}
 }
 
@@ -275,7 +368,7 @@ func TestTheLineByteForByte(t *testing.T) {
 	listen(tr, 60)
 	got := tr.Take(60 * time.Second)
 	want := "inner, the last 1m0s: 5 pkt out / 6 in; tcp: 1 asked (1 SYN), 1 answered, 0 refused, 0 silent 10s+, 0 RST in; " +
-		"dns: 1 asked (1 sent), 1 answered, 0 silent 5s+; udp: 1 flows sent, 1 heard, 0 silent 10s+ (quic 1 / 1 / 0); " +
+		"dns: 1 asked (1 sent), 1 answered, 0 silent 5s+; udp: 1 flows sent, 1 heard, 0 never answered 10s+ (quic 1 / 1 / 0); " +
 		"icmp in: 3 (2 unreachable); other: 2"
 	if got != want {
 		t.Fatalf("the line\n got %q\nwant %q", got, want)
