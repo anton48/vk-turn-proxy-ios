@@ -192,12 +192,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // by the flag above.
     private var _authErrorTimer: DispatchSourceTimer?
     private var _csqttWatchdog: DispatchSourceTimer?
-    private var _endToEndTimer: DispatchSourceTimer?
-
-    /// The prober of the once-a-minute check through the tunnel
-    /// (EndToEndCheck). Behind backendLock like the timers: installed by the
-    /// start unless the stop has run, read by sleep(), taken by the stop.
-    private var _endToEndProber: EndToEndProber?
 
     /// Installs `timer` in the slot (nil clears it) and cancels whatever the
     /// slot held — unless the stop has run, in which case the incoming timer
@@ -310,64 +304,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func stopCsqttWatchdog() {
         swapWatchdog(\._csqttWatchdog, nil)
-    }
-
-    // The once-a-minute question «does the internet answer through the tunnel»
-    // (EndToEndCheck.swift has the rule and the line). The timer's clock is the
-    // process's awake time: a sleeping phone asks now and then, an awake one
-    // every minute. Every transport. Nothing is asked in DIRECT mode — the
-    // routes go round the tunnel there and its resolver is not set — and the
-    // log says so once.
-    private func startEndToEndCheck() {
-        guard #available(iOS 18.0, *) else {
-            logMsg(EndToEndCheck.skipLine("the tunnel's interface is exposed from iOS 18 on"))
-            return
-        }
-        guard let interface = virtualInterface else {
-            logMsg(EndToEndCheck.skipLine("the tunnel's interface is not known"))
-            return
-        }
-        let prober = EndToEndProber(interface: interface,
-                                    resolver: EndToEndCheck.firstResolver(lastSettingsDNS)) { [weak self] line in
-            self?.logMsg(line)
-        }
-        backendLock.lock()
-        _endToEndProber = prober
-        backendLock.unlock()
-
-        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + EndToEndCheck.period, repeating: EndToEndCheck.period)
-        timer.setEventHandler { [weak self] in
-            // The DIRECT machine is the main queue's.
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if self.directReady && self.directSync.isSettled && !self.directSync.applied {
-                    prober.tick()
-                } else {
-                    prober.skip("the tunnel is in DIRECT mode or between two modes")
-                }
-            }
-        }
-        // Install, THEN resume — see the slots' comment.
-        swapWatchdog(\._endToEndTimer, timer)
-        timer.resume()
-        // A stop that ran before the prober was stored did not see it.
-        if stopRequested { stopEndToEndCheck() }
-    }
-
-    private func stopEndToEndCheck() {
-        swapWatchdog(\._endToEndTimer, nil)
-        backendLock.lock()
-        let prober = _endToEndProber
-        _endToEndProber = nil
-        backendLock.unlock()
-        prober?.stop()
-    }
-
-    private func currentEndToEndProber() -> EndToEndProber? {
-        backendLock.lock()
-        defer { backendLock.unlock() }
-        return _endToEndProber
     }
 
     /// A csqtt stop reason as iOS carries it to the app: an NSError with the
@@ -774,7 +710,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         self.startCsqttWatchdog(backend)
                     }
                     completionHandler(nil)
-                    self.startEndToEndCheck()
 
                     // Hand the machine the mode the tunnel actually came up in.
                     // Anything KVO recorded during startup is applied from here.
@@ -922,17 +857,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // when thawed, the watchdog (in Go) detects any actually-dead tunnels
         // via lastRecvTime and forces a reconnect. Short freezes don't kill
         // anything because TURN/DTLS state persists across them.
-        // A round of the end-to-end check under way has no verdict across a
-        // sleep, and none begins before wake(): a tick that fired before this
-        // call can still arrive behind it.
-        currentEndToEndProber()?.cutBySleep()
         logMsg("sleep() — ignored (connections persist through iOS freeze)")
         completionHandler()
     }
 
     override func wake() {
-        // The end-to-end check may ask again (sleep() stopped it).
-        currentEndToEndProber()?.woke()
         logMsg("wake() — running fast-path health check")
 
         // Ask Go to do a quick tunnel-health check with tighter thresholds
@@ -963,7 +892,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         stopPathMonitoring()
         stopAuthErrorWatchdog()
         stopCsqttWatchdog()
-        stopEndToEndCheck()
 
         // Safety net: ensure completionHandler is called exactly once
         // within 3 seconds even if wgTurnOff hangs. Without this, iOS
@@ -1484,12 +1412,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // "outside the tunnel" mean "nowhere". Hand DNS back to the system.
             settings.dnsSettings = nil
         }
-
-        // The default route is about to move in or out of the tunnel: a round
-        // of the end-to-end check under way would report the move, not the
-        // tunnel. Dropped HERE — the minute's tick looks at the mode only when
-        // it fires, and a round lasts ten seconds.
-        currentEndToEndProber()?.routesChanging()
 
         let t0 = Date()
         setTunnelNetworkSettings(settings) { [weak self] error in

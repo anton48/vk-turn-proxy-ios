@@ -60,9 +60,6 @@ SOURCES=(
     "$S/ConnectButtonAction.swift"
     "$S/VKCallCreationGate.swift"
     "$S/InternetRTTReading.swift"
-    # The once-a-minute check through the tunnel: its line, its round, its DNS
-    # question — RUN; compiled into the extension too.
-    "$S/EndToEndCheck.swift"
     "$S/UnseededStartPolicy.swift"
     "$S/PublishChain.swift"
     "$S/TurnCacheFiles.swift"
