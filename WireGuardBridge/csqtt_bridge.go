@@ -87,6 +87,7 @@ type csqttConfig struct {
 	VKLink                  string              `json:"vk_link"`
 	NumConns                int                 `json:"num_conns"`
 	UseUDP                  bool                `json:"use_udp"`
+	InnerTrafficLog         bool                `json:"inner_traffic_log"`    // the once-a-minute inner traffic line (pkg/proxy/innertraffic.go); absent = off
 	BoundedWrites           bool                `json:"csqtt_bounded_writes"` // pkg/csqtt/stall.go; absent = the unbounded write
 	TurnServer              string              `json:"turn_server"`
 	TurnPort                string              `json:"turn_port"`
@@ -495,6 +496,9 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 		log.Printf("csqttStart: server (peer_addr) and csqtt_password are required")
 		return -2
 	}
+	// The inner traffic line is the process's, as on the native path: this
+	// start says what the profile asks for, on or off.
+	proxy.SetInnerTrafficLog(cfg.InnerTrafficLog)
 	gen25, known := csqttGeneration(cfg.Generation)
 	if !known {
 		log.Printf("csqttStart: refused — the config names a protocol generation this build does not know: %q", cfg.Generation)
@@ -826,6 +830,7 @@ func (e *csqttEntry) pumpUp(dev packetDevice, client csqttClient) {
 		}
 		pkt := bufs[0][csqttTunOffset : csqttTunOffset+sizes[0]]
 		e.tunIn.Add(1)
+		proxy.ObserveInnerOut(pkt)
 		if err := client.WritePacket(pkt); err != nil {
 			e.sendErr.Add(1)
 		}
@@ -846,6 +851,7 @@ func (e *csqttEntry) pumpDown(dev packetDevice, client csqttClient) {
 			e.tunTooBig.Add(1)
 			continue
 		}
+		proxy.ObserveInnerIn(p)
 		copy(wbuf[csqttTunOffset:], p)
 		if _, err := dev.Write([][]byte{wbuf[:csqttTunOffset+len(p)]}, csqttTunOffset); err != nil {
 			if e.ctx.Err() == nil {

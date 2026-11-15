@@ -779,6 +779,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("handleAppMessage: memstats fast ticks = \(on)")
             wgSetMemstatsFastTicks(on ? 1 : 0)
             completionHandler?("ok".data(using: .utf8))
+        } else if msg.hasPrefix("set_inner_traffic:") {
+            // Settings › Advanced › Logging, applied to the RUNNING tunnel as the
+            // switch above is: the once-a-minute line of what the device's own
+            // traffic meets inside the tunnel. Process-global in Go, every
+            // transport; proxyConfig carries the same value for the next start.
+            let on = msg.hasSuffix("1")
+            logMsg("handleAppMessage: inner traffic line = \(on)")
+            wgSetInnerTrafficLog(on ? 1 : 0)
+            completionHandler?("ok".data(using: .utf8))
         } else if msg.hasPrefix("set_direct:") {
             // 🚧 DIAGNOSTIC, issue #72 — NOT a feature yet. Re-applies the
             // tunnel's ROUTES on a live session: DIRECT drops the default

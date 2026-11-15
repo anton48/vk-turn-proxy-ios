@@ -4949,6 +4949,62 @@ do {
     check(tm.contains("as written in the settings: \\(config.turnServerOverrideText"), "🚨 the line says the field's text, not the parsed list")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE INNER TRAFFIC LINE'S SWITCH (Settings › Advanced › Logging): one key from
+// the toggle to Go on both paths — the config of the next start and the message
+// to a running tunnel — and through a backup. The counter itself is Go's
+// (pkg/proxy/innertraffic.go) and is tested there; what can go wrong HERE is a
+// key spelled two ways, a path that forgets it, or the toggle declared where it
+// would pop the pushed screen.
+print("")
+print("inner traffic line: the switch from the Advanced screen to Go")
+do {
+    let advanced = codeWithoutComments("VKTurnProxy/VKTurnProxy/AdvancedView.swift")
+    check(advanced.contains("@AppStorage(\"innerTrafficLog\") private var innerTrafficLog = false"),
+          "the switch is stored under innerTrafficLog and is OFF by default")
+    check(inOrder(advanced, ["Toggle(\"Detailed log every second\", isOn: $memstatsFastTicks)",
+                             "Toggle(\"Inner traffic summary every minute\", isOn: $innerTrafficLog)",
+                             ".onChange(of: innerTrafficLog)", "TunnelManager.shared.applyInnerTrafficLog()",
+                             "Text(\"Logging\")"]),
+          "the toggle sits in the Logging section right under «Detailed log every second» and is pushed to a running tunnel")
+    check(!source("VKTurnProxy/VKTurnProxy/ContentView.swift").contains("innerTrafficLog"),
+          "🚨 the key is not declared in ContentView — an @AppStorage there re-renders the NavigationView's host and pops the pushed screen")
+
+    let manager = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(manager.contains("innerTrafficLog: d.bool(forKey: \"innerTrafficLog\")")
+          && manager.contains("\"inner_traffic_log\": config.innerTrafficLog")
+          && manager.contains("var innerTrafficLog: Bool = false"),
+          "the tunnel's config reads the stored switch and hands it to Go as inner_traffic_log")
+    if let f = manager.range(of: "func applyInnerTrafficLog()"), let e = manager.range(of: "\n    }\n", range: f.upperBound..<manager.endIndex) {
+        let body = String(manager[f.upperBound..<e.lowerBound])
+        check(body.contains("UserDefaults.standard.bool(forKey: \"innerTrafficLog\")") && body.contains("\"set_inner_traffic:\\(on ? 1 : 0)\"") && body.contains("sendProviderMessage"),
+              "the live path sends the stored value to the extension as set_inner_traffic:")
+    } else {
+        check(false, "TunnelManager has no applyInnerTrafficLog()")
+    }
+    let tunnel = codeWithoutComments("VKTurnProxy/PacketTunnel/PacketTunnelProvider.swift")
+    if let f = tunnel.range(of: "msg.hasPrefix(\"set_inner_traffic:\")"), let e = tunnel.range(of: "} else if", range: f.upperBound..<tunnel.endIndex) {
+        check(String(tunnel[f.upperBound..<e.lowerBound]).contains("wgSetInnerTrafficLog(on ? 1 : 0)"),
+              "the extension passes the message on to Go")
+    } else {
+        check(false, "the extension does not handle set_inner_traffic:")
+    }
+    // One key, both languages, both start paths.
+    for go in ["WireGuardBridge/bridge.go", "WireGuardBridge/csqtt_bridge.go"] {
+        check(source(go).contains("`json:\"inner_traffic_log"), "\(go) reads the key the app writes — inner_traffic_log")
+    }
+    check(source("WireGuardBridge/bridge.go").contains("//export wgSetInnerTrafficLog\nfunc wgSetInnerTrafficLog(")
+          && source("WireGuardBridge/include/wireguard_turn.h").contains("void wgSetInnerTrafficLog(int32_t enabled);"),
+          "Go exports the call the extension makes, and the bridge's header declares it to Swift")
+    // A backup carries it both ways; Optional, so an older backup changes nothing.
+    let backup = codeWithoutComments("VKTurnProxy/VKTurnProxy/BackupManager.swift")
+    check(source("VKTurnProxy/VKTurnProxy/AppConfig.swift").contains("var innerTrafficLog: Bool? = nil")
+          && backup.contains("d.object(forKey: \"innerTrafficLog\") as? Bool")
+          && backup.contains("innerTrafficLog: innerTraffic,")
+          && backup.contains("if let v = s.innerTrafficLog { d.set(v, forKey: \"innerTrafficLog\") }"),
+          "a backup exports the switch and a restore sets it only when the backup has it")
+}
+
 print("")
 if failures == 0 {
     print("swiftcheck: all checks passed")

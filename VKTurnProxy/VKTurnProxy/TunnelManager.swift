@@ -168,6 +168,7 @@ extension TunnelConfig {
             uplinkSynthMbit: d.double(forKey: "uplinkSynthMbit"),
             uplinkSynthSec: d.integer(forKey: "uplinkSynthSec"),
             memstatsFastTicks: d.bool(forKey: "memstatsFastTicks"),
+            innerTrafficLog: d.bool(forKey: "innerTrafficLog"),
             uplinkPaceKiB: UplinkPace.stored(in: d),
             useCookieAuth: d.bool(forKey: "VKAuth"),
             numConnections: s.numConnections,
@@ -1292,6 +1293,16 @@ class TunnelManager: ObservableObject {
         let on = UserDefaults.standard.bool(forKey: "memstatsFastTicks")
         guard let session = manager?.connection as? NETunnelProviderSession,
               let msg = "set_memstats_fast:\(on ? 1 : 0)".data(using: .utf8) else { return }
+        try? session.sendProviderMessage(msg) { _ in }
+    }
+
+    /// Push the inner traffic line's switch (Settings › Advanced) to a RUNNING
+    /// extension, as the switch above is. proxyConfig carries it for the next
+    /// connect; a tunnel that is not up reads it from UserDefaults at its start.
+    func applyInnerTrafficLog() {
+        let on = UserDefaults.standard.bool(forKey: "innerTrafficLog")
+        guard let session = manager?.connection as? NETunnelProviderSession,
+              let msg = "set_inner_traffic:\(on ? 1 : 0)".data(using: .utf8) else { return }
         try? session.sendProviderMessage(msg) { _ in }
     }
 
@@ -2936,6 +2947,8 @@ class TunnelManager: ObservableObject {
             "uplink_synth_mbit": config.uplinkSynthMbit,
             "uplink_synth_sec": config.uplinkSynthSec,
             "memstats_fast_ticks": config.memstatsFastTicks,
+            // The once-a-minute inner traffic line — every transport reads it.
+            "inner_traffic_log": config.innerTrafficLog,
             // The rate rides the config so the choice survives a reconnect; 0 = off,
             // which is exactly what the Go side's PaceOff means. The burst is not a
             // setting — it is settled at 16 KiB — but it travels with the rate so
@@ -3512,6 +3525,12 @@ struct TunnelConfig {
     // Carried here so it survives a reconnect; the live path that avoids one is
     // TunnelManager.applyMemstatsFastTicks(). Default false.
     var memstatsFastTicks: Bool = false
+    // innerTrafficLog: the once-a-minute line of what the device's own traffic
+    // meets inside the tunnel (connections asked / answered / silent, DNS,
+    // other UDP — counts only). Settings › Advanced › Logging. Carried here so
+    // it survives a reconnect; the live path is
+    // TunnelManager.applyInnerTrafficLog(). Default false.
+    var innerTrafficLog: Bool = false
     /// The uplink pacer's rate in KiB/s of counted bytes per allocation, 0 = off
     /// (Settings › Advanced). DEFAULT OFF — and the default lives here as well as
     /// in `UplinkPace.off`, because a config built without going through

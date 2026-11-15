@@ -100,6 +100,7 @@ enum BackupManager {
         // switch above: a diagnostic that silently resets on a restore is one
         // nobody can rely on mid-investigation.
         let fastTicks = (d.object(forKey: "memstatsFastTicks") as? Bool) ?? false
+        let innerTraffic = (d.object(forKey: "innerTrafficLog") as? Bool) ?? false
         // The uplink pacer. Exported as the RATE, snapped the same way the tunnel
         // snaps it, so a backup can never describe a rate the app does not offer.
         let paceKiB = UplinkPace.stored(in: d)
@@ -124,6 +125,7 @@ enum BackupManager {
             uplinkSynthMbit: synthMbit,
             uplinkSynthSec: synthSec,
             memstatsFastTicks: fastTicks,
+            innerTrafficLog: innerTraffic,
             vkAuth: vkAuth,
             liveActivityEnabled: liveActivity,
             liveActivityCompactClock: liveActivityClock,
@@ -244,6 +246,7 @@ enum BackupManager {
         if let v = s.uplinkSynthMbit { d.set(v, forKey: "uplinkSynthMbit") }
         if let v = s.uplinkSynthSec { d.set(v, forKey: "uplinkSynthSec") }
         if let v = s.memstatsFastTicks { d.set(v, forKey: "memstatsFastTicks") }
+        if let v = s.innerTrafficLog { d.set(v, forKey: "innerTrafficLog") }
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
         if let v = s.liveActivityEnabled { d.set(v, forKey: "liveActivityEnabled") }
         if let v = s.liveActivityCompactClock { d.set(v, forKey: "liveActivityCompactClock") }

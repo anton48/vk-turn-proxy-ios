@@ -225,6 +225,13 @@ type ProxyConfig struct {
 	// the live path, because turning it on must not cost a re-dial of the thirty sessions.
 	MemstatsFastTicks bool `json:"memstats_fast_ticks,omitempty"`
 
+	// InnerTrafficLog turns on the once-a-minute line of what the phone's own
+	// traffic meets inside the tunnel (pkg/proxy/innertraffic.go: connections
+	// asked / answered / silent, DNS, other UDP — counts only). Diagnostic,
+	// default false. Carried here so it survives a reconnect;
+	// wgSetInnerTrafficLog below is the live path.
+	InnerTrafficLog bool `json:"inner_traffic_log,omitempty"`
+
 	// UplinkSynthMbit / UplinkSynthSec drive the paced synthetic uplink in
 	// pkg/proxy/synth.go — a DIAGNOSTIC that splits the ~19 Mbit/s upload
 	// ceiling into "above SendPacket" (WireGuard, inner TCP) versus "at or below
@@ -335,6 +342,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	}
 	proxy.SetForceLegacyCaptcha(pcfg.ForceLegacyCaptcha)
 	proxy.SetMemstatsFastTicks(pcfg.MemstatsFastTicks)
+	proxy.SetInnerTrafficLog(pcfg.InnerTrafficLog)
 	// The pacer is applied at the one connect site there is (the legacy second
 	// site went with wgTurnOnWithTURN in build 384) and again by
 	// wgSetUplinkPace on a running tunnel.
@@ -565,6 +573,10 @@ func wgAttachWireGuardImpl(id int32, goSettings string, tunFd int) int32 {
 	// time goes. It answers "is wireguard-go starved or slow?", which is the
 	// one question left about the ~22 Mbit/s upload ceiling.
 	tunDev = proxy.WrapTUNForStats(tunDev)
+	// And let the inner traffic line see every packet where it passes the TUN,
+	// both ways — see pkg/proxy/innertraffic.go. Transparent too; with the line
+	// off (the default) a packet costs one atomic load.
+	tunDev = proxy.WrapTUNForInner(tunDev)
 
 	logger := device.NewLogger(device.LogLevelVerbose, "(wireguard-turn) ")
 	dev := device.NewDevice(tunDev, bind, logger)
@@ -1064,6 +1076,17 @@ func wgSetForceLegacyCaptcha(enabled C.int32_t) {
 //export wgSetMemstatsFastTicks
 func wgSetMemstatsFastTicks(enabled C.int32_t) {
 	proxy.SetMemstatsFastTicks(enabled != 0)
+}
+
+// Turns the once-a-minute inner traffic line on or off in THIS process, without
+// a reconnect — every transport: the native device and the csqtt pumps show
+// their packets to the same counter. Called by the extension when the app sends
+// `set_inner_traffic:`, and by both start paths from their config's
+// inner_traffic_log.
+//
+//export wgSetInnerTrafficLog
+func wgSetInnerTrafficLog(enabled C.int32_t) {
+	proxy.SetInnerTrafficLog(enabled != 0)
 }
 
 // Applies the uplink pacer to the RUNNING tunnel. kib is KiB/s of counted bytes

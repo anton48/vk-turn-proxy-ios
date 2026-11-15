@@ -177,6 +177,13 @@ void wgSetForceLegacyCaptcha(int32_t enabled);
 /// @param enabled 1 = 1s ticks; 0 = the normal 10s cadence
 void wgSetMemstatsFastTicks(int32_t enabled);
 
+/// Turn the once-a-minute inner traffic line on (non-zero) or off in this
+/// process, without a reconnect — every transport. The line says what the
+/// device's own traffic met inside the tunnel (connections asked / answered /
+/// silent, DNS, other UDP), as counts only. Also set at each start from the
+/// config's inner_traffic_log.
+void wgSetInnerTrafficLog(int32_t enabled);
+
 /// Apply the uplink pacer (Settings > Advanced) to a tunnel that is already
 /// connected: a per-allocation token bucket over the counted wire bytes VK
 /// meters, which turns our bursts into a stream the relay's policer does not

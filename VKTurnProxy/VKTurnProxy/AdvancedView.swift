@@ -69,6 +69,11 @@ struct AdvancedView: View {
     /// HERE, never in ContentView.
     @AppStorage("memstatsFastTicks") private var memstatsFastTicks = false
 
+    /// The once-a-minute line of what this device's own traffic meets inside
+    /// the tunnel (pkg/proxy/innertraffic.go). Off by default. Same rule as the
+    /// keys above: declared HERE, never in ContentView.
+    @AppStorage("innerTrafficLog") private var innerTrafficLog = false
+
     var body: some View {
         Form {
             Section {
@@ -209,10 +214,17 @@ struct AdvancedView: View {
                     .onChange(of: memstatsFastTicks) { _ in
                         TunnelManager.shared.applyMemstatsFastTicks()
                     }
+                Toggle("Inner traffic summary every minute", isOn: $innerTrafficLog)
+                    // Pushed to a running tunnel too, for the same reason: the
+                    // moment worth recording is usually already under way.
+                    // proxyConfig carries the value for the next connect.
+                    .onChange(of: innerTrafficLog) { _ in
+                        TunnelManager.shared.applyInnerTrafficLog()
+                    }
             } header: {
                 Text("Logging")
             } footer: {
-                Text("Writes the memory and queue lines once a second instead of once every ten — the resolution needed to see what happens inside a single second of a transfer. Takes effect immediately, on a tunnel that is already connected.\n\nLeave it off for everyday use: the log fills about ten times faster, so it starts discarding its oldest entries after roughly half a day instead of several. Turn it on for a measurement, then off.")
+                Text("Writes the memory and queue lines once a second instead of once every ten — the resolution needed to see what happens inside a single second of a transfer. Takes effect immediately, on a tunnel that is already connected.\n\nLeave it off for everyday use: the log fills about ten times faster, so it starts discarding its oldest entries after roughly half a day instead of several. Turn it on for a measurement, then off.\n\nThe inner traffic summary adds one line a minute saying what this device's own traffic met inside the tunnel: connections asked, answered and left without an answer, DNS questions, other UDP. Counts only — no address, no name, nothing of a packet's content. It shows whether the internet answers through the tunnel when its own connections all look healthy. Takes effect immediately, on a tunnel that is already connected.")
             }
         }
         .navigationTitle("Advanced")
