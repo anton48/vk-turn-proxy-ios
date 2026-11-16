@@ -30,6 +30,11 @@ import (
 //	       and of the silent ones: how many different hosts they were asked
 //	       of, how many over IPv4 and IPv6, how many on the https port, the
 //	       http port and any other;
+//	tcp established — of the connections past their handshake: how many the
+//	       phone sent DATA on, how many heard anything back (and how many of
+//	       those heard data, not a bare acknowledgement), how many are STALLED
+//	       (data went out and not one packet has come in for 10 s of listening
+//	       since), and how many of the phone's data segments were sent AGAIN;
 //	dns  — questions asked over UDP 53, answered, silent (5 s);
 //	udp  — every other UDP flow that sent, how many heard anything back in the
 //	       period, how many were NEVER answered (10 s of listening since the
@@ -49,6 +54,23 @@ import (
 // that heard once is never «never answered», whatever it sends later (the
 // first cut counted «sent and nothing heard since» and called seven of ten
 // flows of a healthy run silent).
+//
+// 🚨 «Answered» is a SYN-ACK and says nothing of what comes behind it: on the
+// phone, new connections were answered while a daemon's requests timed out for
+// a quarter of an hour. What becomes of a connection past its handshake is the
+// «tcp established» part. Its words are named by what is seen on the wire:
+// «sent data» — a segment of the phone's with payload; «heard» — any packet
+// for the phone, «with data» — one with payload (a far side that acknowledges
+// and never answers reads «heard» and not «with data»); «stalled» — payload
+// out and no packet in for ten seconds of listening since the FIRST such
+// segment, said once a wait — whether a line finds it standing or it ended
+// between two lines, answered or given up; «re-sent» — a data segment that begins below
+// what the connection had already sent. A bare acknowledgement, a keepalive
+// without data and a FIN are no data: a connection whose last word is the
+// phone's acknowledgement waits for nothing. A connection either side RESET
+// is owed nothing more: the phone's own reset ends its wait — one it gives up
+// inside ten seconds is in «sent data», not in «heard», and never «stalled»;
+// its repeats are in «re-sent» all the same.
 //
 // 🚨 «Silent» is counted in LISTENING, never on the wall clock: a process that
 // did not run heard nothing for a reason of its own. The runner steps once a
@@ -72,6 +94,9 @@ const (
 	innerTCPSilent = 10 * time.Second
 	innerUDPSilent = 10 * time.Second
 	innerDNSSilent = 5 * time.Second
+	// innerTCPStalled: listening since the first data segment nothing has come
+	// back behind, after which an established connection is said stalled.
+	innerTCPStalled = 10 * time.Second
 	// innerForget: listening after which an entry nobody answered, or a flow
 	// nobody used, is dropped from the tables.
 	innerForget = 2 * time.Minute
@@ -79,6 +104,7 @@ const (
 	// still counted as asked, and said as not tracked.
 	innerMaxPending = 2048
 	innerMaxFlows   = 1024
+	innerMaxConns   = 1024
 )
 
 // innerKey tells one flow from another: the phone's port, the far address and
@@ -104,6 +130,30 @@ type innerFlow struct {
 	first   time.Duration // the listening clock at its first packet
 	heard   bool          // a packet came back on it, at any time in its life
 	said    bool          // already counted as never answered
+}
+
+// innerConn is a TCP connection past its handshake.
+type innerConn struct {
+	seen time.Duration // the listening clock at its last packet either way
+
+	// the period under way
+	sentData bool // the phone sent a segment with payload
+	heard    bool // a packet came in
+	gotData  bool // a packet with payload came in
+
+	// data of the phone's that nothing has come back behind
+	waiting bool
+	since   time.Duration // the listening clock at the first such segment
+	said    bool          // this wait is already counted as stalled
+
+	// the furthest byte the phone has sent: what begins below it is sent again
+	end    uint32
+	hasEnd bool
+
+	// reset: the far side reset it. Nothing more is read of it; it stays until
+	// forgotten, so that a segment of the phone's that passes behind the reset
+	// — the two directions are seen by two pumps — does not open it anew.
+	reset bool
 }
 
 // innerHost is a far host as the tables keep it.
@@ -157,7 +207,10 @@ type innerPacket struct {
 	src, dst [16]byte
 	sport    uint16
 	dport    uint16
-	flags    uint8 // TCP
+	flags    uint8  // TCP
+	seq      uint32 // TCP: the segment's sequence number
+	payload  int    // TCP: its payload, in bytes — by the headers' own lengths
+	hasSeq   bool   // TCP: the two above were read
 	dnsID    uint16
 	hasID    bool
 	icmpType uint8
@@ -197,6 +250,12 @@ func parseInner(p []byte) (pk innerPacket, ok bool) {
 		if binary.BigEndian.Uint16(p[6:8])&0x1fff != 0 {
 			return pk, true // a later fragment: no transport header here
 		}
+		// The packet ends where its header says, not where the buffer does.
+		end := int(binary.BigEndian.Uint16(p[2:4]))
+		if end < ihl || end > len(p) {
+			end = len(p)
+		}
+		p = p[:end]
 		l4 = p[ihl:]
 	case 6:
 		if len(p) < 40 {
@@ -231,6 +290,9 @@ func parseInner(p []byte) (pk innerPacket, ok bool) {
 			}
 		}
 		pk.proto = next
+		if end := 40 + int(binary.BigEndian.Uint16(p[4:6])); end <= len(p) {
+			p = p[:end]
+		}
 		if len(p) < off {
 			return pk, true
 		}
@@ -244,6 +306,9 @@ func parseInner(p []byte) (pk innerPacket, ok bool) {
 			pk.sport, pk.dport = binary.BigEndian.Uint16(l4[0:2]), binary.BigEndian.Uint16(l4[2:4])
 			pk.flags = l4[13]
 			pk.l4 = true
+			if hdr := int(l4[12]>>4) * 4; hdr >= 20 && hdr <= len(l4) {
+				pk.seq, pk.payload, pk.hasSeq = binary.BigEndian.Uint32(l4[4:8]), len(l4)-hdr, true
+			}
 		}
 	case protoUDP:
 		if len(l4) >= 8 {
@@ -274,11 +339,14 @@ type InnerTraffic struct {
 	tcp map[innerKey]*innerPending
 	dns map[innerKey]*innerPending
 	udp map[innerKey]*innerFlow
+	est map[innerKey]*innerConn
 
 	// the period under way
 	pktOut, pktIn                           uint64
 	syn, tcpAsked, tcpAnswered, tcpLate     uint64
 	tcpRefused, rstIn                       uint64
+	resent, estLate, stalled                uint64
+	goneSent, goneHeard, goneData           uint64 // of connections that ended in the period
 	dnsSent, dnsAsked, dnsAnswered, dnsLate uint64
 	icmpIn, icmpUnreach                     uint64
 	other, untracked                        uint64
@@ -289,6 +357,7 @@ func newInnerTraffic() *InnerTraffic {
 		tcp: map[innerKey]*innerPending{},
 		dns: map[innerKey]*innerPending{},
 		udp: map[innerKey]*innerFlow{},
+		est: map[innerKey]*innerConn{},
 	}
 }
 
@@ -305,9 +374,13 @@ func (t *InnerTraffic) Out(p []byte) {
 	key := innerKey{remote: pk.dst, local: pk.sport, rport: pk.dport, v6: pk.v6}
 	switch pk.proto {
 	case protoTCP:
+		if pk.flags&tcpSYN == 0 {
+			t.estOut(key, pk)
+		}
 		if pk.flags&tcpSYN == 0 || pk.flags&tcpACK != 0 {
 			return
 		}
+		t.estClose(key) // the same ports asked anew: a new connection
 		t.syn++
 		if _, again := t.tcp[key]; again {
 			return // the same connection asking again
@@ -368,6 +441,7 @@ func (t *InnerTraffic) In(p []byte) {
 		}
 		ask := t.tcp[key]
 		if ask == nil {
+			t.estIn(key, pk)
 			return
 		}
 		switch {
@@ -411,6 +485,103 @@ func (t *InnerTraffic) In(p []byte) {
 		}
 	default:
 		t.other++
+	}
+}
+
+// estClose: the connection on these ports is over — the phone reset it, or
+// asks a new one on them. What it did in the period under way stays counted.
+func (t *InnerTraffic) estClose(key innerKey) {
+	c := t.est[key]
+	if c == nil {
+		return
+	}
+	t.estWaitOver(c, false)
+	if c.sentData {
+		t.goneSent++
+	}
+	if c.heard {
+		t.goneHeard++
+		if c.gotData {
+			t.goneData++
+		}
+	}
+	delete(t.est, key)
+}
+
+// estWaitOver: the wait on c, if there is one, ends now — by a packet for the
+// phone, or because the phone gave the connection up. A wait that lasted its
+// ten seconds of listening is a stall whether or not a line saw it standing.
+func (t *InnerTraffic) estWaitOver(c *innerConn, answered bool) {
+	if !c.waiting {
+		return
+	}
+	c.waiting = false
+	stalled := c.said
+	if !stalled && t.listened-c.since >= innerTCPStalled {
+		stalled = true
+		t.stalled++
+	}
+	c.said = false
+	if stalled && answered {
+		t.estLate++
+	}
+}
+
+// estOut: a segment of the phone's that is no SYN.
+func (t *InnerTraffic) estOut(key innerKey, pk innerPacket) {
+	if pk.flags&tcpRST != 0 {
+		t.estClose(key) // the phone gave it up: nothing is owed on it any more
+		return
+	}
+	c := t.est[key]
+	if c == nil {
+		// Its first segment behind the handshake — or a connection opened
+		// before the line was on, or one the table forgot.
+		if len(t.est) >= innerMaxConns {
+			t.untracked++
+			return
+		}
+		c = &innerConn{}
+		t.est[key] = c
+	}
+	if c.reset {
+		return
+	}
+	c.seen = t.listened
+	if pk.payload == 0 {
+		return // an acknowledgement, a keepalive, a bare FIN: no data
+	}
+	c.sentData = true
+	if end := pk.seq + uint32(pk.payload); !c.hasEnd {
+		c.end, c.hasEnd = end, true
+	} else {
+		// Sequence numbers wrap: below and beyond are read as a signed distance.
+		if int32(pk.seq-c.end) < 0 {
+			t.resent++
+		}
+		if int32(end-c.end) > 0 {
+			c.end = end
+		}
+	}
+	if !c.waiting {
+		c.waiting, c.since = true, t.listened
+	}
+}
+
+// estIn: a segment for the phone on a connection that is not being asked.
+func (t *InnerTraffic) estIn(key innerKey, pk innerPacket) {
+	c := t.est[key]
+	if c == nil || c.reset {
+		return
+	}
+	c.seen = t.listened
+	c.heard = true
+	if pk.payload > 0 {
+		c.gotData = true
+	}
+	t.estWaitOver(c, true)
+	if pk.flags&tcpRST != 0 {
+		c.reset = true
 	}
 }
 
@@ -482,11 +653,35 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 		}
 	}
 
+	estSent, estHeard, estData := t.goneSent, t.goneHeard, t.goneData
+	t.goneSent, t.goneHeard, t.goneData = 0, 0, 0
+	for key, c := range t.est {
+		if c.sentData {
+			estSent++
+		}
+		if c.heard {
+			estHeard++
+			if c.gotData {
+				estData++
+			}
+		}
+		if c.waiting && !c.said && t.listened-c.since >= innerTCPStalled {
+			c.said = true
+			t.stalled++
+		}
+		c.sentData, c.heard, c.gotData = false, false, false
+		if t.listened-c.seen >= innerForget {
+			delete(t.est, key)
+		}
+	}
+	estStalled := t.stalled
+	t.stalled = 0
+
 	span := wall.Round(time.Second).String()
 	if wall-awake > 2*time.Second {
 		span += fmt.Sprintf(" (awake %s)", awake.Round(time.Second))
 	}
-	if t.pktOut == 0 && t.pktIn == 0 && tcpSilent+dnsSilent+udpSilent == 0 {
+	if t.pktOut == 0 && t.pktIn == 0 && tcpSilent+dnsSilent+udpSilent+estStalled == 0 {
 		if t.quiet {
 			return ""
 		}
@@ -505,6 +700,8 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 	fmt.Fprintf(&b, "inner, the last %s: %d pkt out / %d in", span, t.pktOut, t.pktIn)
 	fmt.Fprintf(&b, "; tcp: %d asked (%d SYN), %d answered%s, %d refused, %d silent %s+%s, %d RST in",
 		t.tcpAsked, t.syn, t.tcpAnswered, late(t.tcpLate), t.tcpRefused, tcpSilent, innerTCPSilent, split.String(), t.rstIn)
+	fmt.Fprintf(&b, "; tcp established: %d sent data, %d heard (%d with data)%s, %d stalled %s+, %d segment(s) re-sent",
+		estSent, estHeard, estData, late(t.estLate), estStalled, innerTCPStalled, t.resent)
 	fmt.Fprintf(&b, "; dns: %d asked (%d sent), %d answered%s, %d silent %s+",
 		t.dnsAsked, t.dnsSent, t.dnsAnswered, late(t.dnsLate), dnsSilent, innerDNSSilent)
 	fmt.Fprintf(&b, "; udp: %d flows sent, %d heard, %d never answered %s+ (quic %d / %d / %d)",
@@ -522,6 +719,7 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 
 	t.pktOut, t.pktIn = 0, 0
 	t.syn, t.tcpAsked, t.tcpAnswered, t.tcpLate, t.tcpRefused, t.rstIn = 0, 0, 0, 0, 0, 0
+	t.resent, t.estLate = 0, 0
 	t.dnsSent, t.dnsAsked, t.dnsAnswered, t.dnsLate = 0, 0, 0, 0
 	t.icmpIn, t.icmpUnreach, t.other, t.untracked = 0, 0, 0, 0
 	return b.String()

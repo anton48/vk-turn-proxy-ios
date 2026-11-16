@@ -347,7 +347,7 @@ func TestSilentConnectionsAreSplitByHostFamilyAndPortClass(t *testing.T) {
 	// nothing to the connections' split.
 	tr.Out(dnsAsk(40000, 1))
 	listen(tr, 5)
-	if line := tr.Take(time.Minute); !strings.Contains(line, "0 silent 10s+, 0 RST in; dns: 1 asked (1 sent), 0 answered, 1 silent 5s+;") {
+	if line := tr.Take(time.Minute); !strings.Contains(line, "0 silent 10s+, 0 RST in; tcp established: 0 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent; dns: 1 asked (1 sent), 0 answered, 1 silent 5s+;") {
 		t.Fatalf("a silent question is no silent connection: %q", line)
 	}
 }
@@ -356,6 +356,8 @@ func TestTheLineByteForByte(t *testing.T) {
 	tr := newInnerTraffic()
 	tr.Out(syn(50000))
 	tr.In(synAck(50000))
+	tr.Out(segOut(50000, tcpACK, 4000001, 120))
+	tr.In(segIn(50000, tcpACK, 7000001, 700))
 	tr.Out(dnsAsk(40000, 1))
 	tr.In(dnsReply(40000, 1))
 	tr.Out(quicOut(41000))
@@ -367,14 +369,15 @@ func TestTheLineByteForByte(t *testing.T) {
 	tr.Out([]byte{0x00, 1, 2})                               // not an IP packet
 	listen(tr, 60)
 	got := tr.Take(60 * time.Second)
-	want := "inner, the last 1m0s: 5 pkt out / 6 in; tcp: 1 asked (1 SYN), 1 answered, 0 refused, 0 silent 10s+, 0 RST in; " +
+	want := "inner, the last 1m0s: 6 pkt out / 7 in; tcp: 1 asked (1 SYN), 1 answered, 0 refused, 0 silent 10s+, 0 RST in; " +
+		"tcp established: 1 sent data, 1 heard (1 with data), 0 stalled 10s+, 0 segment(s) re-sent; " +
 		"dns: 1 asked (1 sent), 1 answered, 0 silent 5s+; udp: 1 flows sent, 1 heard, 0 never answered 10s+ (quic 1 / 1 / 0); " +
 		"icmp in: 3 (2 unreachable); other: 2"
 	if got != want {
 		t.Fatalf("the line\n got %q\nwant %q", got, want)
 	}
 	// 🚨 Counts only: no address and no port of a packet may reach the line.
-	for _, leak := range []string{"203.0.113", "10.0.0.2", "2001:", "50000", "40000", "41000"} {
+	for _, leak := range []string{"203.0.113", "10.0.0.2", "2001:", "50000", "40000", "41000", "4000001", "7000001", "120", "700"} {
 		if strings.Contains(got, leak) {
 			t.Fatalf("the line carries %q — it must say counts only: %q", leak, got)
 		}
@@ -382,7 +385,7 @@ func TestTheLineByteForByte(t *testing.T) {
 	// A period is its own: the next line starts from nothing.
 	tr.Out(syn(50009))
 	listen(tr, 2)
-	if got := tr.Take(2 * time.Second); !strings.HasPrefix(got, "inner, the last 2s: 1 pkt out / 0 in; tcp: 1 asked (1 SYN), 0 answered, 0 refused, 0 silent 10s+, 0 RST in; dns: 0 asked") || strings.Contains(got, "icmp in: 3") || strings.Contains(got, "other:") {
+	if got := tr.Take(2 * time.Second); !strings.HasPrefix(got, "inner, the last 2s: 1 pkt out / 0 in; tcp: 1 asked (1 SYN), 0 answered, 0 refused, 0 silent 10s+, 0 RST in; tcp established: 0 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent; dns: 0 asked") || strings.Contains(got, "icmp in: 3") || strings.Contains(got, "other:") {
 		t.Fatalf("a new period carried the last one's counts: %q", got)
 	}
 }
@@ -596,5 +599,455 @@ func TestTheRunnerListensInStepsAndSaysTheLine(t *testing.T) {
 	}
 	if tr.listened <= 0 {
 		t.Fatal("the runner's steps added no listening")
+	}
+}
+
+// ── the connections past their handshake ──────────────────────────────────
+
+// tcpData: a segment with a sequence number and `n` bytes of payload.
+func tcpData(sport, dport uint16, flags byte, seq uint32, n int) []byte {
+	s := tcpSeg(sport, dport, flags)
+	binary.BigEndian.PutUint32(s[4:8], seq)
+	return append(s, make([]byte, n)...)
+}
+
+// segOut / segIn: a segment between the phone's `port` and the far side's 443.
+func segOut(port uint16, flags byte, seq uint32, n int) []byte {
+	return ip4(protoTCP, innerPhone4, innerFar4, tcpData(port, 443, flags, seq, n))
+}
+func segIn(port uint16, flags byte, seq uint32, n int) []byte {
+	return ip4(protoTCP, innerFar4, innerPhone4, tcpData(443, port, flags, seq, n))
+}
+
+// estPart: what a line says of the established connections.
+func estPart(line string) string {
+	const head = "; tcp established: "
+	i := strings.Index(line, head)
+	if i < 0 {
+		return "(no such part in: " + line + ")"
+	}
+	rest := line[i+len(head):]
+	if j := strings.Index(rest, "; dns:"); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// estSays takes the period's line and compares its established part.
+func estSays(t *testing.T, tr *InnerTraffic, when, want string) {
+	t.Helper()
+	if got := estPart(tr.Take(time.Minute)); got != want {
+		t.Fatalf("%s\n got %q\nwant %q", when, got, want)
+	}
+}
+
+// openConn: the handshake of a connection the phone makes, as it passes.
+func openConn(tr *InnerTraffic, port uint16) {
+	tr.Out(syn(port))
+	tr.In(synAck(port))
+	tr.Out(segOut(port, tcpACK, 1, 0))
+}
+
+func TestParseInnerMeasuresATCPSegmentsPayloadByTheHeaders(t *testing.T) {
+	read := func(name string, p []byte, seq uint32, payload int) {
+		t.Helper()
+		pk, ok := parseInner(p)
+		if !ok || !pk.l4 || !pk.hasSeq || pk.seq != seq || pk.payload != payload {
+			t.Fatalf("%s: seq %d payload %d hasSeq=%v l4=%v ok=%v, want seq %d payload %d", name, pk.seq, pk.payload, pk.hasSeq, pk.l4, ok, seq, payload)
+		}
+	}
+	read("a bare acknowledgement", segOut(50000, tcpACK, 0x01020304, 0), 0x01020304, 0)
+	read("a segment with data", segOut(50000, tcpACK, 0x01020304, 37), 0x01020304, 37)
+	// TCP options are header, not payload.
+	withOpts := tcpData(50000, 443, tcpACK, 77, 12+5)
+	withOpts[12] = 8 << 4
+	read("twelve bytes of TCP options and five of data", ip4(protoTCP, innerPhone4, innerFar4, withOpts), 77, 5)
+	bareOpts := tcpData(50000, 443, tcpACK, 78, 12)
+	bareOpts[12] = 8 << 4
+	read("an acknowledgement with twelve bytes of options carries no data", ip4(protoTCP, innerPhone4, innerFar4, bareOpts), 78, 0)
+	// IP options too.
+	ipOpts := ip4(protoTCP, innerPhone4, innerFar4, nil)
+	ipOpts[0] = 0x46
+	ipOpts = append(ipOpts, 1, 1, 1, 1)
+	ipOpts = append(ipOpts, tcpData(50000, 443, tcpACK, 79, 9)...)
+	binary.BigEndian.PutUint16(ipOpts[2:4], uint16(len(ipOpts)))
+	read("an IPv4 header with options", ipOpts, 79, 9)
+	// What lies in the buffer behind the packet's own length is no payload.
+	read("an IPv4 acknowledgement with six bytes behind its end", append(segOut(50000, tcpACK, 80, 0), 1, 2, 3, 4, 5, 6), 80, 0)
+	six := ip6(protoTCP, innerPhone6, innerFar6, tcpData(50000, 443, tcpACK, 81, 21))
+	read("an IPv6 segment with data", six, 81, 21)
+	read("an IPv6 acknowledgement with six bytes behind its end", append(ip6(protoTCP, innerPhone6, innerFar6, tcpData(50000, 443, tcpACK, 82, 0)), 1, 2, 3, 4, 5, 6), 82, 0)
+	ext := append([]byte{protoTCP, 0, 0, 0, 0, 0, 0, 0}, tcpData(50000, 443, tcpACK, 83, 4)...)
+	read("an IPv6 segment behind a destination-options header", ip6(60, innerPhone6, innerFar6, ext), 83, 4)
+	// A header whose own length cannot be: its flags are read as before, no payload is.
+	for name, hdr := range map[string]byte{"a data offset below five words": 4 << 4, "a data offset beyond the packet": 15 << 4} {
+		bad := tcpData(50000, 443, tcpACK, 84, 10)
+		bad[12] = hdr
+		if pk, ok := parseInner(ip4(protoTCP, innerPhone4, innerFar4, bad)); !ok || !pk.l4 || pk.flags != tcpACK || pk.hasSeq || pk.payload != 0 {
+			t.Fatalf("%s: %+v ok=%v", name, pk, ok)
+		}
+	}
+	// A packet cut short of the length its header states is read as far as it goes.
+	cut6 := ip6(protoTCP, innerPhone6, innerFar6, tcpData(50000, 443, tcpACK, 85, 21))[:40+16]
+	if pk, ok := parseInner(cut6); !ok || !pk.l4 || pk.flags != tcpACK || pk.hasSeq || pk.payload != 0 {
+		t.Fatalf("an IPv6 packet cut short inside its TCP header: %+v ok=%v", pk, ok)
+	}
+	cut4 := segOut(50000, tcpACK, 86, 21)[:20+16]
+	if pk, ok := parseInner(cut4); !ok || !pk.l4 || pk.flags != tcpACK || pk.hasSeq || pk.payload != 0 {
+		t.Fatalf("an IPv4 packet cut short inside its TCP header: %+v ok=%v", pk, ok)
+	}
+	short := ip4(protoTCP, innerPhone4, innerFar4, tcpSeg(50000, 443, tcpACK)[:16])
+	if pk, ok := parseInner(short); !ok || !pk.l4 || pk.flags != tcpACK || pk.hasSeq || pk.payload != 0 {
+		t.Fatalf("sixteen bytes of a TCP header: the flags and nothing more: %+v ok=%v", pk, ok)
+	}
+}
+
+// 🚨 The ordinary life of a connection — it opens, asks, is answered, idles, is
+// kept alive, closes; it only downloads; it is dropped by either side — must
+// read «0 stalled» and «0 re-sent» in every line.
+func TestAnEstablishedConnectionsOrdinaryLifeIsNeverStalled(t *testing.T) {
+	tr := newInnerTraffic()
+	const quiet = "inner, the last 1m0s: no packet either way"
+	idle := func(when string) {
+		t.Helper()
+		listen(tr, 60)
+		if got := tr.Take(time.Minute); got != quiet {
+			t.Fatalf("%s: an idle minute must be quiet: %q", when, got)
+		}
+		listen(tr, 60)
+		if got := tr.Take(time.Minute); got != "" {
+			t.Fatalf("%s: a second idle minute must say nothing: %q", when, got)
+		}
+	}
+	// A request and its answer; the phone's bare acknowledgement is its last word.
+	const p = 51000
+	openConn(tr, p)
+	tr.Out(segOut(p, tcpACK, 1, 300))
+	tr.In(segIn(p, tcpACK, 1, 0))
+	tr.In(segIn(p, tcpACK, 1, 1200))
+	tr.Out(segOut(p, tcpACK, 301, 0))
+	listen(tr, 60)
+	estSays(t, tr, "a request and its answer", "1 sent data, 1 heard (1 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	idle("behind the answer")
+	// A keepalive of the phone's — no data, an old sequence number — and its answer.
+	tr.Out(segOut(p, tcpACK, 300, 0))
+	tr.In(segIn(p, tcpACK, 1201, 0))
+	listen(tr, 60)
+	estSays(t, tr, "a keepalive", "0 sent data, 1 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// A keepalive nobody answers is no data either: nothing waits behind it.
+	tr.Out(segOut(p, tcpACK, 300, 0))
+	listen(tr, 60)
+	estSays(t, tr, "a keepalive nobody answered", "0 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// It closes: the phone's last data with its FIN, the far side's acknowledgement and FIN, the last acknowledgement.
+	tr.Out(segOut(p, tcpACK|tcpFIN, 301, 24))
+	tr.In(segIn(p, tcpACK, 1201, 0))
+	tr.In(segIn(p, tcpACK|tcpFIN, 1201, 0))
+	tr.Out(segOut(p, tcpACK, 326, 0))
+	listen(tr, 60)
+	estSays(t, tr, "the close", "1 sent data, 1 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	idle("behind the close")
+
+	// A download: the phone only acknowledges.
+	const q = 51001
+	openConn(tr, q)
+	for i := 0; i < 5; i++ {
+		tr.In(segIn(q, tcpACK, uint32(1+1000*i), 1000))
+		tr.Out(segOut(q, tcpACK, 1, 0))
+	}
+	listen(tr, 60)
+	estSays(t, tr, "a download", "0 sent data, 1 heard (1 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+
+	// The phone drops a connection of its own: data, its reset, and nothing ever comes back.
+	const r = 51002
+	openConn(tr, r)
+	tr.Out(segOut(r, tcpACK, 1, 40))
+	tr.Out(segOut(r, tcpRST|tcpACK, 41, 0))
+	listen(tr, 60)
+	estSays(t, tr, "a connection the phone reset behind its own data", "1 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	idle("behind the phone's reset")
+
+	// The far side resets one — and a segment the phone had sent before it learnt of
+	// that passes behind the reset.
+	const s = 51003
+	openConn(tr, s)
+	tr.Out(segOut(s, tcpACK, 1, 40))
+	tr.In(segIn(s, tcpRST, 1, 0))
+	tr.Out(segOut(s, tcpACK, 41, 40))
+	listen(tr, 60)
+	estSays(t, tr, "a connection the far side reset", "1 sent data, 1 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// A minute on — the connection is still remembered as reset — one more of the
+	// phone's and a straggler of the far side's: neither is read.
+	tr.Out(segOut(s, tcpACK, 41, 40))
+	tr.In(segIn(s, tcpACK, 1, 9))
+	if c := tr.est[innerKey{remote: [16]byte{203, 0, 113, 7}, local: s, rport: 443}]; c == nil || !c.reset {
+		t.Fatalf("a reset connection must be remembered as reset for two minutes: %+v", c)
+	}
+	listen(tr, 30)
+	estSays(t, tr, "stragglers on a reset connection", "0 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+}
+
+func TestDataSentIntoSilenceOnAnEstablishedConnectionIsStalledOnce(t *testing.T) {
+	tr := newInnerTraffic()
+	const p = 52000
+	openConn(tr, p)
+	listen(tr, 30) // an idle connection waits for nothing
+	tr.Take(time.Minute)
+	tr.Out(segOut(p, tcpACK, 1, 200)) // the request nobody answers
+	listen(tr, 9)
+	estSays(t, tr, "nine seconds of listening behind the data", "1 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// The phone's stack sends it again, twice. The ten seconds run from the FIRST segment.
+	tr.Out(segOut(p, tcpACK, 1, 200))
+	tr.Out(segOut(p, tcpACK, 1, 200))
+	listen(tr, 1)
+	estSays(t, tr, "ten seconds of listening behind the first unanswered segment", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 2 segment(s) re-sent")
+	// Said once, however long it goes on.
+	tr.Out(segOut(p, tcpACK, 1, 200))
+	listen(tr, 30)
+	estSays(t, tr, "a stalled connection is said once", "1 sent data, 0 heard (0 with data), 0 stalled 10s+, 1 segment(s) re-sent")
+	// It hears again — a bare acknowledgement is enough: late.
+	tr.In(segIn(p, tcpACK, 1, 0))
+	estSays(t, tr, "an answer behind a stall", "0 sent data, 1 heard (0 with data) (1 late), 0 stalled 10s+, 0 segment(s) re-sent")
+	// A new wait is a new one: said again, and its ten seconds are its own.
+	tr.Out(segOut(p, tcpACK, 201, 100))
+	listen(tr, 6)
+	tr.In(segIn(p, tcpACK, 1, 0)) // answered inside its ten seconds
+	tr.Out(segOut(p, tcpACK, 301, 100))
+	listen(tr, 9)
+	estSays(t, tr, "a wait that was answered, and nine seconds of the next", "1 sent data, 1 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// No packet in this period — and a connection turns stalled in it: news, not quiet.
+	listen(tr, 1)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "0 pkt out / 0 in") || estPart(line) != "0 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent" {
+		t.Fatalf("a connection turning stalled in a period without packets must be said: %q", line)
+	}
+	// Data with the FIN, unanswered: closing does not end the wait.
+	const q = 52001
+	openConn(tr, q)
+	tr.Out(segOut(q, tcpACK|tcpFIN, 1, 50))
+	listen(tr, 10)
+	estSays(t, tr, "the last data with a FIN, never acknowledged", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+}
+
+// 🚨 A wait that lasted its ten seconds is a stall wherever the lines fall: one
+// that ends BETWEEN two lines — answered late, or given up by the phone — is
+// counted in the line that follows, not lost.
+func TestAStallThatEndsBetweenTwoLinesIsStillCounted(t *testing.T) {
+	tr := newInnerTraffic()
+	// Answered after thirty seconds, before any line saw it standing.
+	const p = 52600
+	openConn(tr, p)
+	tr.Out(segOut(p, tcpACK, 1, 200))
+	listen(tr, 30)
+	tr.In(segIn(p, tcpACK, 1, 0))
+	estSays(t, tr, "answered after thirty seconds, inside one line", "1 sent data, 1 heard (0 with data) (1 late), 1 stalled 10s+, 0 segment(s) re-sent")
+	if line := tr.Take(time.Minute); strings.Contains(line, "stalled") || strings.Contains(line, "late") {
+		t.Fatalf("a stall counted once is not said again in a period without packets: %q", line)
+	}
+	// Answered at nine seconds: no stall, nothing late.
+	tr.Out(segOut(p, tcpACK, 201, 200))
+	listen(tr, 9)
+	tr.In(segIn(p, tcpACK, 1, 0))
+	estSays(t, tr, "answered at nine seconds", "1 sent data, 1 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// The phone gives one up after twelve seconds of silence: a stall, and no late answer.
+	const q = 52601
+	openConn(tr, q)
+	tr.Out(segOut(q, tcpACK, 1, 200))
+	listen(tr, 12)
+	tr.Out(segOut(q, tcpRST|tcpACK, 201, 0))
+	estSays(t, tr, "given up by the phone after twelve seconds", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+	// …and one it gives up after nine: none.
+	const r = 52602
+	openConn(tr, r)
+	tr.Out(segOut(r, tcpACK, 1, 200))
+	listen(tr, 9)
+	tr.Out(segOut(r, tcpRST|tcpACK, 201, 0))
+	listen(tr, 60)
+	estSays(t, tr, "given up by the phone after nine seconds", "1 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// The same ports asked anew behind twelve seconds of silence: the old connection's stall.
+	const s = 52603
+	openConn(tr, s)
+	tr.Out(segOut(s, tcpACK, 1, 200))
+	listen(tr, 12)
+	tr.Out(syn(s))
+	estSays(t, tr, "replaced after twelve seconds of silence", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+	// A stall a line has already said, then given up or replaced: not said twice, and nothing late.
+	const u = 52604
+	openConn(tr, u)
+	tr.Out(segOut(u, tcpACK, 1, 200))
+	listen(tr, 10)
+	estSays(t, tr, "said standing", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+	tr.Out(segOut(u, tcpRST|tcpACK, 201, 0))
+	estSays(t, tr, "then given up", "0 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+}
+
+func TestAStallIsCountedInListeningNotOnTheWallClock(t *testing.T) {
+	tr := newInnerTraffic()
+	const p = 52500
+	openConn(tr, p)
+	tr.Out(segOut(p, tcpACK, 1, 200))
+	tr.Step(5*time.Minute, time.Second) // a suspension
+	estSays(t, tr, "across a suspension", "1 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	listen(tr, 9)
+	tr.Step(10*time.Minute, time.Second)
+	if line := tr.Take(time.Minute); strings.Contains(line, "stalled") {
+		t.Fatalf("nine seconds of listening and two suspensions are not ten seconds: %q", line)
+	}
+	listen(tr, 1)
+	if line := tr.Take(time.Minute); estPart(line) != "0 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent" {
+		t.Fatalf("at ten seconds of listening: %q", line)
+	}
+}
+
+func TestADataSegmentThatBeginsBelowWhatWasSentIsCountedAgain(t *testing.T) {
+	tr := newInnerTraffic()
+	resent := func() uint64 {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return tr.resent
+	}
+	run := func(port uint16, steps []struct {
+		name string
+		seq  uint32
+		n    int
+		want uint64
+	}) {
+		t.Helper()
+		before := resent()
+		for _, st := range steps {
+			tr.Out(segOut(port, tcpACK, st.seq, st.n))
+			if got := resent() - before; got != st.want {
+				t.Fatalf("%s (seq %d, %d bytes): %d counted as sent again, want %d", st.name, st.seq, st.n, got, st.want)
+			}
+		}
+	}
+	type step = struct {
+		name string
+		seq  uint32
+		n    int
+		want uint64
+	}
+	const p = 53000
+	openConn(tr, p)
+	run(p, []step{
+		{"a connection's first data", 1000, 100, 0},
+		{"the bytes that follow", 1100, 100, 0},
+		{"a bare acknowledgement at an old sequence number", 1000, 0, 0},
+		{"the same bytes again", 1100, 100, 1},
+		{"the first bytes again", 1000, 100, 2},
+		{"a segment that begins inside what was sent and runs past it", 1150, 100, 3},
+		{"the bytes that follow that", 1250, 50, 3},
+		{"one byte below the end", 1299, 1, 4},
+		{"the byte at the end", 1300, 1, 4},
+	})
+	// The sequence numbers wrap: below and above are read around the wrap.
+	const w = 53001
+	openConn(tr, w)
+	run(w, []step{
+		{"before the wrap", 0xfffffe00, 0x100, 0},
+		{"across the wrap", 0xffffff00, 0x200, 0},
+		{"behind the wrap", 0x100, 16, 0},
+		{"behind the wrap, again", 0x100, 16, 1},
+		{"from before the wrap, again", 0xffffff80, 16, 2},
+		{"the bytes that follow", 0x110, 16, 2},
+	})
+	// A connection taken up in its middle: its first segment seen is not «again».
+	run(53002, []step{
+		{"the first segment seen of a connection already open", 900000, 100, 0},
+		{"the same again", 900000, 100, 1},
+	})
+	// One connection's sequence numbers say nothing of another's.
+	const o = 53003
+	openConn(tr, o)
+	run(o, []step{{"another connection's first data at a low number", 10, 100, 0}})
+	// The line says the period's count and starts the next from nothing.
+	if got := estPart(tr.Take(time.Minute)); !strings.HasSuffix(got, ", 7 segment(s) re-sent") {
+		t.Fatalf("the period's count: %q", got)
+	}
+	tr.Out(segOut(o, tcpACK, 110, 100))
+	if got := estPart(tr.Take(time.Minute)); !strings.HasSuffix(got, ", 0 segment(s) re-sent") {
+		t.Fatalf("a new period carried the last one's count: %q", got)
+	}
+}
+
+func TestAConnectionAlreadyOpenIsTakenUpAtThePhonesFirstSegment(t *testing.T) {
+	tr := newInnerTraffic()
+	// A segment FOR the phone on a connection it has not spoken on here: not ours.
+	tr.In(segIn(54000, tcpACK, 1, 500))
+	if len(tr.est) != 0 {
+		t.Fatalf("a segment for the phone alone opened a connection: %d", len(tr.est))
+	}
+	estSays(t, tr, "a segment for the phone alone", "0 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// The line came on in a connection's middle: no handshake was seen.
+	tr.Out(segOut(54001, tcpACK, 9000, 100))
+	listen(tr, 10)
+	if line := tr.Take(time.Minute); !strings.Contains(line, "tcp: 0 asked (0 SYN)") || estPart(line) != "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent" {
+		t.Fatalf("a connection taken up at its first segment: %q", line)
+	}
+	// The phone's reset of a connection never seen opens nothing.
+	tr.Out(segOut(54002, tcpRST, 1, 0))
+	if len(tr.est) != 1 {
+		t.Fatalf("a reset opened a connection: %d", len(tr.est))
+	}
+}
+
+func TestTheSamePortsAskedAnewAreANewConnection(t *testing.T) {
+	tr := newInnerTraffic()
+	const p = 54100
+	openConn(tr, p)
+	tr.Out(segOut(p, tcpACK, 5000, 100)) // unanswered
+	listen(tr, 5)
+	tr.Out(syn(p)) // the phone asks the same ports anew
+	tr.In(synAck(p))
+	tr.Out(segOut(p, tcpACK, 100, 100)) // below the old connection's numbers: not «again»
+	tr.In(segIn(p, tcpACK, 1, 0))
+	listen(tr, 10)
+	// Both connections sent data in this period; the old one's wait is gone with it.
+	estSays(t, tr, "what the old connection owed is gone with it", "2 sent data, 1 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+	// And a connection the far side reset is open again behind a new handshake;
+	// what the old one heard in this period — data, then the reset — stays counted.
+	tr.In(segIn(p, tcpACK, 1, 30))
+	tr.In(segIn(p, tcpRST, 31, 0))
+	tr.Out(syn(p))
+	tr.In(synAck(p))
+	tr.Out(segOut(p, tcpACK, 1, 10))
+	listen(tr, 10)
+	estSays(t, tr, "a new connection on a reset one's ports", "1 sent data, 1 heard (1 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+}
+
+func TestEstablishedConnectionsAreBoundedAndForgotten(t *testing.T) {
+	tr := newInnerTraffic()
+	for i := 0; i < innerMaxConns+3; i++ {
+		tr.Out(segOut(uint16(1000+i), tcpACK, 1, 10))
+	}
+	if len(tr.est) != innerMaxConns {
+		t.Fatalf("established connections: %d, want the bound %d", len(tr.est), innerMaxConns)
+	}
+	openConn(tr, 60000) // and one accepted past the bound: said at its first segment
+	line := tr.Take(time.Minute)
+	if !strings.Contains(line, "tcp established: 1024 sent data") || !strings.HasSuffix(line, "; not tracked: 4 (a table is full)") {
+		t.Fatalf("past the bound a connection is said as not tracked: %q", line)
+	}
+	listen(tr, 119)
+	tr.Take(time.Minute)
+	if len(tr.est) != innerMaxConns {
+		t.Fatalf("forgotten too early: %d at 119 s", len(tr.est))
+	}
+	// One of them speaks at 119 s: its two minutes start again.
+	tr.Out(segOut(1000, tcpACK, 11, 10))
+	listen(tr, 1)
+	tr.Take(time.Minute)
+	if len(tr.est) != 1 {
+		t.Fatalf("at 120 s of listening since their last packet: %d left, want the one that spoke", len(tr.est))
+	}
+	listen(tr, 119)
+	tr.In(segIn(1000, tcpACK, 1, 0)) // and a packet FOR it counts as its last too
+	listen(tr, 1)
+	tr.Take(time.Minute)
+	if len(tr.est) != 1 {
+		t.Fatalf("a packet for the phone must keep its connection: %d left", len(tr.est))
+	}
+	listen(tr, 120)
+	tr.Take(time.Minute)
+	if len(tr.est) != 0 {
+		t.Fatalf("not forgotten: %d", len(tr.est))
 	}
 }
