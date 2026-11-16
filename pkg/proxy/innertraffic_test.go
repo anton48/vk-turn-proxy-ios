@@ -1051,3 +1051,101 @@ func TestEstablishedConnectionsAreBoundedAndForgotten(t *testing.T) {
 		t.Fatalf("not forgotten: %d", len(tr.est))
 	}
 }
+
+// ── an ask whose wait ends between two lines ──────────────────────────────
+
+// tcpPart / dnsPart: what a line says of the connections asked and of the questions.
+func tcpPart(line string) string {
+	i, j := strings.Index(line, "; tcp: "), strings.Index(line, "; tcp established: ")
+	if i < 0 || j < i {
+		return "(no such part in: " + line + ")"
+	}
+	return line[i+len("; tcp: ") : j]
+}
+func dnsPart(line string) string {
+	i, j := strings.Index(line, "; dns: "), strings.Index(line, "; udp: ")
+	if i < 0 || j < i {
+		return "(no such part in: " + line + ")"
+	}
+	return line[i+len("; dns: ") : j]
+}
+
+// 🚨 An ask that waited its ten seconds is silent wherever the lines fall: one
+// answered — or refused — BETWEEN two lines is counted silent in the line that
+// follows, and its answer late; it is not read as an ordinary answer.
+func TestAnAskAnsweredBetweenTwoLinesIsStillSilentAndLate(t *testing.T) {
+	tr := newInnerTraffic()
+	says := func(when, want string) {
+		t.Helper()
+		if got := tcpPart(tr.Take(time.Minute)); got != want {
+			t.Fatalf("%s\n got %q\nwant %q", when, got, want)
+		}
+	}
+	// Answered after thirty seconds of listening, before any line saw it waiting.
+	tr.Out(synTo(50000, innerFar4b, 80))
+	listen(tr, 30)
+	tr.In(ip4(protoTCP, innerFar4b, innerPhone4, tcpSeg(80, 50000, tcpSYN|tcpACK)))
+	says("answered after thirty seconds, inside one line",
+		"1 asked (1 SYN), 1 answered (1 late), 0 refused, 1 silent 10s+ (1 host(s); 1 v4 / 0 v6; 0 https / 1 http / 0 other), 0 RST in")
+	// The next line's counts and its split are its own.
+	tr.Out(syn(50001))
+	listen(tr, 12)
+	tr.In(synAck(50001))
+	says("another, twelve seconds, in the next line",
+		"1 asked (1 SYN), 1 answered (1 late), 0 refused, 1 silent 10s+ (1 host(s); 1 v4 / 0 v6; 1 https / 0 http / 0 other), 0 RST in")
+	// Answered at nine seconds: an ordinary answer.
+	tr.Out(syn(50002))
+	listen(tr, 9)
+	tr.In(synAck(50002))
+	says("answered at nine seconds", "1 asked (1 SYN), 1 answered, 0 refused, 0 silent 10s+, 0 RST in")
+	// Refused after twelve: it was silent ten seconds — and a refusal is no late answer.
+	tr.Out(syn(50003))
+	listen(tr, 12)
+	tr.In(rstTo(50003))
+	says("refused after twelve seconds", "1 asked (1 SYN), 0 answered, 1 refused, 1 silent 10s+ (1 host(s); 1 v4 / 0 v6; 1 https / 0 http / 0 other), 1 RST in")
+	// Across a suspension nothing was listened to: an ordinary answer.
+	tr.Out(syn(50004))
+	tr.Step(5*time.Minute, time.Second)
+	tr.In(synAck(50004))
+	says("answered behind a suspension", "1 asked (1 SYN), 1 answered, 0 refused, 0 silent 10s+, 0 RST in")
+	// One a line has already called silent, answered later: late, and not silent again.
+	tr.Out(syn(50005))
+	listen(tr, 10)
+	says("said waiting", "1 asked (1 SYN), 0 answered, 0 refused, 1 silent 10s+ (1 host(s); 1 v4 / 0 v6; 1 https / 0 http / 0 other), 0 RST in")
+	tr.In(synAck(50005))
+	says("then answered", "0 asked (0 SYN), 1 answered (1 late), 0 refused, 0 silent 10s+, 0 RST in")
+	// One answered late and one still waiting, in one line: both silent, one split.
+	tr.Out(synTo(50006, innerFar4b, 80))
+	tr.Out(syn(50007))
+	listen(tr, 15)
+	tr.In(ip4(protoTCP, innerFar4b, innerPhone4, tcpSeg(80, 50006, tcpSYN|tcpACK)))
+	says("one answered late, one still waiting",
+		"2 asked (2 SYN), 1 answered (1 late), 0 refused, 2 silent 10s+ (2 host(s); 2 v4 / 0 v6; 1 https / 1 http / 0 other), 0 RST in")
+}
+
+func TestAQuestionAnsweredBetweenTwoLinesIsStillSilentAndLate(t *testing.T) {
+	tr := newInnerTraffic()
+	tr.Out(dnsAsk(40000, 1))
+	listen(tr, 7)
+	tr.In(dnsReply(40000, 1))
+	line := tr.Take(time.Minute)
+	if got, want := dnsPart(line), "1 asked (1 sent), 1 answered (1 late), 1 silent 5s+"; got != want {
+		t.Fatalf("answered after seven seconds, inside one line\n got %q\nwant %q", got, want)
+	}
+	if got := tcpPart(line); got != "0 asked (0 SYN), 0 answered, 0 refused, 0 silent 10s+, 0 RST in" {
+		t.Fatalf("a question's silence is no connection's: %q", got)
+	}
+	tr.Out(dnsAsk(40000, 2))
+	listen(tr, 4)
+	tr.In(dnsReply(40000, 2))
+	if got, want := dnsPart(tr.Take(time.Minute)), "1 asked (1 sent), 1 answered, 0 silent 5s+"; got != want {
+		t.Fatalf("answered at four seconds, and nothing carried from the last line\n got %q\nwant %q", got, want)
+	}
+	// Seven seconds is a question's silence, not a connection's.
+	tr.Out(syn(50000))
+	listen(tr, 7)
+	tr.In(synAck(50000))
+	if got := tcpPart(tr.Take(time.Minute)); got != "1 asked (1 SYN), 1 answered, 0 refused, 0 silent 10s+, 0 RST in" {
+		t.Fatalf("a connection answered at seven seconds: %q", got)
+	}
+}

@@ -77,6 +77,11 @@ import (
 // second; a step that comes late is a suspension and adds no listening, so a
 // connection asked right before a sleep is not «silent» at the thaw.
 //
+// 🚨 An ask that waited its threshold is silent WHEREVER THE LINES FALL: one
+// that is answered — or refused — between two lines is counted silent in the
+// line that follows, and its answer late. A line is taken once a minute; an
+// answer that took half of one is not an ordinary answer.
+//
 // 🚨 Three outcomes, never two: answered / asked and not answered / not yet
 // known. A connection younger than its threshold is in none of the line's
 // numbers but «asked»; it is judged by a later line.
@@ -346,7 +351,9 @@ type InnerTraffic struct {
 	syn, tcpAsked, tcpAnswered, tcpLate     uint64
 	tcpRefused, rstIn                       uint64
 	resent, estLate, stalled                uint64
-	goneSent, goneHeard, goneData           uint64 // of connections that ended in the period
+	tcpSilent, dnsSilent                    uint64           // asks whose wait ended, past its threshold, before a line saw it
+	split                                   innerSilentSplit // …and whom those connections were asked of
+	goneSent, goneHeard, goneData           uint64           // of connections that ended in the period
 	dnsSent, dnsAsked, dnsAnswered, dnsLate uint64
 	icmpIn, icmpUnreach                     uint64
 	other, untracked                        uint64
@@ -444,16 +451,22 @@ func (t *InnerTraffic) In(p []byte) {
 			t.estIn(key, pk)
 			return
 		}
+		answered := false
 		switch {
 		case pk.flags&tcpRST != 0:
 			t.tcpRefused++
 		case pk.flags&tcpSYN != 0 && pk.flags&tcpACK != 0:
 			t.tcpAnswered++
-			if ask.said {
-				t.tcpLate++
-			}
+			answered = true
 		default:
 			return
+		}
+		if t.foundSilent(ask, innerTCPSilent) {
+			t.tcpSilent++
+			t.split.add(key)
+		}
+		if ask.said && answered {
+			t.tcpLate++
 		}
 		delete(t.tcp, key)
 	case protoUDP:
@@ -461,6 +474,9 @@ func (t *InnerTraffic) In(p []byte) {
 			key.id = pk.dnsID
 			if ask := t.dns[key]; ask != nil {
 				t.dnsAnswered++
+				if t.foundSilent(ask, innerDNSSilent) {
+					t.dnsSilent++
+				}
 				if ask.said {
 					t.dnsLate++
 				}
@@ -486,6 +502,17 @@ func (t *InnerTraffic) In(p []byte) {
 	default:
 		t.other++
 	}
+}
+
+// foundSilent: whether the ask has waited `after` of listening and nobody has
+// called it silent yet — it is called so here. Asked when a line is taken, and
+// where an ask's wait ENDS: an ask answered between two lines is judged too.
+func (t *InnerTraffic) foundSilent(ask *innerPending, after time.Duration) bool {
+	if ask.said || t.listened-ask.asked < after {
+		return false
+	}
+	ask.said = true
+	return true
 }
 
 // estClose: the connection on these ports is over — the phone reset it, or
@@ -609,21 +636,22 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 
 	silent := func(table map[innerKey]*innerPending, after time.Duration, each func(innerKey)) (n uint64) {
 		for key, ask := range table {
-			age := t.listened - ask.asked
-			if !ask.said && age >= after {
-				ask.said = true
+			if t.foundSilent(ask, after) {
 				n++
 				each(key)
 			}
-			if age >= innerForget {
+			if t.listened-ask.asked >= innerForget {
 				delete(table, key)
 			}
 		}
 		return n
 	}
-	var split innerSilentSplit
-	tcpSilent := silent(t.tcp, innerTCPSilent, split.add)
-	dnsSilent := silent(t.dns, innerDNSSilent, func(innerKey) {})
+	// What ended its wait between two lines was counted where it ended.
+	split := t.split
+	t.split = innerSilentSplit{}
+	tcpSilent := t.tcpSilent + silent(t.tcp, innerTCPSilent, split.add)
+	dnsSilent := t.dnsSilent + silent(t.dns, innerDNSSilent, func(innerKey) {})
+	t.tcpSilent, t.dnsSilent = 0, 0
 
 	var sent, heard, udpSilent, quicSent, quicHeard, quicSilent uint64
 	for key, f := range t.udp {
