@@ -799,7 +799,7 @@ func TestDataSentIntoSilenceOnAnEstablishedConnectionIsStalledOnce(t *testing.T)
 	tr.Out(segOut(p, tcpACK, 1, 200))
 	tr.Out(segOut(p, tcpACK, 1, 200))
 	listen(tr, 1)
-	estSays(t, tr, "ten seconds of listening behind the first unanswered segment", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 2 segment(s) re-sent")
+	estSays(t, tr, "ten seconds of listening behind the first unanswered segment", "1 sent data, 0 heard (0 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 2 segment(s) re-sent")
 	// Said once, however long it goes on.
 	tr.Out(segOut(p, tcpACK, 1, 200))
 	listen(tr, 30)
@@ -816,7 +816,7 @@ func TestDataSentIntoSilenceOnAnEstablishedConnectionIsStalledOnce(t *testing.T)
 	estSays(t, tr, "a wait that was answered, and nine seconds of the next", "1 sent data, 1 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
 	// No packet in this period — and a connection turns stalled in it: news, not quiet.
 	listen(tr, 1)
-	if line := tr.Take(time.Minute); !strings.Contains(line, "0 pkt out / 0 in") || estPart(line) != "0 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent" {
+	if line := tr.Take(time.Minute); !strings.Contains(line, "0 pkt out / 0 in") || estPart(line) != "0 sent data, 0 heard (0 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent" {
 		t.Fatalf("a connection turning stalled in a period without packets must be said: %q", line)
 	}
 	// Data with the FIN, unanswered: closing does not end the wait.
@@ -824,7 +824,7 @@ func TestDataSentIntoSilenceOnAnEstablishedConnectionIsStalledOnce(t *testing.T)
 	openConn(tr, q)
 	tr.Out(segOut(q, tcpACK|tcpFIN, 1, 50))
 	listen(tr, 10)
-	estSays(t, tr, "the last data with a FIN, never acknowledged", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+	estSays(t, tr, "the last data with a FIN, never acknowledged", "1 sent data, 0 heard (0 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent")
 }
 
 // 🚨 A wait that lasted its ten seconds is a stall wherever the lines fall: one
@@ -838,7 +838,7 @@ func TestAStallThatEndsBetweenTwoLinesIsStillCounted(t *testing.T) {
 	tr.Out(segOut(p, tcpACK, 1, 200))
 	listen(tr, 30)
 	tr.In(segIn(p, tcpACK, 1, 0))
-	estSays(t, tr, "answered after thirty seconds, inside one line", "1 sent data, 1 heard (0 with data) (1 late), 1 stalled 10s+, 0 segment(s) re-sent")
+	estSays(t, tr, "answered after thirty seconds, inside one line", "1 sent data, 1 heard (0 with data) (1 late), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent")
 	if line := tr.Take(time.Minute); strings.Contains(line, "stalled") || strings.Contains(line, "late") {
 		t.Fatalf("a stall counted once is not said again in a period without packets: %q", line)
 	}
@@ -853,7 +853,7 @@ func TestAStallThatEndsBetweenTwoLinesIsStillCounted(t *testing.T) {
 	tr.Out(segOut(q, tcpACK, 1, 200))
 	listen(tr, 12)
 	tr.Out(segOut(q, tcpRST|tcpACK, 201, 0))
-	estSays(t, tr, "given up by the phone after twelve seconds", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+	estSays(t, tr, "given up by the phone after twelve seconds", "1 sent data, 0 heard (0 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent")
 	// …and one it gives up after nine: none.
 	const r = 52602
 	openConn(tr, r)
@@ -868,15 +868,59 @@ func TestAStallThatEndsBetweenTwoLinesIsStillCounted(t *testing.T) {
 	tr.Out(segOut(s, tcpACK, 1, 200))
 	listen(tr, 12)
 	tr.Out(syn(s))
-	estSays(t, tr, "replaced after twelve seconds of silence", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+	estSays(t, tr, "replaced after twelve seconds of silence", "1 sent data, 0 heard (0 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent")
 	// A stall a line has already said, then given up or replaced: not said twice, and nothing late.
 	const u = 52604
 	openConn(tr, u)
 	tr.Out(segOut(u, tcpACK, 1, 200))
 	listen(tr, 10)
-	estSays(t, tr, "said standing", "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+	estSays(t, tr, "said standing", "1 sent data, 0 heard (0 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent")
 	tr.Out(segOut(u, tcpRST|tcpACK, 201, 0))
 	estSays(t, tr, "then given up", "0 sent data, 0 heard (0 with data), 0 stalled 10s+, 0 segment(s) re-sent")
+}
+
+// 🚨 Of what port class the stalled connections are is said beside their count
+// — 443, 80, anything else — as the silent connections' split says it: counts,
+// never a port. A stall and its class are counted by one line of code, at a
+// line and where a wait ends between two, so the classes add up to the stalls;
+// a period's classes are its own.
+func TestStalledConnectionsAreSaidByTheirPortClass(t *testing.T) {
+	tr := newInnerTraffic()
+	out := func(port, dport uint16, flags byte, seq uint32, n int) []byte {
+		return ip4(protoTCP, innerPhone4, innerFar4b, tcpData(port, dport, flags, seq, n))
+	}
+	in := func(port, dport uint16, flags byte, seq uint32, n int) []byte {
+		return ip4(protoTCP, innerFar4b, innerPhone4, tcpData(dport, port, flags, seq, n))
+	}
+	// Four connections, taken up at the phone's first segment: two to 443, one to 80, one to 5223.
+	tr.Out(out(53000, 443, tcpACK, 1, 100))
+	tr.Out(out(53001, 443, tcpACK, 1, 100))
+	tr.Out(out(53002, 80, tcpACK, 1, 100))
+	tr.Out(out(53003, 5223, tcpACK, 1, 100))
+	listen(tr, 10)
+	line := tr.Take(time.Minute)
+	if got, want := estPart(line), "4 sent data, 0 heard (0 with data), 4 stalled 10s+ (2 https / 1 http / 1 other), 0 segment(s) re-sent"; got != want {
+		t.Fatalf("four connections found stalled by a line\n got %q\nwant %q", got, want)
+	}
+	for _, leak := range []string{"5223", "53003", "443"} {
+		if strings.Contains(line, leak) {
+			t.Fatalf("the line says counts only — it carries %q: %q", leak, line)
+		}
+	}
+	// A wait that ends between two lines — answered late — is of its class too.
+	tr.Out(out(53004, 5223, tcpACK, 1, 100))
+	listen(tr, 30)
+	tr.In(in(53004, 5223, tcpACK, 1, 0))
+	estSays(t, tr, "answered after thirty seconds on another port", "1 sent data, 1 heard (0 with data) (1 late), 1 stalled 10s+ (0 https / 0 http / 1 other), 0 segment(s) re-sent")
+	// …and one the phone gives up after twelve seconds.
+	tr.Out(out(53005, 80, tcpACK, 1, 100))
+	listen(tr, 12)
+	tr.Out(out(53005, 80, tcpRST|tcpACK, 101, 0))
+	estSays(t, tr, "given up by the phone on port 80", "1 sent data, 0 heard (0 with data), 1 stalled 10s+ (0 https / 1 http / 0 other), 0 segment(s) re-sent")
+	// No stall, no classes: nothing of the periods before is carried.
+	tr.Out(out(53006, 443, tcpACK, 1, 100))
+	tr.In(in(53006, 443, tcpACK, 1, 50))
+	estSays(t, tr, "a period without a stall", "1 sent data, 1 heard (1 with data), 0 stalled 10s+, 0 segment(s) re-sent")
 }
 
 func TestAStallIsCountedInListeningNotOnTheWallClock(t *testing.T) {
@@ -892,7 +936,7 @@ func TestAStallIsCountedInListeningNotOnTheWallClock(t *testing.T) {
 		t.Fatalf("nine seconds of listening and two suspensions are not ten seconds: %q", line)
 	}
 	listen(tr, 1)
-	if line := tr.Take(time.Minute); estPart(line) != "0 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent" {
+	if line := tr.Take(time.Minute); estPart(line) != "0 sent data, 0 heard (0 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent" {
 		t.Fatalf("at ten seconds of listening: %q", line)
 	}
 }
@@ -979,7 +1023,7 @@ func TestAConnectionAlreadyOpenIsTakenUpAtThePhonesFirstSegment(t *testing.T) {
 	// The line came on in a connection's middle: no handshake was seen.
 	tr.Out(segOut(54001, tcpACK, 9000, 100))
 	listen(tr, 10)
-	if line := tr.Take(time.Minute); !strings.Contains(line, "tcp: 0 asked (0 SYN)") || estPart(line) != "1 sent data, 0 heard (0 with data), 1 stalled 10s+, 0 segment(s) re-sent" {
+	if line := tr.Take(time.Minute); !strings.Contains(line, "tcp: 0 asked (0 SYN)") || estPart(line) != "1 sent data, 0 heard (0 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent" {
 		t.Fatalf("a connection taken up at its first segment: %q", line)
 	}
 	// The phone's reset of a connection never seen opens nothing.
@@ -1010,7 +1054,7 @@ func TestTheSamePortsAskedAnewAreANewConnection(t *testing.T) {
 	tr.In(synAck(p))
 	tr.Out(segOut(p, tcpACK, 1, 10))
 	listen(tr, 10)
-	estSays(t, tr, "a new connection on a reset one's ports", "1 sent data, 1 heard (1 with data), 1 stalled 10s+, 0 segment(s) re-sent")
+	estSays(t, tr, "a new connection on a reset one's ports", "1 sent data, 1 heard (1 with data), 1 stalled 10s+ (1 https / 0 http / 0 other), 0 segment(s) re-sent")
 }
 
 func TestEstablishedConnectionsAreBoundedAndForgotten(t *testing.T) {

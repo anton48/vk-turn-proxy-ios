@@ -70,7 +70,9 @@ import (
 // phone's acknowledgement waits for nothing. A connection either side RESET
 // is owed nothing more: the phone's own reset ends its wait — one it gives up
 // inside ten seconds is in «sent data», not in «heard», and never «stalled»;
-// its repeats are in «re-sent» all the same.
+// its repeats are in «re-sent» all the same. Of what port class the stalled
+// connections are — 443, 80, anything else — is said beside their count, as
+// the silent connections' split says it: counts, never a port.
 //
 // 🚨 «Silent» is counted in LISTENING, never on the wall clock: a process that
 // did not run heard nothing for a reason of its own. The runner steps once a
@@ -170,9 +172,32 @@ type innerHost struct {
 // innerSilentSplit says, in counts, whom the connections just found silent
 // were asked of. Counts — never a host, never a port.
 type innerSilentSplit struct {
-	hosts              map[innerHost]struct{}
-	v4, v6             uint64
-	https, http, other uint64
+	hosts  map[innerHost]struct{}
+	v4, v6 uint64
+	ports  innerPortClasses
+}
+
+// innerPortClasses counts connections by the class of their far port: 443,
+// 80, anything else. Counts — never a port. The one place a port is classed:
+// the silent connections' split and the stalled connections' both ask it.
+type innerPortClasses struct{ https, http, other uint64 }
+
+func (p *innerPortClasses) add(rport uint16) {
+	switch rport {
+	case 443:
+		p.https++
+	case 80:
+		p.http++
+	default:
+		p.other++
+	}
+}
+
+func (p innerPortClasses) total() uint64 { return p.https + p.http + p.other }
+
+// String: the classes as the line says them.
+func (p innerPortClasses) String() string {
+	return fmt.Sprintf("%d https / %d http / %d other", p.https, p.http, p.other)
 }
 
 func (s *innerSilentSplit) add(key innerKey) {
@@ -185,14 +210,7 @@ func (s *innerSilentSplit) add(key innerKey) {
 	} else {
 		s.v4++
 	}
-	switch key.rport {
-	case 443:
-		s.https++
-	case 80:
-		s.http++
-	default:
-		s.other++
-	}
+	s.ports.add(key.rport)
 }
 
 // String: the split as the line says it; nothing when no connection was found
@@ -201,8 +219,7 @@ func (s *innerSilentSplit) String() string {
 	if s.v4+s.v6 == 0 {
 		return ""
 	}
-	return fmt.Sprintf(" (%d host(s); %d v4 / %d v6; %d https / %d http / %d other)",
-		len(s.hosts), s.v4, s.v6, s.https, s.http, s.other)
+	return fmt.Sprintf(" (%d host(s); %d v4 / %d v6; %s)", len(s.hosts), s.v4, s.v6, s.ports)
 }
 
 // innerPacket is what one inner packet's headers say.
@@ -350,7 +367,8 @@ type InnerTraffic struct {
 	pktOut, pktIn                           uint64
 	syn, tcpAsked, tcpAnswered, tcpLate     uint64
 	tcpRefused, rstIn                       uint64
-	resent, estLate, stalled                uint64
+	resent, estLate                         uint64
+	stalled                                 innerPortClasses // established connections found stalled, by their far port's class
 	tcpSilent, dnsSilent                    uint64           // asks whose wait ended, past its threshold, before a line saw it
 	split                                   innerSilentSplit // …and whom those connections were asked of
 	goneSent, goneHeard, goneData           uint64           // of connections that ended in the period
@@ -522,7 +540,7 @@ func (t *InnerTraffic) estClose(key innerKey) {
 	if c == nil {
 		return
 	}
-	t.estWaitOver(c, false)
+	t.estWaitOver(key, c, false)
 	if c.sentData {
 		t.goneSent++
 	}
@@ -538,7 +556,7 @@ func (t *InnerTraffic) estClose(key innerKey) {
 // estWaitOver: the wait on c, if there is one, ends now — by a packet for the
 // phone, or because the phone gave the connection up. A wait that lasted its
 // ten seconds of listening is a stall whether or not a line saw it standing.
-func (t *InnerTraffic) estWaitOver(c *innerConn, answered bool) {
+func (t *InnerTraffic) estWaitOver(key innerKey, c *innerConn, answered bool) {
 	if !c.waiting {
 		return
 	}
@@ -546,7 +564,7 @@ func (t *InnerTraffic) estWaitOver(c *innerConn, answered bool) {
 	stalled := c.said
 	if !stalled && t.listened-c.since >= innerTCPStalled {
 		stalled = true
-		t.stalled++
+		t.stalled.add(key.rport)
 	}
 	c.said = false
 	if stalled && answered {
@@ -606,7 +624,7 @@ func (t *InnerTraffic) estIn(key innerKey, pk innerPacket) {
 	if pk.payload > 0 {
 		c.gotData = true
 	}
-	t.estWaitOver(c, true)
+	t.estWaitOver(key, c, true)
 	if pk.flags&tcpRST != 0 {
 		c.reset = true
 	}
@@ -695,15 +713,19 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 		}
 		if c.waiting && !c.said && t.listened-c.since >= innerTCPStalled {
 			c.said = true
-			t.stalled++
+			t.stalled.add(key.rport)
 		}
 		c.sentData, c.heard, c.gotData = false, false, false
 		if t.listened-c.seen >= innerForget {
 			delete(t.est, key)
 		}
 	}
-	estStalled := t.stalled
-	t.stalled = 0
+	stalled := t.stalled
+	t.stalled = innerPortClasses{}
+	estStalled, stalledOf := stalled.total(), ""
+	if estStalled > 0 {
+		stalledOf = " (" + stalled.String() + ")"
+	}
 
 	span := wall.Round(time.Second).String()
 	if wall-awake > 2*time.Second {
@@ -728,8 +750,8 @@ func (t *InnerTraffic) Take(wall time.Duration) string {
 	fmt.Fprintf(&b, "inner, the last %s: %d pkt out / %d in", span, t.pktOut, t.pktIn)
 	fmt.Fprintf(&b, "; tcp: %d asked (%d SYN), %d answered%s, %d refused, %d silent %s+%s, %d RST in",
 		t.tcpAsked, t.syn, t.tcpAnswered, late(t.tcpLate), t.tcpRefused, tcpSilent, innerTCPSilent, split.String(), t.rstIn)
-	fmt.Fprintf(&b, "; tcp established: %d sent data, %d heard (%d with data)%s, %d stalled %s+, %d segment(s) re-sent",
-		estSent, estHeard, estData, late(t.estLate), estStalled, innerTCPStalled, t.resent)
+	fmt.Fprintf(&b, "; tcp established: %d sent data, %d heard (%d with data)%s, %d stalled %s+%s, %d segment(s) re-sent",
+		estSent, estHeard, estData, late(t.estLate), estStalled, innerTCPStalled, stalledOf, t.resent)
 	fmt.Fprintf(&b, "; dns: %d asked (%d sent), %d answered%s, %d silent %s+",
 		t.dnsAsked, t.dnsSent, t.dnsAnswered, late(t.dnsLate), dnsSilent, innerDNSSilent)
 	fmt.Fprintf(&b, "; udp: %d flows sent, %d heard, %d never answered %s+ (quic %d / %d / %d)",
