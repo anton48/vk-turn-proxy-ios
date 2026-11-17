@@ -125,10 +125,7 @@ func (cp *credPool) dialNowLocked(slot int) string {
 func (cp *credPool) peekAddrLocked(slot, connIdx int) string {
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
-		if addr, ok := cp.unlimitedFirstLocked(alive); ok {
-			return addr
-		}
-		return cp.cursorPickLocked(alive, connIdx)
+		return cp.pickAliveRelayLocked(slot, alive, connIdx)
 	}
 	if addr, ok := cp.health.probePeek(cands); ok {
 		return addr

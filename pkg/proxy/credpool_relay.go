@@ -187,10 +187,7 @@ func (cp *credPool) hasRelayLocked(slot int) bool {
 func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
-		if addr, ok := cp.unlimitedFirstLocked(alive); ok {
-			return addr, true
-		}
-		return cp.cursorPickLocked(alive, connIdx), true
+		return cp.pickAliveRelayLocked(slot, alive, connIdx), true
 	}
 	addr, ok, _ := cp.health.probe(cands)
 	if ok {
@@ -528,6 +525,7 @@ func (cp *credPool) pathChangedHealthLocked() {
 	}
 	cp.health.pathChanged()
 	cp.cursor = map[int]int{}
+	cp.handshakeFailures = map[int]map[string]bool{}
 	cp.deadMintUntil, cp.deadMintPause = time.Time{}, 0
 	go cp.reresolveOverride("path change", false) // the new network may see another DNS answer (#105)
 }
