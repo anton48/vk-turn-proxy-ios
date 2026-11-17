@@ -19,6 +19,7 @@ type relayHandshakeProbe struct {
 	primary, alternate string
 	slot, conn         int
 	pending            bool
+	prepare            bool
 	claimedUntil       time.Time
 	next               time.Time
 	retries            int
@@ -113,6 +114,10 @@ func (cp *credPool) planPeerProbeLocked(connIdx int, relay string) {
 	if probe.primary != relay || now.Before(probe.next) || probe.pending && now.Before(probe.claimedUntil) {
 		return
 	}
+	if probe.prepare {
+		probe.conn, probe.pending, probe.claimedUntil = connIdx, true, now.Add(relayProbeClaim)
+		return
+	}
 	for slot := 0; slot < cp.size && slot < len(cp.pool); slot++ {
 		for _, candidate := range cp.candidatesLocked(slot) {
 			if candidate == relay || probe.alternate != "" && candidate != probe.alternate || !cp.peerRelayReadyLocked(slot, candidate) {
@@ -123,6 +128,53 @@ func (cp *credPool) planPeerProbeLocked(connIdx int, relay string) {
 			return
 		}
 	}
+	// Cookie credentials belong to one relay per slot. Bootstrap must be
+	// able to prepare one alternative before the background grower starts.
+	if cp.mode == credCacheModeCookie && probe.alternate == "" {
+		for slot := 0; slot < cp.size && slot < len(cp.pool); slot++ {
+			e := cp.pool[slot]
+			if e.creds != nil || e.fetching || cp.configuredOffLocked(slot) || time.Now().Before(e.cooldownUntil) {
+				continue
+			}
+			probe.slot, probe.conn, probe.prepare = slot, connIdx, true
+			probe.pending, probe.claimedUntil = true, now.Add(relayProbeClaim)
+			return
+		}
+	}
+}
+
+// Reuse the pool's fill path so quota pauses, slot ownership and persistence
+// also apply to the single cold-start alternative.
+func (cp *credPool) preparePeerProbe(connIdx int, allowCaptchaBlock bool) {
+	cp.mu.Lock()
+	probe := cp.peerProbe
+	if !probe.prepare || !probe.pending || probe.conn != connIdx || cp.ctx.Err() != nil ||
+		!cp.health.now().Before(probe.claimedUntil) || time.Now().Before(cp.pauseAcquireUntil) {
+		cp.mu.Unlock()
+		return
+	}
+	cp.peerProbe.pending = false
+	cp.peerProbe.next = cp.health.now().Add(probeBackoff(probe.retries))
+	claim := cp.peerProbe
+	generation := cp.handStamp[connIdx]
+	cp.mu.Unlock()
+
+	log.Printf("credpool: conn %d: preparing cookie slot %d for an alternate peer-handshake probe", connIdx, probe.slot)
+	cp.tryFill(probe.slot, allowCaptchaBlock, 0)
+
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	if cp.ctx.Err() != nil || cp.peerProbe != claim || cp.handStamp[connIdx] != generation {
+		return
+	}
+	for _, relay := range cp.candidatesLocked(probe.slot) {
+		if relay != probe.primary && cp.peerRelayReadyLocked(probe.slot, relay) {
+			cp.peerProbe.alternate, cp.peerProbe.prepare = relay, false
+			cp.peerProbe.pending, cp.peerProbe.claimedUntil = true, cp.health.now().Add(relayProbeClaim)
+			return
+		}
+	}
+	cp.peerProbe.retries++
 }
 
 func (cp *credPool) hasPeerRelayLocked(relay string) bool {

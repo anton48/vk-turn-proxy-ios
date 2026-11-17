@@ -2367,6 +2367,7 @@ type poolParkError struct {
 func (e *poolParkError) Error() string { return e.msg }
 
 func (cp *credPool) handOut(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, uint64, error) {
+	cp.preparePeerProbe(connIdx, allowCaptchaBlock)
 	cp.mu.Lock()
 
 	// Path-change pause: while pauseAcquireUntil is in the future, refuse

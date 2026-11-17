@@ -178,6 +178,205 @@ func TestPeerHandshakeFailuresProbeOneAlternateWithoutSweepingSlots(t *testing.T
 	}
 }
 
+func TestPeerHandshakeCookieBootstrapPreparesOneEmptySlot(t *testing.T) {
+	cp, clock := peerHandshakePool(t, true, relayA, relayB, relayC)
+	cp.pool[1], cp.pool[2] = credPoolEntry{}, credPoolEntry{}
+	cp.setColdStartTarget(1)
+	fetched := 0
+	cp.fetch = func(_ bool, slot int) (string, *TURNCreds, error) {
+		fetched++
+		if slot != 1 {
+			t.Fatalf("fetched slot %d, want the reserved slot 1", slot)
+		}
+		return relayB, &TURNCreds{Username: futureUser("bootstrap-alternate"), Password: "pw", Address: relayB, Addresses: []string{relayA, relayB}}, nil
+	}
+	fail := func(want string) {
+		t.Helper()
+		addr, creds, slot := mustGet(t, cp, 0)
+		if addr != want {
+			t.Fatalf("relay %s, want %s", addr, want)
+		}
+		window := handshakeObservation{started: *clock, ended: clock.Add(time.Second), timedOut: true}
+		*clock = window.ended
+		cp.notePeerHandshakeResult(context.Background(), 0, cp.handStampOf(0), addr, window, context.DeadlineExceeded, nil)
+		cp.release(slot, creds, "")
+	}
+	addr, creds, slot := mustGet(t, cp, 0)
+	cp.release(slot, creds, "")
+	if addr != relayA || fetched != 0 {
+		t.Fatal("bootstrap fetched an alternate before a handshake timeout")
+	}
+	fail(relayA)
+	// Other workers can keep using the primary while the probe is reserved.
+	addr, creds, slot = mustGet(t, cp, 1)
+	cp.release(slot, creds, "")
+	if addr != relayA || fetched != 0 {
+		t.Fatal("another connection consumed the cold-start probe")
+	}
+	fail(relayB)
+	for range 3 {
+		fail(relayA)
+	}
+	*clock = cp.peerProbe.next.Add(time.Millisecond)
+	fail(relayA)
+	fail(relayB)
+	if fetched != 1 || cp.pool[2].creds != nil || cp.peerProbe.retries != 2 || cp.peerMarks != 0 {
+		t.Fatal("bootstrap swept empty slots, refetched credentials or marked a relay without evidence")
+	}
+	if cp.pool[0].active != 0 || cp.pool[1].active != 0 {
+		t.Fatal("bootstrap probe leaked a pool seat")
+	}
+}
+
+func TestPeerHandshakeCookieBootstrapFillFailureKeepsOneSlotAndBackoff(t *testing.T) {
+	cp, clock := peerHandshakePool(t, true, relayA, relayB, relayC)
+	cp.pool[1], cp.pool[2] = credPoolEntry{}, credPoolEntry{}
+	fetched := 0
+	cp.fetch = func(_ bool, slot int) (string, *TURNCreds, error) {
+		fetched++
+		if slot != 1 {
+			t.Fatalf("failed probe swept to slot %d", slot)
+		}
+		return "", nil, errors.New("credential fetch failed")
+	}
+	for range 4 {
+		addr, creds, slot := mustGet(t, cp, 0)
+		if addr != relayA {
+			t.Fatal("failed fill lost the primary credential")
+		}
+		cp.notePeerHandshakeResult(context.Background(), 0, cp.handStampOf(0), addr,
+			handshakeObservation{started: *clock, ended: clock.Add(time.Second), timedOut: true}, context.DeadlineExceeded, nil)
+		cp.release(slot, creds, "")
+	}
+	if fetched != 1 || !cp.peerProbe.prepare || cp.pool[1].cooldownUntil.IsZero() || cp.pool[2].creds != nil {
+		t.Fatal("failed bootstrap fill ignored fetch cooldown or probe backoff")
+	}
+}
+
+func TestPeerHandshakeCookieBootstrapFillIgnoresChangedAttempt(t *testing.T) {
+	for _, change := range []string{"network path", "canceled pool", "superseded attempt"} {
+		t.Run(change, func(t *testing.T) {
+			cp, clock := peerHandshakePool(t, true, relayA, relayB)
+			cp.pool[1] = credPoolEntry{}
+			ctx, cancel := context.WithCancel(cp.ctx)
+			defer cancel()
+			cp.ctx = ctx
+			cp.fetch = func(_ bool, _ int) (string, *TURNCreds, error) {
+				cp.mu.Lock()
+				switch change {
+				case "network path":
+					cp.pathChangedHealthLocked()
+				case "canceled pool":
+					cancel()
+				case "superseded attempt":
+					cp.handStamp[0]++
+				}
+				cp.mu.Unlock()
+				return relayB, &TURNCreds{Username: futureUser("changed-bootstrap"), Password: "pw", Address: relayB}, nil
+			}
+			addr, creds, slot := mustGet(t, cp, 0)
+			cp.notePeerHandshakeResult(context.Background(), 0, cp.handStampOf(0), addr,
+				handshakeObservation{started: *clock, ended: clock.Add(time.Second), timedOut: true}, context.DeadlineExceeded, nil)
+			cp.release(slot, creds, "")
+			cp.preparePeerProbe(0, false)
+			if cp.peerProbe.pending || cp.peerMarks != 0 || cp.pool[1].active != 0 {
+				t.Fatal("stale bootstrap fill published a probe or took a seat")
+			}
+		})
+	}
+}
+
+func TestPeerHandshakeCookieBootstrapRespectsMintAndSlotPauses(t *testing.T) {
+	for _, blocked := range []string{"quota", "dead mint", "slot cooldown", "pending credential", "fetch in progress", "path settle", "canceled pool"} {
+		t.Run(blocked, func(t *testing.T) {
+			cp, clock := peerHandshakePool(t, true, relayA, relayB)
+			cp.pool[1] = credPoolEntry{}
+			fetched := 0
+			cp.fetch = func(bool, int) (string, *TURNCreds, error) {
+				fetched++
+				return "", nil, errors.New("unexpected credential fetch")
+			}
+			addr, creds, slot := mustGet(t, cp, 0)
+			cp.notePeerHandshakeResult(context.Background(), 0, cp.handStampOf(0), addr,
+				handshakeObservation{started: *clock, ended: clock.Add(time.Second), timedOut: true}, context.DeadlineExceeded, nil)
+			cp.release(slot, creds, "")
+			until := time.Now().Add(time.Minute)
+			switch blocked {
+			case "quota":
+				cp.quota.pausedUntil = until
+			case "dead mint":
+				cp.deadMintUntil = until
+			case "slot cooldown":
+				cp.pool[1].cooldownUntil = until
+			case "pending credential":
+				cp.seedSlot(1, relayB, &TURNCreds{Username: futureUser("pending-bootstrap"), Password: "pw", Address: relayB})
+				cp.pool[1].availableAt = until
+			case "fetch in progress":
+				cp.claimForFetchLocked(1)
+			case "path settle":
+				cp.pauseAcquireUntil = until
+			case "canceled pool":
+				ctx, cancel := context.WithCancel(cp.ctx)
+				cancel()
+				cp.ctx = ctx
+			}
+			cp.preparePeerProbe(0, false)
+			if fetched != 0 || cp.pool[1].active != 0 || cp.peerProbe.alternate != "" {
+				t.Fatal("bootstrap probe bypassed a mint or slot restriction")
+			}
+		})
+	}
+}
+
+func TestPeerHandshakeCookieBootstrapFillIsSharedAcrossWorkers(t *testing.T) {
+	cp, clock := peerHandshakePool(t, true, relayA, relayB, relayC)
+	cp.pool[1], cp.pool[2] = credPoolEntry{}, credPoolEntry{}
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	cp.fetch = func(bool, int) (string, *TURNCreds, error) {
+		close(entered)
+		<-proceed
+		return relayB, &TURNCreds{Username: futureUser("shared-bootstrap"), Password: "pw", Address: relayB}, nil
+	}
+	addr, creds, slot := mustGet(t, cp, 0)
+	window := handshakeObservation{started: *clock, ended: clock.Add(time.Second), timedOut: true}
+	cp.notePeerHandshakeResult(context.Background(), 0, cp.handStampOf(0), addr, window, context.DeadlineExceeded, nil)
+	cp.release(slot, creds, "")
+	done := make(chan error, 1)
+	go func() {
+		addr, creds, slot, err := cp.get(0, false)
+		if err == nil {
+			cp.release(slot, creds, "")
+			if addr != relayB {
+				err = errors.New("reserved worker did not use the prepared alternative")
+			}
+		}
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		close(proceed)
+		t.Fatal("bootstrap fill did not start")
+	}
+	for conn := 1; conn < 5; conn++ {
+		addr, creds, slot := mustGet(t, cp, conn)
+		cp.notePeerHandshakeResult(context.Background(), conn, cp.handStampOf(conn), addr, window, context.DeadlineExceeded, nil)
+		cp.release(slot, creds, "")
+	}
+	close(proceed)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("bootstrap fill did not return")
+	}
+	if cp.pool[2].creds != nil || cp.pool[0].active != 0 || cp.pool[1].active != 0 {
+		t.Fatal("concurrent workers filled another slot or leaked a seat")
+	}
+}
+
 func TestPeerHandshakeResultIgnoresCanceledSuspendedAndStaleAttempts(t *testing.T) {
 	for _, reason := range []string{"parent canceled", "suspended", "non-deadline", "stale generation", "old path"} {
 		t.Run(reason, func(t *testing.T) {
