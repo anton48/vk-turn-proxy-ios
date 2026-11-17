@@ -257,7 +257,7 @@ func TestARestartDoesNotOutrunItsOwnDeallocate(t *testing.T) {
 		defer cancel()
 		done := make(chan error, 1)
 		go func() {
-			done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+			done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil, nil)
 		}()
 		waitUntil(t, "the allocation", 5*time.Second, func() bool { return srv.AllocationCount() == 1 })
 		if ok, err := allocateNow(t, tap); ok || err == nil {
@@ -281,7 +281,7 @@ func TestARestartDoesNotOutrunItsOwnDeallocate(t *testing.T) {
 		defer cancel()
 		done := make(chan error, 1)
 		go func() {
-			c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil)
+			c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil, 0)
 			if c != nil {
 				_ = c.Close()
 			}
@@ -350,7 +350,7 @@ func TestALostDeallocateIsSentAgain(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return srv.AllocationCount() == 1 })
 	tap.dropNext.Store(1) // the first deallocate datagram never reaches the relay
@@ -385,7 +385,7 @@ func TestAnUnansweredDeallocateIsBoundedAndCounted(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return srv.AllocationCount() == 1 })
 	tap.mute.Store(true) // no deallocate gets through from here on
@@ -644,7 +644,7 @@ func TestOverTCPTheTeardownSendsNoRequestOfItsOwn(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return p.turnRTTns.Load() != 0 })
 	cancel()

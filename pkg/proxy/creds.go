@@ -1210,7 +1210,15 @@ type credPool struct {
 	healthTimer   *time.Timer
 	healthWakeAt  time.Time
 
-	handshakeFailures map[int]map[string]bool
+	// Written by completed peer handshakes under mu and cleared on path changes.
+	// The bounded alternate reservation is consumed when its lease is handed out.
+	peerHandshakes map[int]peerHandshake
+	peerFailures   map[string]handshakeObservation
+	peerProbe      relayHandshakeProbe
+
+	// Cumulative valid handshake deadlines and corroborated peer-path failures.
+	peerTimeouts uint64
+	peerMarks    uint64
 
 	// relayUsedAt (cookie mode): relay → the last moment a lease on it ended;
 	// the quota clock of the RELAY — see relayQuarantineUntilLocked.
@@ -1749,7 +1757,8 @@ func newCredPool(ctx context.Context, size int, cooldown time.Duration, cachePat
 		cursor:          map[int]int{},
 		relayUsedAt:     map[string]time.Time{},
 
-		handshakeFailures: map[int]map[string]bool{},
+		peerHandshakes: map[int]peerHandshake{},
+		peerFailures:   map[string]handshakeObservation{},
 	}
 	if cachePath != "" {
 		cp.loadFromDisk()
@@ -2212,7 +2221,9 @@ const connsPerSlot = 10
 // memory for the empirical context (build 87, 2026-05-14).
 func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (int, string, string) {
 	now := time.Now()
-	preferOtherRelay := false
+	if slot, addr, ok := cp.peerProbeChoiceLocked(connIdx); ok {
+		return slot, addr, "peer handshake probe"
+	}
 
 	// Priority 1: ownSlot, unconditionally preferred when usable.
 	if cp.isFreshLocked(ownSlot) && !cp.usableLocked(ownSlot) && logSkips {
@@ -2246,18 +2257,7 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 		if !cp.roomOnLocked(i, addr) {
 			return "", false
 		}
-		if preferOtherRelay && cp.handshakeFailures[connIdx][addr] {
-			return "", false
-		}
 		return addr, true
-	}
-	if len(cp.handshakeFailures[connIdx]) > 0 {
-		for i := 0; i < cp.size; i++ {
-			if addr, ok := eligible(i); ok && !cp.handshakeFailures[connIdx][addr] {
-				preferOtherRelay = true
-				break
-			}
-		}
 	}
 	// Priority 0: a slot whose relay has no quota (the list's host:port:0 —
 	// the user's own relay) takes every connection while it answers, in both
@@ -2266,7 +2266,7 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 	// fixed list keeps such a slot eligible in its own turn: the list is
 	// cycled, not minted around — hasRelayLocked).
 	for i := 0; i < cp.size && i < len(cp.pool); i++ {
-		if addr, ok := eligible(i); ok && cp.override.unlimited(addr) && !cp.handshakeFailures[connIdx][addr] && len(cp.health.untried([]string{addr})) > 0 {
+		if addr, ok := eligible(i); ok && cp.override.unlimited(addr) && len(cp.health.untried([]string{addr})) > 0 {
 			return i, addr, "unlimited relay"
 		}
 	}
@@ -2280,9 +2280,7 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 	// it for ever while the other entry's slot sat untried). In anonymous mode
 	// the cursor already steers a connection past a silent candidate; the
 	// rounds change nothing there.
-	untried := func(addr string) bool {
-		return !cp.handshakeFailures[connIdx][addr] && len(cp.health.untried([]string{addr})) > 0
-	}
+	untried := func(addr string) bool { return len(cp.health.untried([]string{addr})) > 0 }
 	kindOf := func(slot int) string {
 		switch {
 		case slot == ownSlot:

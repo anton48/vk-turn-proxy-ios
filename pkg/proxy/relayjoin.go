@@ -60,6 +60,7 @@ type relayLeg struct {
 	running int           // started and not yet ended, teardown included
 	joined  bool          // the session is ending: nothing is started behind a join
 	idle    chan struct{} // made by a join that found a leg running; closed by the last one's end
+	ready   chan struct{} // optional DTLS setup barrier, after Allocate and CreatePermission
 
 	gave gaveBack // when the leg gave its allocation back — what the session releases its lease by (seatcool.go)
 }
@@ -121,7 +122,7 @@ func (p *Proxy) goRunTURN(ctx context.Context, leg *relayLeg, turnAddr string, c
 	ch := make(chan error, 1)
 	go func() {
 		defer leg.done()
-		ch <- p.runTURN(ctx, turnAddr, creds, conn2, connIdx, slotIdx, &leg.gave)
+		ch <- p.runTURN(ctx, turnAddr, creds, conn2, connIdx, slotIdx, &leg.gave, leg.ready)
 		if after != nil {
 			after()
 		}

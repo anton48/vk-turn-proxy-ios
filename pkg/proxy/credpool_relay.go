@@ -35,6 +35,7 @@ func (cp *credPool) setOverride(o turnOverride) {
 		log.Printf("credpool: TURN relay override: cookie mode — %s takes every slot after the %d fixed entr(ies); the %d entr(ies) after it are not used", TURNServersVK, len(fixed), len(o.servers)-len(fixed)-1)
 	}
 	cp.override = o
+	cp.peerProbe = relayHandshakeProbe{}
 	cp.growForListLocked() // the fixed entries add to the VK slots
 	// Cookie mode under a list: every slot asks the list afresh, in order —
 	// its stored address when the list names it and no slot holds it, else a
@@ -185,9 +186,15 @@ func (cp *credPool) hasRelayLocked(slot int) bool {
 // mark), or — with every candidate marked — the one longest due for a re-try,
 // reserved for this connection. ok=false: nothing to dial now.
 func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
+	if probeSlot, addr, ok := cp.peerProbeChoiceLocked(connIdx); ok && probeSlot == slot {
+		return addr, true
+	}
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
-		return cp.pickAliveRelayLocked(slot, alive, connIdx), true
+		if addr, ok := cp.unlimitedFirstLocked(alive); ok {
+			return addr, true
+		}
+		return cp.cursorPickLocked(alive, connIdx), true
 	}
 	addr, ok, _ := cp.health.probe(cands)
 	if ok {
@@ -363,6 +370,7 @@ func (cp *credPool) stampLocked() uint64 {
 // after a mint with the connection's previous stamp, and a late notice of an
 // old mark ended the new session). A scan pins that get seats nothing bare.
 func (cp *credPool) handOutLocked(connIdx, slot int, addr string) uint64 {
+	cp.claimPeerProbeLocked(connIdx, slot, addr)
 	cp.seatLocked(slot, addr)
 	return cp.stampHandOutLocked(connIdx)
 }
@@ -525,7 +533,9 @@ func (cp *credPool) pathChangedHealthLocked() {
 	}
 	cp.health.pathChanged()
 	cp.cursor = map[int]int{}
-	cp.handshakeFailures = map[int]map[string]bool{}
+	cp.peerHandshakes = map[int]peerHandshake{}
+	cp.peerFailures = map[string]handshakeObservation{}
+	cp.peerProbe = relayHandshakeProbe{}
 	cp.deadMintUntil, cp.deadMintPause = time.Time{}, 0
 	go cp.reresolveOverride("path change", false) // the new network may see another DNS answer (#105)
 }
@@ -588,6 +598,7 @@ func (cp *credPool) reresolveOverride(reason string, limited bool) {
 		return
 	}
 	cp.override.servers, cp.override.quotas, cp.override.paces = next.servers, next.quotas, next.paces // the name's fields on its new IPs — the paces too (the user's review of 9d58dda)
+	cp.peerProbe = relayHandshakeProbe{}
 	servers = next.servers
 	if cp.mode == credCacheModeCookie {
 		cp.growForListLocked()               // more fixed entries: more slots, VK's kept

@@ -119,6 +119,9 @@ type relayRecord struct {
 }
 
 type relayHealth struct {
+	// Peer forwarding failures require another relay's handshake or data evidence.
+	// A successful peer handshake or network-path change clears them.
+	peerFailed   map[string]bool
 	rec          map[string]*relayRecord
 	lastAnswer   time.Time // the latest answer on this path — a relay's or VK's API
 	lastVKAnswer time.Time // the latest answer of VK's API on this path (the evidence a relay's own answer cannot be)
@@ -132,7 +135,7 @@ type relayHealth struct {
 }
 
 func newRelayHealth() *relayHealth {
-	return &relayHealth{rec: map[string]*relayRecord{}, now: time.Now}
+	return &relayHealth{rec: map[string]*relayRecord{}, peerFailed: map[string]bool{}, now: time.Now}
 }
 
 func (h *relayHealth) record(addr string) *relayRecord {
@@ -290,13 +293,14 @@ func (h *relayHealth) answered(addr string, start time.Time) {
 // pathChanged forgets everything: the verdicts were about the old network.
 func (h *relayHealth) pathChanged() {
 	h.rec = map[string]*relayRecord{}
+	h.peerFailed = map[string]bool{}
 	h.lastAnswer, h.lastVKAnswer = time.Time{}, time.Time{}
 	h.pathChangedAt = h.now()
 }
 
 func (h *relayHealth) isDead(addr string) bool {
 	r := h.rec[addr]
-	return r != nil && r.dead
+	return h.peerFailed[addr] || r != nil && r.dead
 }
 
 // alive is the unmarked candidates, in the list's order.
@@ -365,7 +369,7 @@ func (h *relayHealth) dueCandidate(cands []string) (addr string, ok bool, nextDu
 	var dues []due
 	for _, a := range cands {
 		r := h.rec[a]
-		if r == nil || !r.dead {
+		if h.peerFailed[a] || r == nil || !r.dead {
 			continue
 		}
 		if r.claimedUntil.After(now) {
@@ -391,7 +395,7 @@ func (h *relayHealth) dueCandidate(cands []string) (addr string, ok bool, nextDu
 func (h *relayHealth) untried(cands []string) []string {
 	out := make([]string, 0, len(cands))
 	for _, a := range cands {
-		if r := h.rec[a]; r == nil || (!r.dead && r.unanswered == 0) {
+		if r := h.rec[a]; !h.peerFailed[a] && (r == nil || (!r.dead && r.unanswered == 0)) {
 			out = append(out, a)
 		}
 	}
@@ -426,7 +430,7 @@ func (h *relayHealth) hasCandidate(cands []string) bool {
 	due := false
 	for _, a := range cands {
 		r := h.rec[a]
-		if r == nil || !r.dead {
+		if h.peerFailed[a] || r == nil || !r.dead {
 			continue
 		}
 		if r.claimedUntil.After(now) {

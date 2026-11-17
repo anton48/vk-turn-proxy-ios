@@ -333,6 +333,9 @@ type Proxy struct {
 	// Used to detect dead tunnels after iOS freeze/thaw.
 	lastRecvTime atomic.Int64
 
+	// Cumulative attempts invalidated by process suspension or a wake callback.
+	handshakeSuspended atomic.Uint64
+
 	// Pion silent-degradation detector. The pion TURN client logs Errorf when
 	// CreatePermission refresh fails and Warnf when ChannelBind refresh fails.
 	// Neither failure tears down the underlying allocation, so a partial loss
@@ -2486,6 +2489,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
+	leg.ready = make(chan struct{})
 	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
 	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave) }()
 
@@ -2524,9 +2528,16 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
 	// DTLS handshake — packets go through conn1 → conn2 → TURN relay → peer
+	// Start its deadline only after the TURN leg has permission to send.
+	select {
+	case <-leg.ready:
+	case <-connCtx.Done():
+	}
 	dtlsStart := time.Now()
-	dtlsConn, err := dialDTLS(connCtx, conn1, p.peer)
-	p.credPool.noteHandshakeResult(sessCtx, connIdx, sessGen, turnAddr, dtlsStart, err)
+	wakeEpoch := p.wakeEpoch.Load()
+	dtlsConn, err, observation := dialDTLSObserved(connCtx, conn1, p.peer)
+	observation.suspended = observation.suspended || p.wakeEpoch.Load() != wakeEpoch
+	p.notePeerHandshake(sessCtx, connIdx, sessGen, turnAddr, observation, err)
 	if err != nil {
 		connCancel()
 		select {
@@ -3488,7 +3499,7 @@ func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
 // Runs until the relay fails or ctx is cancelled. No forced lifetime —
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
-func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, gave *gaveBack) error {
+func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, gave *gaveBack, ready chan<- struct{}) error {
 	attempt := time.Now() // when this relay attempt began — the relay health's window (relayhealth.go)
 	turnUDPAddr, err := net.ResolveUDPAddr("udp", turnAddr)
 	if err != nil {
@@ -3683,6 +3694,18 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		// Close: whichever of the two a late transaction meets, it ends.
 		client.Close()
 	})
+	quiesce := sync.OnceFunc(func() {
+		if !stopHook() {
+			<-hookDone
+		}
+	})
+	defer quiesce()
+	if ready != nil {
+		if err := client.CreatePermission(p.peer); err != nil {
+			return fmt.Errorf("TURN create permission: %w", err)
+		}
+		close(ready)
+	}
 
 	var peerAddr atomic.Value
 
@@ -3869,9 +3892,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// for its lifetime (the user's review of 395). The hook is stopped, or
 	// waited for, before anything below touches a deadline.
 	turnCancel()
-	if !stopHook() {
-		<-hookDone
-	}
+	quiesce()
 	// Reset conn2 deadline so it can be reused by the next TURN session.
 	relayConn.SetDeadline(time.Time{})
 	conn2.SetDeadline(time.Time{})
@@ -4240,6 +4261,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 	var prevForced bool
 
 	dump := func(label string) {
+		peerTimeouts, peerMarks := p.credPool.peerHandshakeStats()
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 		rssStr := "n/a"
@@ -4279,7 +4301,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s peer-hs-timeouts=%d peer-hs-marked=%d peer-hs-suspended=%d",
 			label,
 			rssStr,
 			internalStr,
@@ -4338,7 +4360,10 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// that can see a packet waiting AFTER Write returned. 🚨 `sb`
 			// includes in-flight data by the SDK's own definition; read
 			// sockstats.go before quoting it.
-			p.sockStats.summary())
+			p.sockStats.summary(),
+			peerTimeouts,
+			peerMarks,
+			p.handshakeSuspended.Load())
 
 		// The downlink's own disorder, on its own line so it can be diffed
 		// field-for-field against server1's `reorder(uplink)` line — the two
@@ -4600,10 +4625,18 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
 }
 
+// A variable so local transport tests can bound a handshake independently of TURN setup.
+var dtlsHandshakeTimeout = 15 * time.Second
+
 func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
+	conn, err, _ := dialDTLSObserved(ctx, transport, peer)
+	return conn, err
+}
+
+func dialDTLSObserved(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) (net.Conn, error, handshakeObservation) {
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
-		return nil, err
+		return nil, err, handshakeObservation{}
 	}
 	// CipherSuites order is chosen to overlap with Apple WebRTC's ClientHello
 	// (captured via Wireshark on a real VK call): c02b, c02f, c00a, c014 are
@@ -4632,7 +4665,7 @@ func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) 
 	}
 	dtlsConn, err := dtls.Client(transport, peer, config)
 	if err != nil {
-		return nil, err
+		return nil, err, handshakeObservation{}
 	}
 	// 15s timeout: shorter than the 30s default so the bootstrap retry
 	// loop (see startConnections) gets ~4 chances within ~90s instead of
@@ -4640,13 +4673,13 @@ func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) 
 	// complete in ~50-300ms (see "DTLS HS" in stats), so 15s is plenty
 	// of headroom for slow networks while still failing fast on transient
 	// network breaks worth retrying.
-	hsCtx, hsCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer hsCancel()
-	if err := dtlsConn.HandshakeContext(hsCtx); err != nil {
-		dtlsConn.Close()
-		return nil, err
-	}
-	return dtlsConn, nil
+	return observePeerHandshake(ctx, dtlsHandshakeTimeout, func(hsCtx context.Context) (net.Conn, error) {
+		if err := dtlsConn.HandshakeContext(hsCtx); err != nil {
+			_ = dtlsConn.Close()
+			return nil, err
+		}
+		return dtlsConn, nil
+	})
 }
 
 type connectedUDPConn struct {
@@ -5384,11 +5417,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 
 	// Set up TURN allocation and DTLS-SRTP handshake to the peer.
 	sessStart := time.Now()
-	srtpConn, err := p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx, &gave)
-	var handshakeError *transportHandshakeError
-	if err == nil || errors.As(err, &handshakeError) {
-		p.credPool.noteHandshakeResult(connCtx, connIdx, sessGen, turnAddr, sessStart, err)
-	}
+	srtpConn, err := p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx, &gave, sessGen)
 	if err != nil {
 		// Mirror runDTLSSession's error attribution so quota / auth
 		// failures land on the correct slot.
@@ -5752,7 +5781,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 // (srtpSessionConn wrapper) whose Read/Write framing is RTP+SRTP and
 // whose Close tears down the SRTP wrapper, the relay allocation, the
 // TURN client, and the underlying control conn together.
-func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TURNCreds, credSlot, connIdx int, gave *gaveBack) (net.Conn, error) {
+func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TURNCreds, credSlot, connIdx int, gave *gaveBack, generation uint64) (net.Conn, error) {
 	attempt := time.Now() // when this relay attempt began — the relay health's window (relayhealth.go)
 	// Local control conn: UDP socket (UDP-control) or TCP dial wrapped
 	// in turn.NewSTUNConn (TCP-control). Mirrors tools/turn_srtp_test
@@ -5891,12 +5920,15 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms, local=%s)",
 		connIdx, relayConn.LocalAddr(), allocDur.Milliseconds(), ctlConn.LocalAddr())
 
-	hsCtx, hsCancel := context.WithTimeout(ctx, srtpwrap.HandshakeTimeout)
-	srtpConn, err := srtpwrap.Client(hsCtx, relayConn, p.peer, &p.rtpChPeak)
-	hsCancel()
+	wakeEpoch := p.wakeEpoch.Load()
+	srtpConn, err, observation := observePeerHandshake(ctx, srtpwrap.HandshakeTimeout, func(hsCtx context.Context) (net.Conn, error) {
+		return srtpwrap.Client(hsCtx, relayConn, p.peer, &p.rtpChPeak)
+	})
+	observation.suspended = observation.suspended || p.wakeEpoch.Load() != wakeEpoch
+	p.notePeerHandshake(ctx, connIdx, generation, turnAddr, observation, err)
 	if err != nil {
 		abortSetup()
-		return nil, &transportHandshakeError{fmt.Errorf("srtp handshake: %w", err)}
+		return nil, fmt.Errorf("srtp handshake: %w", err)
 	}
 
 	return &srtpSessionConn{

@@ -341,7 +341,7 @@ func TestAnAbortedSetupNotesTheAllocationItGaveBack(t *testing.T) {
 		var gave gaveBack
 		done := make(chan error, 1)
 		go func() {
-			c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, &gave)
+			c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, &gave, 0)
 			if c != nil {
 				_ = c.Close()
 			}
@@ -371,7 +371,7 @@ func TestAnAbortedSetupNotesTheAllocationItGaveBack(t *testing.T) {
 		relay, _ := udpQuotaTURNFor(t, 1, func(string) bool { return false }) // the relay knows no such user: the Allocate is refused
 		p := udpProxy()
 		var gave gaveBack
-		c, err := p.setupSRTPSession(context.Background(), relay, &TURNCreds{Username: "u", Password: "pw"}, 0, 0, &gave)
+		c, err := p.setupSRTPSession(context.Background(), relay, &TURNCreds{Username: "u", Password: "pw"}, 0, 0, &gave, 0)
 		if err == nil {
 			_ = c.Close()
 			t.Fatal("fixture: the setup succeeded with credentials the relay does not know")
@@ -814,7 +814,7 @@ func TestOverTCPASessionTheRelayDroppedNotesNoGiveBack(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			var gave gaveBack
-			conn, err := p.setupSRTPSession(ctx, relay.addr, &TURNCreds{Username: user, Password: "pw"}, 0, 0, &gave)
+			conn, err := p.setupSRTPSession(ctx, relay.addr, &TURNCreds{Username: user, Password: "pw"}, 0, 0, &gave, 0)
 			if err != nil {
 				t.Fatalf("fixture: the session did not come up over TCP: %v", err)
 			}
@@ -881,7 +881,7 @@ func TestEverySessionReleasesItsLeaseBehindTheRelaysSecond(t *testing.T) {
 			t.Errorf("%s: %d deferred releaseLease(currentSlot, currentCreds, currentAddr, %s), want 1", fn, n, note)
 		}
 	}
-	if b := body(src, "func (p *Proxy) runSRTPSession("); !strings.Contains(b, "p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx, &gave)") {
+	if b := body(src, "func (p *Proxy) runSRTPSession("); !strings.Contains(b, "p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx, &gave, sessGen)") {
 		t.Error("runSRTPSession does not hand ITS note to setupSRTPSession — the teardown would write a note the lease never reads")
 	}
 	if b := body(src, "func (p *Proxy) runDirectSession("); !strings.Contains(b, "p.releaseLease(credSlot, currentCreds, currentAddr, &leg.gave)") {
@@ -900,7 +900,7 @@ func TestEverySessionReleasesItsLeaseBehindTheRelaysSecond(t *testing.T) {
 			}
 		}
 	}
-	if b := body(join, "func (p *Proxy) goRunTURN("); !strings.Contains(b, "&leg.gave)") {
+	if b := body(join, "func (p *Proxy) goRunTURN("); !strings.Contains(b, "&leg.gave, leg.ready)") {
 		t.Error("goRunTURN does not hand the leg's note to runTURN")
 	}
 	if b := body(join, "func (p *Proxy) joinRelayLeg("); !strings.Contains(b, "leg.gave.note(") {

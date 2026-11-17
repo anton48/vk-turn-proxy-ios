@@ -163,7 +163,7 @@ func TestRunTURNReturnsWhenTheRelayGoesSilentAtCreatePermission(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return p.turnRTTns.Load() != 0 })
 
@@ -201,7 +201,7 @@ func TestSetupSRTPSessionReturnsWhenTheRelayGoesSilentAtCreatePermission(t *test
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil)
+		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil, 0)
 		if c != nil {
 			_ = c.Close()
 		}
@@ -246,7 +246,7 @@ func TestSetupSRTPSessionReturnsWhenTheCancelPrecedesThePermission(t *testing.T)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil)
+		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil, 0)
 		if c != nil {
 			_ = c.Close()
 		}
@@ -339,7 +339,7 @@ func TestRunTURNDeallocatesAfterACancelOnAHealthyRelay(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return p.turnRTTns.Load() != 0 })
 	_, _ = conn1.WriteTo(make([]byte, 100), peer)
@@ -364,7 +364,7 @@ func TestSetupSRTPSessionDeallocatesAfterACancelOnAHealthyRelay(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil)
+		c, err := p.setupSRTPSession(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, 0, 0, nil, 0)
 		if c != nil {
 			_ = c.Close()
 		}
@@ -412,7 +412,7 @@ func TestTheTeardownsQuiesceTheCancelHookBeforeReArmingTheBudget(t *testing.T) {
 		t.Fatal("runTURN: no return after wg.Wait")
 	}
 	after := tail[w : w+end]
-	wait := strings.Index(after, "if !stopHook() {\n\t\t<-hookDone")
+	wait := strings.Index(after, "\tquiesce()\n")
 	reset := strings.Index(after, "relayConn.SetDeadline(time.Time{})")
 	if wait < 0 {
 		t.Error("runTURN does not wait for its cancel hook after wg.Wait — the hook's past deadline can land after the deferred budget and fail the deallocate")
@@ -422,6 +422,25 @@ func TestTheTeardownsQuiesceTheCancelHookBeforeReArmingTheBudget(t *testing.T) {
 	}
 	if c := strings.Index(after, "turnCancel()"); c < 0 || (wait >= 0 && c > wait) {
 		t.Error("runTURN must cancel turnCtx before stopping/waiting for the hook, so a hook that has not started yet is stopped rather than left to run later")
+	}
+	qturn := strings.Index(tail, "quiesce := sync.OnceFunc(func() {")
+	if qturn < 0 {
+		t.Fatal("runTURN has no once-only cancel-hook quiescence")
+	}
+	qturnEnd := strings.Index(tail[qturn:], "\n\t})")
+	if qturnEnd < 0 {
+		t.Fatal("runTURN's quiesce closure does not end")
+	}
+	qturnBody := tail[qturn : qturn+qturnEnd]
+	for _, need := range []string{"if !stopHook() {", "<-hookDone"} {
+		if !strings.Contains(qturnBody, need) {
+			t.Errorf("runTURN's quiesce lacks %q", need)
+		}
+	}
+	deferred := strings.Index(tail, "\tdefer quiesce()\n")
+	permission := strings.Index(tail, "client.CreatePermission(p.peer)")
+	if deferred < 0 || permission < 0 || deferred > permission {
+		t.Error("runTURN must defer hook quiescence before a permission failure can return")
 	}
 	// setupSRTPSession: the hook closes hookDone; quiesce stops or waits, once;
 	// abortSetup quiesces before the budget; the return quiesces too.

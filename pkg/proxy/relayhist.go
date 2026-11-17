@@ -123,9 +123,15 @@ func (cp *credPool) dialNowLocked(slot int) string {
 // selection the claim is taken by); else the relay the slot dials now. Caller
 // holds cp.mu.
 func (cp *credPool) peekAddrLocked(slot, connIdx int) string {
+	if probeSlot, addr, ok := cp.peerProbeChoiceLocked(connIdx); ok && probeSlot == slot {
+		return addr
+	}
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
-		return cp.pickAliveRelayLocked(slot, alive, connIdx)
+		if addr, ok := cp.unlimitedFirstLocked(alive); ok {
+			return addr
+		}
+		return cp.cursorPickLocked(alive, connIdx)
 	}
 	if addr, ok := cp.health.probePeek(cands); ok {
 		return addr
