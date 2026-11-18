@@ -212,13 +212,17 @@ func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 // A single connection cannot corroborate its own failure. It can use the
 // initial alternate probe, subject to that probe's backoff on reconnects.
 //
-// 🚫 Not for a bootstrap's connection while the slot has another relay to
-// dial (cp.bootstraps, beginBootstrap): that connection is ALONE — every
-// other one waits for it — so a check of a relay that is still broken costs
-// the whole tunnel the handshake's deadline and the bootstrap's pause (a
-// phone, 2026-11-18: behind a ForceReconnect the due check went to conn 0 and
-// forty connections came up 21 s later instead of one). With nothing else to
-// dial on the slot the check is still the only way up, and is given.
+// 🚫 Not for a bootstrap's connection while the slot has another relay it
+// can SEAT a connection on (cp.bootstraps, beginBootstrap): that connection
+// is ALONE — every other one waits for it — so a check of a relay that is
+// still broken costs the whole tunnel the handshake's deadline and the
+// bootstrap's pause (a phone, 2026-11-18: behind a ForceReconnect the due
+// check went to conn 0 and forty connections came up 21 s later instead of
+// one). With nothing else the slot can dial NOW the check is still the only
+// way up, and is given: an unmarked relay that is full, benched behind a 486
+// or inside its clock is no alternative (a review of the first cut, which
+// asked only whether one was unmarked — the bootstrap parked, or minted,
+// with a due check in hand).
 func (cp *credPool) peerRecoveryChoiceLocked(onlySlot int) (slot int, relay string, nextDue time.Time) {
 	if len(cp.health.peerFailed) == 0 {
 		return -1, "", time.Time{}
@@ -234,7 +238,7 @@ func (cp *credPool) peerRecoveryChoiceLocked(onlySlot int) (slot int, relay stri
 			continue
 		}
 		cands := cp.candidatesLocked(i)
-		if cp.bootstraps > 0 && len(cp.health.alive(cands)) > 0 {
+		if cp.bootstraps > 0 && cp.hasSeatableAliveLocked(i, cands) {
 			continue
 		}
 		for _, candidate := range cands {
@@ -251,6 +255,18 @@ func (cp *credPool) peerRecoveryChoiceLocked(onlySlot int) (slot int, relay stri
 		return -1, "", nextDue
 	}
 	return slot, relay, time.Time{}
+}
+
+// hasSeatableAliveLocked: one of cands is unmarked AND slot's credential can
+// seat a connection on it now (seatableOnLocked: its clock, its bench, its
+// room there). Caller holds cp.mu.
+func (cp *credPool) hasSeatableAliveLocked(slot int, cands []string) bool {
+	for _, a := range cp.health.alive(cands) {
+		if cp.seatableOnLocked(slot, a) {
+			return true
+		}
+	}
+	return false
 }
 
 // beginBootstrap and endBootstrap bracket the stretch in which ONE connection

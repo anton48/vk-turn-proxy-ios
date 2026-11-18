@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A phone, 2026-11-18 (native / UDP / LTE, one VK relay dropped at the
@@ -73,6 +74,57 @@ func TestABootstrapWithNothingElseToDialStillTakesTheRecoveryCheck(t *testing.T)
 			}
 			if n := mints.Load(); n != 0 {
 				t.Fatalf("the bootstrap minted %d credential(s) to reach the check — it is taken on the credential the pool has", n)
+			}
+			if got := cp.health.peerFailed[relayA].retries; got != 1 {
+				t.Fatalf("the hand-out did not claim the check (retries %d)", got)
+			}
+			cp.release(slot, creds, relayA)
+		})
+	}
+}
+
+// "Another relay to dial" means one the slot can SEAT a connection on now. An
+// unmarked relay that is full, benched behind a 486 or inside its clock is no
+// alternative: the first cut asked only whether one was unmarked, and the
+// bootstrap parked — or minted — with a due check in hand.
+func TestABootstrapTakesTheCheckWhenTheOtherRelayCannotSeat(t *testing.T) {
+	for _, why := range []struct {
+		name string
+		make func(cp *credPool)
+	}{
+		{"the other relay is full", func(cp *credPool) {
+			for i := 0; i < connsPerSlot; i++ {
+				cp.seatLocked(0, relayB)
+			}
+		}},
+		{"the credential is benched on the other relay (a 486)", func(cp *credPool) {
+			cp.histPtrLocked(0, relayB).saturatedUntil = time.Now().Add(time.Minute)
+		}},
+		{"the credential's clock on the other relay has not run out", func(cp *credPool) {
+			cp.histPtrLocked(0, relayB).availableAt = time.Now().Add(time.Minute)
+		}},
+	} {
+		t.Run(why.name, func(t *testing.T) {
+			cp, mints, clock := peerHandshakePoolMints(t, false, relayA, relayB)
+			cp.markPeerFailedLocked(relayA)
+			*clock = clock.Add(probeBackoff(0))
+			why.make(cp)
+			if cp.seatableOnLocked(0, relayB) || !cp.seatableOnLocked(0, relayA) || len(cp.health.alive([]string{relayB})) != 1 {
+				t.Fatal("fixture: the other relay can seat, or is marked, or the marked one cannot seat")
+			}
+
+			cp.beginBootstrap()
+			defer cp.endBootstrap()
+			const conn = connsPerSlot + 1
+			addr, creds, slot, err := cp.get(conn, false)
+			if err != nil {
+				t.Fatalf("the bootstrap's connection got nothing (%v) with a due check on a relay it can seat", err)
+			}
+			if n := mints.Load(); n != 0 {
+				t.Fatalf("the bootstrap minted %d credential(s) instead of taking the due check", n)
+			}
+			if addr != relayA {
+				t.Fatalf("got %s, want the due check on %s", addr, relayA)
 			}
 			if got := cp.health.peerFailed[relayA].retries; got != 1 {
 				t.Fatalf("the hand-out did not claim the check (retries %d)", got)
