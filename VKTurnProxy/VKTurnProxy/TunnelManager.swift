@@ -587,6 +587,10 @@ class TunnelManager: ObservableObject {
             }
 
             var seededTURN: (address: String, username: String, password: String)? = nil
+            // Every relay VK named with a FRESH seed (the probe's answer) — handed to
+            // the extension's pool beside the seed, so that a cold cache has a second
+            // relay to move to. Empty for a cached seed: its twin on disk carries them.
+            var seedAddresses: [String] = []
 
             if config.useCookieAuth {
                 // ── VKAuth (non-anonymous cookie) pre-bootstrap ──────────────
@@ -624,11 +628,12 @@ class TunnelManager: ObservableObject {
                 let cookieProbe = await probeVKCreds(linkID: linkID, vkHostIPsJSON: hostIPsJSONStr)
                 if attemptCancelled() { return } // a late probe answer after a Disconnect: no error, no captcha
                 switch cookieProbe {
-                case .ok(let addr, let user, let pass):
+                case .ok(let addr, let user, let pass, let addrs):
                     // VK's own address: the TURN override (a list since 2026-10-19)
                     // is applied by the extension's pool when the credential is
                     // handed out — to this seed, to cached ones, to every mint.
                     seededTURN = (addr, user, pass)
+                    seedAddresses = addrs
                     SharedLogger.shared.log("[AppDebug] VKAuth: TURN creds via cookie path (addr=\(addr))")
                 case .cookieRejected:
                     SharedLogger.shared.log("[AppDebug] VKAuth: cookie rejected by VK — aborting")
@@ -685,12 +690,13 @@ class TunnelManager: ObservableObject {
                 )
                 if attemptCancelled() { return } // a late probe answer after a Disconnect: no captcha, no error, no retry
                 switch result {
-                case .ok(let addr, let user, let pass):
+                case .ok(let addr, let user, let pass, let addrs):
                     // VK's own address. The TURN override (a list since 2026-10-19)
                     // is the extension's pool's business: applied when the credential
                     // is handed out, to this seed, to cached ones and to every mint
                     // alike (issue #102: the app-side rewrite never reached a cache).
                     seededTURN = (addr, user, pass)
+                    seedAddresses = addrs
                     SharedLogger.shared.log("[AppDebug] pre-bootstrap: TURN creds acquired (addr=\(addr))")
                     break probeLoop
                 case .captcha(let url, let sid, let ts, let captchaAttempt, let token1, let clientID, let isRateLimit):
@@ -762,7 +768,8 @@ class TunnelManager: ObservableObject {
             if attemptCancelled() { return }
             try await applyConfigurationAndStart(config: config,
                                                  vkHostIPs: vkHostIPs,
-                                                 seededTURN: seeded)
+                                                 seededTURN: seeded,
+                                                 seedAddresses: seedAddresses)
         } catch is CancellationError {
             // Disconnect cancelled the attempt before the tunnel started (the
             // settle sleep or checkCancellation threw): the notice, no error.
@@ -846,7 +853,7 @@ class TunnelManager: ObservableObject {
     /// captcha is terminal there; native: yes, as before). Usually the free
     /// path answers in ~3s (vpn.11: 16:44:34.9 → 16:44:37.4).
     enum UIlessProbe {
-        case seed(address: String, username: String, password: String)
+        case seed(address: String, username: String, password: String, addresses: [String])
         case captcha
         case failed
     }
@@ -871,10 +878,10 @@ class TunnelManager: ObservableObject {
         }
 
         switch await probeVKCreds(linkID: linkID, vkHostIPsJSON: "") {
-        case .ok(let addr, let user, let pass):
+        case .ok(let addr, let user, let pass, let addrs):
             // VK's own address; the TURN override is applied by the pool at hand-out.
             SharedLogger.shared.log("[AppDebug] live-activity: fresh TURN cred acquired (addr=\(addr))")
-            return .seed(address: addr, username: user, password: pass)
+            return .seed(address: addr, username: user, password: pass, addresses: addrs)
         case .captcha:
             SharedLogger.shared.log("[AppDebug] live-activity: captcha required — cannot solve from a background intent")
             return .captcha
@@ -981,11 +988,13 @@ class TunnelManager: ObservableObject {
         // purpose: the app's own sockets are captured by the tunnel, and a
         // probe through it would show VK the server's address, not ours.
         var seed = CredCache.loadValidCred(useCookieAuth: config.useCookieAuth)
+        var seedAddresses: [String] = []  // a fresh probe's relay list; a cached seed has its twin on disk
         var probe: UnseededStartPolicy.Probe = seed == nil ? .failed : .seeded
         if seed == nil {
             switch await probeFreshCredWithoutUI(config: config) {
-            case .seed(let address, let username, let password):
+            case .seed(let address, let username, let password, let addresses):
                 seed = (address, username, password)
+                seedAddresses = addresses
                 probe = .seeded
             case .captcha:
                 probe = .captcha
@@ -1011,7 +1020,7 @@ class TunnelManager: ObservableObject {
             return .refusedUnseeded(reason: why)
         }
         do {
-            try await applyConfigurationAndStart(config: config, seededTURN: seed)
+            try await applyConfigurationAndStart(config: config, seededTURN: seed, seedAddresses: seedAddresses)
             // Stay alive long enough to SEE it come up, so the card can be told.
             await awaitConnected()
             return .started
@@ -1047,7 +1056,8 @@ class TunnelManager: ObservableObject {
     func applyConfigurationAndStart(
         config: TunnelConfig,
         vkHostIPs: [String: [String]] = [:],
-        seededTURN: (address: String, username: String, password: String)? = nil
+        seededTURN: (address: String, username: String, password: String)? = nil,
+        seedAddresses: [String] = []
     ) async throws {
         let manager = try await getOrCreateManager()
         let wgConfig = try buildUAPIConfig(config: config)
@@ -1057,7 +1067,7 @@ class TunnelManager: ObservableObject {
             if config.effectiveNumConnections != config.numConnections {
                 SharedLogger.shared.log("[AppDebug] cookie mode: Connections \(config.numConnections) → \(config.effectiveNumConnections) (\(config.cookieLinks.count) call link(s) × 20)")
             }
-            let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seededTURN)
+            let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seededTURN, seedAddresses: seedAddresses)
 
             // Pick serverAddress. iOS always excludes serverAddress from the
             // tunnel per Apple's documented rule. We set it to the TURN IP we
@@ -2936,7 +2946,8 @@ class TunnelManager: ObservableObject {
     private func buildProxyConfig(
         config: TunnelConfig,
         vkHostIPs: [String: [String]] = [:],
-        seededTURN: (address: String, username: String, password: String)? = nil
+        seededTURN: (address: String, username: String, password: String)? = nil,
+        seedAddresses: [String] = []
     ) -> String {
         var dict: [String: Any] = [
             "vk_link": config.vkLink,
@@ -3008,11 +3019,8 @@ class TunnelManager: ObservableObject {
             dict["vk_host_ips"] = vkHostIPs
         }
         if let s = seededTURN {
-            dict["seeded_turn"] = [
-                "address": s.address,
-                "username": s.username,
-                "password": s.password
-            ]
+            dict["seeded_turn"] = SeededTURNConfig.object(address: s.address, username: s.username,
+                                                          password: s.password, addresses: seedAddresses)
         }
 
         guard let data = try? JSONSerialization.data(withJSONObject: dict),
@@ -3123,7 +3131,7 @@ class TunnelManager: ObservableObject {
     // MARK: - Pre-bootstrap captcha probe
 
     enum ProbeResult {
-        case ok(address: String, username: String, password: String)
+        case ok(address: String, username: String, password: String, addresses: [String])
         case captcha(url: String, sid: String, ts: Double, attempt: Double, token1: String, clientID: String, isRateLimit: Bool)
         case cookieRejected(message: String)
         case callUnavailable(code: Int, message: String)
@@ -3184,7 +3192,8 @@ class TunnelManager: ObservableObject {
                 return .ok(
                     address: dict["turn_address"] as? String ?? "",
                     username: dict["turn_username"] as? String ?? "",
-                    password: dict["turn_password"] as? String ?? ""
+                    password: dict["turn_password"] as? String ?? "",
+                    addresses: SeededTURNConfig.probeAddresses(dict["turn_addresses"])
                 )
             case "captcha":
                 return .captcha(

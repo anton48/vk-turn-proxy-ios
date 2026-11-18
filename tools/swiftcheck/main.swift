@@ -2704,7 +2704,7 @@ do {
                // releaseHold in the function" would be that one.
                let r = body.range(of: "LiveActivityController.shared.releaseHold()", range: e.upperBound..<body.endIndex),
                let ret = body.range(of: "return .refusedUnseeded(reason: why)"),
-               let start = body.range(of: "try await applyConfigurationAndStart(config: config, seededTURN: seed)") {
+               let start = body.range(of: "try await applyConfigurationAndStart(config: config, seededTURN: seed") {
                 refusal = d.lowerBound < e.lowerBound && e.lowerBound < r.lowerBound && r.lowerBound < ret.lowerBound
                     && ret.lowerBound < start.lowerBound
                     && body.contains("transport: config.useCsqtt ? .csqtt : .native")
@@ -5003,6 +5003,60 @@ do {
           && backup.contains("innerTrafficLog: innerTraffic,")
           && backup.contains("if let v = s.innerTrafficLog { d.set(v, forKey: \"innerTrafficLog\") }"),
           "a backup exports the switch and a restore sets it only when the backup has it")
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// The seed carries every relay VK named (2026-11-18): a cold cache had ONE
+// relay — the probe's answer and seeded_turn named the first alone — and a
+// relay that answers TURN and does not forward left the bootstrap nowhere to go.
+print("\nseed: every relay VK named travels with it")
+do {
+    let a = "203.0.113.11:19302", b = "203.0.113.12:19302"
+    check(SeededTURNConfig.probeAddresses([a, b]) == [a, b], "a probe's list is taken in VK's order")
+    check(SeededTURNConfig.probeAddresses([a, "", b, a, 7, NSNull()] as [Any]) == [a, b],
+          "an empty entry, a repeat and a value that is no string are dropped")
+    check(SeededTURNConfig.probeAddresses(nil).isEmpty && SeededTURNConfig.probeAddresses("x").isEmpty
+          && SeededTURNConfig.probeAddresses([String]()).isEmpty,
+          "a missing key, a value that is no list and an empty list are no list")
+
+    let plain = SeededTURNConfig.object(address: a, username: "u", password: "p", addresses: [])
+    check(plain.count == 3 && plain["address"] as? String == a && plain["username"] as? String == "u"
+          && plain["password"] as? String == "p" && plain["addresses"] == nil,
+          "without a list the seed object is the three fields it always was (a cached seed)")
+    let full = SeededTURNConfig.object(address: a, username: "u", password: "p", addresses: [b, a, "", b])
+    check(full["addresses"] as? [String] == [a, b] && full["address"] as? String == a,
+          "with a list the seed's own relay stands first, each relay once, no empty entry")
+    if let data = try? JSONSerialization.data(withJSONObject: ["seeded_turn": full]),
+       let text = String(data: data, encoding: .utf8) {
+        let red = ProxyConfigRedaction.redacted(text)
+        check(red.contains("203.0.113.12") && !red.contains("\"p\""),
+              "the config's log redaction keeps the relay list and still masks the password")
+    } else {
+        check(false, "the seed object does not serialise")
+    }
+
+    let tm = codeWithoutComments("VKTurnProxy/VKTurnProxy/TunnelManager.swift")
+    check(tm.contains("addresses: SeededTURNConfig.probeAddresses(dict[\"turn_addresses\"])"),
+          "the probe's answer is read for its relay list")
+    check(tm.components(separatedBy: "seedAddresses = addrs").count - 1 == 2,
+          "both pre-bootstrap paths (cookie and anonymous) keep the list a fresh probe named")
+    check(tm.contains("return .seed(address: addr, username: user, password: pass, addresses: addrs)")
+          && tm.contains("seedAddresses = addresses")
+          && tm.contains("applyConfigurationAndStart(config: config, seededTURN: seed, seedAddresses: seedAddresses)"),
+          "the start without UI (the card, a repair) carries a fresh probe's list too")
+    check(tm.contains("seededTURN: seeded,\n                                                 seedAddresses: seedAddresses)")
+          && tm.contains("buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seededTURN, seedAddresses: seedAddresses)"),
+          "the list reaches the proxy config through applyConfigurationAndStart")
+    check(tm.contains("dict[\"seeded_turn\"] = SeededTURNConfig.object(address: s.address, username: s.username,")
+          && tm.contains("password: s.password, addresses: seedAddresses)")
+          && !tm.contains("\"address\": s.address"),
+          "seeded_turn is built by SeededTURNConfig.object — never as a bare three-field literal")
+    for go in ["WireGuardBridge/bridge.go", "WireGuardBridge/csqtt_bridge.go"] {
+        check(source(go).contains("Addresses []string `json:\"addresses,omitempty\"`") && source(go).contains("proxy.SeedCreds("),
+              "\(go) reads seeded_turn.addresses and builds the seed from it")
+    }
+    check(source("WireGuardBridge/bridge.go").contains("resp[\"turn_addresses\"] = creds.Addresses"),
+          "Go's probe names every relay in turn_addresses — the key the app reads")
 }
 
 print("")

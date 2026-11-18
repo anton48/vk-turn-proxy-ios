@@ -95,9 +95,10 @@ type csqttConfig struct {
 	CredPoolCooldownSeconds int                 `json:"cred_pool_cooldown_seconds"`
 	VKHostIPs               map[string][]string `json:"vk_host_ips"`
 	SeededTURN              *struct {
-		Address  string `json:"address"`
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Address   string   `json:"address"`
+		Username  string   `json:"username"`
+		Password  string   `json:"password"`
+		Addresses []string `json:"addresses,omitempty"` // as the native bridge's
 	} `json:"seeded_turn"`
 	UseCookieAuth      bool `json:"use_cookie_auth"`
 	ForceLegacyCaptcha bool `json:"force_legacy_captcha"`
@@ -537,8 +538,10 @@ func csqttStartImpl(proxyConfigJSON string) int32 {
 	}
 	var seed *proxy.TURNCreds
 	if cfg.SeededTURN != nil && cfg.SeededTURN.Address != "" {
-		seed = &proxy.TURNCreds{Address: cfg.SeededTURN.Address, Username: cfg.SeededTURN.Username, Password: cfg.SeededTURN.Password,
-			Addresses: []string{cfg.SeededTURN.Address}}
+		// The seed has always named its own relay in Addresses here; the app's
+		// list, when it sends one, follows it.
+		seed = proxy.SeedCreds(cfg.SeededTURN.Address, cfg.SeededTURN.Username, cfg.SeededTURN.Password,
+			append([]string{cfg.SeededTURN.Address}, cfg.SeededTURN.Addresses...))
 		log.Printf("csqttStart: using pre-fetched TURN creds (addr=%s)", seed.Address)
 	}
 

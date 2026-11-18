@@ -46,6 +46,8 @@ SOURCES=(
     "$S/TurnOverrideEntry.swift"
     "$S/UplinkPaceSync.swift"
     "$S/UplinkSynth.swift"
+    # The seed's config object and a probe's relay list (Foundation only): RUN.
+    "$S/SeededTURNConfig.swift"
     "$S/DirectRouteSync.swift"
     "$S/SpeedTestPath.swift"
     "$S/SpeedTestRunConfig.swift"

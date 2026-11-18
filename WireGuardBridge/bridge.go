@@ -201,9 +201,10 @@ type ProxyConfig struct {
 	// VK API call (no captcha risk in the .connecting window where
 	// the main app would be unable to display a WebView).
 	SeededTURN *struct {
-		Address  string `json:"address"`
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Address   string   `json:"address"`
+		Username  string   `json:"username"`
+		Password  string   `json:"password"`
+		Addresses []string `json:"addresses,omitempty"` // every relay VK returned with it (a fresh probe's); absent for a cached seed
 	} `json:"seeded_turn,omitempty"`
 
 	// ForceLegacyCaptcha, when true, makes GetVKCreds skip the captcha-free VK
@@ -358,11 +359,7 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	// Seeded TURN creds from main app's pre-bootstrap captcha flow (optional).
 	var seededTURN *proxy.TURNCreds
 	if pcfg.SeededTURN != nil && pcfg.SeededTURN.Address != "" {
-		seededTURN = &proxy.TURNCreds{
-			Username: pcfg.SeededTURN.Username,
-			Password: pcfg.SeededTURN.Password,
-			Address:  pcfg.SeededTURN.Address,
-		}
+		seededTURN = proxy.SeedCreds(pcfg.SeededTURN.Address, pcfg.SeededTURN.Username, pcfg.SeededTURN.Password, pcfg.SeededTURN.Addresses)
 		log.Printf("wgStartVKBootstrap: using pre-fetched TURN creds (addr=%s)", seededTURN.Address)
 	}
 
@@ -1201,6 +1198,12 @@ func wgProbeVKCreds(linkID, vkHostIPsJSON, savedSID, savedKey, savedToken1, save
 		resp["turn_address"] = creds.Address
 		resp["turn_username"] = creds.Username
 		resp["turn_password"] = creds.Password
+		// EVERY relay VK returned with the credential, not only the first: the
+		// app hands them back in seeded_turn.addresses, and the pool's seed can
+		// then fail over on a cold cache (proxy.SeedCreds).
+		if len(creds.Addresses) > 0 {
+			resp["turn_addresses"] = creds.Addresses
+		}
 	}
 
 	out, mErr := json.Marshal(resp)
