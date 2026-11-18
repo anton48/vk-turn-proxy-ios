@@ -211,6 +211,14 @@ func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 // advances the backoff, so selection and logging cannot consume an attempt.
 // A single connection cannot corroborate its own failure. It can use the
 // initial alternate probe, subject to that probe's backoff on reconnects.
+//
+// 🚫 Not for a bootstrap's connection while the slot has another relay to
+// dial (cp.bootstraps, beginBootstrap): that connection is ALONE — every
+// other one waits for it — so a check of a relay that is still broken costs
+// the whole tunnel the handshake's deadline and the bootstrap's pause (a
+// phone, 2026-11-18: behind a ForceReconnect the due check went to conn 0 and
+// forty connections came up 21 s later instead of one). With nothing else to
+// dial on the slot the check is still the only way up, and is given.
 func (cp *credPool) peerRecoveryChoiceLocked(onlySlot int) (slot int, relay string, nextDue time.Time) {
 	if len(cp.health.peerFailed) == 0 {
 		return -1, "", time.Time{}
@@ -225,7 +233,11 @@ func (cp *credPool) peerRecoveryChoiceLocked(onlySlot int) (slot int, relay stri
 		if cp.configuredOffLocked(i) {
 			continue
 		}
-		for _, candidate := range cp.candidatesLocked(i) {
+		cands := cp.candidatesLocked(i)
+		if cp.bootstraps > 0 && len(cp.health.alive(cands)) > 0 {
+			continue
+		}
+		for _, candidate := range cands {
 			due := cp.health.peerRecoveryDueAt(candidate)
 			if due.IsZero() || !cp.freshOnLocked(i, candidate) || now.Before(cp.markLocked(i, candidate)) || !cp.roomOnLocked(i, candidate) {
 				continue
@@ -239,6 +251,46 @@ func (cp *credPool) peerRecoveryChoiceLocked(onlySlot int) (slot int, relay stri
 		return -1, "", nextDue
 	}
 	return slot, relay, time.Time{}
+}
+
+// beginBootstrap and endBootstrap bracket the stretch in which ONE connection
+// is brought up alone and every other waits for it (Proxy.startConnections: a
+// start, a ForceReconnect). A count, not a flag: a ForceReconnect may begin a
+// second bootstrap before the first has returned. While it is above zero the
+// recovery check stands back (peerRecoveryChoiceLocked, pickAcquireSlotLocked).
+func (cp *credPool) beginBootstrap() {
+	cp.mu.Lock()
+	cp.bootstraps++
+	cp.mu.Unlock()
+}
+
+func (cp *credPool) endBootstrap() {
+	cp.mu.Lock()
+	if cp.bootstraps > 0 {
+		cp.bootstraps--
+	}
+	cp.mu.Unlock()
+}
+
+// bootstrapBracket is ONE bootstrap, ended exactly once however often its end
+// is asked for — startConnections ends it where conn 0's attempts end AND by
+// a defer, and a second end must not close a bootstrap another
+// startConnections has begun meanwhile.
+type bootstrapBracket struct {
+	cp   *credPool
+	open bool
+}
+
+func (cp *credPool) bootstrap() *bootstrapBracket {
+	cp.beginBootstrap()
+	return &bootstrapBracket{cp: cp, open: true}
+}
+
+func (b *bootstrapBracket) end() {
+	if b.open {
+		b.open = false
+		b.cp.endBootstrap()
+	}
 }
 
 // relayPace: the pace the override list gives the relay at addr, in KiB/s

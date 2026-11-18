@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -496,7 +497,8 @@ func TestPeerProbeResetsOnAChangedDNSAnswer(t *testing.T) {
 	}
 }
 
-func peerHandshakePool(t *testing.T, cookie bool, relays ...string) (*credPool, *time.Time) {
+// peerHandshakePoolMints is peerHandshakePool with the pool's mint counter.
+func peerHandshakePoolMints(t *testing.T, cookie bool, relays ...string) (*credPool, *atomic.Int32, *time.Time) {
 	t.Helper()
 	if cookie {
 		SetVKCookieAuth(true, "remixsid=test", []string{"https://vk.ru/call/join/abcdef", "https://vk.ru/call/join/ghijkl"})
@@ -506,7 +508,7 @@ func peerHandshakePool(t *testing.T, cookie bool, relays ...string) (*credPool, 
 	if cookie {
 		size = len(relays)
 	}
-	cp, _, clock := relayPoolN(t, "", size, relays...)
+	cp, mints, clock := relayPoolN(t, "", size, relays...)
 	if cookie {
 		for slot, addr := range relays {
 			cp.seedSlot(slot, addr, &TURNCreds{Username: futureUser(addr), Password: "pw", Address: addr, Addresses: []string{addr}})
@@ -514,5 +516,11 @@ func peerHandshakePool(t *testing.T, cookie bool, relays ...string) (*credPool, 
 	} else {
 		cp.seedSlot(0, relays[0], &TURNCreds{Username: futureUser("handshake"), Password: "pw", Address: relays[0], Addresses: relays})
 	}
+	return cp, mints, clock
+}
+
+func peerHandshakePool(t *testing.T, cookie bool, relays ...string) (*credPool, *time.Time) {
+	t.Helper()
+	cp, _, clock := peerHandshakePoolMints(t, cookie, relays...)
 	return cp, clock
 }

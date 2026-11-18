@@ -1215,6 +1215,10 @@ type credPool struct {
 	peerHandshakes map[int]peerHandshake
 	peerFailures   map[string]handshakeObservation
 	peerProbe      relayHandshakeProbe
+	// bootstraps counts the bootstraps under way — Proxy.startConnections'
+	// first connection, alone until it succeeds (beginBootstrap). While one
+	// is, a due peer recovery check stands back (peerRecoveryChoiceLocked).
+	bootstraps int
 
 	// Cumulative valid handshake deadlines and corroborated peer-path failures.
 	peerTimeouts uint64
@@ -2224,8 +2228,17 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 	if slot, addr, ok := cp.peerProbeChoiceLocked(connIdx); ok {
 		return slot, addr, "peer handshake probe"
 	}
-	if slot, addr, _ := cp.peerRecoveryChoiceLocked(-1); slot >= 0 {
-		return slot, addr, "peer recovery probe"
+	// A due recovery check goes to whoever asks first, ahead of the ordinary
+	// choice — except while a bootstrap is under way: there it is the LAST
+	// resort, taken only when no slot has anything else for this connection
+	// (in cookie mode a slot has ONE relay, so "the slot has another relay"
+	// — peerRecoveryChoiceLocked's own rule — does not cover a marked slot
+	// beside a healthy one).
+	boot := cp.bootstraps > 0
+	if !boot {
+		if slot, addr, _ := cp.peerRecoveryChoiceLocked(-1); slot >= 0 {
+			return slot, addr, "peer recovery probe"
+		}
 	}
 
 	// Priority 1: ownSlot, unconditionally preferred when usable.
@@ -2338,6 +2351,11 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 		}
 	}
 	if len(slots) == 0 {
+		if boot {
+			if slot, addr, _ := cp.peerRecoveryChoiceLocked(-1); slot >= 0 {
+				return slot, addr, "peer recovery probe"
+			}
+		}
 		return -1, "", ""
 	}
 	i := cp.cursor[connIdx] % len(slots)

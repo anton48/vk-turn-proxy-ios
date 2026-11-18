@@ -1019,6 +1019,13 @@ func (p *Proxy) startConnections() error {
 	// firing slightly after our calculated deadline (re-arms, scheduler
 	// jitter, etc). Empirically a few seconds is plenty.
 	const allSaturatedWaitSafety = 5 * time.Second
+	// The bootstrap: conn 0 is brought up ALONE, and the pool is told so for
+	// its whole length — a due peer recovery check is not handed to the one
+	// connection every other waits for (credPool.bootstrap). It ends
+	// where conn 0's attempts end, BEFORE the other connections are started
+	// (they take the check as before), and on every way out of this function.
+	boot := p.credPool.bootstrap()
+	defer boot.end()
 	err := spawnConn0()
 	for attempt := 1; err != nil && attempt < maxBootstrapAttempts; attempt++ {
 		var captchaErr *CaptchaRequiredError
@@ -1089,6 +1096,7 @@ func (p *Proxy) startConnections() error {
 			log.Printf("proxy: bootstrap attempt %d/%d succeeded", attempt+1, maxBootstrapAttempts)
 		}
 	}
+	boot.end()
 
 	if err != nil {
 		// Diagnostic: when bootstrap exhausts because pool has zero
