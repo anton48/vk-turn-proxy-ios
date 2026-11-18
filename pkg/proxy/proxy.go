@@ -2140,6 +2140,15 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		established := p.ups.since(connIdx, start)
 		if established {
 			floor.reset()
+			// … and the run of SHORT failures: "consecutive" ends at a session
+			// that came up, however it ended. The count was reset only by a
+			// path change, a dormancy, or an ERROR behind five minutes — and a
+			// session that ran returns nil (a kill, a restart), so failures a
+			// whole session apart added up: a phone, 2026-11-18 — a connection
+			// whose third set-up failure of the run came behind a twelve-minute
+			// session slept 35 s ("3 consecutive short failures") while the
+			// other thirty-nine carried the tunnel.
+			shortFailures = 0
 		}
 		// A restart WE asked for (a path-up) ended this session, not the
 		// path: no failure count, no dormancy, a sub-second stagger so the

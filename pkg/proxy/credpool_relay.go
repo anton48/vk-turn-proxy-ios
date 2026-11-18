@@ -631,6 +631,9 @@ func (cp *credPool) pathChangedHealthLocked() {
 	if n := cp.deadCountLocked(); n > 0 {
 		log.Printf("credpool: path changed — %d relay mark(s) cleared (they were about the old network)", n)
 	}
+	if n := len(cp.health.peerFailed); n > 0 {
+		log.Printf("credpool: path changed — %d peer handshake mark(s) cleared (they were about the old network)", n)
+	}
 	cp.health.pathChanged()
 	cp.cursor = map[int]int{}
 	cp.peerHandshakes = map[int]peerHandshake{}

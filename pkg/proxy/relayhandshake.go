@@ -33,6 +33,9 @@ func (cp *credPool) notePeerHandshakeResult(ctx context.Context, connIdx int, ge
 	if err == nil {
 		if cp.health.isPeerFailed(relay) {
 			delete(cp.health.peerFailed, relay)
+			// Said: until 2026-11-18 a relay's return to use left no line —
+			// peer-hs-marked counts marks SET and never falls.
+			log.Printf("credpool: conn %d: relay %s passed its peer handshake recovery check — the mark is cleared, it is handed out again", connIdx, relay)
 			go cp.broadcastSlotAvailable()
 		}
 		cp.peerHandshakes[connIdx] = peerHandshake{generation: generation, relay: relay, window: window}

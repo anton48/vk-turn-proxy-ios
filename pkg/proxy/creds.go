@@ -2223,6 +2223,42 @@ const connsPerSlot = 10
 // ceil(NumConns/connsPerSlot), so the pool survives more back-to-back
 // cascades before all-saturated. See open_improvement_compact_fill in
 // memory for the empirical context (build 87, 2026-05-14).
+// pickForHandOutLocked is the slot choice AND the address the slot is handed
+// out on, agreed: pickAcquireSlotLocked judges a slot on one relay (its
+// clock, its bench, its quota), and pickAddrLocked then names the address
+// with looks of its own at the clock — a reserved alternate's claim
+// (peerProbeChoiceLocked) can run out between the two, at its edge or with
+// the process frozen in between (the lock does not stop time), and the
+// address then falls back to the cursor's relay, which nobody judged: a
+// stand, 2026-11-18 — ten seats on the main relay, the alternate free, the
+// claim run out between the looks, an eleventh seat on the main relay.
+// 🚫 An address that is not the judged one is handed out only if the slot
+// can seat the connection ON IT; otherwise the choice is made once more —
+// time only goes forward, so the second choice sees what the pick saw.
+// ok=false: a slot, and nothing to dial on it (the caller parks).
+func (cp *credPool) pickForHandOutLocked(connIdx, ownSlot int, logSkips bool) (slot int, addr, kind string, ok bool) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var judged string
+		slot, judged, kind = cp.pickAcquireSlotLocked(connIdx, ownSlot, logSkips && attempt == 0)
+		if slot < 0 {
+			return -1, "", "", false
+		}
+		addr, ok = cp.pickAddrLocked(slot, connIdx)
+		if !ok || addr == judged || cp.seatableOnLocked(slot, addr) {
+			return slot, addr, kind, ok
+		}
+	}
+	return -1, "", "", false
+}
+
+// seatableOnLocked: slot's credential may seat one more connection on relay
+// now — its clock there has run out, it is not benched there, and it has
+// room there (what pickAcquireSlotLocked's eligible asks of the relay it
+// judges a slot on). Caller holds cp.mu.
+func (cp *credPool) seatableOnLocked(slot int, relay string) bool {
+	return cp.freshOnLocked(slot, relay) && !time.Now().Before(cp.markLocked(slot, relay)) && cp.roomOnLocked(slot, relay)
+}
+
 func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (int, string, string) {
 	now := time.Now()
 	if slot, addr, ok := cp.peerProbeChoiceLocked(connIdx); ok {
@@ -2438,11 +2474,10 @@ func (cp *credPool) handOut(connIdx int, allowCaptchaBlock bool) (string, *TURNC
 	// onto already-active slots) instead of first-by-index. See
 	// pickAcquireSlotLocked for the selection logic + rationale (each
 	// path event marks fewer slots when conns cluster).
-	if slot, _, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, true); slot >= 0 {
+	if slot, addr, kind, ok := cp.pickForHandOutLocked(connIdx, ownSlot, true); slot >= 0 {
 		// The ADDRESS is chosen now, for this connection (credpool_relay.go):
 		// the override list's or VK's, the one the pick was judged on — the
 		// unmarked candidate at the connection's cursor (or a re-try's claim).
-		addr, ok := cp.pickAddrLocked(slot, connIdx)
 		if !ok { // no address after all (a re-try's claim ran out between the two looks): no seat, a park
 			park := cp.relayParkLocked(connIdx, slot)
 			cp.mu.Unlock()
@@ -2769,8 +2804,7 @@ func (cp *credPool) handOut(connIdx int, allowCaptchaBlock bool) (string, *TURNC
 	// filled a slot during our fetch window, prefer the most-active
 	// one. logSkips=false because Phase 1's initial scan already
 	// emitted any per-slot "VK-saturated" lines for these slots.
-	if slot, _, kind := cp.pickAcquireSlotLocked(connIdx, ownSlot, false); slot >= 0 {
-		dial, ok := cp.pickAddrLocked(slot, connIdx) // the same choice as every hand-out: the override's, the health's
+	if slot, dial, kind, ok := cp.pickForHandOutLocked(connIdx, ownSlot, false); slot >= 0 { // the same choice as every hand-out: the override's, the health's
 		if !ok {
 			park := cp.relayParkLocked(connIdx, slot)
 			cp.mu.Unlock()
