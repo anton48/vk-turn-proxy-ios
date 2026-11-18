@@ -31,14 +31,17 @@ func (cp *credPool) notePeerHandshakeResult(ctx context.Context, connIdx int, ge
 		return
 	}
 	if err == nil {
-		delete(cp.health.peerFailed, relay)
+		if cp.health.isPeerFailed(relay) {
+			delete(cp.health.peerFailed, relay)
+			go cp.broadcastSlotAvailable()
+		}
 		cp.peerHandshakes[connIdx] = peerHandshake{generation: generation, relay: relay, window: window}
 		delete(cp.peerFailures, relay)
 		if cp.peerProbe.primary == relay {
 			cp.peerProbe = relayHandshakeProbe{}
 		}
 		for failed, failure := range cp.peerFailures {
-			if failed != relay && handshakeWindowsOverlap(failure, window) {
+			if failed != relay && failure.hasEvidenceAt(window.ended) {
 				cp.markPeerFailedLocked(failed)
 			}
 		}
@@ -48,15 +51,18 @@ func (cp *credPool) notePeerHandshakeResult(ctx context.Context, connIdx int, ge
 		return
 	}
 	cp.peerTimeouts++
+	if cp.health.isPeerFailed(relay) {
+		return // Recovery hand-outs already schedule their next check.
+	}
 	cp.peerFailures[relay] = window
 	for conn, success := range cp.peerHandshakes {
-		if success.relay == relay || cp.health.peerFailed[success.relay] || cp.handStamp[conn] != success.generation {
+		if success.relay == relay || cp.health.isPeerFailed(success.relay) || cp.handStamp[conn] != success.generation {
 			continue
 		}
-		overlap := handshakeWindowsOverlap(window, success.window)
+		overlap := window.hasEvidenceAt(success.window.ended)
 		if conn >= 0 && conn < len(received) && received[conn] != 0 {
 			at := time.Unix(0, received[conn])
-			overlap = overlap || !at.Before(window.started) && !at.After(window.ended) && !at.Before(success.window.ended)
+			overlap = overlap || window.hasEvidenceAt(at) && !at.Before(success.window.ended)
 		}
 		if overlap {
 			cp.markPeerFailedLocked(relay)
@@ -66,21 +72,23 @@ func (cp *credPool) notePeerHandshakeResult(ctx context.Context, connIdx int, ge
 	cp.planPeerProbeLocked(connIdx, relay)
 }
 
-func handshakeWindowsOverlap(a, b handshakeObservation) bool {
-	return !a.started.After(b.ended) && !b.started.After(a.ended)
+// A path may have recovered at the end of the deadline without the
+// failed handshake having sent anything since that recovery.
+func (h handshakeObservation) hasEvidenceAt(at time.Time) bool {
+	return !at.Before(h.started) && at.Before(h.lastRetry)
 }
 
 func (cp *credPool) markPeerFailedLocked(relay string) {
-	if cp.health.peerFailed[relay] {
+	if cp.health.isPeerFailed(relay) {
 		return
 	}
-	cp.health.peerFailed[relay] = true
+	cp.health.markPeerFailed(relay)
 	cp.peerMarks++
 	delete(cp.peerFailures, relay)
 	if cp.peerProbe.primary == relay {
 		cp.peerProbe = relayHandshakeProbe{}
 	}
-	log.Printf("credpool: relay %s peer handshake failed while another relay carried the peer connection — avoiding new attempts until peer recovery or a network-path change", relay)
+	log.Printf("credpool: relay %s peer handshake failed while another relay carried the peer connection — deferring new attempts except for recovery probes", relay)
 }
 
 func (cp *credPool) peerRelayReadyLocked(slot int, relay string) bool {

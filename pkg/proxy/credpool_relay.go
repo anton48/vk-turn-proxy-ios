@@ -189,6 +189,9 @@ func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 	if probeSlot, addr, ok := cp.peerProbeChoiceLocked(connIdx); ok && probeSlot == slot {
 		return addr, true
 	}
+	if _, addr, _ := cp.peerRecoveryChoiceLocked(slot); addr != "" {
+		return addr, true
+	}
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
 		if addr, ok := cp.unlimitedFirstLocked(alive); ok {
@@ -201,6 +204,41 @@ func (cp *credPool) pickAddrLocked(slot, connIdx int) (string, bool) {
 		log.Printf("credpool: conn %d: every relay of slot %d is marked unreachable (%s) — trying %s again", connIdx, slot, cp.health.deadList(cands), addr)
 	}
 	return addr, ok
+}
+
+// peerRecoveryChoiceLocked gives the earliest due peer mark one new attempt
+// from a usable credential. Pass -1 to look across the pool. Only hand-out
+// advances the backoff, so selection and logging cannot consume an attempt.
+// A single connection cannot corroborate its own failure. It can use the
+// initial alternate probe, subject to that probe's backoff on reconnects.
+func (cp *credPool) peerRecoveryChoiceLocked(onlySlot int) (slot int, relay string, nextDue time.Time) {
+	if len(cp.health.peerFailed) == 0 {
+		return -1, "", time.Time{}
+	}
+	now := cp.health.now()
+	first, end := 0, min(len(cp.pool), cp.size)
+	if onlySlot >= 0 {
+		first, end = onlySlot, min(end, onlySlot+1)
+	}
+	slot = -1
+	for i := first; i < end; i++ {
+		if cp.configuredOffLocked(i) {
+			continue
+		}
+		for _, candidate := range cp.candidatesLocked(i) {
+			due := cp.health.peerRecoveryDueAt(candidate)
+			if due.IsZero() || !cp.freshOnLocked(i, candidate) || now.Before(cp.markLocked(i, candidate)) || !cp.roomOnLocked(i, candidate) {
+				continue
+			}
+			if nextDue.IsZero() || due.Before(nextDue) {
+				slot, relay, nextDue = i, candidate, due
+			}
+		}
+	}
+	if nextDue.After(now) {
+		return -1, "", nextDue
+	}
+	return slot, relay, time.Time{}
 }
 
 // relayPace: the pace the override list gives the relay at addr, in KiB/s
@@ -253,6 +291,10 @@ func (cp *credPool) cursorPickLocked(alive []string, connIdx int) string {
 func (cp *credPool) relayParkLocked(connIdx, slot int) *poolParkError {
 	cands := cp.candidatesLocked(slot)
 	_, _, due := cp.health.probe(cands)
+	_, _, peerDue := cp.peerRecoveryChoiceLocked(slot)
+	if !peerDue.IsZero() && (due.IsZero() || peerDue.Before(due)) {
+		due = peerDue
+	}
 	cp.armHealthWakeLocked(due)
 	wait := "a re-try is out on another connection"
 	if !due.IsZero() {
@@ -371,6 +413,9 @@ func (cp *credPool) stampLocked() uint64 {
 // old mark ended the new session). A scan pins that get seats nothing bare.
 func (cp *credPool) handOutLocked(connIdx, slot int, addr string) uint64 {
 	cp.claimPeerProbeLocked(connIdx, slot, addr)
+	if cp.health.claimPeerRecovery(addr) {
+		log.Printf("credpool: conn %d: checking peer handshake recovery via relay %s", connIdx, addr)
+	}
 	cp.seatLocked(slot, addr)
 	return cp.stampHandOutLocked(connIdx)
 }
@@ -445,7 +490,8 @@ func (cp *credPool) noteVKAnsweredLocked(start time.Time) {
 // relay ends the pause. It reports whether the credential can be dialled.
 func (cp *credPool) noteMintLocked(slot int) bool {
 	cands := cp.candidatesLocked(slot)
-	if cp.health.hasCandidate(cands) {
+	recoverySlot, _, peerDue := cp.peerRecoveryChoiceLocked(slot)
+	if cp.health.hasCandidate(cands) || recoverySlot >= 0 {
 		cp.deadMintPause = 0
 		return true
 	}
@@ -455,6 +501,7 @@ func (cp *credPool) noteMintLocked(slot int) bool {
 		cp.deadMintPause *= 2
 	}
 	cp.deadMintUntil = cp.health.now().Add(cp.deadMintPause)
+	cp.armHealthWakeLocked(peerDue)
 	log.Printf("credpool: the fresh credential in slot %d names only relays marked unreachable (%s) — kept, and no mint for %s", slot, cp.health.deadList(cands), cp.deadMintPause)
 	cp.armHealthWakeLocked(cp.deadMintUntil)
 	return false
@@ -466,7 +513,8 @@ func (cp *credPool) noteMintLocked(slot int) bool {
 // to come due, a mark to clear or the pause to end. nil: carry on to a mint.
 func (cp *credPool) healthParkLocked() error {
 	now := cp.health.now()
-	blocked, nextDue := 0, time.Time{}
+	_, _, nextDue := cp.peerRecoveryChoiceLocked(-1)
+	blocked := 0
 	for i := range cp.pool {
 		if !cp.isFreshLocked(i) || cp.usableLocked(i) || cp.configuredOffLocked(i) {
 			continue

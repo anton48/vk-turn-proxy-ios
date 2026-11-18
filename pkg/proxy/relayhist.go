@@ -126,6 +126,9 @@ func (cp *credPool) peekAddrLocked(slot, connIdx int) string {
 	if probeSlot, addr, ok := cp.peerProbeChoiceLocked(connIdx); ok && probeSlot == slot {
 		return addr
 	}
+	if _, addr, _ := cp.peerRecoveryChoiceLocked(slot); addr != "" {
+		return addr
+	}
 	cands := cp.candidatesLocked(slot)
 	if alive := cp.health.alive(cands); len(alive) > 0 {
 		if addr, ok := cp.unlimitedFirstLocked(alive); ok {

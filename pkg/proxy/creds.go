@@ -2224,6 +2224,9 @@ func (cp *credPool) pickAcquireSlotLocked(connIdx, ownSlot int, logSkips bool) (
 	if slot, addr, ok := cp.peerProbeChoiceLocked(connIdx); ok {
 		return slot, addr, "peer handshake probe"
 	}
+	if slot, addr, _ := cp.peerRecoveryChoiceLocked(-1); slot >= 0 {
+		return slot, addr, "peer recovery probe"
+	}
 
 	// Priority 1: ownSlot, unconditionally preferred when usable.
 	if cp.isFreshLocked(ownSlot) && !cp.usableLocked(ownSlot) && logSkips {
@@ -2440,6 +2443,8 @@ func (cp *credPool) handOut(connIdx int, allowCaptchaBlock bool) (string, *TURNC
 			tag = "fallback compact-fill"
 		case "unlimited relay":
 			tag = "the relay without a quota"
+		case "peer handshake probe", "peer recovery probe":
+			tag = kind
 		default: // "fresh"
 			tag = "fallback fresh slot"
 		}
@@ -2653,8 +2658,7 @@ func (cp *credPool) handOut(connIdx int, allowCaptchaBlock bool) (string, *TURNC
 		} else {
 			cp.noteVKAnsweredLocked(fetchStart)
 			if !cp.health.hasCandidate(cp.candidatesForSlot(-1, creds)) {
-				if got, why = cp.placeIntoEmptySlotLocked(addr, creds, 0); got >= 0 {
-					_ = cp.noteMintLocked(got)
+				if got, why = cp.placeIntoEmptySlotLocked(addr, creds, 0); got >= 0 && !cp.noteMintLocked(got) {
 					wake := cp.slotAvailableCh
 					cp.mu.Unlock()
 					cp.saveToDisk()

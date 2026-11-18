@@ -57,15 +57,20 @@ import (
 	"github.com/pion/dtls/v3"
 )
 
+const (
+	defaultWakeProbePoll       = 100 * time.Millisecond
+	defaultWakeProbeFreezeStep = time.Second
+)
+
 // Vars so that a test can shrink them; nothing else writes them.
 var (
-	wakeProbeWindow      = 30 * time.Second       // LISTENING without an answer before the verdict
-	wakeProbeResendEvery = time.Second            // listening between two pings of one probe
-	wakeProbePoll        = 100 * time.Millisecond // how often the mark is looked at
-	wakeProbeFreezeStep  = time.Second            // a poll step longer than this was a freeze, not listening
-	wakeProbeAdopt       = time.Second            // a ping sent this recently is the probe's first ping
-	wakeProbeJitter      = 300 * time.Millisecond // the pool's probes are spread over this much
-	wakeProbeRetry       = time.Second            // the pause before an OWED probe is tried again (build 470)
+	wakeProbeWindow      = 30 * time.Second           // LISTENING without an answer before the verdict
+	wakeProbeResendEvery = time.Second                // listening between two pings of one probe
+	wakeProbePoll        = defaultWakeProbePoll       // how often the mark is looked at
+	wakeProbeFreezeStep  = defaultWakeProbeFreezeStep // a poll step longer than this was a freeze, not listening
+	wakeProbeAdopt       = time.Second                // a ping sent this recently is the probe's first ping
+	wakeProbeJitter      = 300 * time.Millisecond     // the pool's probes are spread over this much
+	wakeProbeRetry       = time.Second                // the pause before an OWED probe is tried again (build 470)
 	wakeProbeClock       = time.Now
 )
 

@@ -4,16 +4,12 @@ import (
 	"context"
 	"errors"
 	"net"
-	"os"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestSessionHandshakeTimeoutRotatesRelayAfterCleanup(t *testing.T) {
-	if os.Getenv("VKTP_SLOW") == "" {
-		t.Skip("set VKTP_SLOW=1 to exercise production handshake deadlines")
-	}
 	for _, transport := range []string{"SRTP UDP", "SRTP TCP", "DTLS UDP", "DTLS TCP"} {
 		t.Run(transport, func(t *testing.T) {
 			udp := transport == "SRTP UDP" || transport == "DTLS UDP"
@@ -34,15 +30,21 @@ func TestSessionHandshakeTimeoutRotatesRelayAfterCleanup(t *testing.T) {
 				Username: user, Password: "pw", Address: first.addr,
 				Addresses: []string{first.addr, second.addr},
 			})
+			runSession := p.runDTLSSession
+			if srtp {
+				runSession = p.runSRTPSession
+			}
 			for attempt, relay := range []*laggingRelay{first, second} {
-				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-				signaled := false
-				var err error
-				if srtp {
-					err = p.runSRTPSession(ctx, "", nil, &signaled, 0)
-				} else {
-					err = p.runDTLSSession(ctx, "", nil, &signaled, 0)
+				wantRetry := udp && attempt == 0
+				timeout := 150 * time.Millisecond
+				if wantRetry {
+					// Exercise one actual DTLS retransmission in each transport family.
+					timeout = peerHandshakeFirstRetry + 500*time.Millisecond
 				}
+				p.dtlsHandshakeTimeout, p.srtpHandshakeTimeout = timeout, timeout
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				signaled := false
+				err := runSession(ctx, "", nil, &signaled, 0)
 				cancel()
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("attempt %d: expected handshake deadline, got %v", attempt, err)
@@ -53,6 +55,12 @@ func TestSessionHandshakeTimeoutRotatesRelayAfterCleanup(t *testing.T) {
 				timeouts, marked := p.credPool.peerHandshakeStats()
 				if timeouts != uint64(attempt+1) || marked != 0 || p.credPool.health.isDead(relay.addr) {
 					t.Fatalf("attempt %d lost deadline telemetry or marked a relay without peer evidence", attempt)
+				}
+				p.credPool.mu.Lock()
+				retry := p.credPool.peerFailures[relay.addr].lastRetry
+				p.credPool.mu.Unlock()
+				if gotRetry := !retry.IsZero(); gotRetry != wantRetry {
+					t.Fatalf("attempt %d recorded a handshake retransmission: %t, want %t", attempt, gotRetry, wantRetry)
 				}
 				waitUntil(t, "released TURN allocation", 2*time.Second, func() bool {
 					return relay.srv.AllocationCount() == 0
@@ -71,9 +79,6 @@ func TestSessionHandshakeTimeoutRotatesRelayAfterCleanup(t *testing.T) {
 }
 
 func TestLegacyHandshakeWaitsForTURNReadiness(t *testing.T) {
-	savedTimeout := dtlsHandshakeTimeout
-	dtlsHandshakeTimeout = 80 * time.Millisecond
-	t.Cleanup(func() { dtlsHandshakeTimeout = savedTimeout })
 	var delayed sync.Once
 	user := futureUser("readiness")
 	relay := newLaggingRelay(t, 1, 0, func(username string) bool {
@@ -82,6 +87,7 @@ func TestLegacyHandshakeWaitsForTURNReadiness(t *testing.T) {
 	}, true)
 	peer := dtlsPeer(t)
 	p := NewProxy(Config{UseUDP: true, UseDTLS: true, NumConns: 1, PeerAddr: peer.String()})
+	p.dtlsHandshakeTimeout = 80 * time.Millisecond
 	p.peer = peer
 	t.Cleanup(p.cancel)
 	p.credPool = newCredPool(p.ctx, 1, 0, "", func(bool, int) (string, *TURNCreds, error) {
@@ -156,10 +162,13 @@ func TestLegacyCancellationBeforeAllocationDoesNotObservePeerHandshake(t *testin
 	}
 }
 
-func TestLegacyWakeDuringHandshakeIsExcludedFromPeerEvidence(t *testing.T) {
-	savedTimeout := dtlsHandshakeTimeout
-	dtlsHandshakeTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { dtlsHandshakeTimeout = savedTimeout })
+func TestWakeDuringHandshakeIsExcludedFromPeerEvidence(t *testing.T) {
+	t.Run("DTLS", func(t *testing.T) { testWakeDuringHandshake(t, false) })
+	t.Run("SRTP", func(t *testing.T) { testWakeDuringHandshake(t, true) })
+}
+
+func testWakeDuringHandshake(t *testing.T, srtp bool) {
+	t.Helper()
 	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +176,9 @@ func TestLegacyWakeDuringHandshakeIsExcludedFromPeerEvidence(t *testing.T) {
 	t.Cleanup(func() { _ = peer.Close() })
 	user := futureUser("wake-inside-handshake")
 	relay := newLaggingRelay(t, 1, 0, func(username string) bool { return username == user }, true)
-	p := NewProxy(Config{UseUDP: true, UseDTLS: true, NumConns: 1})
+	p := NewProxy(Config{UseUDP: true, UseSrtp: srtp, UseDTLS: true, NumConns: 1})
+	p.dtlsHandshakeTimeout = 300 * time.Millisecond
+	p.srtpHandshakeTimeout = 300 * time.Millisecond
 	p.peer = peer.LocalAddr().(*net.UDPAddr)
 	t.Cleanup(p.cancel)
 	p.credPool = newCredPool(p.ctx, 1, 0, "", func(bool, int) (string, *TURNCreds, error) {
@@ -177,9 +188,13 @@ func TestLegacyWakeDuringHandshakeIsExcludedFromPeerEvidence(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
+	runSession := p.runDTLSSession
+	if srtp {
+		runSession = p.runSRTPSession
+	}
 	go func() {
 		signaled := false
-		done <- p.runDTLSSession(ctx, "", nil, &signaled, 0)
+		done <- runSession(ctx, "", nil, &signaled, 0)
 	}()
 	_ = peer.SetReadDeadline(time.Now().Add(3 * time.Second))
 	if _, _, err := peer.ReadFromUDP(make([]byte, 2048)); err != nil {

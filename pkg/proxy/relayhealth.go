@@ -121,7 +121,7 @@ type relayRecord struct {
 type relayHealth struct {
 	// Peer forwarding failures require another relay's handshake or data evidence.
 	// A successful peer handshake or network-path change clears them.
-	peerFailed   map[string]bool
+	peerFailed   map[string]peerRelayMark
 	rec          map[string]*relayRecord
 	lastAnswer   time.Time // the latest answer on this path — a relay's or VK's API
 	lastVKAnswer time.Time // the latest answer of VK's API on this path (the evidence a relay's own answer cannot be)
@@ -134,8 +134,13 @@ type relayHealth struct {
 	now           func() time.Time
 }
 
+type peerRelayMark struct {
+	next    time.Time // earliest new attempt; set at hand-out even if it never reaches the handshake
+	retries int
+}
+
 func newRelayHealth() *relayHealth {
-	return &relayHealth{rec: map[string]*relayRecord{}, peerFailed: map[string]bool{}, now: time.Now}
+	return &relayHealth{rec: map[string]*relayRecord{}, peerFailed: map[string]peerRelayMark{}, now: time.Now}
 }
 
 func (h *relayHealth) record(addr string) *relayRecord {
@@ -293,14 +298,58 @@ func (h *relayHealth) answered(addr string, start time.Time) {
 // pathChanged forgets everything: the verdicts were about the old network.
 func (h *relayHealth) pathChanged() {
 	h.rec = map[string]*relayRecord{}
-	h.peerFailed = map[string]bool{}
+	h.peerFailed = map[string]peerRelayMark{}
 	h.lastAnswer, h.lastVKAnswer = time.Time{}, time.Time{}
 	h.pathChangedAt = h.now()
 }
 
+func (h *relayHealth) isPeerFailed(addr string) bool {
+	_, marked := h.peerFailed[addr]
+	return marked
+}
+
+func (h *relayHealth) markPeerFailed(addr string) {
+	h.peerFailed[addr] = peerRelayMark{next: h.now().Add(probeBackoff(0))}
+}
+
+// peerRecoveryDueAt respects both retry schedules when TURN control is also
+// marked. A TURN response can clear its own mark while the peer mark remains.
+func (h *relayHealth) peerRecoveryDueAt(addr string) time.Time {
+	mark, ok := h.peerFailed[addr]
+	if !ok {
+		return time.Time{}
+	}
+	if r := h.rec[addr]; r != nil && r.dead {
+		h.settleRunOutClaim(r)
+		due := r.claimedUntil
+		if due.IsZero() {
+			due = r.dueAt()
+		}
+		if due.After(mark.next) {
+			return due
+		}
+	}
+	return mark.next
+}
+
+func (h *relayHealth) claimPeerRecovery(addr string) bool {
+	mark, ok := h.peerFailed[addr]
+	if !ok {
+		return false
+	}
+	now := h.now()
+	mark.retries++
+	mark.next = now.Add(probeBackoff(mark.retries))
+	h.peerFailed[addr] = mark
+	if r := h.rec[addr]; r != nil && r.dead {
+		r.claimedUntil, r.claimedAt = now.Add(relayProbeClaim), now
+	}
+	return true
+}
+
 func (h *relayHealth) isDead(addr string) bool {
 	r := h.rec[addr]
-	return h.peerFailed[addr] || r != nil && r.dead
+	return h.isPeerFailed(addr) || r != nil && r.dead
 }
 
 // alive is the unmarked candidates, in the list's order.
@@ -369,7 +418,7 @@ func (h *relayHealth) dueCandidate(cands []string) (addr string, ok bool, nextDu
 	var dues []due
 	for _, a := range cands {
 		r := h.rec[a]
-		if h.peerFailed[a] || r == nil || !r.dead {
+		if h.isPeerFailed(a) || r == nil || !r.dead {
 			continue
 		}
 		if r.claimedUntil.After(now) {
@@ -395,7 +444,7 @@ func (h *relayHealth) dueCandidate(cands []string) (addr string, ok bool, nextDu
 func (h *relayHealth) untried(cands []string) []string {
 	out := make([]string, 0, len(cands))
 	for _, a := range cands {
-		if r := h.rec[a]; !h.peerFailed[a] && (r == nil || (!r.dead && r.unanswered == 0)) {
+		if r := h.rec[a]; !h.isPeerFailed(a) && (r == nil || (!r.dead && r.unanswered == 0)) {
 			out = append(out, a)
 		}
 	}
@@ -430,7 +479,7 @@ func (h *relayHealth) hasCandidate(cands []string) bool {
 	due := false
 	for _, a := range cands {
 		r := h.rec[a]
-		if h.peerFailed[a] || r == nil || !r.dead {
+		if h.isPeerFailed(a) || r == nil || !r.dead {
 			continue
 		}
 		if r.claimedUntil.After(now) {

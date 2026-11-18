@@ -189,6 +189,10 @@ type Proxy struct {
 	peer   *net.UDPAddr
 	linkID string
 
+	// Per-instance test overrides set before starting sessions. Zero uses the default.
+	dtlsHandshakeTimeout time.Duration
+	srtpHandshakeTimeout time.Duration
+
 	// For packet I/O from the WireGuard side. sendCh carries a sendItem rather
 	// than a bare []byte so each packet's enqueue instant travels WITH it —
 	// see sendwait.go for why a parallel structure cannot pair them correctly.
@@ -2535,7 +2539,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	}
 	dtlsStart := time.Now()
 	wakeEpoch := p.wakeEpoch.Load()
-	dtlsConn, err, observation := dialDTLSObserved(connCtx, conn1, p.peer)
+	dtlsConn, err, observation := p.dialDTLS(connCtx, conn1)
 	observation.suspended = observation.suspended || p.wakeEpoch.Load() != wakeEpoch
 	p.notePeerHandshake(sessCtx, connIdx, sessGen, turnAddr, observation, err)
 	if err != nil {
@@ -4625,15 +4629,8 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
 }
 
-// A variable so local transport tests can bound a handshake independently of TURN setup.
-var dtlsHandshakeTimeout = 15 * time.Second
-
-func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
-	conn, err, _ := dialDTLSObserved(ctx, transport, peer)
-	return conn, err
-}
-
-func dialDTLSObserved(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) (net.Conn, error, handshakeObservation) {
+// dialDTLS establishes a legacy DTLS connection over the ready TURN leg.
+func (p *Proxy) dialDTLS(ctx context.Context, transport net.PacketConn) (net.Conn, error, handshakeObservation) {
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
 		return nil, err, handshakeObservation{}
@@ -4663,7 +4660,8 @@ func dialDTLSObserved(ctx context.Context, transport net.PacketConn, peer *net.U
 			dtls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,      // 0xc014
 		},
 	}
-	dtlsConn, err := dtls.Client(transport, peer, config)
+	observed := &handshakePacketConn{PacketConn: transport}
+	dtlsConn, err := dtls.Client(observed, p.peer, config)
 	if err != nil {
 		return nil, err, handshakeObservation{}
 	}
@@ -4673,7 +4671,13 @@ func dialDTLSObserved(ctx context.Context, transport net.PacketConn, peer *net.U
 	// complete in ~50-300ms (see "DTLS HS" in stats), so 15s is plenty
 	// of headroom for slow networks while still failing fast on transient
 	// network breaks worth retrying.
-	return observePeerHandshake(ctx, dtlsHandshakeTimeout, func(hsCtx context.Context) (net.Conn, error) {
+	timeout := p.dtlsHandshakeTimeout
+	if timeout == 0 {
+		timeout = 15 * time.Second
+	}
+	return observePeerHandshake(ctx, timeout, p.snapshotPeerTraffic, func(hsCtx context.Context, noteSend func()) (net.Conn, error) {
+		observed.observer.Store(&noteSend)
+		defer observed.observer.Store(nil)
 		if err := dtlsConn.HandshakeContext(hsCtx); err != nil {
 			_ = dtlsConn.Close()
 			return nil, err
@@ -5920,9 +5924,16 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms, local=%s)",
 		connIdx, relayConn.LocalAddr(), allocDur.Milliseconds(), ctlConn.LocalAddr())
 
+	timeout := p.srtpHandshakeTimeout
+	if timeout == 0 {
+		timeout = srtpwrap.HandshakeTimeout
+	}
 	wakeEpoch := p.wakeEpoch.Load()
-	srtpConn, err, observation := observePeerHandshake(ctx, srtpwrap.HandshakeTimeout, func(hsCtx context.Context) (net.Conn, error) {
-		return srtpwrap.Client(hsCtx, relayConn, p.peer, &p.rtpChPeak)
+	observed := &handshakePacketConn{PacketConn: relayConn}
+	srtpConn, err, observation := observePeerHandshake(ctx, timeout, p.snapshotPeerTraffic, func(hsCtx context.Context, noteSend func()) (net.Conn, error) {
+		observed.observer.Store(&noteSend)
+		defer observed.observer.Store(nil)
+		return srtpwrap.Client(hsCtx, observed, p.peer, &p.rtpChPeak)
 	})
 	observation.suspended = observation.suspended || p.wakeEpoch.Load() != wakeEpoch
 	p.notePeerHandshake(ctx, connIdx, generation, turnAddr, observation, err)

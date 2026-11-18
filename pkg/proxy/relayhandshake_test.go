@@ -3,13 +3,25 @@ package proxy
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 )
 
-func TestPeerHandshakeMarkRequiresOverlappingSuccess(t *testing.T) {
-	for _, order := range []string{"success first", "failure first"} {
-		t.Run(order, func(t *testing.T) {
+func TestPeerHandshakeMarkRequiresSuccessBeforeRetry(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		failureFirst bool
+		successAt    time.Duration
+		wantMark     bool
+	}{
+		{name: "success reported first", successAt: 2 * time.Second, wantMark: true},
+		{name: "failure reported first", failureFirst: true, successAt: 2 * time.Second, wantMark: true},
+		{name: "success in the quiet tail", successAt: 9900 * time.Millisecond},
+		{name: "quiet tail success reported second", failureFirst: true, successAt: 9900 * time.Millisecond},
+		{name: "success at the last retry", successAt: 7 * time.Second},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			cp, clock := peerHandshakePool(t, false, relayA, relayB)
 			_, credsA, slotA := mustGet(t, cp, 0)
 			generationA := cp.handStampOf(0)
@@ -18,8 +30,8 @@ func TestPeerHandshakeMarkRequiresOverlappingSuccess(t *testing.T) {
 			cp.mu.Unlock()
 			_, credsB, slotB := mustGet(t, cp, 1)
 			generationB := cp.handStampOf(1)
-			failure := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), timedOut: true}
-			success := handshakeObservation{started: clock.Add(time.Second), ended: clock.Add(2 * time.Second)}
+			failure := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), lastRetry: clock.Add(7 * time.Second), timedOut: true}
+			success := handshakeObservation{started: clock.Add(test.successAt - time.Second), ended: clock.Add(test.successAt)}
 			cp.onRelayMarked = func(string, uint64) { t.Error("peer evidence canceled existing TURN sessions") }
 			failed := func() {
 				cp.notePeerHandshakeResult(context.Background(), 0, generationA, relayA, failure, context.DeadlineExceeded, nil)
@@ -27,7 +39,7 @@ func TestPeerHandshakeMarkRequiresOverlappingSuccess(t *testing.T) {
 			succeeded := func() {
 				cp.notePeerHandshakeResult(context.Background(), 1, generationB, relayB, success, nil, nil)
 			}
-			if order == "success first" {
+			if !test.failureFirst {
 				succeeded()
 				failed()
 			} else {
@@ -37,6 +49,27 @@ func TestPeerHandshakeMarkRequiresOverlappingSuccess(t *testing.T) {
 					t.Fatal("an Allocate reply became peer reachability evidence")
 				}
 				succeeded()
+			}
+			if !test.wantMark {
+				if cp.health.isDead(relayA) || cp.peerMarks != 0 {
+					t.Fatal("success at or after the last send marked the failed relay")
+				}
+				if len(cp.peerFailures) != 1 {
+					t.Fatal("fixture did not record the uncorroborated timeout")
+				}
+				cp.mu.Lock()
+				cp.pathChangedHealthLocked()
+				staleFailures := len(cp.peerFailures)
+				cp.mu.Unlock()
+				if staleFailures != 0 {
+					t.Fatal("path change retained an uncorroborated timeout")
+				}
+				cp.release(slotA, credsA, "")
+				cp.release(slotB, credsB, "")
+				return
+			}
+			if cp.peerProbe.primary != "" {
+				t.Fatal("marking the primary left a pending alternate probe")
 			}
 			if !cp.health.isDead(relayA) || cp.health.isDead(relayB) || cp.peerMarks != 1 || cp.peerTimeouts != 1 {
 				t.Fatal("overlapping peer success did not produce one global mark")
@@ -68,7 +101,7 @@ func TestPeerHandshakeMarkRequiresOverlappingSuccess(t *testing.T) {
 }
 
 func TestPeerHandshakeMarkUsesCurrentSessionReceiveEvidence(t *testing.T) {
-	for _, evidence := range []string{"overlapping receive", "early receive", "late receive", "stale generation", "same relay"} {
+	for _, evidence := range []string{"overlapping receive", "early receive", "late receive", "before handshake success", "no retry", "stale generation", "same relay"} {
 		t.Run(evidence, func(t *testing.T) {
 			cp, clock := peerHandshakePool(t, false, relayA, relayB)
 			_, credsA, slotA := mustGet(t, cp, 0)
@@ -84,13 +117,18 @@ func TestPeerHandshakeMarkUsesCurrentSessionReceiveEvidence(t *testing.T) {
 			generationB := cp.handStampOf(1)
 			success := handshakeObservation{started: clock.Add(-20 * time.Second), ended: clock.Add(-15 * time.Second)}
 			cp.notePeerHandshakeResult(context.Background(), 1, generationB, addrB, success, nil, nil)
-			failure := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), timedOut: true}
+			failure := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), lastRetry: clock.Add(7 * time.Second), timedOut: true}
 			received := []int64{0, clock.Add(5 * time.Second).UnixNano()}
 			switch evidence {
 			case "early receive":
 				received[1] = clock.Add(-time.Second).UnixNano()
 			case "late receive":
-				received[1] = clock.Add(11 * time.Second).UnixNano()
+				received[1] = clock.Add(9 * time.Second).UnixNano()
+			case "before handshake success":
+				success.ended = clock.Add(8 * time.Second)
+				cp.notePeerHandshakeResult(context.Background(), 1, generationB, addrB, success, nil, nil)
+			case "no retry":
+				failure.lastRetry = time.Time{}
 			case "stale generation":
 				_, nextCreds, nextSlot := mustGet(t, cp, 1)
 				cp.release(nextSlot, nextCreds, "")
@@ -173,7 +211,7 @@ func TestPeerHandshakeResultIgnoresCanceledSuspendedAndStaleAttempts(t *testing.
 }
 
 func TestPeerHandshakeProbePreservesUnavailableAlternativeAndCache(t *testing.T) {
-	for _, blocked := range []string{"saturated", "full", "expired", "cooldown"} {
+	for _, blocked := range []string{"saturated", "full", "expired", "cooldown", "unanswered"} {
 		t.Run(blocked, func(t *testing.T) {
 			cp, clock := peerHandshakePool(t, true, relayA, relayB)
 			addr, creds, slot := mustGet(t, cp, 0)
@@ -181,6 +219,8 @@ func TestPeerHandshakeProbePreservesUnavailableAlternativeAndCache(t *testing.T)
 			switch blocked {
 			case "saturated":
 				cp.histPtrLocked(1, relayB).saturatedUntil = clock.Add(time.Minute)
+			case "unanswered":
+				cp.health.record(relayB).unanswered = 1
 			case "full":
 				for range connsPerSlot {
 					heldAddr, heldCreds, heldSlot := mustGet(t, cp, 10)
@@ -243,7 +283,7 @@ func TestPeerHandshakeMarkOverridesCookieAndUnlimitedPriorities(t *testing.T) {
 				cp.setOverride(turnOverride{servers: servers})
 			}
 			success := handshakeObservation{started: clock.Add(time.Second), ended: clock.Add(2 * time.Second)}
-			failure := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), timedOut: true}
+			failure := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), lastRetry: clock.Add(7 * time.Second), timedOut: true}
 			cp.notePeerHandshakeResult(context.Background(), connB, cp.handStampOf(connB), relayB, success, nil, nil)
 			cp.notePeerHandshakeResult(context.Background(), 0, generationA, relayA, failure, context.DeadlineExceeded, nil)
 			cp.release(slotA, credsA, "")
@@ -273,7 +313,7 @@ func TestPeerHandshakeRecoveryClearsOnlyPendingFailure(t *testing.T) {
 	cp.cursor[1] = 1
 	_, credsB, slotB := mustGet(t, cp, 1)
 	defer cp.release(slotB, credsB, "")
-	failure := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), timedOut: true}
+	failure := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), lastRetry: clock.Add(7 * time.Second), timedOut: true}
 	success := handshakeObservation{started: clock.Add(time.Second), ended: clock.Add(2 * time.Second)}
 	cp.notePeerHandshakeResult(context.Background(), 0, cp.handStampOf(0), relayA, failure, context.DeadlineExceeded, nil)
 	cp.notePeerHandshakeResult(context.Background(), 2, cp.handStampOf(2), relayA, success, nil, nil)
@@ -294,13 +334,13 @@ func TestPeerHandshakeMarkedRelayCannotCorroborateAnotherMark(t *testing.T) {
 	activeA := handshakeObservation{started: clock.Add(-20 * time.Second), ended: clock.Add(-15 * time.Second)}
 	cp.notePeerHandshakeResult(context.Background(), 2, cp.handStampOf(2), relayA, activeA, nil, nil)
 	successB := handshakeObservation{started: clock.Add(time.Second), ended: clock.Add(2 * time.Second)}
-	failureA := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), timedOut: true}
+	failureA := handshakeObservation{started: *clock, ended: clock.Add(10 * time.Second), lastRetry: clock.Add(7 * time.Second), timedOut: true}
 	cp.notePeerHandshakeResult(context.Background(), 1, cp.handStampOf(1), relayB, successB, nil, nil)
 	cp.notePeerHandshakeResult(context.Background(), 0, cp.handStampOf(0), relayA, failureA, context.DeadlineExceeded, nil)
 	if !cp.health.isDead(relayA) {
 		t.Fatal("fixture did not mark A using successful B")
 	}
-	failureB := handshakeObservation{started: clock.Add(19 * time.Second), ended: clock.Add(25 * time.Second), timedOut: true}
+	failureB := handshakeObservation{started: clock.Add(19 * time.Second), ended: clock.Add(25 * time.Second), lastRetry: clock.Add(24 * time.Second), timedOut: true}
 	received := []int64{0, 0, clock.Add(22 * time.Second).UnixNano()}
 	cp.notePeerHandshakeResult(context.Background(), 1, cp.handStampOf(1), relayB, failureB, context.DeadlineExceeded, received)
 	if !cp.health.isDead(relayA) || cp.health.isDead(relayB) || cp.peerMarks != 1 {
@@ -370,7 +410,7 @@ func TestPeerHandshakeProbeFollowsChangedRelayCandidates(t *testing.T) {
 				t.Fatal("fixture did not establish the old bounded probe backoff")
 			}
 			quotaClock := *clock
-			cp.health.peerFailed[relayO] = true
+			cp.health.markPeerFailed(relayO)
 			cp.relayUsedAt[relayO] = quotaClock
 			if change.override {
 				servers, err := ParseTURNServers(change.primary + ":0," + change.alternate)
@@ -393,10 +433,66 @@ func TestPeerHandshakeProbeFollowsChangedRelayCandidates(t *testing.T) {
 			if addr != change.alternate || cp.peerProbe.primary != change.primary || cp.peerProbe.alternate != change.alternate || cp.peerProbe.retries != 1 {
 				t.Fatalf("the old probe blocked new relay exploration: chosen=%s primary=%s alternate=%s retries=%d", addr, cp.peerProbe.primary, cp.peerProbe.alternate, cp.peerProbe.retries)
 			}
-			if !cp.health.peerFailed[relayO] || !cp.relayUsedAt[relayO].Equal(quotaClock) {
+			if !cp.health.isPeerFailed(relayO) || !cp.relayUsedAt[relayO].Equal(quotaClock) {
 				t.Fatal("updating probe candidates changed an existing relay mark or quota clock")
 			}
 		})
+	}
+}
+
+func TestPeerProbeKeepsItsChosenRelayWhenItRunsOutOfSeats(t *testing.T) {
+	cp, clock := peerHandshakePool(t, false, relayA, relayB, relayC)
+	cp.planPeerProbeLocked(0, relayA)
+	if addr := cp.peekAddrLocked(0, 0); addr != relayB {
+		t.Fatalf("peek did not see conn 0's reserved probe: %s", addr)
+	}
+
+	cp.histPtrLocked(0, relayB).saturatedUntil = clock.Add(time.Hour)
+	*clock = cp.peerProbe.claimedUntil
+	if _, _, ok := cp.peerProbeChoiceLocked(0); ok {
+		t.Fatal("a reservation could be selected after its claim expired")
+	}
+	cp.planPeerProbeLocked(0, relayA)
+	if cp.peerProbe.alternate != relayB {
+		t.Fatal("an unavailable alternate caused a sweep to another relay")
+	}
+	cp.histPtrLocked(0, relayB).saturatedUntil = time.Time{}
+	cp.planPeerProbeLocked(1, relayC)
+	if cp.peerProbe.primary != relayA || cp.peerProbe.alternate != relayB || cp.peerProbe.conn != 0 {
+		t.Fatal("an unrelated failure redirected the alternate probe")
+	}
+}
+
+func TestPeerProbeRejectsAnExpiredReservation(t *testing.T) {
+	cp, clock := peerHandshakePool(t, false, relayA, relayB)
+	cp.planPeerProbeLocked(0, relayA)
+	*clock = cp.peerProbe.claimedUntil
+	if _, _, ok := cp.peerProbeChoiceLocked(0); ok {
+		t.Fatal("a ready relay was returned for an expired probe reservation")
+	}
+}
+
+func TestPeerProbeRejectsDisabledCookieSlot(t *testing.T) {
+	cp, _ := peerHandshakePool(t, true, relayA, relayB)
+	cp.override.setServers([]string{relayA})
+	if cp.peerRelayReadyLocked(1, relayB) {
+		t.Fatal("a cached credential was considered for a disabled slot")
+	}
+}
+
+func TestPeerProbeResetsOnAChangedDNSAnswer(t *testing.T) {
+	oldLookup := lookupTURNHost
+	t.Cleanup(func() { lookupTURNHost = oldLookup })
+	lookupTURNHost = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("203.0.113.33")}, nil
+	}
+	cp, clock := peerHandshakePool(t, false, relayA, relayB)
+	cp.override.raw = []string{"relay.example:3478"}
+	cp.override.setServers([]string{relayA})
+	cp.peerProbe = relayHandshakeProbe{primary: relayA, alternate: relayB, next: clock.Add(time.Hour)}
+	cp.reresolveOverride("test", false)
+	if cp.peerProbe != (relayHandshakeProbe{}) {
+		t.Fatal("a changed DNS answer retained the old alternate probe")
 	}
 }
 
