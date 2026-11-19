@@ -2541,7 +2541,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// The relay leg runs in a goroutine of its own and is JOINED before this
 	// session returns (relayjoin.go). On its exit it always cancels the session:
 	// without TURN there's no DTLS transport, so the conn is dead either way.
-	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, sessGen, connCancel)
 	// Registered BEHIND the credential's release above, so it runs BEFORE it, and
 	// ahead of every return below — the early ones too: the session gives its
 	// credential back, and its connection re-dials, only after the relay leg's
@@ -3050,7 +3050,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	})
 
 	// allowCaptchaBlock=false — see runDTLSSession's matching comment.
-	turnAddr, creds, credSlot, _, err := p.resolveTURNAddr(sessCtx, connIdx, false)
+	turnAddr, creds, credSlot, sessGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
@@ -3067,7 +3067,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	// returns — behind the credential's release above, so ahead of it
 	// (relayjoin.go). The reconnect loop below starts the next one through the
 	// same leg.
-	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, nil)
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, sessGen, nil)
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
 	if readyCh != nil && !*signaled {
@@ -3116,7 +3116,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 					return
 				}
 				// allowCaptchaBlock=false — see runDTLSSession's matching comment.
-				newAddr, newCreds, newSlot, _, err := p.resolveTURNAddr(sessCtx, connIdx, false)
+				newAddr, newCreds, newSlot, newGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 				if err != nil {
 					retries++
 					select {
@@ -3128,7 +3128,7 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 				}
 				credSlot = newSlot
 				currentSlot, currentCreds, currentAddr = newSlot, newCreds, newAddr
-				next, started := p.goRunTURN(connCtx, &leg, newAddr, newCreds, conn2, connIdx, newSlot, nil)
+				next, started := p.goRunTURN(connCtx, &leg, newAddr, newCreds, conn2, connIdx, newSlot, newGen, nil)
 				if !started {
 					return // the session is ending: nothing is started behind its join
 				}
@@ -3230,10 +3230,11 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	defer conn1.Close()
 	defer conn2.Close()
 
-	turnAddr, creds, credSlot, _, err := p.resolveTURNAddr(sessCtx, connIdx, false)
+	turnAddr, creds, credSlot, sessGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
+	attempt := time.Now() // when this attempt on the relay began — what its success is dated by (peerrefused.go)
 	// The lease is the pair (slot, credential) — see runDTLSSession.
 	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// The relay leg this session starts below. It also carries the note of the
@@ -3248,7 +3249,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	// rebuilds it, and the relay leg is JOINED before this session returns —
 	// behind the credential's release above, so ahead of it, and ahead of every
 	// return below, the early ones too (relayjoin.go).
-	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, sessGen, connCancel)
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
 	// WRAP-A obfuscation around the DTLS-transport end of the pipe, then a
@@ -3308,6 +3309,11 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	p.signalBootstrapDone(nil)
 
 	p.noteSessionUp(connIdx) // the retry floor's evidence that the network works — retryfloor.go
+	// The SERVER answered through this relay — DTLS and its GETCONF: the pool
+	// is told, as the DTLS family tells it from its handshake. This transport
+	// can SET the relay's peer mark (the refusal met inside the first write),
+	// so it is also the one to clear it (peerrefused.go).
+	p.relayCarriedPeer(sessCtx, connIdx, sessGen, turnAddr, attempt)
 	log.Printf("proxy: [conn %d, cred %d] WRAP-A+TURN session established (getconf ok)", connIdx, credSlot)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
@@ -3520,7 +3526,7 @@ func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
 // Runs until the relay fails or ctx is cancelled. No forced lifetime —
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
-func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, gave *gaveBack, ready chan<- struct{}) error {
+func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, generation uint64, gave *gaveBack, ready chan<- struct{}) error {
 	attempt := time.Now() // when this relay attempt began — the relay health's window (relayhealth.go)
 	turnUDPAddr, err := net.ResolveUDPAddr("udp", turnAddr)
 	if err != nil {
@@ -3858,13 +3864,22 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		// Plaintext destination buffer for unwrap. Sized for the same
 		// 1600-byte upper bound conn2 expects to see.
 		plain := make([]byte, 1600)
+		carried := false // the pool has been told that this leg's relay carries the peer
 		for {
-			n, _, err := relayConn.ReadFrom(buf)
+			n, from, err := relayConn.ReadFrom(buf)
 			if err != nil {
 				if ctx.Err() == nil {
 					log.Printf("proxy: [conn %d] runTURN relay→conn2: ReadFrom error: %v (ctx=%v)", connIdx, err, ctx.Err())
 				}
 				return
+			}
+			// The direct session has nothing above the relay that could say the
+			// SERVER answered through it: the peer's first datagram on this leg
+			// is that word — once a leg, with the leg's own hand-out and start
+			// (peerrefused.go). The other transports say it from their handshake.
+			if !carried && p.directMode() && isFromPeer(from, p.peer) {
+				carried = true
+				p.relayCarriedPeer(ctx, connIdx, generation, turnAddr, attempt)
 			}
 			payload := buf[:n]
 			if useWrap {

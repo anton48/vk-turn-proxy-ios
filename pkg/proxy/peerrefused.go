@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"log"
+	"net"
 	"strings"
 	"time"
 )
@@ -25,6 +26,11 @@ import (
 // schedule and a session that comes up through it clears the mark, so a relay
 // whose list is mended returns by itself. A path change clears it with the
 // other marks.
+//
+// Who clears it, by transport — each from its OWN event that the server
+// answered through the relay: the DTLS family and SRTP from their handshake
+// (notePeerHandshake), WRAP-A behind its GETCONF and the direct session at the
+// peer's first datagram (relayCarriedPeer), csqtt from its lease (NotePeerUp).
 //
 // 🚫 NARROW: an error response to CreatePermission with NO error code (pion's
 // server answers so when its permission handler refuses the peer) or with 403
@@ -106,6 +112,30 @@ func (p *CredPool) NotePeerUp(connIdx int, stamp uint64, addr string, began time
 	}
 	p.cp.notePeerHandshakeResult(context.Background(), connIdx, stamp, addr,
 		handshakeObservation{started: began, lastRetry: began, ended: time.Now()}, nil, nil)
+}
+
+// relayCarriedPeer tells the pool that the SERVER answered through turnAddr on
+// the hand-out `generation`, on an attempt begun at attempt — for the session
+// kinds that have no handshake window of this package's to report: WRAP-A
+// behind its GETCONF, the direct session at the peer's first datagram through
+// the relay. It is the success the DTLS and SRTP sessions report from their
+// handshake, through the same way in (notePeerHandshake: a set-up without a
+// lease says nothing): a relay that carries the peer loses its peer mark.
+// 🚫 Every transport that can SET the mark — these two meet the relay's refusal
+// inside the first write to the peer — has to be able to clear it, or a relay
+// whose list was mended stays out of use but for the rare recovery checks,
+// each of which comes up and changes nothing. 🚫 An accepted allocation is not
+// that word, nor a granted permission: the peer has to have answered.
+func (p *Proxy) relayCarriedPeer(ctx context.Context, connIdx int, generation uint64, turnAddr string, attempt time.Time) {
+	p.notePeerHandshake(ctx, connIdx, generation, turnAddr,
+		handshakeObservation{started: attempt, ended: time.Now()}, nil)
+}
+
+// isFromPeer: a datagram the relay delivered came from the peer's own address
+// (a permission is the peer HOST's — another socket there is not the peer).
+func isFromPeer(from net.Addr, peer *net.UDPAddr) bool {
+	u, ok := from.(*net.UDPAddr)
+	return ok && u.Port == peer.Port && u.IP.Equal(peer.IP)
 }
 
 // relayRefusedPeer is the relay leg's way out on a failed CreatePermission:

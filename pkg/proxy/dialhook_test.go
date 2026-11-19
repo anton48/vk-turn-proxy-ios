@@ -125,7 +125,7 @@ func TestTheDialHookIsToldTheRelayByEveryTURNSocket(t *testing.T) {
 				conn1, conn2 := connutil.AsyncPacketPipe()
 				defer conn1.Close()
 				defer conn2.Close()
-				go func() { done <- p.runTURN(ctx, addr, creds, conn2, 0, 0, nil, nil) }()
+				go func() { done <- p.runTURN(ctx, addr, creds, conn2, 0, 0, 0, nil, nil) }()
 			}
 			waitUntil(t, "the relay to accept the allocation", 5*time.Second, func() bool { return slotAllocated(cp) == 1 })
 			cancel()
@@ -228,7 +228,7 @@ func TestADialHookRefusalAbortsTheDialBeforeAnythingIsSent(t *testing.T) {
 				conn1, conn2 := connutil.AsyncPacketPipe()
 				defer conn1.Close()
 				defer conn2.Close()
-				err = p.runTURN(ctx, addr, creds, conn2, 0, 0, nil, nil)
+				err = p.runTURN(ctx, addr, creds, conn2, 0, 0, 0, nil, nil)
 			}
 			if !errors.Is(err, errRefusedByTest) {
 				t.Fatalf("err = %v, want the hook's refusal", err)

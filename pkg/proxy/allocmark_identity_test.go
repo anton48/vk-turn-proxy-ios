@@ -210,7 +210,7 @@ func TestALateAllocateAnswerMarksTheCredentialItWasIssuedTo(t *testing.T) {
 			conn1, conn2 := connutil.AsyncPacketPipe()
 			defer conn1.Close()
 			defer conn2.Close()
-			return p.runTURN(ctx, relay, old, conn2, 0, 0, nil, nil)
+			return p.runTURN(ctx, relay, old, conn2, 0, 0, 0, nil, nil)
 		}},
 		{"setupSRTPSession — where SRTP allocates", func(ctx context.Context, p *Proxy, relay string) error {
 			c, err := p.setupSRTPSession(ctx, relay, old, 0, 0, nil, 0)

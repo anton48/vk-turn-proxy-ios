@@ -163,7 +163,7 @@ func TestRunTURNReturnsWhenTheRelayGoesSilentAtCreatePermission(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil, nil)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, 0, nil, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return p.turnRTTns.Load() != 0 })
 
@@ -339,7 +339,7 @@ func TestRunTURNDeallocatesAfterACancelOnAHealthyRelay(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, nil, nil)
+		done <- p.runTURN(ctx, tap.addr(), &TURNCreds{Username: "u", Password: "pw"}, conn2, 0, 0, 0, nil, nil)
 	}()
 	waitUntil(t, "the allocation", 5*time.Second, func() bool { return p.turnRTTns.Load() != 0 })
 	_, _ = conn1.WriteTo(make([]byte, 100), peer)
