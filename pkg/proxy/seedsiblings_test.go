@@ -159,7 +159,8 @@ func TestASiblingPlacedAgainKeepsItsLeases(t *testing.T) {
 	path := writeCookieCache(t, t.TempDir(),
 		credCacheEntry{Slot: 0, Address: relayA, Addresses: []string{relayA}, Username: futureUser("disk-A"), Password: "p"})
 	cp, _, _ := cookieSeedPool(t, path, 2)
-	seed := func() *TURNCreds { return SeedCreds(relayA, futureUser("seed"), "pw", []string{relayA, relayB}) }
+	user := futureUser("seed") // ONE name for both seedings: it carries the clock's second, and a second may pass between them
+	seed := func() *TURNCreds { return SeedCreds(relayA, user, "pw", []string{relayA, relayB}) }
 	cp.seedSlot(0, relayA, seed())
 	wantSeedSlots(t, cp, "0:A:disk-A", "1:B:seed")
 	cp.mu.Lock()
