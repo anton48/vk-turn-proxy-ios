@@ -245,7 +245,7 @@ func GetVKCreds(linkID string, captchaSolver CaptchaSolver, solvedCaptchaSID, so
 		// holds a distinct (call, relay) bucket. Single-relay creds; NO captcha;
 		// NO anonymous fallback.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		creds, err := cookieCredForSlot(ctx, 0, nil, nil, nil) // the app's probe: VK's relay; the pool's slot 0 takes the override's first when a list is set
+		creds, err := cookieSeedCred(ctx) // the app's probe: VK's relay and every relay VK named with it; the pool's slot 0 takes the override's first when a list is set
 		cancel()
 		if err != nil {
 			if errors.Is(err, ErrCookieRejected) {
@@ -1522,8 +1522,16 @@ func poolSizeForNumConns(n int) int {
 func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	cp.mu.Lock()
 	if len(cp.pool) > slot && cp.isFreshLocked(slot) {
+		// The slot keeps its credential; the relays the seed names that nobody
+		// dials are still worth a slot each (cookie mode — seedsiblings.go).
+		siblings := cp.seedSiblingsLocked(creds)
 		cp.mu.Unlock()
 		log.Printf("credpool: seed for slot %d ignored — slot already has a fresh cred (likely loaded from disk)", slot)
+		if len(siblings) > 0 {
+			cp.seedSiblingsPlaced(siblings)
+			cp.saveToDisk()
+			cp.broadcastSlotAvailable()
+		}
 		return
 	}
 	for len(cp.pool) <= slot {
@@ -1534,8 +1542,12 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	// than the seed, we'll move it aside instead of dropping it — it
 	// might still become useful in 10 minutes. Slots vacated by the
 	// dedup pass below are good targets for the relocation.
+	// Cookie mode: the same credential on ANOTHER relay is another slot's
+	// content, not this seed's copy — the seed's own credential sits in a slot
+	// per relay VK named with it (seedsiblings.go), and a cached seed that is
+	// one of them must not overwrite its sibling on the other relay.
 	var displaced *credPoolEntry
-	if entry := cp.pool[slot]; entry.creds != nil && entry.creds.Username != creds.Username {
+	if entry := cp.pool[slot]; entry.creds != nil && (entry.creds.Username != creds.Username || cp.dialsAnotherRelayLocked(slot, creds)) {
 		copyEntry := entry
 		displaced = &copyEntry
 	}
@@ -1577,8 +1589,12 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 	// draft-uberti-behave-turn-rest format (<expiry_unix>:<key_id>):
 	// VK never reissues the same key_id+expiry tuple to a different
 	// session, so equal usernames mean equal cred sets.
+	//
+	// 🚫 Not in cookie mode: there one credential sits in several slots, a
+	// relay each — two quotas, not a duplicate. What IS one there is a slot
+	// on the seed's RELAY, under whatever username: the pass below.
 	duplicates := 0
-	if creds != nil {
+	if creds != nil && cp.mode != credCacheModeCookie {
 		for i := range cp.pool {
 			if i == slot {
 				continue
@@ -1633,6 +1649,10 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 			}
 		}
 	}
+	// Cookie mode: the seed's credential on every other relay VK named with it
+	// that nobody dials — behind the dedup passes and the relocation above, so
+	// that whatever they left in place is found there (seedsiblings.go).
+	siblings := cp.seedSiblingsLocked(creds)
 	cp.mu.Unlock()
 	if creds != nil {
 		if exp, ok := parseCredExpiry(creds.Username); ok {
@@ -1666,6 +1686,7 @@ func (cp *credPool) seedSlot(slot int, addr string, creds *TURNCreds) {
 		// subsequent kill snapshots reflect only this cred's history.
 		cp.authErrors[slot].Store(0)
 	}
+	cp.seedSiblingsPlaced(siblings)
 	cp.saveToDisk()
 	// Wake any conn parked in "no slot available" backoff: a fresh seed
 	// just placed a usable cred into the pool. Also covers the dedup-

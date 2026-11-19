@@ -317,6 +317,12 @@ func TestCookieModeTheQuotaClockStaysWithTheRelayItUsed(t *testing.T) {
 // username) wiped A's quarantine and the pool handed A out a minute after
 // its last use. The relay's clock is fed at load from every entry and at
 // release, so no dedupe loses it; and B's own clock stays untouched.
+//
+// Since 2026-11-19 that pass does not run in cookie mode at all: one username
+// in two slots is two quotas there, a relay each (the seed's own credential
+// now sits in a slot per relay — seedsiblings.go). The seed clears the slot on
+// ITS relay; the same call's credential on the other relay stays where it is,
+// pending under that relay's clock.
 func TestCookieModeASameUsernameTwinsQuarantineSurvivesTheSeed(t *testing.T) {
 	cookieTestMode(t)
 	user := futureUser("one-call")
@@ -328,9 +334,13 @@ func TestCookieModeASameUsernameTwinsQuarantineSurvivesTheSeed(t *testing.T) {
 	cp, _, _ := relayPool(t, path, relayA) // the minter answers with A
 	cp.seedSlot(0, relayB, &TURNCreds{Username: user, Password: "p", Address: relayB, Addresses: []string{relayB}})
 	cp.mu.Lock()
-	if !cp.isFreshLocked(0) || cp.pool[2].creds != nil || cp.pool[3].creds != nil {
+	if !cp.isFreshLocked(0) || cp.pool[3].creds != nil {
 		cp.mu.Unlock()
-		t.Fatalf("the seed on B: fresh %v, twins cleared %v %v", cp.isFreshLocked(0), cp.pool[2].creds == nil, cp.pool[3].creds == nil)
+		t.Fatalf("the seed on B: fresh %v, the slot on its own relay cleared %v", cp.isFreshLocked(0), cp.pool[3].creds == nil)
+	}
+	if cp.pool[2].creds == nil || cp.isFreshLocked(2) || !cp.pendingLocked(2) {
+		cp.mu.Unlock()
+		t.Fatalf("the same call's credential on A: kept %v, fresh %v, pending %v — want it kept (another relay is another quota) and pending under A's clock", cp.pool[2].creds != nil, cp.isFreshLocked(2), cp.pendingLocked(2))
 	}
 	if until := cp.relayQuarantineUntilLocked(relayA); !until.After(time.Now()) {
 		cp.mu.Unlock()

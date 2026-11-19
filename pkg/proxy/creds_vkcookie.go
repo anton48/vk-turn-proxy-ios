@@ -382,6 +382,31 @@ func cookieCredForSlot(ctx context.Context, slot int, override []string, held []
 	}, nil
 }
 
+// cookieSeedCred is the app's probe in cookie mode: slot 0's credential as
+// cookieCredForSlot gives it — and with it EVERY relay VK named for that call.
+// cookieCredForSlot cuts a mint to the slot's one relay (a slot IS a relay),
+// so the probe's answer named one relay, the app's seed carried one, and a cold
+// pool had nowhere to go from it without asking VK again — while the mint the
+// probe had just paid for named the others. The list goes back to the app in
+// turn_addresses, returns in seeded_turn.addresses, and the pool makes the
+// further relays slots of the seed's credential (credPool.seedSiblingsLocked).
+// The credential's own relay stands first. The list is taken from the cached
+// mint this very credential came from (its username) — never another call's.
+func cookieSeedCred(ctx context.Context) (*TURNCreds, error) {
+	creds, err := cookieCredForSlot(ctx, 0, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	for _, cc := range cookieCache {
+		if cc != nil && cc.creds != nil && cc.creds.Username == creds.Username {
+			creds.Addresses = dedupeAddrs(append([]string{creds.Address}, cc.creds.Addresses...))
+		}
+	}
+	return creds, nil
+}
+
 // cookieMintCachedLocked returns the cached (or freshly minted) multi-relay cred
 // for a call link; re-mints when the cached cred nears expiry. Caller holds cookieMu.
 func cookieMintCachedLocked(ctx context.Context, linkID, ch string) (*TURNCreds, error) {
