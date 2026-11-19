@@ -1003,6 +1003,9 @@ func (w *worker) session() (readyAt time.Time, err error) {
 	readyAt = time.Now()
 	w.lastRx.Store(readyAt.UnixNano())
 	w.took.Store(&streamSetup{began: began, ready: readyAt, stages: stages}) // before ready: whoever counts this stream ready finds it
+	if n, ok := conn.(ReadyNoter); ok {
+		n.StreamReady()
+	}
 	w.ready.Store(true)
 	c.sessions.Add(1)
 	c.rallied()

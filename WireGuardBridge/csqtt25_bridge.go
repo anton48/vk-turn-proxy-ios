@@ -208,6 +208,11 @@ func (a *csqtt25Client) dialer(server *net.UDPAddr, transport string,
 		if n, ok := conn.(interface{ noteLease(time.Duration) }); ok {
 			n.noteLease(began.Sub(asked))
 		}
+		// The session established — the server answered through this relay — is
+		// told to the lease, as the 2.1.9 worker tells it (Credential.Established).
+		if n, ok := conn.(interface{ onReady(func()) }); ok && cred.Established != nil {
+			n.onReady(cred.Established)
+		}
 		// A relay that says it has no allocation for this stream's socket ends
 		// the stream by itself (csqtt25_noalloc.go); whose stream it was is said
 		// here, where the worker is known.

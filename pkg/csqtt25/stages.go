@@ -30,6 +30,14 @@ type DialStager interface {
 	DialStages() []Stage
 }
 
+// ReadyNoter is what the conn a DialFunc returns MAY be: it is told when the
+// stream it carries is READY — the server has answered through it, its
+// configuration received. Once per session, on the worker's goroutine, before
+// the stream is counted ready. The dial's owner knows whose relay that is.
+type ReadyNoter interface {
+	StreamReady()
+}
+
 // streamSetup is one session's set-up as the «all ready» line needs it. Written
 // once, before the worker is marked ready; never changed.
 type streamSetup struct {

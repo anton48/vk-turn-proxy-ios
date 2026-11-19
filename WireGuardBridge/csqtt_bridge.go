@@ -358,6 +358,8 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 			var allocated atomic.Bool
 			var madeAt atomic.Int64               // when the relay accepted the allocation, wall clock
 			var outOfReach atomic.Pointer[string] // why the relay did not confirm the deallocate, if it did not
+			var dialBegan atomic.Int64            // when this lease's dial began (Allocated says it)
+			stamp := a.pool.HandStamp(idx)        // THIS hand-out's: what the lease reports later is about it
 			return csqtt.Credential{
 				TURNCredentials: csqtt.TURNCredentials{Username: creds.Username, Password: creds.Password, Address: addr},
 				// A worker releases its lease right behind closing its relay — the
@@ -384,10 +386,15 @@ func (a *csqttPoolAdapter) creds(ctx context.Context, workerID int) (csqtt.Crede
 				Failed: func(err error, began time.Time) { a.refused(workerID, idx, slot, creds, addr, began, err) },
 				Allocated: func(began time.Time) {
 					madeAt.Store(a.wallNow().UnixNano())
+					dialBegan.Store(began.UnixNano())
 					allocated.Store(true)
 					a.pool.NoteAllocatedAt(slot, creds, addr, began)
 				},
 				OutOfReach: func(why string) { outOfReach.Store(&why) },
+				// The session is up: the server answered through this relay. A
+				// relay marked for refusing the server (refused, below) has passed
+				// its recovery check — the mark goes, as it does for native.
+				Established: func() { a.pool.NotePeerUp(idx, stamp, addr, time.Unix(0, dialBegan.Load())) },
 			}, nil
 		}
 		if terminal := csqttTerminalCredError(err); terminal != nil {

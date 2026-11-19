@@ -60,6 +60,10 @@ type csqtt25Relay struct {
 	// stream's into its «all ready» line.
 	stages []csqtt25.Stage
 	leased atomic.Pointer[time.Duration]
+	// up is what the dialer wants done when the stream this allocation carries
+	// is READY (onReady) — the lease's word to the pool that the relay carries
+	// the server.
+	up atomic.Pointer[func()]
 }
 
 // csqtt25StageClock times a dial's stretches: each mark closes the stretch that
@@ -82,6 +86,17 @@ func (c csqtt25RelayConn) DialStages() []csqtt25.Stage {
 		out = append(out, csqtt25.Stage{Name: "lease", Took: *d})
 	}
 	return append(out, c.r.stages...)
+}
+
+// onReady is the dialer's: f is called when the engine says the stream is
+// ready (StreamReady — csqtt25.ReadyNoter).
+func (c csqtt25RelayConn) onReady(f func()) { c.r.up.Store(&f) }
+
+// StreamReady is csqtt25.ReadyNoter.
+func (c csqtt25RelayConn) StreamReady() {
+	if f := c.r.up.Load(); f != nil {
+		(*f)()
+	}
 }
 
 // noteLease is the dialer's word on how long this stream waited for its

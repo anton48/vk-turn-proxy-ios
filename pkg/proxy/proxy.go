@@ -3814,6 +3814,11 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 				out = wireBuf[:wn]
 			}
 			if _, err = relayConn.WriteTo(out, p.peer); err != nil {
+				// pion asks for the permission INSIDE the first write to the peer:
+				// a session that starts this leg without the explicit request
+				// above (WRAP-A, direct) meets the relay's refusal HERE, and the
+				// pool hears it from here (peerrefused.go).
+				_ = p.relayRefusedPeer(connIdx, turnAddr, attempt, err)
 				if ctx.Err() == nil {
 					log.Printf("proxy: [conn %d] runTURN conn2→relay: WriteTo error: %v (ctx=%v)", connIdx, err, ctx.Err())
 				}

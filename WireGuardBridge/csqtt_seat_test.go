@@ -41,6 +41,9 @@ type permissionRefusingRelay struct {
 	addr     string
 	accepted atomic.Int32
 	refused  atomic.Int32
+	// refusing: the handler refuses the peer — true from the start for
+	// newPermissionRefusingRelay; a test lifts it (the relay's list mended).
+	refusing atomic.Bool
 }
 
 func newPermissionRefusingRelay(t *testing.T, lag time.Duration) *permissionRefusingRelay {
@@ -81,6 +84,7 @@ func (c permission400Conn) ReadFrom(p []byte) (int, net.Addr, error) {
 func newSeatRelay(t *testing.T, lag time.Duration, refuse bool) *permissionRefusingRelay {
 	t.Helper()
 	r := &permissionRefusingRelay{}
+	r.refusing.Store(refuse)
 	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +133,7 @@ func newSeatRelay(t *testing.T, lag time.Duration, refuse bool) *permissionRefus
 		PacketConnConfigs: []turn.PacketConnConfig{{
 			PacketConn:            served,
 			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"},
-			PermissionHandler:     func(net.Addr, net.IP) bool { return !refuse },
+			PermissionHandler:     func(net.Addr, net.IP) bool { return !r.refusing.Load() },
 		}},
 	})
 	if err != nil {

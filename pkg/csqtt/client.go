@@ -227,6 +227,13 @@ type Credential struct {
 	// The seat may then stay taken at the relay until the allocation expires;
 	// what to do about it is the pool's (dealloc.go).
 	OutOfReach func(why string)
+	// Established, when set, is called once the session is READY — the server
+	// has ANSWERED through this lease's relay (its configuration received) —
+	// at most once per Creds, behind Allocated, on the worker's goroutine. An
+	// accepted allocation says the relay took the credential; this says the
+	// relay carries the server — what a pool that marked the relay for
+	// refusing the server waits for.
+	Established func()
 }
 
 // dialRelay is DialRelay, replaceable by tests with a loopback relay.
@@ -1561,6 +1568,9 @@ attempts:
 	w.c.setConfig(conf)
 	if err := w.send([]byte(ReadyRequest)); err != nil {
 		return fmt.Errorf("READY send: %w", err)
+	}
+	if cred.Established != nil {
+		cred.Established()
 	}
 	w.ready.Store(true)
 	w.readyAt.Store(time.Now().UnixNano())

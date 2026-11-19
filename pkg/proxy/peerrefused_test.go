@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -61,43 +62,51 @@ func TestThePermissionsRefusalIsReadOffTheRelaysAnswer(t *testing.T) {
 // permission handler refuses the peer — what tools/turn-relay's -peer list
 // does — answers with an error of no code, and the client's error is exactly
 // the phrase the classifier looks for. With the handler allowing: no error.
+// permissionRelay: a pion TURN server on loopback (UDP) that accepts every
+// allocation and whose permission handler allows the peer, or refuses it.
+func permissionRelay(t *testing.T, allow bool) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := turn.NewServer(turn.ServerConfig{
+		Realm: "okcdn.ru",
+		AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
+			return ra.Username, turn.GenerateAuthKey(ra.Username, "okcdn.ru", "pw"), true
+		},
+		PacketConnConfigs: []turn.PacketConnConfig{{
+			PacketConn:            pc,
+			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"},
+			PermissionHandler:     func(net.Addr, net.IP) bool { return allow },
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { // the server goes only after its allocations have
+		deadline := time.Now().Add(2 * time.Second)
+		for srv.AllocationCount() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		_ = srv.Close()
+	})
+	return pc.LocalAddr().String()
+}
+
 func TestARealRelaysRefusalOfThePeerIsRead(t *testing.T) {
 	for _, c := range []struct {
 		name  string
 		allow bool
 	}{{"the relay refuses the peer", false}, {"the relay allows it", true}} {
 		t.Run(c.name, func(t *testing.T) {
-			pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			srv, err := turn.NewServer(turn.ServerConfig{
-				Realm: "okcdn.ru",
-				AuthHandler: func(ra *turn.RequestAttributes) (string, []byte, bool) {
-					return ra.Username, turn.GenerateAuthKey(ra.Username, "okcdn.ru", "pw"), true
-				},
-				PacketConnConfigs: []turn.PacketConnConfig{{
-					PacketConn:            pc,
-					RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"},
-					PermissionHandler:     func(net.Addr, net.IP) bool { return c.allow },
-				}},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { // the server goes only after its allocations have
-				deadline := time.Now().Add(2 * time.Second)
-				for srv.AllocationCount() != 0 && time.Now().Before(deadline) {
-					time.Sleep(time.Millisecond)
-				}
-				_ = srv.Close()
-			})
+			relay := permissionRelay(t, c.allow)
 			ctl, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer ctl.Close()
-			tc, err := turn.NewClient(&turn.ClientConfig{TURNServerAddr: pc.LocalAddr().String(), Conn: ctl, Username: "u", Password: "pw", Realm: "okcdn.ru"})
+			tc, err := turn.NewClient(&turn.ClientConfig{TURNServerAddr: relay, Conn: ctl, Username: "u", Password: "pw", Realm: "okcdn.ru"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -134,6 +143,119 @@ func TestARealRelaysRefusalOfThePeerIsRead(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A review of the first cut, (2): the pool was told from the two EXPLICIT
+// CreatePermission requests, and a session that starts its relay leg without
+// one never makes it — pion asks for the permission inside the first write to
+// the peer, and that write's error was only logged. WRAP-A against a relay
+// that refuses the peer ended on its cancelled context, the relay unmarked,
+// and was handed the same relay again. Through the session functions, against
+// a real relay.
+func TestASessionMarksARelayThatRefusesThePeerWhereverThePermissionIsAsked(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		cfg  Config
+		run  func(p *Proxy, ctx context.Context) error
+	}{
+		{"WRAP-A: the permission is asked inside the first write", Config{UseWrapA: true, WrapAPassword: "stand", DeviceID: "stand"},
+			func(p *Proxy, ctx context.Context) error { s := false; return p.runWrapASession(ctx, "", nil, &s, 0) }},
+		{"DTLS: the explicit permission", Config{UseDTLS: true},
+			func(p *Proxy, ctx context.Context) error {
+				s := false
+				return p.runDTLSSession(ctx, "", make(chan struct{}, 1), &s, 0)
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			relay, peer := permissionRelay(t, false), silentPeer(t)
+			cfg := c.cfg
+			cfg.UseUDP, cfg.NumConns, cfg.PeerAddr = true, 1, peer.String()
+			cfg.SeededTURN = &TURNCreds{Username: futureUser("refused"), Password: "pw", Address: relay, Addresses: []string{relay, relayB}}
+			p := NewProxy(cfg)
+			p.peer = peer // Start would resolve it; the stand runs one session function
+			t.Cleanup(p.cancel)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- c.run(p, ctx) }()
+			marked := func() bool {
+				p.credPool.mu.Lock()
+				defer p.credPool.mu.Unlock()
+				return p.credPool.health.isPeerFailed(relay)
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for !marked() && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			told := marked()
+			cancel()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("fixture: a session came up through a relay that refuses the peer")
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("the session did not return")
+			}
+			if !told {
+				t.Fatal("the relay refused the permission for our peer and the pool was not told — the next attempt is handed the same relay")
+			}
+			next, creds, slot, err := p.credPool.get(0, false)
+			if err != nil || next != relayB {
+				t.Fatalf("the next attempt: the refusing relay again %v, err %v — want the other relay", next == relay, err)
+			}
+			p.credPool.release(slot, creds, next)
+		})
+	}
+}
+
+// A review of the first cut, (1), in the pool: the pool's second owner tells a
+// refusal and had no way to tell a session that came UP — so a relay it had
+// marked stayed marked for good, tried only by the rare recovery checks, each
+// of which came up and changed nothing. The lease's word that its session is
+// established clears the mark, as a native session's handshake does. An
+// accepted allocation is not that word, nor is the word of an older hand-out.
+func TestAnEstablishedSessionOfTheSecondOwnerClearsTheMark(t *testing.T) {
+	cp, _, clock := peerHandshakePoolMints(t, false, relayA, relayB)
+	pool := &CredPool{cp: cp}
+	cp.notePeerRefused(0, relayA, *clock)
+	*clock = clock.Add(probeBackoff(0))
+	a, creds, slot := mustGet(t, cp, 1) // the recovery check
+	if a != relayA {
+		t.Fatalf("fixture: the due check was not handed out (%s)", refusedRelayName(a))
+	}
+	stamp := pool.HandStamp(1)
+	if stamp == 0 || pool.HandStamp(7) != 0 {
+		t.Fatalf("the hand-out's stamp is %d, a connection never handed anything has %d", stamp, pool.HandStamp(7))
+	}
+	cp.noteAllocatedAt(slot, creds, relayA, *clock)
+	if !cp.health.isPeerFailed(relayA) {
+		t.Fatal("an accepted allocation cleared the mark — the relay that refused the permission had accepted the allocation too")
+	}
+	pool.NotePeerUp(1, stamp-1, relayA, *clock)
+	pool.NotePeerUp(7, 0, relayA, *clock)
+	if !cp.health.isPeerFailed(relayA) {
+		t.Fatal("the mark was cleared on the word of another hand-out than the connection's own")
+	}
+	// A session whose dial began before the last path change came up on the old
+	// network: it says nothing of a mark set on this one.
+	old := *clock
+	*clock = clock.Add(time.Second)
+	cp.pathChangedHealthLocked() // …which clears the marks; the relay refuses again on the new network
+	cp.notePeerRefused(0, relayA, *clock)
+	pool.NotePeerUp(1, stamp, relayA, old)
+	if !cp.health.isPeerFailed(relayA) {
+		t.Fatal("a session begun before the path change cleared a mark set behind it")
+	}
+	logged := captureLog(t)
+	pool.NotePeerUp(1, stamp, relayA, *clock)
+	if cp.health.isPeerFailed(relayA) {
+		t.Fatal("a session came up through the marked relay and its mark stands — the relay stays out of use but for the rare checks")
+	}
+	if n := strings.Count(logged(), "credpool: conn 1: relay "+relayA+" passed its peer handshake recovery check — the mark is cleared"); n != 1 {
+		t.Fatalf("the clearing was said %d time(s), want once", n)
+	}
+	cp.release(slot, creds, relayA)
 }
 
 // A 403 on the PERMISSION is the relay's policy about the peer, not a dead
@@ -342,6 +464,15 @@ func TestNativesPermissionExitsTellThePool(t *testing.T) {
 	}
 	if n := strings.Count(s, "create permission: %w"); n != 2 {
 		t.Errorf("proxy.go wraps a permission's failure %d time(s), 2 are known — a new exit must tell the pool too", n)
+	}
+	// …and the permission pion asks for by ITSELF, inside the first write to the
+	// peer: the one write to the relay tells the pool of its error, before
+	// anything else is done with it.
+	if n := strings.Count(s, "relayConn.WriteTo("); n != 1 {
+		t.Errorf("proxy.go writes to a relay conn in %d place(s), 1 is known — each is a place a refusal can come back from", n)
+	}
+	if !strings.Contains(s, "if _, err = relayConn.WriteTo(out, p.peer); err != nil {") || strings.Count(s, "\t\t\t\t_ = p.relayRefusedPeer(connIdx, turnAddr, attempt, err)\n") != 1 {
+		t.Error("proxy.go: the write to the relay does not tell the pool of a refused permission (WRAP-A and direct ask for none before it)")
 	}
 
 	cp, _, clock := peerHandshakePoolMints(t, false, relayA, relayB)

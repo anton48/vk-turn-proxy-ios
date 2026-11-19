@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"log"
 	"strings"
 	"time"
@@ -85,6 +86,26 @@ func (cp *credPool) notePeerRefused(connIdx int, relay string, start time.Time) 
 // lease). See notePeerRefused.
 func (p *CredPool) NotePeerRefused(connIdx int, addr string, start time.Time) {
 	p.cp.notePeerRefused(connIdx, addr, start)
+}
+
+// HandStamp is the stamp of connIdx's latest hand-out: a lease takes it right
+// behind its Acquire, so that what it reports later is known to be about THAT
+// hand-out and not about one the connection was given since.
+func (p *CredPool) HandStamp(connIdx int) uint64 { return p.cp.handStampOf(connIdx) }
+
+// NotePeerUp tells the pool that a session of the pool's second owner (csqtt)
+// came up through the relay at addr — the SERVER answered through it — on the
+// hand-out stamp, its dial begun at began. It is the success native's sessions
+// report from their handshake (notePeerHandshakeResult, the one body): a relay
+// that carries the peer loses its peer mark — the recovery check passed — and
+// is handed out again. 🚫 An accepted allocation is not that word: the relay
+// that refused the permission had accepted the allocation too.
+func (p *CredPool) NotePeerUp(connIdx int, stamp uint64, addr string, began time.Time) {
+	if stamp == 0 {
+		return // no hand-out's stamp: a connection never handed anything has stamp 0 too
+	}
+	p.cp.notePeerHandshakeResult(context.Background(), connIdx, stamp, addr,
+		handshakeObservation{started: began, lastRetry: began, ended: time.Now()}, nil, nil)
 }
 
 // relayRefusedPeer is the relay leg's way out on a failed CreatePermission:

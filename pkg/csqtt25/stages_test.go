@@ -5,6 +5,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -165,5 +166,58 @@ func TestTheDialsPartIsTheConnsWordOrTheWholeDial(t *testing.T) {
 	}
 	if keysStage(KeysWrap) != "keys" || keysStage(KeysAuto) != "handshake" || keysStage(KeysDTLS) != "handshake" {
 		t.Fatalf("the keys' stretch is named %q / %q / %q", keysStage(KeysWrap), keysStage(KeysAuto), keysStage(KeysDTLS))
+	}
+}
+
+// readyNotedConn is a dialled socket that is told when its stream is ready.
+type readyNotedConn struct {
+	net.PacketConn
+	told *atomic.Int32
+}
+
+func (c readyNotedConn) StreamReady() { c.told.Add(1) }
+
+// A conn that is a ReadyNoter is told ONCE when the stream it carries is ready
+// — the server answered through it — and not at all when the server never
+// answers: the dial's owner (the bridge's lease) tells its pool that the relay
+// carries the server, which an accepted allocation does not say.
+func TestAConnIsToldWhenItsStreamIsReady(t *testing.T) {
+	quickClocks(t)
+	srv := newFakeServer(t, "pw-ready-1")
+	d := &dialer{server: srv.sock.LocalAddr(), dials: map[int]int{}}
+	var told [4]atomic.Int32
+	noted := func(ctx context.Context, id int) (net.PacketConn, net.Addr, func(), error) {
+		conn, peer, closer, err := d.dial(ctx, id)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return readyNotedConn{conn, &told[id]}, peer, closer, nil
+	}
+	_, lc := dialStaged(t, srv, 3, noted)
+	eventually(t, "the all-ready line", func() bool { return len(lc.rallies()) == 1 })
+	for id := 1; id <= 3; id++ {
+		if n := told[id].Load(); n != 1 {
+			t.Fatalf("worker %d's conn was told %d time(s) that its stream is ready, want once", id, n)
+		}
+	}
+
+	// A server that never answers this password: dials are made, nobody is told.
+	var silent atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	c, err := Dial(ctx, ClientConfig{Password: "not-the-servers", Workers: 1, Keys: KeysWrap, Logf: func(string, ...any) {},
+		Dial: func(ctx context.Context, id int) (net.PacketConn, net.Addr, func(), error) {
+			conn, peer, closer, err := d.dial(ctx, id)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			return readyNotedConn{conn, &silent}, peer, closer, nil
+		}})
+	if err == nil {
+		c.Close()
+		t.Fatal("fixture: a stream came up under a password the server does not know")
+	}
+	if n := silent.Load(); n != 0 {
+		t.Fatalf("a stream the server never answered told its conn it was ready (%d)", n)
 	}
 }
