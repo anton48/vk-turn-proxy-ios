@@ -3723,7 +3723,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	defer quiesce()
 	if ready != nil {
 		if err := client.CreatePermission(p.peer); err != nil {
-			return fmt.Errorf("TURN create permission: %w", err)
+			return p.relayRefusedPeer(connIdx, turnAddr, attempt, fmt.Errorf("TURN create permission: %w", err))
 		}
 		close(ready)
 	}
@@ -4881,6 +4881,9 @@ func isAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if isPeerRefused(err) {
+		return false // a 403 on the PERMISSION is the relay's policy about our peer, not a dead credential (peerrefused.go)
+	}
 	s := err.Error()
 	return strings.Contains(s, "error 401:") || strings.Contains(s, "error 403:")
 }
@@ -5936,7 +5939,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	}
 	if err := tc.CreatePermission(p.peer); err != nil {
 		abortSetup()
-		return nil, fmt.Errorf("turn create permission: %w", err)
+		return nil, p.relayRefusedPeer(connIdx, turnAddr, attempt, fmt.Errorf("turn create permission: %w", err))
 	}
 	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms, local=%s)",
 		connIdx, relayConn.LocalAddr(), allocDur.Milliseconds(), ctlConn.LocalAddr())

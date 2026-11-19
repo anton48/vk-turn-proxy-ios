@@ -422,6 +422,13 @@ func (a *csqttPoolAdapter) refused(workerID, connIdx, slot int, creds *proxy.TUR
 	switch {
 	case proxy.IsRelayUnanswered(err):
 		a.pool.NoteRelayUnanswered(connIdx, slot, creds, addr, attempt, err)
+	case proxy.IsPeerRefused(err):
+		// The relay answered the dial's CreatePermission for the csqtt server
+		// with a refusal: its own word that it will not relay to this peer —
+		// the pool marks it at once and the worker's next credential names
+		// another relay (proxy's peerrefused.go). Before the auth case: a 403
+		// on the permission is no dead credential.
+		a.pool.NotePeerRefused(connIdx, addr, attempt)
 	case proxy.IsQuotaError(err):
 		cd := a.pool.MarkSaturated(slot, creds, addr)
 		log.Printf("csqtt: worker %d: TURN allocate quota error (486) on slot %d (cooldown %s) — the next credential comes from another slot",

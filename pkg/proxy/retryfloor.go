@@ -101,7 +101,7 @@ func isNetworkClassFailure(err error) bool {
 	}
 	var park *poolParkError
 	var captcha *CaptchaRequiredError
-	if errors.As(err, &park) || errors.As(err, &captcha) || isQuotaError(err) || isAuthError(err) {
+	if errors.As(err, &park) || errors.As(err, &captcha) || isQuotaError(err) || isAuthError(err) || isPeerRefused(err) {
 		return false
 	}
 	return true

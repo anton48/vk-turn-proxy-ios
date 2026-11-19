@@ -5,8 +5,14 @@ package main
 // CreatePermission that fails right behind the Allocate too (the user's review of
 // build 430). The whole chain, nothing faked: csqtt.Dial's own worker and
 // DialRelay, the pool adapter, the pool — and a pion TURN server on loopback that
-// accepts the Allocate, refuses the permission, and keeps a deallocated seat on
+// accepts the Allocate, fails the permission, and keeps a deallocated seat on
 // the quota for a while, as the VK relay does.
+//
+// Since 2026-11-19 a permission the relay REFUSES for our peer marks that relay
+// (proxy's peerrefused.go) and nobody is seated on it again — so the stand
+// fails the permission the OTHER way a relay answers one: 400, what a relay
+// says of a 5-tuple it holds no allocation for (a changed mapping). That is
+// the case the seat's hold is still for.
 
 import (
 	"context"
@@ -19,6 +25,7 @@ import (
 	"time"
 
 	"github.com/pion/logging"
+	"github.com/pion/stun/v3"
 	"github.com/pion/turn/v5"
 
 	"github.com/cacggghp/vk-turn-proxy/pkg/csqtt"
@@ -26,7 +33,10 @@ import (
 )
 
 // permissionRefusingRelay: ONE seat per identity, held `lag` behind its
-// deallocate; every Allocate within the quota accepted, every permission refused.
+// deallocate; every Allocate within the quota accepted, every permission failed:
+// REFUSED by the server's own handler (newPermissionRefusingRelay — pion's
+// answer with no error code, what a relay with an allow-list of peers says), or
+// answered 400 (newPermissionFailingRelay).
 type permissionRefusingRelay struct {
 	addr     string
 	accepted atomic.Int32
@@ -35,10 +45,49 @@ type permissionRefusingRelay struct {
 
 func newPermissionRefusingRelay(t *testing.T, lag time.Duration) *permissionRefusingRelay {
 	t.Helper()
+	return newSeatRelay(t, lag, true)
+}
+
+// newPermissionFailingRelay: the permission is answered 400 Bad Request.
+func newPermissionFailingRelay(t *testing.T, lag time.Duration) *permissionRefusingRelay {
+	t.Helper()
+	return newSeatRelay(t, lag, false)
+}
+
+// permission400Conn answers every CreatePermission request itself, with 400,
+// and hands the server everything else.
+type permission400Conn struct{ net.PacketConn }
+
+func (c permission400Conn) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		n, from, err := c.PacketConn.ReadFrom(p)
+		if err != nil || !stun.IsMessage(p[:n]) {
+			return n, from, err
+		}
+		m := &stun.Message{Raw: append([]byte(nil), p[:n]...)}
+		if m.Decode() != nil || m.Type != stun.NewType(stun.MethodCreatePermission, stun.ClassRequest) {
+			return n, from, err
+		}
+		res, berr := stun.Build(stun.NewTransactionIDSetter(m.TransactionID),
+			stun.NewType(stun.MethodCreatePermission, stun.ClassErrorResponse),
+			stun.ErrorCodeAttribute{Code: stun.CodeBadRequest, Reason: []byte("Bad Request")})
+		if berr != nil {
+			return n, from, err
+		}
+		_, _ = c.PacketConn.WriteTo(res.Raw, from)
+	}
+}
+
+func newSeatRelay(t *testing.T, lag time.Duration, refuse bool) *permissionRefusingRelay {
+	t.Helper()
 	r := &permissionRefusingRelay{}
 	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
+	}
+	var served net.PacketConn = pc
+	if !refuse {
+		served = permission400Conn{pc}
 	}
 	var (
 		srvRef  atomic.Pointer[turn.Server]
@@ -78,9 +127,9 @@ func newPermissionRefusingRelay(t *testing.T, lag time.Duration) *permissionRefu
 			},
 		},
 		PacketConnConfigs: []turn.PacketConnConfig{{
-			PacketConn:            pc,
+			PacketConn:            served,
 			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{RelayAddress: net.ParseIP("127.0.0.1"), Address: "127.0.0.1"},
-			PermissionHandler:     func(net.Addr, net.IP) bool { return false },
+			PermissionHandler:     func(net.Addr, net.IP) bool { return !refuse },
 		}},
 	})
 	if err != nil {
@@ -99,7 +148,7 @@ func newPermissionRefusingRelay(t *testing.T, lag time.Duration) *permissionRefu
 }
 
 func TestCsqttASeatUsedBehindAFailedPermissionStaysCountedForTheRelaysSecond(t *testing.T) {
-	relay := newPermissionRefusingRelay(t, 400*time.Millisecond)
+	relay := newPermissionFailingRelay(t, 400*time.Millisecond)
 	user := freshUsername("seat")
 	fetch := func(bool, int) (string, *proxy.TURNCreds, error) {
 		return relay.addr, &proxy.TURNCreds{Username: user, Password: "pw", Address: relay.addr, Addresses: []string{relay.addr}}, nil

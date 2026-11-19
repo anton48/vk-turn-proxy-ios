@@ -82,8 +82,19 @@ func (h handshakeObservation) hasEvidenceAt(at time.Time) bool {
 }
 
 func (cp *credPool) markPeerFailedLocked(relay string) {
-	if cp.health.isPeerFailed(relay) {
+	if !cp.peerMarkLocked(relay) {
 		return
+	}
+	log.Printf("credpool: relay %s peer handshake failed while another relay carried the peer connection — deferring new attempts except for recovery probes", relay)
+}
+
+// peerMarkLocked sets the peer mark on relay — the ONE body for both ways a
+// relay comes by it: a handshake that failed while another relay carried the
+// peer (markPeerFailedLocked) and the relay's own refusal of a permission for
+// the peer (notePeerRefused). False: the relay was marked already.
+func (cp *credPool) peerMarkLocked(relay string) bool {
+	if cp.health.isPeerFailed(relay) {
+		return false
 	}
 	cp.health.markPeerFailed(relay)
 	cp.peerMarks++
@@ -91,7 +102,7 @@ func (cp *credPool) markPeerFailedLocked(relay string) {
 	if cp.peerProbe.primary == relay {
 		cp.peerProbe = relayHandshakeProbe{}
 	}
-	log.Printf("credpool: relay %s peer handshake failed while another relay carried the peer connection — deferring new attempts except for recovery probes", relay)
+	return true
 }
 
 func (cp *credPool) peerRelayReadyLocked(slot int, relay string) bool {
