@@ -59,6 +59,15 @@ package proxy
 // liveness rule of its transport finds it. WRAP-A has none of its own: eleven of
 // thirty sessions stood so for eight minutes on a phone. pion says the loop's
 // end in one Debug line; a session that hears it is ended at once (readerEnded).
+//
+// WHOSE word it is (lifeEar). A session's life is heard through ONE pion client
+// at a time — the direct session makes one relay leg after another under one
+// note — and pion's Close waits for neither the client's reader nor its timers:
+// a word of a client whose leg is over can arrive when the next leg's client is
+// up. Each client's logger therefore speaks into an ear of its own, and a word
+// that is not of the client listened to NOW is dropped — asked under the lock
+// its effect is begun or written under. 🚫 Nothing re-opens the session's life to
+// a client that is gone: the next client's ear does it, for that client alone.
 
 import (
 	"errors"
@@ -96,6 +105,7 @@ type allocLife struct {
 	mu     sync.Mutex
 	heard  lifeHeard      // what pion has said of the allocation's life
 	ending bool           // wait has been called: nothing is begun behind it
+	hears  uint64         // which of the session's pion clients is listened to — newEar's count; another one's word is dropped
 	asks   sync.WaitGroup // the goroutines that ask the relay: joined behind the client's Close (wait)
 
 	// Set by the session before its client exists, never written again.
@@ -118,15 +128,37 @@ type lifeHeard struct {
 // delay later than this side's. A var for tests.
 var lifeSlack = 2 * time.Second
 
+// lifeEar is what ONE pion client's logger speaks into: the session's life and
+// which of its clients this is (the header).
+type lifeEar struct {
+	life *allocLife
+	gen  uint64
+}
+
+// newEar: from here on the session listens to the client this ear is handed to,
+// and to no client before it. Called before that client exists. What the client
+// before had begun was joined behind its Close (wait) — and whatever it says
+// from now on is not this client's.
+func (l *allocLife) newEar() *lifeEar {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.hears++
+	l.ending = false
+	return &lifeEar{life: l, gen: l.hears}
+}
+
 // fresh forgets the allocation before: called right BEFORE an Allocate — pion
 // says the lifetime it was granted from inside that call. (The direct session
-// makes one allocation after another under one note.)
+// makes one allocation after another under one note.) 🚫 It does not open the
+// life again behind a wait — a client's ear does (newEar), for that client.
 func (l *allocLife) fresh() {
 	if l == nil {
 		return
 	}
 	l.mu.Lock()
-	l.ending = false // the asks of the allocation before were joined behind its client's Close
 	l.heard = lifeHeard{}
 	l.mu.Unlock()
 	l.mapped.Store(nil)
@@ -140,13 +172,15 @@ func (l *allocLife) isGone() bool { return l != nil && l.gone.Load() }
 
 // granted stamps the lifetime the relay has just been HEARD to grant. The grant
 // settles whatever was sent before it: the relay's clock was set by the copy it
-// answered, and that copy left before now.
-func (l *allocLife) granted(d time.Duration) {
+// answered, and that copy left before now. gen: whose word it is (lifeEar).
+func (l *allocLife) granted(gen uint64, d time.Duration) {
 	if l == nil {
 		return
 	}
 	l.mu.Lock()
-	l.heard = lifeHeard{until: wallClock().Add(d + lifeSlack), granted: d}
+	if gen == l.hears {
+		l.heard = lifeHeard{until: wallClock().Add(d + lifeSlack), granted: d}
+	}
 	l.mu.Unlock()
 }
 
@@ -155,13 +189,13 @@ func (l *allocLife) granted(d time.Duration) {
 // already — a refresh cannot bring a dead allocation back: the overdue refreshes
 // of a wake behind a long sleep must not turn forty honest 437s into forty seats
 // held for a lifetime.
-func (l *allocLife) refreshAsked() {
+func (l *allocLife) refreshAsked(gen uint64) {
 	if l == nil {
 		return
 	}
 	now := wallClock()
 	l.mu.Lock()
-	if now.Before(l.boundLocked(now)) {
+	if gen == l.hears && now.Before(l.boundLocked(now)) {
 		l.heard.asked, l.heard.ended = now, time.Time{}
 	}
 	l.mu.Unlock()
@@ -169,13 +203,13 @@ func (l *allocLife) refreshAsked() {
 
 // refreshEnded: the transaction of the refresh last sent has come back — with an
 // answer that may be no grant, or with none. No copy of it leaves after this.
-func (l *allocLife) refreshEnded() {
+func (l *allocLife) refreshEnded(gen uint64) {
 	if l == nil {
 		return
 	}
 	now := wallClock()
 	l.mu.Lock()
-	if !l.heard.asked.IsZero() && l.heard.ended.IsZero() {
+	if gen == l.hears && !l.heard.asked.IsZero() && l.heard.ended.IsZero() {
 		l.heard.ended = now
 	}
 	l.mu.Unlock()
@@ -222,11 +256,25 @@ func (l *allocLife) expiry(now time.Time) time.Time {
 func (l *allocLife) begin() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.beginLocked()
+}
+
+func (l *allocLife) beginLocked() bool {
 	if l.ending {
 		return false
 	}
 	l.asks.Add(1)
 	return true
+}
+
+// begin, for what a word of this ear's client sets off: false as well when that
+// client is not the one listened to now — ONE look, under the lock a wait and
+// the next client's ear take.
+func (e *lifeEar) begin() bool {
+	l := e.life
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return e.gen == l.hears && l.beginLocked()
 }
 
 // wait joins whatever is still asking the relay on this session's behalf. Called
@@ -266,27 +314,28 @@ const (
 	ownSocketClosed   = "use of closed network connection"
 )
 
-// heardDebug is pion's Debug line: a lifetime the relay granted, or a refresh on
-// its way out and back.
-func (l *allocLife) heardDebug(msg string) {
-	if l == nil {
+// heardDebug is pion's Debug line: a lifetime the relay granted, a refresh on
+// its way out and back, or the end of the client's read loop.
+func (e *lifeEar) heardDebug(msg string) {
+	if e == nil {
 		return
 	}
+	l := e.life
 	switch msg {
 	case pionRefreshSent:
-		l.refreshAsked()
+		l.refreshAsked(e.gen)
 		return
 	case pionRefreshAnswered:
-		l.refreshEnded()
+		l.refreshEnded(e.gen)
 		return
 	}
 	if relayReaderEnded(msg) {
-		l.readerEnded(msg)
+		e.readerEnded(msg)
 		return
 	}
 	if m := pionLifetimeLine.FindStringSubmatch(msg); m != nil {
 		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			l.granted(time.Duration(n) * time.Second)
+			l.granted(e.gen, time.Duration(n)*time.Second)
 		}
 	}
 }
@@ -296,18 +345,18 @@ func (l *allocLife) heardDebug(msg string) {
 // session is dead at the relay, whatever the probe will find in half a minute.
 // Anchored on pion's prefix and on the error-code form — a bare "400" is a
 // port number as often as not.
-func (l *allocLife) heardError(msg string) {
-	if l == nil {
+func (e *lifeEar) heardError(msg string) {
+	if e == nil {
 		return
 	}
 	if strings.HasPrefix(msg, pionRefreshFailed) {
-		l.refreshEnded() // no answer at all: whether a copy was granted stays unknown — but none leaves later
+		e.life.refreshEnded(e.gen) // no answer at all: whether a copy was granted stays unknown — but none leaves later
 		return
 	}
 	if !RelayHoldsNoAllocation(msg) {
 		return
 	}
-	l.outOfReach("its permission refresh was answered 400")
+	e.outOfReach("its permission refresh was answered 400")
 }
 
 // relayReaderEnded reports whether msg — a Debug line of pion's TURN client — says
@@ -322,12 +371,14 @@ func relayReaderEnded(msg string) bool {
 // readerEnded: pion's client has stopped reading this session's relay socket.
 // Nothing the relay says will be heard again — no answer to a refresh, no data —
 // while the session's writes still leave: it is ended now. Not behind the
-// session's own teardown (begin), which closes the socket itself. Asks the relay
-// nothing — nobody would hear the answer.
-func (l *allocLife) readerEnded(msg string) {
-	if !l.begin() {
+// session's own teardown, which closes the socket itself, and not for a client
+// whose leg is over while the next one's is up (begin). Asks the relay nothing —
+// nobody would hear the answer.
+func (e *lifeEar) readerEnded(msg string) {
+	if !e.begin() {
 		return
 	}
+	l := e.life
 	defer l.asks.Done()
 	what := "a read error on its socket"
 	switch {
@@ -358,9 +409,16 @@ func RelayHoldsNoAllocation(msg string) bool {
 // outOfReach is called when the relay has answered for this socket as for one
 // that has no allocation. Once per session: the mapping is asked about and
 // SAID, then the session is ended. Never on the caller's goroutine — pion's
-// refresh loop calls from inside the client — and joined by wait.
-func (l *allocLife) outOfReach(what string) {
-	if l == nil || !l.gone.CompareAndSwap(false, true) || !l.begin() {
+// refresh loop calls from inside the client — and joined by wait. The word is
+// taken as this ear's client's FIRST (begin), and only then is the socket marked
+// disowned: the mark is the next allocation's as soon as there is one.
+func (e *lifeEar) outOfReach(what string) {
+	if !e.begin() {
+		return
+	}
+	l := e.life
+	if !l.gone.CompareAndSwap(false, true) {
+		l.asks.Done()
 		return
 	}
 	go func() {

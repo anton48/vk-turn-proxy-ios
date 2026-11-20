@@ -225,7 +225,7 @@ func TestTheSessionsEarHearsItsReaderEnd(t *testing.T) {
 		gave.watch(func() { kills.Add(1) }, 7, true)
 		return gave.lifeOf(), kills
 	}
-	settle := func(l *allocLife) { l.wait(); l.fresh() } // joins what was begun; the next allocation's ear
+	settle := func(l *allocLife) { l.wait(); l.newEar(); l.fresh() } // joins what was begun; the next client's ear, the next allocation's life
 	const refused = "Failed to read: read udp 192.0.2.1:50000->192.0.2.2:3478: read: connection refused. Exiting loop"
 	for _, c := range []struct {
 		name  string

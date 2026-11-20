@@ -173,7 +173,7 @@ func TestASeatOutOfReachStaysCountedUntilItsAllocationCanHaveExpired(t *testing.
 		p := &Proxy{credPool: cp}
 		var gave gaveBack
 		gave.note(time.Now())
-		gave.life.granted(time.Minute)
+		gave.life.granted(gave.life.hears, time.Minute)
 		gave.noteOutOfReach(time.Now())
 		p.releaseLease(0, creds, "", &gave)
 		time.Sleep(60 * time.Millisecond)
@@ -227,7 +227,7 @@ func TestAllocLifeHearsWhatPionSays(t *testing.T) {
 		var gave gaveBack
 		var kills atomic.Int32
 		gave.watch(func() { kills.Add(1) }, 7, false)
-		lg := (&turnLoggerFactory{slot: 0, life: gave.lifeOf()}).NewLogger("turnc")
+		lg := (&turnLoggerFactory{slot: 0, ear: gave.lifeOf().newEar()}).NewLogger("turnc")
 		lg.Debugf("Initial lifetime: %d seconds", 1200) // pion's own call, udp_conn.go
 		if d := time.Until(gave.lifeOf().expiry(time.Now())); d < 1199*time.Second || d > 1201*time.Second+lifeSlack {
 			t.Errorf("the lifetime pion said through its logger was not stamped: expires in %s, want 20m", d.Round(time.Second))
@@ -236,7 +236,7 @@ func TestAllocLifeHearsWhatPionSays(t *testing.T) {
 		waitUntil(t, "the session to be ended by pion's FIRST line for the failure", time.Second, func() bool { return kills.Load() == 1 })
 		lg.Warnf("Failed to refresh permissions: %s", "CreatePermission error response (error 400: Bad Request)") // … and its second line for the same failure
 		lg.Error(refused)
-		gave.lifeOf().wait()
+		joinLife(t, gave.lifeOf()) // every one of those lines counted off what it began
 		if n := kills.Load(); n != 1 {
 			t.Errorf("the session was ended %d time(s), want once", n)
 		}
@@ -281,11 +281,18 @@ func TestAllocLifeHearsWhatPionSays(t *testing.T) {
 		if kills.Load() != 0 {
 			t.Error("a session that has been joined was ended once more")
 		}
-		gave.lifeOf().fresh() // the direct session's next allocation under the same note
+		gave.lifeOf().fresh() // forgets the allocation before — and opens nothing again
+		gave.lifeOf().heardError(refused)
+		time.Sleep(30 * time.Millisecond)
+		if kills.Load() != 0 || gave.lifeOf().isGone() {
+			t.Error("fresh() opened a joined life again — the late word of a client that is gone would be taken for the next one's")
+		}
+		gave.lifeOf().newEar() // the direct session's next client under the same note
+		gave.lifeOf().fresh()
 		gave.lifeOf().heardError(refused)
 		gave.lifeOf().wait()
 		if kills.Load() != 1 {
-			t.Errorf("after fresh(): ended %d time(s), want 1 — the next allocation's life starts clean", kills.Load())
+			t.Errorf("behind the next client's ear: ended %d time(s), want 1 — the next allocation's life starts clean", kills.Load())
 		}
 		var none *allocLife
 		none.heardDebug("Initial lifetime: 600 seconds")
@@ -296,6 +303,19 @@ func TestAllocLifeHearsWhatPionSays(t *testing.T) {
 		none.wait()
 		(*gaveBack)(nil).noteOutOfReach(time.Now())
 	})
+}
+
+// joinLife is the session's join of what its allocation's life had begun —
+// bounded: something begun and never counted off would hang it for good.
+func joinLife(t *testing.T, l *allocLife) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { l.wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the join of what the allocation's life had begun never returned — a word that began nothing was not counted off")
+	}
 }
 
 // The three strings this build hears are pion's OWN — and an upgrade that rewords
@@ -412,12 +432,18 @@ func TestEverySessionsAllocationLifeIsWiredAndJoined(t *testing.T) {
 		}
 	}
 	run := body("func (p *Proxy) runTURN(")
-	order("runTURN", run, "life: gave.lifeOf()}", "defer func() { client.Close(); gave.lifeOf().wait() }()", "gave.lifeOf().fresh()", "client.Allocate()", "gave.lifeOf().askMappingAtAllocate(client)")
+	order("runTURN", run, "ear: gave.lifeOf().newEar()}", "defer func() { client.Close(); gave.lifeOf().wait() }()", "gave.lifeOf().fresh()", "client.Allocate()", "gave.lifeOf().askMappingAtAllocate(client)")
 	setup := body("func (p *Proxy) setupSRTPSession(")
-	order("setupSRTPSession", setup, "life: gave.lifeOf()}", "gave.lifeOf().fresh()", "tc.Allocate()", "gave.lifeOf().askMappingAtAllocate(tc)")
+	order("setupSRTPSession", setup, "ear: gave.lifeOf().newEar()}", "gave.lifeOf().fresh()", "tc.Allocate()", "gave.lifeOf().askMappingAtAllocate(tc)")
 	a := strings.Index(setup, "abortSetup := func() {")
 	order("abortSetup", setup[a:a+strings.Index(setup[a:], "\n\t}\n")], "returnAllocation(relayConn, release, gave)", "tc.Close()", "gave.lifeOf().wait()", "ctlConn.Close()")
 	order("srtpSessionConn.Close", body("func (s *srtpSessionConn) Close() error {"), "returnAllocation(s.relayConn, s.release, s.gave)", "s.tc.Close()", "s.gave.lifeOf().wait()", "s.ctlConn.Close()")
+	// Every pion client this file makes is heard through an ear of ITS OWN — a
+	// factory handed the session's life itself, or an ear made elsewhere, would
+	// let one client's late word pass for the next one's (staleear_test.go).
+	if n, m := strings.Count(src, "&turnLoggerFactory{"), strings.Count(src, "ear: gave.lifeOf().newEar()}"); n != 2 || m != n {
+		t.Errorf("proxy.go makes %d logger factory(ies) for a pion client, %d of them with an ear made for that client — want 2 and 2", n, m)
+	}
 	if strings.Contains(run, "defer client.Close()") {
 		t.Error("runTURN closes its client without joining what asks the relay on the allocation's behalf")
 	}

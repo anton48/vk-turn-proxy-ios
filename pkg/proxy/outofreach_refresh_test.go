@@ -145,7 +145,7 @@ func TestAnAllocationsLifeCountsARefreshNotHeardGranted(t *testing.T) {
 			pass(2 * time.Second)
 			var back time.Time
 			if refreshed {
-				lg := (&turnLoggerFactory{slot: 0, life: gave.lifeOf()}).NewLogger("turnc")
+				lg := (&turnLoggerFactory{slot: 0, ear: gave.lifeOf().newEar()}).NewLogger("turnc")
 				lg.Debugf("Send refresh request (dontWait=%v)", false) // pion's own calls, allocation.go
 				pass(200 * time.Millisecond)
 				back = now()

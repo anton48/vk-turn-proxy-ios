@@ -275,7 +275,7 @@ func TestReturnAllocationNotesWhatTheRelayStillHolds(t *testing.T) {
 		second         // given back: the relay's second
 		hold           // out of reach: counted until the allocation can have expired
 	)
-	heard := func(d time.Duration) func(*gaveBack) { return func(g *gaveBack) { g.life.granted(d) } }
+	heard := func(d time.Duration) func(*gaveBack) { return func(g *gaveBack) { g.life.granted(g.life.hears, d) } }
 	disowned := func(g *gaveBack) { g.life.gone.Store(true) }
 	for _, c := range []struct {
 		what     string

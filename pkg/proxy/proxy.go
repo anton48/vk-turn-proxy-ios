@@ -3571,7 +3571,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		Username:               creds.Username,
 		Password:               creds.Password,
 		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: slotIdx, life: gave.lifeOf()},
+		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: slotIdx, ear: gave.lifeOf().newEar()},
 	}
 
 	client, err := turn.NewClient(cfg)
@@ -4743,27 +4743,29 @@ type turnLoggerFactory struct {
 	// runDirectSession path). Loggers inherit it so per-slot auth-error
 	// attribution works when pion logs a 401/403 — see turnLogger.maybeFlagAuthError.
 	slot int
-	// life is what the SESSION whose client this factory logs for keeps of its
+	// ear is where this factory's client is heard by the SESSION that keeps its
 	// allocation's life at the relay — pion's lines are the only place a
-	// refresh's outcome is heard (outofreach.go). nil = no bookkeeping.
-	life *allocLife
+	// refresh's outcome is heard — as THIS client's word and no other's: one ear
+	// a client, made for it (allocLife.newEar, outofreach.go). nil = no
+	// bookkeeping.
+	ear *lifeEar
 }
 
 func (f *turnLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
-	return &turnLogger{scope: scope, proxy: f.proxy, slot: f.slot, life: f.life}
+	return &turnLogger{scope: scope, proxy: f.proxy, slot: f.slot, ear: f.ear}
 }
 
 type turnLogger struct {
 	scope string
 	proxy *Proxy
 	slot  int
-	life  *allocLife
+	ear   *lifeEar
 }
 
 func (l *turnLogger) Trace(msg string)                          {}
 func (l *turnLogger) Tracef(format string, args ...interface{}) {}
 func (l *turnLogger) Debug(msg string) {
-	l.life.heardDebug(msg)
+	l.ear.heardDebug(msg)
 	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") ||
 		strings.Contains(msg, "Failed to read") || strings.Contains(msg, "Failed to handle") || strings.Contains(msg, "Exiting loop") {
 		log.Printf("pion/%s: %s", l.scope, msg)
@@ -4771,7 +4773,7 @@ func (l *turnLogger) Debug(msg string) {
 }
 func (l *turnLogger) Debugf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	l.life.heardDebug(msg)
+	l.ear.heardDebug(msg)
 	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") || strings.Contains(msg, "ifetime") ||
 		strings.Contains(msg, "Failed to read") || strings.Contains(msg, "Failed to handle") || strings.Contains(msg, "Exiting loop") {
 		log.Printf("pion/%s: %s", l.scope, msg)
@@ -4783,27 +4785,27 @@ func (l *turnLogger) Warn(msg string) {
 	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
-	l.life.heardError(msg)
+	l.ear.heardError(msg)
 }
 func (l *turnLogger) Warnf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
-	l.life.heardError(msg)
+	l.ear.heardError(msg)
 }
 func (l *turnLogger) Error(msg string) {
 	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
-	l.life.heardError(msg)
+	l.ear.heardError(msg)
 }
 func (l *turnLogger) Errorf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
-	l.life.heardError(msg)
+	l.ear.heardError(msg)
 }
 
 // maybeCountTransientError bumps the per-Proxy silent-degradation counter when
@@ -5867,7 +5869,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		Realm:          "okcdn.ru",
 		Software:       "vk-turn-srtp",
 		// Custom factory (not pion's default LogLevelError) so SRTP-path TURN refresh/auth failures feed the silent-degradation watchdog + get sanitized, matching runTURN.
-		LoggerFactory: &turnLoggerFactory{proxy: p, slot: credSlot, life: gave.lifeOf()},
+		LoggerFactory: &turnLoggerFactory{proxy: p, slot: credSlot, ear: gave.lifeOf().newEar()},
 		// Match the relay family to the peer (see addrFamilyFor) — was
 		// hardcoded IPv4, which 443'd ("Peer Address Family Mismatch") on an
 		// IPv6 peer (e.g. a DNS name resolving to AAAA) — issue #39.
