@@ -50,6 +50,15 @@ package proxy
 //     TCP the 5-tuple is the connection's) — one line, for whoever reads the log.
 //     The address itself is not printed: the port, and whether the address is
 //     the same.
+//
+// And the session hears when pion's client STOPS LISTENING (2026-11-20). The
+// client's read loop ends on any read error — a datagram refused because nobody
+// listened at the relay's address for a second (a relay process restarted), a
+// reset of a TCP connection — and never reads again: every answer of the relay,
+// the 400 above among them, goes unheard, and the session stands deaf until a
+// liveness rule of its transport finds it. WRAP-A has none of its own: eleven of
+// thirty sessions stood so for eight minutes on a phone. pion says the loop's
+// end in one Debug line; a session that hears it is ended at once (readerEnded).
 
 import (
 	"errors"
@@ -247,6 +256,14 @@ const (
 	pionRefreshSent     = "Send refresh request (dontWait=false)"
 	pionRefreshAnswered = "Refresh request sent, and waiting response"
 	pionRefreshFailed   = "Failed to refresh allocation: "
+	// The client's read loop, as pion says its end (client.go, Listen): a read
+	// error on the socket, or an inbound message it could not handle — behind
+	// either the loop breaks. Our own close of the socket ends it too, and says
+	// so: that is a teardown, not a finding.
+	pionReadFailed    = "Failed to read: "
+	pionInboundFailed = "Failed to handle inbound message: "
+	pionReaderExits   = ". Exiting loop"
+	ownSocketClosed   = "use of closed network connection"
 )
 
 // heardDebug is pion's Debug line: a lifetime the relay granted, or a refresh on
@@ -261,6 +278,10 @@ func (l *allocLife) heardDebug(msg string) {
 		return
 	case pionRefreshAnswered:
 		l.refreshEnded()
+		return
+	}
+	if relayReaderEnded(msg) {
+		l.readerEnded(msg)
 		return
 	}
 	if m := pionLifetimeLine.FindStringSubmatch(msg); m != nil {
@@ -287,6 +308,38 @@ func (l *allocLife) heardError(msg string) {
 		return
 	}
 	l.outOfReach("its permission refresh was answered 400")
+}
+
+// relayReaderEnded reports whether msg — a Debug line of pion's TURN client — says
+// that the client's read loop has ended on something other than our own close of
+// its socket.
+func relayReaderEnded(msg string) bool {
+	return strings.HasSuffix(msg, pionReaderExits) &&
+		(strings.HasPrefix(msg, pionReadFailed) || strings.HasPrefix(msg, pionInboundFailed)) &&
+		!strings.Contains(msg, ownSocketClosed)
+}
+
+// readerEnded: pion's client has stopped reading this session's relay socket.
+// Nothing the relay says will be heard again — no answer to a refresh, no data —
+// while the session's writes still leave: it is ended now. Not behind the
+// session's own teardown (begin), which closes the socket itself. Asks the relay
+// nothing — nobody would hear the answer.
+func (l *allocLife) readerEnded(msg string) {
+	if !l.begin() {
+		return
+	}
+	defer l.asks.Done()
+	what := "a read error on its socket"
+	switch {
+	case strings.HasPrefix(msg, pionInboundFailed):
+		what = "an inbound message it could not handle"
+	case strings.Contains(msg, "connection refused"):
+		what = "connection refused: nobody was listening at the relay's address"
+	}
+	log.Printf("proxy: [conn %d] the relay socket's reader has ENDED (%s) — pion's client never reads again, so nothing the relay says will be heard on this session: ending it now, ahead of the probe's verdict", l.connIdx, what)
+	if l.kill != nil {
+		l.kill()
+	}
 }
 
 // RelayHoldsNoAllocation reports whether msg — a Warn / Error line of pion's TURN

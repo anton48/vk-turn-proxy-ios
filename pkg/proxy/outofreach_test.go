@@ -314,6 +314,15 @@ func TestPionStillSaysWhatThisBuildListensFor(t *testing.T) {
 		return string(b)
 	}
 	alloc, conn := read("internal/client/allocation.go"), read("internal/client/udp_conn.go")
+	// The client's read loop says its end, and ENDS there: each line right in
+	// front of the break (client.go, Listen) — a session that hears one is ended.
+	listen := read("client.go")
+	for _, lit := range []string{`c.log.Debugf("` + pionReadFailed + `%s` + pionReaderExits + `", err)`, `c.log.Debugf("` + pionInboundFailed + `%s` + pionReaderExits + `", err)`} {
+		at := strings.Index(listen, lit)
+		if at < 0 || strings.TrimSpace(listen[at+len(lit):at+len(lit)+12]) != "break" {
+			t.Errorf("pion's client no longer says %s right in front of the break of its read loop — a session whose reader has ended is ended on that line (outofreach.go)", lit)
+		}
+	}
 	for _, want := range []struct{ src, lit, why string }{
 		{alloc, `a.log.Debugf("Updated lifetime: %d seconds"`, "the expiry is stamped from it at every refresh"},
 		{conn, `conn.log.Debugf("Initial lifetime: %d seconds"`, "the expiry is stamped from it at the Allocate"},
