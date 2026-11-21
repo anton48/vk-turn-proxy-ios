@@ -243,7 +243,7 @@ struct AdvancedView: View {
             } header: {
                 Text("GeoIP")
             } footer: {
-                Text("Tunnel sends the selected IPv4 networks through the tunnel. Direct sends them outside it. The other IPv4 traffic takes the opposite route. Both modes use system DNS and take effect after reconnecting. If the VPN drops, traffic can continue outside it.")
+                Text("Tunnel sends the selected IPv4 networks through the tunnel. Direct sends them outside it. The other IPv4 traffic takes the opposite route. Both modes take effect after reconnecting. IPv6 and Apple push notifications (APNs) use the regular connection, and DNS uses the network resolver. If the VPN drops, traffic can continue outside it. In an allowlist-only network, push notifications may stop arriving.")
             }
             .onAppear {
                 if geoIPCountries.isEmpty, let savedGeoIP {
