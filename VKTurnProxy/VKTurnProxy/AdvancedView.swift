@@ -195,7 +195,7 @@ struct AdvancedView: View {
             }
 
             Section {
-                Picker("Routing mode", selection: $geoIPMode) {
+                Picker("Route selected networks", selection: $geoIPMode) {
                     ForEach(GeoIPMode.allCases, id: \.self) { mode in
                         Text(mode.label).tag(mode)
                     }
@@ -236,9 +236,9 @@ struct AdvancedView: View {
                     Text(geoIPMessage).foregroundStyle(.red)
                 }
             } header: {
-                Text("GeoIP routing")
+                Text("GeoIP")
             } footer: {
-                Text("Selected via VPN sends only the saved IPv4 networks through the VPN. Selected directly sends those networks outside the VPN and tunnels the other IPv4 traffic. Both modes use system DNS and apply after reconnecting. If the VPN drops, traffic can continue outside it.")
+                Text("Tunnel sends the selected IPv4 networks through the tunnel. Direct sends them outside it. The other IPv4 traffic takes the opposite route. Both modes use system DNS and take effect after reconnecting. If the VPN drops, traffic can continue outside it.")
             }
             .onAppear {
                 if geoIPCountries.isEmpty, let savedGeoIP {

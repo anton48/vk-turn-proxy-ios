@@ -14,8 +14,8 @@ enum GeoIPMode: String, Codable, CaseIterable {
 
     var label: String {
         switch self {
-        case .include: return "Selected via VPN"
-        case .exclude: return "Selected directly"
+        case .include: return "Tunnel"
+        case .exclude: return "Direct"
         }
     }
 }
