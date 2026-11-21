@@ -61,7 +61,12 @@ struct SpeedTestServerList: Equatable {
 
     /// Names whose neighbourhood the ROWS describe — never the current one.
     func header(now: SpeedTestPath) -> String {
-        let whose = fetchedOn == .throughVPN ? "Servers near your EXIT" : "Servers near you"
+        let whose: String
+        switch fetchedOn {
+        case .throughVPN: whose = "Servers near your EXIT"
+        case .geoIP: whose = "Nearby servers"
+        case .directMode, .vpnOff: whose = "Servers near you"
+        }
         return isStale(now: now) ? "\(whose) — fetched before the route changed" : whose
     }
 

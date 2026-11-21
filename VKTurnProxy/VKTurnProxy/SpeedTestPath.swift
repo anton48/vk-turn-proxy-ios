@@ -20,12 +20,13 @@ import Foundation
 enum SpeedTestPath: String, Codable {
     case throughVPN = "Through VPN"
     case directMode = "DIRECT mode — outside the tunnel"
+    case geoIP = "GeoIP routing — path depends on the destination"
     case vpnOff = "VPN off"
 
-    /// Pure, so the harness can test it. The caller supplies the two facts;
-    /// reading them from `TunnelManager` is the view's job, not this type's.
-    static func current(connected: Bool, directMode: Bool) -> SpeedTestPath {
+    /// Classifies the active routing configuration without guessing a server's IP path.
+    static func current(connected: Bool, directMode: Bool, geoIP: Bool = false) -> SpeedTestPath {
         guard connected else { return .vpnOff }
+        if geoIP { return .geoIP }
         return directMode ? .directMode : .throughVPN
     }
 }
@@ -161,6 +162,7 @@ struct SpeedTestPathTrace: Equatable {
         switch p {
         case .throughVPN: return "VPN"
         case .directMode: return "DIRECT"
+        case .geoIP: return "GeoIP"
         case .vpnOff: return "no VPN"
         }
     }

@@ -753,6 +753,15 @@ do {
     check(SpeedTestPath.current(connected: true, directMode: true) == .directMode,
           "🚨 DIRECT is labelled, never refused — measuring without the tunnel is the arm users want")
 
+    check(SpeedTestPath.current(connected: true, directMode: false, geoIP: true) == .geoIP,
+          "a connected GeoIP session reports split routing")
+    check(SpeedTestPath.current(connected: false, directMode: false, geoIP: true) == .vpnOff,
+          "a saved GeoIP configuration has no effect while the VPN is off")
+    check(SpeedTestPathTrace(.geoIP).label == SpeedTestPath.geoIP.rawValue,
+          "a GeoIP speed test does not claim the server used the VPN")
+    check(SpeedTestServerList(servers: [], fetchedOn: .geoIP).header(now: .geoIP) == "Nearby servers",
+          "GeoIP server discovery does not claim an exit or device location")
+
     var stable = SpeedTestPathTrace(.throughVPN)
     stable.record(.throughVPN)
     stable.record(.throughVPN)

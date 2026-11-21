@@ -21,7 +21,8 @@ struct SpeedTestServerPicker: View {
     /// The route RIGHT NOW — used only to ask the list whether it is stale, never
     /// to describe the rows.
     private var livePath: SpeedTestPath {
-        .current(connected: tunnel.status == .connected, directMode: tunnel.directMode)
+        .current(connected: tunnel.status == .connected, directMode: tunnel.directMode,
+                        geoIP: tunnel.usesGeoIPRouting)
     }
 
     /// 🚨 Asked of the LIST, which knows what it was fetched under. This used to

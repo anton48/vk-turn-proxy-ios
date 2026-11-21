@@ -372,7 +372,8 @@ final class SpeedTestRunner: ObservableObject {
     /// Sampled repeatedly, not once — see `SpeedTestPathTrace`.
     private static func currentPath() -> SpeedTestPath {
         let tunnel = TunnelManager.shared
-        return .current(connected: tunnel.status == .connected, directMode: tunnel.directMode)
+        return .current(connected: tunnel.status == .connected, directMode: tunnel.directMode,
+                        geoIP: tunnel.usesGeoIPRouting)
     }
 }
 
@@ -396,7 +397,10 @@ extension SpeedTestRunner {
         pathWatch.removeAll()
         let tunnel = TunnelManager.shared
         Publishers.CombineLatest(tunnel.$status, tunnel.$directMode)
-            .map { SpeedTestPath.current(connected: $0 == .connected, directMode: $1) }
+            .map { status, directMode in
+                SpeedTestPath.current(connected: status == .connected, directMode: directMode,
+                                      geoIP: tunnel.usesGeoIPRouting)
+            }
             .removeDuplicates()
             // 🚨 STAMPED HERE, UPSTREAM OF THE HOP. `receive(on:)` schedules the
             // sink for a later turn of the main run loop, so a `Date()` taken

@@ -77,21 +77,27 @@ struct AdvancedView: View {
     @AppStorage(GeoIPSelection.settingsKey) private var geoIPSelection = Data()
     @State private var geoIPCountries = ""
     @State private var geoIPMode: GeoIPMode = .include
-    @State private var geoIPUpdating = false
+    @State private var geoIPRequest: UUID?
+    private var geoIPUpdating: Bool { geoIPRequest != nil }
     @State private var geoIPMessage: String?
 
     private var savedGeoIP: GeoIPSelection? {
         try? PropertyListDecoder().decode(GeoIPSelection.self, from: geoIPSelection)
     }
 
-    private func updateGeoIP() async {
-        defer { geoIPUpdating = false }
+    @MainActor
+    private func updateGeoIP(_ request: UUID) async {
+        defer {
+            if geoIPRequest == request { geoIPRequest = nil }
+        }
         do {
             let selection = try await GeoIPSelection.download(countries: geoIPCountries, mode: geoIPMode)
+            guard !Task.isCancelled, geoIPRequest == request else { return }
             geoIPSelection = try PropertyListEncoder().encode(selection)
             geoIPCountries = selection.countries
             geoIPMessage = nil
         } catch {
+            guard !Task.isCancelled, geoIPRequest == request else { return }
             geoIPMessage = error.localizedDescription
         }
     }
@@ -216,9 +222,8 @@ struct AdvancedView: View {
                     .disableAutocorrection(true)
                     .disabled(geoIPUpdating)
                 Button(geoIPUpdating ? "Updating…" : "Download and save") {
-                    geoIPUpdating = true
                     geoIPMessage = nil
-                    Task { await updateGeoIP() }
+                    geoIPRequest = UUID()
                 }
                 .disabled(geoIPUpdating || geoIPCountries.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 if let savedGeoIP {
@@ -303,5 +308,10 @@ struct AdvancedView: View {
             }
         }
         .navigationTitle("Advanced")
+        .task(id: geoIPRequest) { [geoIPRequest] in
+            guard let geoIPRequest, !Task.isCancelled else { return }
+            await updateGeoIP(geoIPRequest)
+        }
+        .onDisappear { geoIPRequest = nil }
     }
 }
