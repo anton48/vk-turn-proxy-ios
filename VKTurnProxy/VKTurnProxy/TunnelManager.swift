@@ -1061,6 +1061,15 @@ class TunnelManager: ObservableObject {
     ) async throws {
         let manager = try await getOrCreateManager()
         let wgConfig = try buildUAPIConfig(config: config)
+        let geoIPSnapshot = UserDefaults.standard.data(forKey: GeoIPSelection.settingsKey) ?? Data()
+        let geoIPRoutes: Data?
+        if geoIPSnapshot.isEmpty {
+            geoIPRoutes = nil
+        } else {
+            let selection = try PropertyListDecoder().decode(GeoIPSelection.self, from: geoIPSnapshot)
+            guard GeoIPSelection.validRoutes(selection.routes) else { throw GeoIPError.invalidDatabase }
+            geoIPRoutes = selection.routes
+        }
 
             // Build proxy config JSON, seeding credPool slot 0 with the
             // pre-fetched TURN creds.
@@ -1176,7 +1185,11 @@ class TunnelManager: ObservableObject {
             // Saving a profile whose includeAllNetworks changed re-prompts
             // iOS for VPN permission on the next connect. This is a
             // one-time UX cost for existing users.
-            proto.includeAllNetworks = true
+            if let geoIPRoutes {
+                proto.providerConfiguration?[GeoIPSelection.routesKey] = geoIPRoutes
+                proto.enforceRoutes = true
+            }
+            proto.includeAllNetworks = geoIPRoutes == nil
             proto.excludeLocalNetworks = true
             if #available(iOS 16.4, *) {
                 proto.excludeAPNs = false
@@ -1361,13 +1374,18 @@ class TunnelManager: ObservableObject {
     private var paceSync = UplinkPaceSync()
     private var paceRetryScheduled = false
 
+    var usesGeoIPRouting: Bool {
+        (manager?.protocolConfiguration as? NETunnelProviderProtocol)?
+            .providerConfiguration?[GeoIPSelection.routesKey] != nil
+    }
+
     /// Reads DIRECT's state back out of the VPN profile. Cheap, and the only
     /// place `directMode` is ever assigned outside a change we made ourselves.
     func refreshDirectMode() {
         guard let proto = manager?.protocolConfiguration else { return }
         var enforced = false
         if #available(iOS 14.2, *) { enforced = proto.enforceRoutes }
-        adoptDirectMode(!proto.includeAllNetworks && enforced)
+        adoptDirectMode(!usesGeoIPRouting && !proto.includeAllNetworks && enforced)
     }
 
     /// The ONE place `directMode` is written, so that every surface showing it
@@ -1470,6 +1488,9 @@ class TunnelManager: ObservableObject {
             refreshDirectMode()
             return .notConnected
         }
+        if usesGeoIPRouting {
+            return .failed("DIRECT is unavailable while GeoIP routing is active.")
+        }
         if directModeBusy {
             note("a change is already in flight — ignored")
             return .busy
@@ -1487,6 +1508,9 @@ class TunnelManager: ObservableObject {
             guard let proto = manager.protocolConfiguration as? NETunnelProviderProtocol else {
                 note("protocolConfiguration is not an NETunnelProviderProtocol — aborting")
                 return .failed("The VPN profile could not be read.")
+            }
+            guard proto.providerConfiguration?[GeoIPSelection.routesKey] == nil else {
+                return .failed("DIRECT is unavailable while GeoIP routing is active.")
             }
             // 🚨 `proto` IS A CLASS, so the two assignments below mutate the very
             // object `manager.protocolConfiguration` — and `refreshDirectMode()`

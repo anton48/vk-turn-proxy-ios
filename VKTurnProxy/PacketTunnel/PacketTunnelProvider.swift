@@ -398,6 +398,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
+        let geoIPRoutes = config[GeoIPSelection.routesKey] as? Data
+        if config[GeoIPSelection.routesKey] != nil {
+            guard let geoIPRoutes, GeoIPSelection.validRoutes(geoIPRoutes),
+                  !protocolConfiguration.includeAllNetworks, protocolConfiguration.enforceRoutes else {
+                stopPathMonitoring()
+                logMsg("ERROR: invalid GeoIP routing configuration")
+                completionHandler(VPNError.invalidConfiguration)
+                return
+            }
+        }
+
         let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
         let dnsServers = config["dns_servers"] as? String ?? "1.1.1.1"
         // Clamped, not trusted: this arrives from UserDefaults, which an
@@ -650,14 +661,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let startupProto = self.protocolConfiguration
             var startupEnforce = false
             if #available(iOS 14.2, *) { startupEnforce = startupProto.enforceRoutes }
-            let initialDirect = !startupProto.includeAllNetworks && startupEnforce
+            let initialDirect = geoIPRoutes == nil && !startupProto.includeAllNetworks && startupEnforce
 
             let finalSettings = self.createTunnelSettings(
                 address: effAddress,
                 dns: effDNS,
                 mtu: effMTU,
                 tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP,
-                includeDefaultRoute: !initialDirect
+                includeDefaultRoute: !initialDirect,
+                geoIPRoutes: geoIPRoutes
             )
             if initialDirect {
                 // Same reason as the live switch: a resolver reachable only
@@ -673,7 +685,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
             DispatchQueue.main.async {
                 self.logMsg("setTunnelNetworkSettings: applying "
-                    + (initialDirect ? "DIRECT routes (the profile says so)" : "full routes")
+                    + (geoIPRoutes != nil ? "GeoIP routes" : (initialDirect ? "DIRECT routes" : "full routes"))
                     + " (single shot)")
                 self.setTunnelNetworkSettings(finalSettings) { error in
                     if let error = error {
@@ -1268,7 +1280,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         dns: String,
         mtu: String,
         tunnelRemoteAddress: String,
-        includeDefaultRoute: Bool = true
+        includeDefaultRoute: Bool = true,
+        geoIPRoutes: Data? = nil
     ) -> NEPacketTunnelNetworkSettings {
         // Defensive: `address` can originate from an untrusted source (the
         // WRAP-A GETCONF provision, or an imported backup's tunnelAddress). A
@@ -1308,7 +1321,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // ⇒ Treat this parameter as "do not ASK for the default route yet",
         // never as "traffic will stay outside". A DIRECT mode cannot be built
         // on it while IAN is true. *(User-caught: I proposed exactly that.)*
-        ipv4.includedRoutes = includeDefaultRoute ? [NEIPv4Route.default()] : []
+        if let geoIPRoutes {
+            ipv4.includedRoutes = stride(from: geoIPRoutes.startIndex, to: geoIPRoutes.endIndex, by: 5).map { index in
+                let address = geoIPRoutes[index..<index + 4].map { String($0) }.joined(separator: ".")
+                return NEIPv4Route(destinationAddress: address,
+                                   subnetMask: prefixToSubnet(Int(geoIPRoutes[index + 4])))
+            }
+        } else {
+            ipv4.includedRoutes = includeDefaultRoute ? [NEIPv4Route.default()] : []
+        }
         // No excludedRoutes: with includeAllNetworks=true on the VPN profile,
         // iOS ignores excludedRoutes entirely (Apple docs). The only
         // always-excluded destination is the serverAddress (see above), plus
@@ -1318,7 +1339,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.excludedRoutes = []
         settings.ipv4Settings = ipv4
 
-        if !dns.isEmpty {
+        if geoIPRoutes == nil && !dns.isEmpty {
             let dnsAddresses = dns.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
             settings.dnsSettings = NEDNSSettings(servers: dnsAddresses)
         }
@@ -1373,6 +1394,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                completion: ((Bool) -> Void)? = nil) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { completion?(false); return }
+            let config = (self.protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration
+            guard config?[GeoIPSelection.routesKey] == nil else { completion?(false); return }
             if let completion = completion { self.directWaiters.append(completion) }
 
             guard self.directReady else {

@@ -74,6 +74,27 @@ struct AdvancedView: View {
     /// keys above: declared HERE, never in ContentView.
     @AppStorage("innerTrafficLog") private var innerTrafficLog = false
 
+    @AppStorage(GeoIPSelection.settingsKey) private var geoIPSelection = Data()
+    @State private var geoIPCountries = ""
+    @State private var geoIPUpdating = false
+    @State private var geoIPMessage: String?
+
+    private var savedGeoIP: GeoIPSelection? {
+        try? PropertyListDecoder().decode(GeoIPSelection.self, from: geoIPSelection)
+    }
+
+    private func updateGeoIP() async {
+        defer { geoIPUpdating = false }
+        do {
+            let selection = try await GeoIPSelection.download(countries: geoIPCountries)
+            geoIPSelection = try PropertyListEncoder().encode(selection)
+            geoIPCountries = selection.countries
+            geoIPMessage = nil
+        } catch {
+            geoIPMessage = error.localizedDescription
+        }
+    }
+
     var body: some View {
         Form {
             Section {
@@ -172,6 +193,40 @@ struct AdvancedView: View {
                 Text("Spaces this device's uploads across the relay connections instead of sending them in bursts, so the relay's own rate limit stops cutting them.\n\nMeasured here on 30 connections under real traffic: upload 30 → 47 Mbit/s and uplink packet loss 2% → 0.06%, with download and idle ping unchanged. The cost is response time while the upload is saturated — about 60 ms more, against roughly 470 ms that this phone's cellular link adds under the same load.\n\nOff by default. Takes effect immediately, on a tunnel that is already connected.")
             }
 
+            Section {
+                TextField("Country codes, e.g. RU", text: $geoIPCountries)
+                    .textInputAutocapitalization(.characters)
+                    .disableAutocorrection(true)
+                    .disabled(geoIPUpdating)
+                Button(geoIPUpdating ? "Updating…" : "Download and save") {
+                    geoIPUpdating = true
+                    geoIPMessage = nil
+                    Task { await updateGeoIP() }
+                }
+                .disabled(geoIPUpdating || geoIPCountries.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if let savedGeoIP {
+                    Text("Saved countries: \(savedGeoIP.countries)")
+                }
+                if !geoIPSelection.isEmpty {
+                    Button("Disable GeoIP", role: .destructive) {
+                        geoIPSelection = Data()
+                        geoIPCountries = ""
+                        geoIPMessage = nil
+                    }
+                    .disabled(geoIPUpdating)
+                }
+                if let geoIPMessage {
+                    Text(geoIPMessage).foregroundStyle(.red)
+                }
+            } header: {
+                Text("GeoIP routing")
+            } footer: {
+                Text("On the next connection, only IPv4 networks in the saved countries use the VPN. Other traffic uses the regular connection and system DNS. If the VPN drops, traffic can continue outside it. Some countries exceed the route limit even on their own.")
+            }
+            .onAppear {
+                if geoIPCountries.isEmpty { geoIPCountries = savedGeoIP?.countries ?? "" }
+            }
+
             // Issue #72. A SWITCH, not the two buttons the experiment used: a
             // button that starts async work and says nothing reads as broken,
             // which is exactly how the first field run went (four taps because
@@ -181,7 +236,7 @@ struct AdvancedView: View {
                     get: { tunnel.directMode },
                     set: { on in Task { await tunnel.setDirectMode(on, from: .advancedSwitch) } }
                 ))
-                .disabled(tunnel.directModeBusy || tunnel.status != .connected)
+                .disabled(tunnel.directModeBusy || tunnel.status != .connected || tunnel.usesGeoIPRouting)
 
                 // 🚨 AN UNCONFIRMED CHANGE MUST NOT LOOK LIKE A SUCCESSFUL ONE.
                 // The switch is driven by the PROFILE, so it flips as soon as

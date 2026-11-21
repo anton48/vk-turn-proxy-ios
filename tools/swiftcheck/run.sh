@@ -49,6 +49,7 @@ SOURCES=(
     # The seed's config object and a probe's relay list (Foundation only): RUN.
     "$S/SeededTURNConfig.swift"
     "$S/DirectRouteSync.swift"
+    "$S/GeoIPSelection.swift"
     "$S/SpeedTestPath.swift"
     "$S/SpeedTestRunConfig.swift"
     "$S/SpeedTestServerList.swift"

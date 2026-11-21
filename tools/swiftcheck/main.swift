@@ -465,6 +465,38 @@ do {
           "and UplinkChunk.swift is gone rather than dormant")
 }
 
+print("GeoIP — selected IPv4 routes and malformed catalogs")
+do {
+    func message(_ field: UInt8, _ body: [UInt8]) -> [UInt8] {
+        precondition(body.count < 128)
+        return [field << 3 | 2, UInt8(body.count)] + body
+    }
+    func cidr(_ address: [UInt8], _ length: UInt8) -> [UInt8] {
+        message(2, message(1, address) + [16, length])
+    }
+
+    let ru = message(1, Array("RU".utf8))
+        + cidr([203, 0, 113, 128], 25)
+        + cidr([203, 0, 113, 7], 25)
+        + cidr([203, 0, 113, 8], 32)
+        + cidr(Array(repeating: 0, count: 16), 64)
+    let de = message(1, Array("DE".utf8)) + cidr([192, 0, 2, 0], 24)
+    let catalog = Data(message(1, de) + message(1, ru))
+    let routes = try? GeoIPSelection.resolve(catalog, tags: ["RU"])
+    check(routes == Data([203, 0, 113, 0, 24]), "IPv4 ranges are masked, merged and limited to the selected country")
+    let both = try? GeoIPSelection.resolve(catalog, tags: ["RU", "DE"])
+    check(both == Data([192, 0, 2, 0, 24, 203, 0, 113, 0, 24]), "multiple country codes produce a sorted route snapshot")
+    check((try? GeoIPSelection.resolve(catalog, tags: ["RU", "FR"])) == nil,
+          "an unknown country fails the whole update")
+    check((try? GeoIPSelection.resolve(Data(catalog.dropLast()), tags: ["RU"])) == nil,
+          "a truncated database cannot replace the saved selection")
+    check((try? GeoIPSelection.resolve(Data(message(1, ru + [24, 1])), tags: ["RU"])) == nil,
+          "inverse GeoIP rules are rejected")
+    check(GeoIPSelection.validRoutes(routes ?? Data()), "the generated snapshot is accepted")
+    check(!GeoIPSelection.validRoutes(Data([0, 0, 0, 0, 0])), "the default route is rejected")
+    check(!GeoIPSelection.validRoutes(Data([192, 0, 2, 0, 33])), "invalid prefix lengths are rejected")
+}
+
 print("DirectRouteSync — one apply at a time, last intent wins")
 
 // 18. 🚨🚨 THE DEFECT THIS TYPE EXISTS FOR, AND IT IS THE ONE A FLAG CANNOT SEE.

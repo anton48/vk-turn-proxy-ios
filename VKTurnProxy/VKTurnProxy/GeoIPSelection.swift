@@ -1,0 +1,173 @@
+import Foundation
+
+struct GeoIPSelection: Codable {
+    static let settingsKey = "geoIPSelection"
+    static let routesKey = "geoip_routes"
+    static let maxRoutes = 16_384
+
+    let countries: String
+    let routes: Data
+
+    static func download(countries: String) async throws -> Self {
+        let tags = Set(countries.uppercased().split {
+            $0 == "," || $0.isWhitespace
+        }.map(String.init))
+        guard !tags.isEmpty, tags.allSatisfy({
+            $0.utf8.count == 2 && $0.utf8.allSatisfy { (65...90).contains($0) }
+        }) else {
+            throw GeoIPError.invalidCountries
+        }
+
+        let source = URL(string: "https://github.com/Loyalsoldier/geoip/releases/latest/download/geoip.dat")!
+        let (file, response) = try await URLSession.shared.download(from: source)
+        defer { try? FileManager.default.removeItem(at: file) }
+        guard (response as? HTTPURLResponse)?.statusCode == 200,
+              let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              (1...32 * 1024 * 1024).contains(size) else {
+            throw GeoIPError.invalidDatabase
+        }
+        let routes = try resolve(try Data(contentsOf: file, options: .mappedIfSafe), tags: tags)
+        return Self(countries: tags.sorted().joined(separator: ", "), routes: routes)
+    }
+
+    // Each route is four network address bytes followed by its prefix length.
+    static func validRoutes(_ routes: Data) -> Bool {
+        !routes.isEmpty && routes.count % 5 == 0 && routes.count <= maxRoutes * 5
+            && routes.enumerated().allSatisfy { $0.offset % 5 != 4 || (1...32).contains($0.element) }
+    }
+
+    static func resolve(_ database: Data, tags: Set<String>) throws -> Data {
+        var remaining = tags
+        var prefixes = Set<UInt64>()
+        try fields(database) { number, scalar, entry in
+            guard number == 1 else { return }
+            guard scalar == nil else { throw GeoIPError.invalidDatabase }
+            var tag = ""
+            var inverse = false
+            try fields(entry) { field, value, bytes in
+                switch field {
+                case 1:
+                    guard value == nil else { throw GeoIPError.invalidDatabase }
+                    tag = String(decoding: bytes, as: UTF8.self).uppercased()
+                case 3:
+                    guard let value else { throw GeoIPError.invalidDatabase }
+                    inverse = value != 0
+                default: break
+                }
+            }
+            guard tags.contains(tag) else { return }
+            guard remaining.remove(tag) != nil, !inverse else { throw GeoIPError.invalidDatabase }
+
+            var foundIPv4 = false
+            try fields(entry) { field, scalar, cidr in
+                guard field == 2 else { return }
+                guard scalar == nil else { throw GeoIPError.invalidDatabase }
+                var address = Data()
+                var length: UInt64 = 0
+                try fields(cidr) { field, value, bytes in
+                    switch field {
+                    case 1:
+                        guard value == nil else { throw GeoIPError.invalidDatabase }
+                        address = bytes
+                    case 2:
+                        guard let value else { throw GeoIPError.invalidDatabase }
+                        length = value
+                    default: break
+                    }
+                }
+                if address.count == 16 && length <= 128 { return }
+                guard address.count == 4, (1...32).contains(length) else {
+                    throw GeoIPError.invalidDatabase
+                }
+                let ip = address.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+                let network = ip & (UInt32.max << (32 - Int(length)))
+                prefixes.insert(UInt64(network) << 8 | length)
+                foundIPv4 = true
+            }
+            guard foundIPv4 else { throw GeoIPError.missingCountry(tag) }
+        }
+        if let missing = remaining.sorted().first { throw GeoIPError.missingCountry(missing) }
+        guard !prefixes.isEmpty else { throw GeoIPError.invalidDatabase }
+
+        let routes = aggregate(prefixes.sorted())
+        guard routes.count <= maxRoutes else { throw GeoIPError.tooManyRoutes }
+        return Data(routes.flatMap { prefix in
+            (0..<5).reversed().map { UInt8(truncatingIfNeeded: prefix >> ($0 * 8)) }
+        })
+    }
+
+    private static func aggregate(_ prefixes: [UInt64]) -> [UInt64] {
+        var routes: [UInt64] = []
+        for prefix in prefixes {
+            let address = prefix >> 8
+            var length = Int(prefix & 0xFF)
+            if let last = routes.last {
+                let size = UInt64(1) << (32 - Int(last & 0xFF))
+                if address < (last >> 8) + size { continue }
+            }
+
+            var network = address
+            while length > 1, let last = routes.last, Int(last & 0xFF) == length {
+                let size = UInt64(1) << (32 - length)
+                guard network & size != 0, last >> 8 == network - size else { break }
+                routes.removeLast()
+                network -= size
+                length -= 1
+            }
+            routes.append(network << 8 | UInt64(length))
+        }
+        return routes
+    }
+
+    // V2Ray GeoIPList uses protobuf varints and length-delimited messages.
+    private static func fields(_ data: Data, _ visit: (UInt64, UInt64?, Data) throws -> Void) throws {
+        var index = data.startIndex
+
+        func varint() throws -> UInt64 {
+            var value: UInt64 = 0
+            for shift in stride(from: 0, through: 63, by: 7) {
+                guard index < data.endIndex else { throw GeoIPError.invalidDatabase }
+                let byte = data[index]
+                index += 1
+                guard shift != 63 || byte <= 1 else { throw GeoIPError.invalidDatabase }
+                value |= UInt64(byte & 0x7F) << shift
+                if byte < 0x80 { return value }
+            }
+            throw GeoIPError.invalidDatabase
+        }
+
+        while index < data.endIndex {
+            let key = try varint()
+            let field = key >> 3
+            guard field != 0 else { throw GeoIPError.invalidDatabase }
+            switch key & 7 {
+            case 0:
+                try visit(field, varint(), Data())
+            case 2:
+                let length = try varint()
+                guard length <= UInt64(data.endIndex - index) else { throw GeoIPError.invalidDatabase }
+                let end = index + Int(length)
+                try visit(field, nil, data[index..<end])
+                index = end
+            default:
+                throw GeoIPError.invalidDatabase
+            }
+        }
+    }
+}
+
+enum GeoIPError: LocalizedError {
+    case invalidCountries
+    case invalidDatabase
+    case missingCountry(String)
+    case tooManyRoutes
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidCountries: return "Enter two-letter country codes, such as RU or CN."
+        case .invalidDatabase: return "The GeoIP routing data is invalid."
+        case .missingCountry(let country): return "The GeoIP database has no IPv4 networks for \(country)."
+        case .tooManyRoutes: return "The selected countries contain too many IPv4 routes. Select fewer countries."
+        }
+    }
+}

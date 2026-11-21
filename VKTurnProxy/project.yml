@@ -151,6 +151,7 @@ targets:
       # compiles the REAL source standalone. A copy under PacketTunnel/ would be
       # a second file to keep in step with the one the harness checks.
       - path: VKTurnProxy/DirectRouteSync.swift
+      - path: VKTurnProxy/GeoIPSelection.swift
       # AppEntitlements.swift — reads this process's own code signature so the
       # App-Group failure can name the team that signed the build. Compiled into
       # the extension too: it has its OWN signature, and app/extension can
