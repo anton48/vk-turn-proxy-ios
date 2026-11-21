@@ -399,7 +399,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         let geoIPRoutes = config[GeoIPSelection.routesKey] as? Data
-        if config[GeoIPSelection.routesKey] != nil {
+        let geoIPMode: GeoIPMode
+        do {
+            geoIPMode = try GeoIPMode.fromProvider(config[GeoIPSelection.modeKey])
+        } catch {
+            stopPathMonitoring()
+            completionHandler(VPNError.invalidConfiguration)
+            return
+        }
+        if config[GeoIPSelection.routesKey] != nil || config[GeoIPSelection.modeKey] != nil {
             guard let geoIPRoutes, GeoIPSelection.validRoutes(geoIPRoutes),
                   !protocolConfiguration.includeAllNetworks, protocolConfiguration.enforceRoutes else {
                 stopPathMonitoring()
@@ -631,7 +639,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             if let geoIPRoutes, !isCSQTT,
-               !GeoIPSelection.wireGuardCovers(geoIPRoutes, uapi: effWGConfig) {
+               !GeoIPSelection.wireGuardCovers(geoIPRoutes, uapi: effWGConfig, mode: geoIPMode) {
                 self.failStart(backend, at: "GeoIP routing",
                                line: "ERROR: WireGuard AllowedIPs do not cover the GeoIP routes",
                                error: GeoIPError.incompatibleWireGuardRoutes, completionHandler)
@@ -678,7 +686,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 mtu: effMTU,
                 tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP,
                 includeDefaultRoute: !initialDirect,
-                geoIPRoutes: geoIPRoutes
+                geoIPRoutes: geoIPRoutes,
+                geoIPMode: geoIPMode
             )
             if initialDirect {
                 // Same reason as the live switch: a resolver reachable only
@@ -1290,7 +1299,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         mtu: String,
         tunnelRemoteAddress: String,
         includeDefaultRoute: Bool = true,
-        geoIPRoutes: Data? = nil
+        geoIPRoutes: Data? = nil,
+        geoIPMode: GeoIPMode = .include
     ) -> NEPacketTunnelNetworkSettings {
         // Defensive: `address` can originate from an untrusted source (the
         // WRAP-A GETCONF provision, or an imported backup's tunnelAddress). A
@@ -1330,22 +1340,22 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // ⇒ Treat this parameter as "do not ASK for the default route yet",
         // never as "traffic will stay outside". A DIRECT mode cannot be built
         // on it while IAN is true. *(User-caught: I proposed exactly that.)*
+        ipv4.excludedRoutes = []
         if let geoIPRoutes {
-            ipv4.includedRoutes = stride(from: geoIPRoutes.startIndex, to: geoIPRoutes.endIndex, by: 5).map { index in
+            let routes = stride(from: geoIPRoutes.startIndex, to: geoIPRoutes.endIndex, by: 5).map { index in
                 let address = geoIPRoutes[index..<index + 4].map { String($0) }.joined(separator: ".")
                 return NEIPv4Route(destinationAddress: address,
                                    subnetMask: prefixToSubnet(Int(geoIPRoutes[index + 4])))
             }
+            if geoIPMode == .include {
+                ipv4.includedRoutes = routes
+            } else {
+                ipv4.includedRoutes = [NEIPv4Route.default()]
+                ipv4.excludedRoutes = routes
+            }
         } else {
             ipv4.includedRoutes = includeDefaultRoute ? [NEIPv4Route.default()] : []
         }
-        // No excludedRoutes: with includeAllNetworks=true on the VPN profile,
-        // iOS ignores excludedRoutes entirely (Apple docs). The only
-        // always-excluded destination is the serverAddress (see above), plus
-        // Apple's built-in list (DHCP, captive networks, cellular services
-        // when flagged). Removing excludedRoutes here keeps the intent
-        // explicit.
-        ipv4.excludedRoutes = []
         settings.ipv4Settings = ipv4
 
         if geoIPRoutes == nil && !dns.isEmpty {

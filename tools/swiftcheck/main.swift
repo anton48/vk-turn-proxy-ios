@@ -503,8 +503,29 @@ do {
         check(!GeoIPSelection.wireGuardCovers(routes, uapi: "allowed_ip=::/0"),
               "an IPv6 AllowedIPs default does not cover IPv4")
     }
+    let firstHalf = Data([0, 0, 0, 0, 1])
+    check(GeoIPSelection.wireGuardCovers(firstHalf, uapi: "allowed_ip=128.0.0.0/1", mode: .exclude),
+          "exclude mode requires the complement, not the selected network")
+    check(!GeoIPSelection.wireGuardCovers(firstHalf, uapi: "allowed_ip=0.0.0.0/1", mode: .exclude),
+          "covering only excluded networks cannot carry the remaining traffic")
+    let middleHalves = Data([64, 0, 0, 0, 2, 128, 0, 0, 0, 2])
+    check(GeoIPSelection.wireGuardCovers(middleHalves, uapi: "allowed_ip=0.0.0.0/2\nallowed_ip=192.0.0.0/2", mode: .exclude),
+          "separate AllowedIPs can cover both sides of an exclusion")
+    check(!GeoIPSelection.wireGuardCovers(middleHalves, uapi: "allowed_ip=0.0.0.0/2", mode: .exclude),
+          "a gap beyond the last exclusion fails coverage")
+    let saved = try? PropertyListSerialization.data(
+        fromPropertyList: ["countries": "RU", "routes": firstHalf],
+        format: .binary, options: 0)
+    let legacy = saved.flatMap { try? PropertyListDecoder().decode(GeoIPSelection.self, from: $0) }
+    check(legacy?.routingMode == .include, "existing GeoIP selections retain include mode")
+    check((try? GeoIPMode.fromProvider(nil)) == .include, "existing VPN profiles retain include mode")
+    check((try? GeoIPMode.fromProvider("exclude")) == .exclude, "exclude mode survives the provider configuration")
+    check((try? GeoIPMode.fromProvider("unknown")) == nil, "an invalid VPN routing mode fails explicitly")
     check(!GeoIPSelection.validRoutes(Data([0, 0, 0, 0, 0])), "the default route is rejected")
     check(!GeoIPSelection.validRoutes(Data([192, 0, 2, 0, 33])), "invalid prefix lengths are rejected")
+    check(!GeoIPSelection.validRoutes(Data([192, 0, 2, 1, 24])), "host bits in a saved network are rejected")
+    check(!GeoIPSelection.validRoutes(Data([203, 0, 113, 0, 24, 192, 0, 2, 0, 24])),
+          "unsorted networks cannot enter the AllowedIPs coverage scan")
 }
 
 print("DirectRouteSync — one apply at a time, last intent wins")

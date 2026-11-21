@@ -1062,17 +1062,17 @@ class TunnelManager: ObservableObject {
         let manager = try await getOrCreateManager()
         let wgConfig = try buildUAPIConfig(config: config)
         let geoIPSnapshot = UserDefaults.standard.data(forKey: GeoIPSelection.settingsKey) ?? Data()
-        let geoIPRoutes: Data?
+        let geoIP: GeoIPSelection?
         if geoIPSnapshot.isEmpty {
-            geoIPRoutes = nil
+            geoIP = nil
         } else {
             let selection = try PropertyListDecoder().decode(GeoIPSelection.self, from: geoIPSnapshot)
             guard GeoIPSelection.validRoutes(selection.routes) else { throw GeoIPError.invalidDatabase }
             if !config.useWrapA && !config.useCsqtt,
-               !GeoIPSelection.wireGuardCovers(selection.routes, uapi: wgConfig) {
+               !GeoIPSelection.wireGuardCovers(selection.routes, uapi: wgConfig, mode: selection.routingMode) {
                 throw GeoIPError.incompatibleWireGuardRoutes
             }
-            geoIPRoutes = selection.routes
+            geoIP = selection
         }
 
             // Build proxy config JSON, seeding credPool slot 0 with the
@@ -1189,11 +1189,12 @@ class TunnelManager: ObservableObject {
             // Saving a profile whose includeAllNetworks changed re-prompts
             // iOS for VPN permission on the next connect. This is a
             // one-time UX cost for existing users.
-            if let geoIPRoutes {
-                proto.providerConfiguration?[GeoIPSelection.routesKey] = geoIPRoutes
+            if let geoIP {
+                proto.providerConfiguration?[GeoIPSelection.routesKey] = geoIP.routes
+                proto.providerConfiguration?[GeoIPSelection.modeKey] = geoIP.routingMode.rawValue
                 proto.enforceRoutes = true
             }
-            proto.includeAllNetworks = geoIPRoutes == nil
+            proto.includeAllNetworks = geoIP == nil
             proto.excludeLocalNetworks = true
             if #available(iOS 16.4, *) {
                 proto.excludeAPNs = false

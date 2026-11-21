@@ -76,6 +76,7 @@ struct AdvancedView: View {
 
     @AppStorage(GeoIPSelection.settingsKey) private var geoIPSelection = Data()
     @State private var geoIPCountries = ""
+    @State private var geoIPMode: GeoIPMode = .include
     @State private var geoIPUpdating = false
     @State private var geoIPMessage: String?
 
@@ -86,7 +87,7 @@ struct AdvancedView: View {
     private func updateGeoIP() async {
         defer { geoIPUpdating = false }
         do {
-            let selection = try await GeoIPSelection.download(countries: geoIPCountries)
+            let selection = try await GeoIPSelection.download(countries: geoIPCountries, mode: geoIPMode)
             geoIPSelection = try PropertyListEncoder().encode(selection)
             geoIPCountries = selection.countries
             geoIPMessage = nil
@@ -194,6 +195,22 @@ struct AdvancedView: View {
             }
 
             Section {
+                Picker("Routing mode", selection: $geoIPMode) {
+                    ForEach(GeoIPMode.allCases, id: \.self) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .disabled(geoIPUpdating)
+                .onChange(of: geoIPMode) { mode in
+                    guard let savedGeoIP, savedGeoIP.routingMode != mode else { return }
+                    do {
+                        let updated = GeoIPSelection(countries: savedGeoIP.countries, routes: savedGeoIP.routes, mode: mode)
+                        geoIPSelection = try PropertyListEncoder().encode(updated)
+                        geoIPMessage = nil
+                    } catch {
+                        geoIPMessage = error.localizedDescription
+                    }
+                }
                 TextField("Country codes, e.g. RU", text: $geoIPCountries)
                     .textInputAutocapitalization(.characters)
                     .disableAutocorrection(true)
@@ -221,10 +238,13 @@ struct AdvancedView: View {
             } header: {
                 Text("GeoIP routing")
             } footer: {
-                Text("On the next connection, only IPv4 networks in the saved countries use the VPN. Other traffic uses the regular connection and system DNS. If the VPN drops, traffic can continue outside it. Some countries exceed the route limit even on their own.")
+                Text("Selected via VPN sends only the saved IPv4 networks through the VPN. Selected directly sends those networks outside the VPN and tunnels the other IPv4 traffic. Both modes use system DNS and apply after reconnecting. If the VPN drops, traffic can continue outside it.")
             }
             .onAppear {
-                if geoIPCountries.isEmpty { geoIPCountries = savedGeoIP?.countries ?? "" }
+                if geoIPCountries.isEmpty, let savedGeoIP {
+                    geoIPCountries = savedGeoIP.countries
+                    geoIPMode = savedGeoIP.routingMode
+                }
             }
 
             // Issue #72. A SWITCH, not the two buttons the experiment used: a

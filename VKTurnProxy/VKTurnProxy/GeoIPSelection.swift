@@ -1,14 +1,38 @@
 import Foundation
 
+enum GeoIPMode: String, Codable, CaseIterable {
+    case include
+    case exclude
+
+    static func fromProvider(_ value: Any?) throws -> Self {
+        guard let value else { return .include }
+        guard let raw = value as? String, let mode = Self(rawValue: raw) else {
+            throw GeoIPError.invalidDatabase
+        }
+        return mode
+    }
+
+    var label: String {
+        switch self {
+        case .include: return "Selected via VPN"
+        case .exclude: return "Selected directly"
+        }
+    }
+}
+
 struct GeoIPSelection: Codable {
     static let settingsKey = "geoIPSelection"
     static let routesKey = "geoip_routes"
+    static let modeKey = "geoip_mode"
     static let maxRoutes = 16_384
 
     let countries: String
     let routes: Data
+    let mode: GeoIPMode?
 
-    static func download(countries: String) async throws -> Self {
+    var routingMode: GeoIPMode { mode ?? .include }
+
+    static func download(countries: String, mode: GeoIPMode) async throws -> Self {
         let tags = Set(countries.uppercased().split {
             $0 == "," || $0.isWhitespace
         }.map(String.init))
@@ -27,17 +51,26 @@ struct GeoIPSelection: Codable {
             throw GeoIPError.invalidDatabase
         }
         let routes = try resolve(try Data(contentsOf: file, options: .mappedIfSafe), tags: tags)
-        return Self(countries: tags.sorted().joined(separator: ", "), routes: routes)
+        return Self(countries: tags.sorted().joined(separator: ", "), routes: routes, mode: mode)
     }
 
     // Each route is four network address bytes followed by its prefix length.
     static func validRoutes(_ routes: Data) -> Bool {
-        !routes.isEmpty && routes.count % 5 == 0 && routes.count <= maxRoutes * 5
-            && routes.enumerated().allSatisfy { $0.offset % 5 != 4 || (1...32).contains($0.element) }
+        guard !routes.isEmpty, routes.count % 5 == 0, routes.count <= maxRoutes * 5 else { return false }
+        var previousEnd: UInt64 = 0
+        for index in stride(from: routes.startIndex, to: routes.endIndex, by: 5) {
+            let length = Int(routes[index + 4])
+            guard (1...32).contains(length) else { return false }
+            let start = networkAddress(routes, at: index)
+            let size = UInt64(1) << (32 - length)
+            guard start >= previousEnd, start % size == 0 else { return false }
+            previousEnd = start + size
+        }
+        return true
     }
 
     // The WireGuard peer must accept every IP that iOS sends into the TUN.
-    static func wireGuardCovers(_ routes: Data, uapi: String) -> Bool {
+    static func wireGuardCovers(_ routes: Data, uapi: String, mode: GeoIPMode = .include) -> Bool {
         let allowed = uapi.split(separator: "\n").compactMap { line -> UInt64? in
             let key = "allowed_ip="
             guard line.hasPrefix(key) else { return nil }
@@ -51,19 +84,34 @@ struct GeoIPSelection: Codable {
             return UInt64(network) << 8 | UInt64(length)
         }
         if allowed.contains(0) { return true }
-        let coverage = aggregate(allowed.sorted())
+        let coverage = allowed.sorted()
         var candidate = coverage.startIndex
-        for index in stride(from: routes.startIndex, to: routes.endIndex, by: 5) {
-            let start = routes[index..<index + 4].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-            let end = start + (1 << (32 - Int(routes[index + 4])))
-            while candidate < coverage.endIndex && prefixEnd(coverage[candidate]) <= start {
+
+        func covers(_ range: Range<UInt64>) -> Bool {
+            var next = range.lowerBound
+            while next < range.upperBound, candidate < coverage.endIndex {
+                let prefix = coverage[candidate]
+                guard prefix >> 8 <= next else { return false }
+                let end = prefixEnd(prefix)
+                if end >= range.upperBound { return true }
+                next = max(next, end)
                 candidate += 1
             }
-            guard candidate < coverage.endIndex,
-                  coverage[candidate] >> 8 <= start,
-                  prefixEnd(coverage[candidate]) >= end else { return false }
+            return next == range.upperBound
         }
-        return true
+
+        var cursor: UInt64 = 0
+        for index in stride(from: routes.startIndex, to: routes.endIndex, by: 5) {
+            let start = networkAddress(routes, at: index)
+            let end = start + (1 << (32 - Int(routes[index + 4])))
+            if mode == .include {
+                guard covers(start..<end) else { return false }
+            } else {
+                guard cursor >= start || covers(cursor..<start) else { return false }
+                cursor = max(cursor, end)
+            }
+        }
+        return mode == .include || covers(cursor..<(1 << 32))
     }
 
     static func resolve(_ database: Data, tags: Set<String>) throws -> Data {
@@ -146,6 +194,10 @@ struct GeoIPSelection: Codable {
         return routes
     }
 
+    private static func networkAddress(_ routes: Data, at index: Int) -> UInt64 {
+        routes[index..<index + 4].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+    }
+
     private static func prefixEnd(_ prefix: UInt64) -> UInt64 {
         (prefix >> 8) + (1 << (32 - Int(prefix & 0xFF)))
     }
@@ -200,7 +252,7 @@ enum GeoIPError: LocalizedError {
         case .invalidDatabase: return "The GeoIP routing data is invalid."
         case .missingCountry(let country): return "The GeoIP database has no IPv4 networks for \(country)."
         case .tooManyRoutes: return "The selection exceeds the IPv4 route limit. Try a smaller set of countries."
-        case .incompatibleWireGuardRoutes: return "The WireGuard profile’s AllowedIPs must cover all selected GeoIP networks."
+        case .incompatibleWireGuardRoutes: return "The WireGuard profile’s AllowedIPs must cover all IPv4 networks routed through the VPN."
         }
     }
 }
