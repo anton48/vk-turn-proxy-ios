@@ -36,6 +36,36 @@ struct GeoIPSelection: Codable {
             && routes.enumerated().allSatisfy { $0.offset % 5 != 4 || (1...32).contains($0.element) }
     }
 
+    // The WireGuard peer must accept every IP that iOS sends into the TUN.
+    static func wireGuardCovers(_ routes: Data, uapi: String) -> Bool {
+        let allowed = uapi.split(separator: "\n").compactMap { line -> UInt64? in
+            let key = "allowed_ip="
+            guard line.hasPrefix(key) else { return nil }
+            let cidr = line.dropFirst(key.count).split(separator: "/", omittingEmptySubsequences: false)
+            guard cidr.count == 2, let length = Int(cidr[1]), (0...32).contains(length) else { return nil }
+            let parts = cidr[0].split(separator: ".", omittingEmptySubsequences: false)
+            let octets = parts.compactMap { UInt8($0) }
+            guard parts.count == 4, octets.count == 4 else { return nil }
+            let ip = octets.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            let network = length == 0 ? 0 : ip & (UInt32.max << (32 - length))
+            return UInt64(network) << 8 | UInt64(length)
+        }
+        if allowed.contains(0) { return true }
+        let coverage = aggregate(allowed.sorted())
+        var candidate = coverage.startIndex
+        for index in stride(from: routes.startIndex, to: routes.endIndex, by: 5) {
+            let start = routes[index..<index + 4].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            let end = start + (1 << (32 - Int(routes[index + 4])))
+            while candidate < coverage.endIndex && prefixEnd(coverage[candidate]) <= start {
+                candidate += 1
+            }
+            guard candidate < coverage.endIndex,
+                  coverage[candidate] >> 8 <= start,
+                  prefixEnd(coverage[candidate]) >= end else { return false }
+        }
+        return true
+    }
+
     static func resolve(_ database: Data, tags: Set<String>) throws -> Data {
         var remaining = tags
         var prefixes = Set<UInt64>()
@@ -101,10 +131,7 @@ struct GeoIPSelection: Codable {
         for prefix in prefixes {
             let address = prefix >> 8
             var length = Int(prefix & 0xFF)
-            if let last = routes.last {
-                let size = UInt64(1) << (32 - Int(last & 0xFF))
-                if address < (last >> 8) + size { continue }
-            }
+            if let last = routes.last, address < prefixEnd(last) { continue }
 
             var network = address
             while length > 1, let last = routes.last, Int(last & 0xFF) == length {
@@ -117,6 +144,10 @@ struct GeoIPSelection: Codable {
             routes.append(network << 8 | UInt64(length))
         }
         return routes
+    }
+
+    private static func prefixEnd(_ prefix: UInt64) -> UInt64 {
+        (prefix >> 8) + (1 << (32 - Int(prefix & 0xFF)))
     }
 
     // V2Ray GeoIPList uses protobuf varints and length-delimited messages.
@@ -161,13 +192,15 @@ enum GeoIPError: LocalizedError {
     case invalidDatabase
     case missingCountry(String)
     case tooManyRoutes
+    case incompatibleWireGuardRoutes
 
     var errorDescription: String? {
         switch self {
         case .invalidCountries: return "Enter two-letter country codes, such as RU or CN."
         case .invalidDatabase: return "The GeoIP routing data is invalid."
         case .missingCountry(let country): return "The GeoIP database has no IPv4 networks for \(country)."
-        case .tooManyRoutes: return "The selected countries contain too many IPv4 routes. Select fewer countries."
+        case .tooManyRoutes: return "The selection exceeds the IPv4 route limit. Try a smaller set of countries."
+        case .incompatibleWireGuardRoutes: return "The WireGuard profile’s AllowedIPs must cover all selected GeoIP networks."
         }
     }
 }

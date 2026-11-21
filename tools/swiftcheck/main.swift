@@ -493,6 +493,16 @@ do {
     check((try? GeoIPSelection.resolve(Data(message(1, ru + [24, 1])), tags: ["RU"])) == nil,
           "inverse GeoIP rules are rejected")
     check(GeoIPSelection.validRoutes(routes ?? Data()), "the generated snapshot is accepted")
+    if let routes, let both {
+        check(GeoIPSelection.wireGuardCovers(both, uapi: "allowed_ip=0.0.0.0/0"),
+              "the default WireGuard peer covers all selected networks")
+        check(GeoIPSelection.wireGuardCovers(routes, uapi: "allowed_ip=203.0.113.0/25\nallowed_ip=203.0.113.128/25"),
+              "the union of two AllowedIPs can cover a selected subnet")
+        check(!GeoIPSelection.wireGuardCovers(both, uapi: "allowed_ip=203.0.113.0/24"),
+              "a second GeoIP subnet outside AllowedIPs blocks the connection")
+        check(!GeoIPSelection.wireGuardCovers(routes, uapi: "allowed_ip=::/0"),
+              "an IPv6 AllowedIPs default does not cover IPv4")
+    }
     check(!GeoIPSelection.validRoutes(Data([0, 0, 0, 0, 0])), "the default route is rejected")
     check(!GeoIPSelection.validRoutes(Data([192, 0, 2, 0, 33])), "invalid prefix lengths are rejected")
 }
@@ -4483,8 +4493,8 @@ do {
     check(turnOffs == 2,
           "🚨 a failure branch tears down on its own (\(turnOffs) backend.turnOff() calls, want failStart's and stopTunnel's)")
     let failStarts = provider.components(separatedBy: "self.failStart(backend, at: ").count - 1
-    check(failStarts == 9,
-          "every failure branch after the backend exists goes through failStart (\(failStarts) call sites, want 9: the waitReady timeout and failure, WRAP-A ×3, the csqtt provision, setTunnelNetworkSettings, the TUN fd, the attach)")
+    check(failStarts == 10,
+          "every failure branch after the backend exists goes through failStart (\(failStarts) call sites, want 10: the waitReady timeout and failure, WRAP-A ×3, the csqtt provision, GeoIP coverage, setTunnelNetworkSettings, the TUN fd, the attach)")
     if let install = provider.range(of: "self.backend = backend"),
        let end = provider.range(of: "override func handleAppMessage(") , install.upperBound < end.lowerBound {
         let rest = String(provider[install.upperBound..<end.lowerBound])

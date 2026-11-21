@@ -450,6 +450,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // cannot end up disagreeing if a message is lost.
         protoObservation = observe(\.protocolConfiguration, options: [.new]) { [weak self] _, _ in
             guard let self = self else { return }
+            guard geoIPRoutes == nil else { return }
             let p = self.protocolConfiguration
             var enforce = false
             if #available(iOS 14.2, *) { enforce = p.enforceRoutes }
@@ -627,6 +628,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     effMTU = String(TunnelMTU.clamp(m))
                 }
                 self.logMsg("csqtt provisioned: address=\(effAddress) dns=\(effDNS) mtu=\(effMTU)")
+            }
+
+            if let geoIPRoutes, !isCSQTT,
+               !GeoIPSelection.wireGuardCovers(geoIPRoutes, uapi: effWGConfig) {
+                self.failStart(backend, at: "GeoIP routing",
+                               line: "ERROR: WireGuard AllowedIPs do not cover the GeoIP routes",
+                               error: GeoIPError.incompatibleWireGuardRoutes, completionHandler)
+                return
             }
 
             // Read the TURN server IP that Go picked during bootstrap and

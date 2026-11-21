@@ -1068,6 +1068,10 @@ class TunnelManager: ObservableObject {
         } else {
             let selection = try PropertyListDecoder().decode(GeoIPSelection.self, from: geoIPSnapshot)
             guard GeoIPSelection.validRoutes(selection.routes) else { throw GeoIPError.invalidDatabase }
+            if !config.useWrapA && !config.useCsqtt,
+               !GeoIPSelection.wireGuardCovers(selection.routes, uapi: wgConfig) {
+                throw GeoIPError.incompatibleWireGuardRoutes
+            }
             geoIPRoutes = selection.routes
         }
 
