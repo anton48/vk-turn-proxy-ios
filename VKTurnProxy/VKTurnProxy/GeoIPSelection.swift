@@ -24,7 +24,6 @@ struct GeoIPSelection: Codable {
     static let settingsKey = "geoIPSelection"
     static let routesKey = "geoip_routes"
     static let modeKey = "geoip_mode"
-    static let maxRoutes = 16_384
 
     let countries: String
     let routes: Data
@@ -56,7 +55,7 @@ struct GeoIPSelection: Codable {
 
     // Each route is four network address bytes followed by its prefix length.
     static func validRoutes(_ routes: Data) -> Bool {
-        guard !routes.isEmpty, routes.count % 5 == 0, routes.count <= maxRoutes * 5 else { return false }
+        guard !routes.isEmpty, routes.count % 5 == 0 else { return false }
         var previousEnd: UInt64 = 0
         for index in stride(from: routes.startIndex, to: routes.endIndex, by: 5) {
             let length = Int(routes[index + 4])
@@ -168,7 +167,6 @@ struct GeoIPSelection: Codable {
         guard !prefixes.isEmpty else { throw GeoIPError.invalidDatabase }
 
         let routes = aggregate(prefixes.sorted())
-        guard routes.count <= maxRoutes else { throw GeoIPError.tooManyRoutes }
         return Data(routes.flatMap { prefix in
             (0..<5).reversed().map { UInt8(truncatingIfNeeded: prefix >> ($0 * 8)) }
         })
@@ -243,7 +241,6 @@ enum GeoIPError: LocalizedError {
     case invalidCountries
     case invalidDatabase
     case missingCountry(String)
-    case tooManyRoutes
     case incompatibleWireGuardRoutes
 
     var errorDescription: String? {
@@ -251,7 +248,6 @@ enum GeoIPError: LocalizedError {
         case .invalidCountries: return "Enter two-letter country codes, such as RU or CN."
         case .invalidDatabase: return "The GeoIP routing data is invalid."
         case .missingCountry(let country): return "The GeoIP database has no IPv4 networks for \(country)."
-        case .tooManyRoutes: return "The selection exceeds the IPv4 route limit. Try a smaller set of countries."
         case .incompatibleWireGuardRoutes: return "The WireGuard profile’s AllowedIPs must cover all IPv4 networks routed through the VPN."
         }
     }
